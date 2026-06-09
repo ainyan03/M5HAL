@@ -32,7 +32,16 @@ namespace {
 
 ::i2c_addr_bit_len_t addressBitLen(bool address_is_10bit)
 {
+#if SOC_I2C_SUPPORT_10BIT_ADDR
     return address_is_10bit ? I2C_ADDR_BIT_LEN_10 : I2C_ADDR_BIT_LEN_7;
+#else
+    // I2C_ADDR_BIT_LEN_10 is gated behind SOC_I2C_SUPPORT_10BIT_ADDR (absent on
+    // targets without 10-bit support, and on esp32 IDF patches before it was
+    // backported: v5.2.4 / v5.3.3 / v5.4.1). ensureDevice() rejects a 10-bit
+    // request up front when the cap is missing, so we only reach 7-bit here.
+    (void)address_is_10bit;
+    return I2C_ADDR_BIT_LEN_7;
+#endif
 }
 
 bool isValidAddress(const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg)
@@ -130,6 +139,12 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::removeDevice(void)
 m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::ensureDevice(
     const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg)
 {
+#if !SOC_I2C_SUPPORT_10BIT_ADDR
+    if (cfg.address_is_10bit) {
+        // This target's I2C peripheral does not expose 10-bit addressing.
+        return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
+    }
+#endif
     const uint32_t scl_wait_us = cfg.timeout_ms * 1000u;
     if (_dev_handle != nullptr && _dev_addr == cfg.i2c_addr && _dev_freq == cfg.freq &&
         _dev_scl_wait_us == scl_wait_us && _dev_address_is_10bit == cfg.address_is_10bit) {
@@ -145,7 +160,11 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::ensureDevice(
     dev_config.dev_addr_length       = addressBitLen(cfg.address_is_10bit);
     dev_config.device_address        = cfg.i2c_addr;
     dev_config.scl_speed_hz          = cfg.freq;
-    dev_config.scl_wait_us           = scl_wait_us;
+    // i2c_device_config_t::scl_wait_us was added to the bus-device API in IDF
+    // v5.2.2 (backported into the v5.2 line); skip it on older patches.
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 2)
+    dev_config.scl_wait_us = scl_wait_us;
+#endif
 
     auto err    = ::i2c_master_bus_add_device(_bus_handle, &dev_config, &_dev_handle);
     auto mapped = mapEspErr(err);

@@ -19,24 +19,24 @@ if(COMMAND idf_component_register)
     # The espidf variant public headers expose driver types for attach/native
     # handles, so the driver component dependencies must be public.
     #
-    # esp_driver_* components were split out of the monolithic 'driver'
-    # component in IDF v5.2. On v5.0/v5.1 they live in 'driver'.
-    if("${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}" VERSION_GREATER_EQUAL "5.2")
+    # The esp_driver_* components (gpio / i2c / spi / uart) were all split out
+    # of the monolithic 'driver' component in the IDF v5.3 "driver as
+    # components" refactor. On v5.2 and earlier the headers we use
+    # (driver/gpio.h, driver/i2c_master.h, driver/spi_master.h, driver/uart.h)
+    # all live in 'driver'. Note the new i2c_master API shipped in v5.2 but
+    # inside 'driver'; the standalone esp_driver_i2c component only exists from
+    # v5.3 — requiring it on v5.2 fails to resolve (verified via the idf-matrix
+    # esp32 build). The v5.3 threshold also matches upstream m5stack/M5HAL's
+    # esp_driver_gpio fix (commit 67e314f).
+    if("${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}" VERSION_GREATER_EQUAL "5.3")
         set(m5hal_gpio_req esp_driver_gpio)
         set(m5hal_i2c_req esp_driver_i2c)
         set(m5hal_spi_req esp_driver_spi)
+        set(m5hal_uart_req esp_driver_uart)
     else()
         set(m5hal_gpio_req driver)
         set(m5hal_i2c_req driver)
         set(m5hal_spi_req driver)
-    endif()
-
-    # UART (driver/uart.h, used by the espidf UART variant) was split into its
-    # own esp_driver_uart component later, in IDF v5.3; on v5.2 and earlier it
-    # still lives in 'driver'.
-    if("${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}" VERSION_GREATER_EQUAL "5.3")
-        set(m5hal_uart_req esp_driver_uart)
-    else()
         set(m5hal_uart_req driver)
     endif()
 

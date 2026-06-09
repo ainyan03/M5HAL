@@ -21,18 +21,35 @@
 // Detection is by header presence (__has_include), not by version number, so a
 // runtime that ships only one of the headers still resolves correctly.
 
-// gen5: bus-device I2C master API (driver/i2c_master.h, ESP-IDF v5.2+).
+// Capability probes (header presence) — independent of which backend M5HAL
+// actually selects below.
+//   gen5: bus-device API (driver/i2c_master.h, ESP-IDF v5.2+).
+//   gen4: command-link (legacy) API (driver/i2c.h, ESP-IDF v1..v6.0 EOL).
 #if __has_include(<driver/i2c_master.h>)
-#define M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5 1
+#define M5HAL_ESPIDF_I2C_HAVE_GEN5 1
 #else
-#define M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5 0
+#define M5HAL_ESPIDF_I2C_HAVE_GEN5 0
+#endif
+#if __has_include(<driver/i2c.h>)
+#define M5HAL_ESPIDF_I2C_HAVE_GEN4 1
+#else
+#define M5HAL_ESPIDF_I2C_HAVE_GEN4 0
 #endif
 
-// gen4: command-link (legacy) I2C master API (driver/i2c.h, ESP-IDF v1..v6.0 EOL).
-#if __has_include(<driver/i2c.h>)
-#define M5HAL_ESPIDF_I2C_HAS_MASTER_GEN4 1
+// Backend selection — M5HAL compiles exactly ONE I2C backend. ESP-IDF aborts at
+// runtime if the legacy command-link driver (driver/i2c.h) and the modern
+// bus-device driver (driver/i2c_master.h) are linked into the same image, so we
+// must never pull in both. Default = modern gen5. The legacy gen4 backend is
+// OPT-IN via M5HAL_USE_LEGACY_IDF_DRIVER: a project that already uses the legacy
+// driver defines it to force M5HAL onto gen4 and avoid the mixed-link abort.
+// Exception: on ESP-IDF older than v5.2 the modern driver does not exist (so no
+// conflict is possible), and M5HAL falls back to gen4 automatically there.
+#if defined(M5HAL_USE_LEGACY_IDF_DRIVER)
+#define M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5 0
+#define M5HAL_ESPIDF_I2C_HAS_MASTER_GEN4 M5HAL_ESPIDF_I2C_HAVE_GEN4
 #else
-#define M5HAL_ESPIDF_I2C_HAS_MASTER_GEN4 0
+#define M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5 M5HAL_ESPIDF_I2C_HAVE_GEN5
+#define M5HAL_ESPIDF_I2C_HAS_MASTER_GEN4 (!M5HAL_ESPIDF_I2C_HAVE_GEN5 && M5HAL_ESPIDF_I2C_HAVE_GEN4)
 #endif
 
 #define M5HAL_ESPIDF_I2C_HAS_MASTER (M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5 || M5HAL_ESPIDF_I2C_HAS_MASTER_GEN4)
