@@ -8,7 +8,7 @@
 // is offered (and flat-injected as the host UART) only on a POSIX host
 // build; gated by M5HAL_FRAMEWORK_HAS_POSIX (frameworks/_checker.hpp),
 // which defaults on for non-ESP/non-Arduino hosts and is suppressed by
-// defining M5HAL_DISABLE_POSIX.
+// setting M5HAL_CONFIG_POSIX_UART=0.
 
 #if M5HAL_FRAMEWORK_HAS_POSIX
 

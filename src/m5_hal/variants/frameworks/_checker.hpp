@@ -27,9 +27,12 @@
 // plain POSIX host (no Arduino / ESP-IDF SDK in the build) the host serial
 // port is what a real application wants, so posix is the default UART
 // provider there. stub keeps no-op'ing the HAL kinds that have no host
-// implementation. Define M5HAL_DISABLE_POSIX to suppress it (e.g. a host
+// implementation. Set M5HAL_CONFIG_POSIX_UART=0 to suppress it (e.g. a host
 // test that wants UART left unprovided).
-#if !defined(M5HAL_DISABLE_POSIX) && !defined(ESP_PLATFORM) && !defined(ARDUINO) && __has_include(<termios.h>)
+#ifndef M5HAL_CONFIG_POSIX_UART
+#define M5HAL_CONFIG_POSIX_UART 1
+#endif
+#if M5HAL_CONFIG_POSIX_UART && !defined(ESP_PLATFORM) && !defined(ARDUINO) && __has_include(<termios.h>)
 #define M5HAL_FRAMEWORK_HAS_POSIX 1
 #else
 #define M5HAL_FRAMEWORK_HAS_POSIX 0

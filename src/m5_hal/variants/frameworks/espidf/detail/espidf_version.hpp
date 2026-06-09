@@ -40,11 +40,14 @@
 // runtime if the legacy command-link driver (driver/i2c.h) and the modern
 // bus-device driver (driver/i2c_master.h) are linked into the same image, so we
 // must never pull in both. Default = modern gen5. The legacy gen4 backend is
-// OPT-IN via M5HAL_USE_LEGACY_IDF_DRIVER: a project that already uses the legacy
-// driver defines it to force M5HAL onto gen4 and avoid the mixed-link abort.
+// opt-in via M5HAL_CONFIG_IDF_I2C_LEGACY=1: a project that already uses the
+// legacy driver sets it to force M5HAL onto gen4 and avoid the mixed-link abort.
 // Exception: on ESP-IDF older than v5.2 the modern driver does not exist (so no
 // conflict is possible), and M5HAL falls back to gen4 automatically there.
-#if defined(M5HAL_USE_LEGACY_IDF_DRIVER)
+#ifndef M5HAL_CONFIG_IDF_I2C_LEGACY
+#define M5HAL_CONFIG_IDF_I2C_LEGACY 0
+#endif
+#if M5HAL_CONFIG_IDF_I2C_LEGACY
 #define M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5 0
 #define M5HAL_ESPIDF_I2C_HAS_MASTER_GEN4 M5HAL_ESPIDF_I2C_HAVE_GEN4
 #else

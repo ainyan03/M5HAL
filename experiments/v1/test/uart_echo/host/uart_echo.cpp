@@ -95,7 +95,7 @@ TEST_F(UartEcho, EchoesLargePayloadInOrder)
 
 TEST(UartEcho, SkippedWhenPosixDisabled)
 {
-    SUCCEED() << "POSIX UART variant disabled (M5HAL_DISABLE_POSIX or non-POSIX host)";
+    SUCCEED() << "POSIX UART variant disabled (M5HAL_CONFIG_POSIX_UART=0 or non-POSIX host)";
 }
 
 #endif  // M5HAL_FRAMEWORK_HAS_POSIX

@@ -11,12 +11,21 @@
 
 #include <thread>
 
-#ifndef M5HAL_SOFTWARE_I2C_SYNC_RUNNER_NO_WAIT
-#define M5HAL_SOFTWARE_I2C_SYNC_RUNNER_NO_WAIT 0
+// Sync runner pacing. YIELD_PROBE_SPINS tunes the normal (production) idle path:
+// when the service is idle the runner yields the thread only after this many busy
+// probes (and only if the next due time is far enough out). This yield is
+// load-bearing for host cooperation — a same-thread master+slave native test
+// needs the runner to yield so the peer can make progress (cf. ADR 014).
+#ifndef M5HAL_CONFIG_SOFTWARE_I2C_YIELD_PROBE_SPINS
+#define M5HAL_CONFIG_SOFTWARE_I2C_YIELD_PROBE_SPINS 64
 #endif
 
-#ifndef M5HAL_SOFTWARE_I2C_SYNC_RUNNER_YIELD_PROBE_SPINS
-#define M5HAL_SOFTWARE_I2C_SYNC_RUNNER_YIELD_PROBE_SPINS 64
+// M5HAL_DEBUG_* is the diagnostic family (default off, not a supported config).
+// NO_WAIT=1 compiles the whole yield path out so the runner spins continuously;
+// it breaks host cooperation, so use it only to isolate timing while debugging
+// the runner.
+#ifndef M5HAL_DEBUG_SOFTWARE_I2C_NO_WAIT
+#define M5HAL_DEBUG_SOFTWARE_I2C_NO_WAIT 0
 #endif
 
 namespace m5::variants::frameworks::software::hal::v1::i2c {
@@ -86,7 +95,7 @@ detail::MasterTiming serviceTimingFromNsec(const detail::MasterTiming& timing)
 template <typename Service>
 m5::stl::expected<void, ::m5::hal::v1::error::error_t> runErrorReportingService(Service& service)
 {
-#if !M5HAL_SOFTWARE_I2C_SYNC_RUNNER_NO_WAIT
+#if !M5HAL_DEBUG_SOFTWARE_I2C_NO_WAIT
     uint32_t idle_spins = 0;
 #endif
     for (;;) {
@@ -99,8 +108,8 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> runErrorReportingService(
             return m5::stl::make_unexpected(service.error());
         }
         if (result == ::m5::hal::v1::service::ServiceResult::Idle) {
-#if !M5HAL_SOFTWARE_I2C_SYNC_RUNNER_NO_WAIT
-            if (++idle_spins < M5HAL_SOFTWARE_I2C_SYNC_RUNNER_YIELD_PROBE_SPINS) {
+#if !M5HAL_DEBUG_SOFTWARE_I2C_NO_WAIT
+            if (++idle_spins < M5HAL_CONFIG_SOFTWARE_I2C_YIELD_PROBE_SPINS) {
                 continue;
             }
             idle_spins                                                        = 0;
@@ -111,7 +120,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> runErrorReportingService(
             }
 #endif
         } else {
-#if !M5HAL_SOFTWARE_I2C_SYNC_RUNNER_NO_WAIT
+#if !M5HAL_DEBUG_SOFTWARE_I2C_NO_WAIT
             idle_spins = 0;
 #endif
         }

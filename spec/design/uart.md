@@ -86,7 +86,7 @@ Arduino backend は `HardwareSerial::flush()` を使う。
   caller-owned fd（pty の片端など）を採用する。termios は最初の write/read で
   per-access `UARTAccessConfig` から適用（baud / 8bit / stop / parity）、timeout は
   `select()` で実装する。read/write 以外の line は raw（`cfmakeraw`）。素の POSIX
-  host で既定有効の opt-out（`M5HAL_DISABLE_POSIX` で抑止）。高速 baud: Linux glibc/musl は
+  host で既定有効の opt-out（`M5HAL_CONFIG_POSIX_UART=0` で抑止）。高速 baud: Linux glibc/musl は
   `B460800`〜`B4000000` の定数経由、 macOS は B230400 超を `IOSSIOSPEED` ioctl で任意 baud 設定
   （いずれも 3 Mbaud を実機実績 — Core BASIC v2.7 の CH9102 ↔ MacBook）。round-trip は pty を
   使った native gtest で検証 (`test/v1/native/bus/test_posix_uart`)。
