@@ -1,17 +1,15 @@
-# Fork-only build-check matrix for the ainyan03/M5HAL fork.
+# Cross-repository PlatformIO build-check matrix.
 #
-# Runs the full PlatformIO build matrix on GitHub-hosted ubuntu-latest runners,
-# where every matrix entry gets its own VM (fully parallel, no contention). It is
-# the clean-environment build verification that complements the local per-commit
-# checks (scripts/local-ci.sh). The official m5stack template CI is lint +
-# clang-format only; this adds the build/test matrix the template lacks.
+# Runs the public compile fences on GitHub-hosted ubuntu-latest runners. The
+# workflow is intentionally the same on the upstream repository and on forks:
+# each matrix entry gets its own VM, so the expensive ESP-IDF generation probes
+# can run in parallel without depending on the availability of self-hosted
+# runners.
 #
-# Fork-guarded (`if: github.repository == 'ainyan03/M5HAL'`) so it stays inert if
-# ever merged upstream, and excluded from the official PR. The upstream-template
-# Arduino-Lint / clang-format workflows are dual-mode (self-hosted on the m5stack
-# org, free ubuntu runners on forks), so they run on this fork too — no clang
-# -format duplicate is needed here.
-name: fork-build-check
+# Arduino-Lint and clang-format live in separate workflows. This workflow keeps
+# only build/test checks so users and maintainers see one common build matrix
+# regardless of whether the run came from m5stack/M5HAL or a fork.
+name: build-check-pio
 
 on:
   push:
@@ -20,7 +18,6 @@ on:
 
 jobs:
   build:
-    if: github.repository == 'ainyan03/M5HAL'
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     continue-on-error: ${{ matrix.soft_fail == 'true' }}

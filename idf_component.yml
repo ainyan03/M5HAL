@@ -18,9 +18,21 @@ targets:
   - esp32p4
   - esp32h2
 
+# Ship only the library itself in the published ESP-IDF component (src + headers
+# + CMakeLists + README + LICENSE). examples/ is excluded here because an IDF
+# component never builds or consumes them; the PlatformIO package (library.json)
+# intentionally KEEPS examples/ since Arduino / PlatformIO users do. Rationale:
+# spec/reference/directory-layout.md (published-package excludes).
 files:
   exclude:
-    - ".claude/**"
-    - ".pio/**"
-    - ".platformio/**"
-    - "dependencies.lock"
+    - "docs/**"
+    - "examples/**"
+    - "experiments/**"
+    - "test/**"
+    - "spec/**"
+    - "pio_envs/**"
+    - ".github/**"
+    - "boards/**"
+    - "platformio.ini"
+    - "library.json"
+    - "library.properties"

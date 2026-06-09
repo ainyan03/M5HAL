@@ -17,15 +17,23 @@ namespace m5::hal::v1::error {
   documented in coding_style.md §Naming.
  */
 enum class ErrorType : int8_t {
-    ASYNC_RUNNING    = 1,   ///< Operation accepted and still running asynchronously.
-    OK               = 0,   ///< Success.
-    UNKNOWN_ERROR    = -1,  ///< Unclassified failure.
-    TIMEOUT_ERROR    = -2,  ///< Operation timed out before completion.
-    INVALID_ARGUMENT = -3,  ///< A caller-supplied argument violated the API contract.
-    NOT_IMPLEMENTED  = -4,  ///< The operation is not implemented by the current variant.
-    I2C_BUS_ERROR    = -5,  ///< Low-level I2C bus error (arbitration loss, stretch timeout, etc).
-    I2C_NO_ACK       = -6,  ///< Addressed I2C target did not acknowledge.
-    BUSY             = -7,  ///< Resource is currently locked by another owner.
+    ASYNC_RUNNING    = 1,    ///< Operation accepted and still running asynchronously.
+    OK               = 0,    ///< Success.
+    UNKNOWN_ERROR    = -1,   ///< Unclassified failure.
+    TIMEOUT_ERROR    = -2,   ///< Operation timed out before completion.
+    INVALID_ARGUMENT = -3,   ///< A caller-supplied argument violated the API contract.
+    NOT_IMPLEMENTED  = -4,   ///< The operation is not implemented by the current variant.
+    I2C_BUS_ERROR    = -5,   ///< Low-level I2C bus error (arbitration loss, stretch timeout, etc).
+    I2C_NO_ACK       = -6,   ///< Addressed I2C target did not acknowledge.
+    BUSY             = -7,   ///< Resource is currently locked by another owner.
+    IO_ERROR         = -8,   ///< Generic transport / OS / driver I/O failure.
+    CLOSED           = -9,   ///< Resource, stream, or endpoint is closed.
+    OUT_OF_RESOURCE  = -10,  ///< Fixed storage, handle slots, or other bounded resources are exhausted.
+    BUFFER_OVERFLOW  = -11,  ///< Producer wrote or received more data than the destination can hold.
+    BUFFER_UNDERFLOW = -12,  ///< Consumer requested data that is not currently available.
+    END_OF_STREAM    = -13,  ///< Stream reached a clean end condition.
+    CHECKSUM_ERROR   = -14,  ///< Frame or payload integrity check failed.
+    PROTOCOL_ERROR   = -15,  ///< Well-formed bytes violated the protocol state / semantics.
 };
 using error_t = ErrorType;
 

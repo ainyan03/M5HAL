@@ -105,11 +105,12 @@ Source / Sink の 4 つの core API (`peek` / `advance` / `reserve` / `commit`) 
 
 | 派生想定 | 返し得る error_t |
 |---|---|
-| network/remote bus Source/Sink | `TIMEOUT_ERROR`, `I2C_BUS_ERROR` 相当の disconnect/transport error、 将来追加の `OVERFLOW` / `EOF` 等 |
-| ringbuffer Sink | `OVERFLOW` (commit 量 > 内部空き)、 ただし派生側で eof 様の closed() で吸収する設計も可 |
-| DMA backed Source/Sink | ハードウェア検出の transport error |
+| network/remote bus Source/Sink | `TIMEOUT_ERROR`, `IO_ERROR`, `CLOSED`, `PROTOCOL_ERROR` 等 |
+| ringbuffer Sink | `BUFFER_OVERFLOW` (commit 量 > 内部空き)、 `BUFFER_UNDERFLOW` (read 要求に対してデータ不足)、 `END_OF_STREAM` |
+| framed stream Source/Sink | `CHECKSUM_ERROR`, `PROTOCOL_ERROR`, `BUFFER_OVERFLOW`, `TIMEOUT_ERROR` |
+| DMA backed Source/Sink | `IO_ERROR`, `TIMEOUT_ERROR` 等のハードウェア検出 transport error |
 
-新規 error_t 値追加は残論点 L5 に従って必要時に行う。
+stream / frame / remote 系で必要になる粒度は v1 `error_t` に追加済み。 個別実装は上表を目安に、 可能な限り `UNKNOWN_ERROR` へ潰さず recoverable error の意味を保つ。
 
 ## 採用しない要素
 

@@ -1,19 +1,18 @@
-# Fork-only official ESP-IDF component build check for the ainyan03/M5HAL fork.
+# Official ESP-IDF component build check.
 #
 # Builds M5HAL as an ESP-IDF component (test/idf_component_build) with the
 # official `espressif/idf` toolchain across the full chip family — crucially
 # including esp32-h2 and esp32-p4, which the PlatformIO `espressif32` platform
 # cannot build (it ships no h2/p4 board files). Official ESP-IDF supports every
 # chip M5HAL targets (see idf_component.yml `targets:`), so this is the
-# authoritative, all-official verification lane. The PlatformIO
-# fork-build-check covers esp32 / s3 / c3 / c6 across IDF 4/5/6 in parallel; the
-# community pioarduino platform is deliberately NOT used as a verification gate.
+# authoritative, all-official verification lane. The build-check-pio workflow
+# covers the fast public compile fences across selected Arduino /
+# ESP-IDF generations; this workflow covers official component integration for
+# all supported chip targets.
 #
-# NOT part of the upstream m5stack PR:
-#   - guarded by `if: github.repository == 'ainyan03/M5HAL'` so it stays inert
-#     if ever merged upstream, and excluded from the official PR.
-# (The upstream-template Arduino-Lint / clang-format workflows are dual-mode:
-#  self-hosted on the m5stack org, free ubuntu runners on forks.)
+# This workflow is intentionally shared by upstream and forks. It uses
+# GitHub-hosted ubuntu-latest plus Espressif's official container image, so it
+# does not require m5stack self-hosted runners.
 #
 # Modeled on the LovyanGFX / M5GFX / M5Unified `IDFBuild.yml` pattern, using the
 # official image directly as the job container (no manual esp-idf clone). The
@@ -21,7 +20,7 @@
 # M5Utility checkout as components (IDF_COMPONENT_MANAGER=0 -> hermetic, no
 # network deps) and compiles the shared v1 API surface (test/v1/build_check),
 # which references PinBackup / ScopedPinBackup.
-name: IDFBuild
+name: build-check-idf
 
 on:
   push:
@@ -30,7 +29,6 @@ on:
 
 jobs:
   idf-build:
-    if: github.repository == 'ainyan03/M5HAL'
     name: idf ${{ matrix.idf }} ${{ matrix.target }}
     runs-on: ubuntu-latest
     container: espressif/idf:${{ matrix.idf }}

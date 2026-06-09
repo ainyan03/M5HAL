@@ -25,10 +25,13 @@
     "license": "MIT",
     "export": {
         "exclude": [
-            ".claude",
-            ".pio",
-            ".platformio",
-            "dependencies.lock"
+            "experiments",
+            "test",
+            "spec",
+            "pio_envs",
+            ".github",
+            "platformio.ini",
+            "idf_component.yml"
         ]
     }
 }

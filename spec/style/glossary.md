@@ -58,6 +58,14 @@
 | 未実装 | not implemented | `error_t::NOT_IMPLEMENTED` |
 | 不正引数 | invalid argument | `error_t::INVALID_ARGUMENT` |
 | ビジー | busy | `error_t::BUSY` |
+| I/O エラー | I/O error | `error_t::IO_ERROR` |
+| 閉じている | closed | `error_t::CLOSED` |
+| 資源不足 | out of resource | `error_t::OUT_OF_RESOURCE` |
+| バッファオーバーフロー | buffer overflow | `error_t::BUFFER_OVERFLOW` |
+| バッファアンダーフロー | buffer underflow | `error_t::BUFFER_UNDERFLOW` |
+| stream 終端 | end-of-stream | `error_t::END_OF_STREAM` |
+| checksum 不一致 | checksum error | `error_t::CHECKSUM_ERROR` |
+| protocol 違反 | protocol error | `error_t::PROTOCOL_ERROR` |
 | 短絡終了 / early return | early exit / short-circuit return | エラー時の処理中断 |
 | no-op (release) | no-op in release builds | `M5HAL_ASSERT` の release 挙動 |
 | sentinel (番兵) | sentinel | `_lock_owner = nullptr` 等 |

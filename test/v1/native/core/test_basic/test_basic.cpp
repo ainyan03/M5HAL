@@ -30,6 +30,25 @@ TEST(NativeEnvironment, GoogleTestRuns)
     EXPECT_EQ(1 + 1, 2);
 }
 
+TEST(ErrorCode, ClassifiesExtendedFailures)
+{
+    namespace error = m5::hal::v1::error;
+
+    EXPECT_FALSE(error::isError(error::error_t::OK));
+    EXPECT_FALSE(error::isError(error::error_t::ASYNC_RUNNING));
+    EXPECT_TRUE(error::isOk(error::error_t::OK));
+    EXPECT_FALSE(error::isOk(error::error_t::ASYNC_RUNNING));
+
+    EXPECT_TRUE(error::isError(error::error_t::IO_ERROR));
+    EXPECT_TRUE(error::isError(error::error_t::CLOSED));
+    EXPECT_TRUE(error::isError(error::error_t::OUT_OF_RESOURCE));
+    EXPECT_TRUE(error::isError(error::error_t::BUFFER_OVERFLOW));
+    EXPECT_TRUE(error::isError(error::error_t::BUFFER_UNDERFLOW));
+    EXPECT_TRUE(error::isError(error::error_t::END_OF_STREAM));
+    EXPECT_TRUE(error::isError(error::error_t::CHECKSUM_ERROR));
+    EXPECT_TRUE(error::isError(error::error_t::PROTOCOL_ERROR));
+}
+
 TEST(ServiceRunner, RunsRegisteredServicesInOrder)
 {
     using m5::hal::v1::service::ServiceResult;

@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.16.0)
 # from the local source trees, then builds the tiny consumer in main/ that
 # exercises the public API surface (test/v1/build_check). Run with the official
 # espressif/idf toolchain via `idf.py set-target <chip> build`, locally or in
-# CI (.github/workflows/IDFBuild.yml). This is the authoritative full-family
+# CI (.github/workflows/build-check-idf.yml). This is the authoritative full-family
 # verification (esp32 / s3 / c3 / c6 / h2 / p4) — official ESP-IDF supports
 # every chip M5HAL targets, whereas the PlatformIO `espressif32` platform ships
 # no h2/p4 boards.
