@@ -1,0 +1,91 @@
+# Fork-only build-check matrix for the ainyan03/M5HAL fork.
+#
+# Runs the full PlatformIO build matrix on GitHub-hosted ubuntu-latest runners,
+# where every matrix entry gets its own VM (fully parallel, no contention). It is
+# the clean-environment build verification that complements the local per-commit
+# checks (scripts/local-ci.sh). The official m5stack template CI is lint +
+# clang-format only; this adds the build/test matrix the template lacks.
+#
+# Fork-guarded (`if: github.repository == 'ainyan03/M5HAL'`) so it stays inert if
+# ever merged upstream, and excluded from the official PR. The upstream-template
+# Arduino-Lint / clang-format workflows are dual-mode (self-hosted on the m5stack
+# org, free ubuntu runners on forks), so they run on this fork too — no clang
+# -format duplicate is needed here.
+name: fork-build-check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    if: github.repository == 'ainyan03/M5HAL'
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.soft_fail == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: native checks
+            envs: -e v0_check_native -e v1_check_native -e v1_check_native_inline
+            run_native_test: "true"
+          - name: arduino checks
+            envs: -e v0_check_esp32_arduino -e v0_check_esp32s3_arduino -e v1_check_esp32_arduino -e v1_check_esp32s3_arduino
+          - name: ESP-IDF 5 checks
+            envs: -e v0_check_esp32_espidf -e v0_check_esp32s3_espidf -e v1_check_esp32_espidf -e v1_check_esp32s3_espidf
+          - name: ESP-IDF 4 compatibility checks
+            envs: -e v0_check_esp32_espidf4 -e v1_check_esp32_espidf4
+          - name: ESP-IDF 6 forward probes
+            envs: -e v0_check_esp32_espidf6 -e v1_check_esp32_espidf6 -e v1_check_esp32s3_espidf6
+            soft_fail: "true"
+    steps:
+      - name: Checkout M5HAL
+        uses: actions/checkout@v6
+        with:
+          path: M5HAL
+
+      - name: Checkout M5Utility (parallel)
+        uses: actions/checkout@v6
+        with:
+          repository: m5stack/M5Utility
+          ref: develop
+          path: M5Utility
+
+      - name: Cache PlatformIO and pip
+        uses: actions/cache@v5
+        continue-on-error: true
+        with:
+          path: |
+            .platformio
+            ~/.cache/pip
+          key: ${{ runner.os }}-pio-${{ hashFiles('M5HAL/platformio.ini', 'M5HAL/pio_envs/**/*.ini*') }}
+          restore-keys: |
+            ${{ runner.os }}-pio-
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Install PlatformIO
+        # The older espressif32@5.4.0 (ESP-IDF 4.4) builder imports
+        # pkg_resources, which ships inside setuptools. Python 3.12+ no longer
+        # bundles setuptools, and setuptools >= 81 dropped pkg_resources
+        # entirely, so pin to < 81 (which still provides it) or the
+        # "ESP-IDF 4 compatibility checks" matrix entry fails to configure.
+        run: pip3 install -U platformio "setuptools<81"
+
+      # check envs live in *.ini.cli (kept out of the PlatformIO GUI). Load them
+      # via M5HAL_PIO_EXTRA_CONFIG (platformio.ini's ${sysenv.*} hook) — no copy.
+      - name: Build fences
+        working-directory: M5HAL
+        env:
+          M5HAL_PIO_EXTRA_CONFIG: pio_envs/*/check.ini.cli
+        run: pio run ${{ matrix.envs }}
+
+      - name: Run test_native
+        if: matrix.run_native_test == 'true'
+        working-directory: M5HAL
+        run: pio test -e test_native

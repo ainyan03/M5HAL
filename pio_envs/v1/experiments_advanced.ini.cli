@@ -1,0 +1,32 @@
+; =============================================================================
+; M5HAL — v1 advanced experiments (disabled by default)
+;
+; This file intentionally does not end with ".ini", so PlatformIO's
+; `pio_envs/v1/*.ini` glob does not load these envs into the GUI.
+;
+; Keep GUI-visible entries small. Enable these only when doing focused
+; benchmarks or logic-analyzer work that the menu harnesses (BoardMenu /
+; BenchmarkMenu) do not cover. General I2C / SPI / GPIO smoke and timer /
+; memory benchmarks live in the menu envs (v1_exp_menu_* / v1_exp_bench_*).
+; =============================================================================
+
+[env:v1_experiment_I2CHotPathBenchmark_esp32_arduino]
+extends = common_esp32dev, common_arduino
+build_src_filter = +<*> +<../experiments/v1/I2CHotPathBenchmark/I2CHotPathBenchmark.cpp>
+
+[env:v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino]
+extends = common_esp32dev, common_arduino
+build_src_filter = +<*> +<../experiments/v1/SoftwareSPILogicAnalyzer/SoftwareSPILogicAnalyzer.cpp>
+
+[env:v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino_5mhz]
+extends = env:v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino
+build_flags =
+    ${common_esp32.build_flags}
+    -DM5HAL_EXPERIMENT_SOFTWARE_SPI_FREQ=5000000
+
+[env:v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino_5mhz_ndebug]
+extends = env:v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino_5mhz
+build_flags =
+    ${common_esp32.build_flags}
+    -DM5HAL_EXPERIMENT_SOFTWARE_SPI_FREQ=5000000
+    -DNDEBUG

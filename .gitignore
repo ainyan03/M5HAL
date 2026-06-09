@@ -30,3 +30,27 @@
 *.exe
 *.out
 *.app
+
+# macOS
+.DS_Store
+
+# PlatformIO
+.pio/
+
+# IDE
+.vscode/
+.cache/
+
+# Local-only Claude Code workspace
+.claude/
+
+# ESP-IDF auto-generated config
+sdkconfig*
+
+# IDF Component Manager auto-generated backups / local cache
+*.orig
+managed_components/
+dependencies.lock
+
+# Local-only AI agent rules
+CLAUDE.local.md

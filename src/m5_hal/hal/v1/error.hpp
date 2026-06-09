@@ -1,0 +1,46 @@
+#ifndef M5_HAL_ERROR_HPP
+#define M5_HAL_ERROR_HPP
+
+#include <stdint.h>
+
+/*!
+  @namespace m5::hal::v1::error
+  @brief Error codes returned by v1 HAL APIs via `m5::stl::expected<T, error_t>`.
+ */
+namespace m5::hal::v1::error {
+
+/*!
+  @brief Error codes returned by v1 HAL APIs.
+
+  Negative values indicate failures. `OK` (0) and `ASYNC_RUNNING` (1) are
+  non-failure states. UPPER_SNAKE_CASE follows the POSIX-style convention
+  documented in coding_style.md §Naming.
+ */
+enum class ErrorType : int8_t {
+    ASYNC_RUNNING    = 1,   ///< Operation accepted and still running asynchronously.
+    OK               = 0,   ///< Success.
+    UNKNOWN_ERROR    = -1,  ///< Unclassified failure.
+    TIMEOUT_ERROR    = -2,  ///< Operation timed out before completion.
+    INVALID_ARGUMENT = -3,  ///< A caller-supplied argument violated the API contract.
+    NOT_IMPLEMENTED  = -4,  ///< The operation is not implemented by the current variant.
+    I2C_BUS_ERROR    = -5,  ///< Low-level I2C bus error (arbitration loss, stretch timeout, etc).
+    I2C_NO_ACK       = -6,  ///< Addressed I2C target did not acknowledge.
+    BUSY             = -7,  ///< Resource is currently locked by another owner.
+};
+using error_t = ErrorType;
+
+// Internal helpers. Public APIs return `m5::stl::expected<..., error_t>` so
+// callers use `if (auto r = ...; !r) ...` uniformly; these are kept for
+// variant implementations and test fixtures that handle a raw error_t.
+constexpr bool isError(const error_t e)
+{
+    return e < error_t::OK;
+}
+constexpr bool isOk(const error_t e)
+{
+    return e == error_t::OK;
+}
+
+}  // namespace m5::hal::v1::error
+
+#endif

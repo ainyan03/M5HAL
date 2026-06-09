@@ -1,0 +1,446 @@
+// SPDX-License-Identifier: MIT
+#ifndef M5HAL_TEST_V1_BUILD_CHECK_BUILD_CHECK_HPP_
+#define M5HAL_TEST_V1_BUILD_CHECK_BUILD_CHECK_HPP_
+
+#include <M5HAL_v1.hpp>
+
+#if defined(ARDUINO)
+#include <Arduino.h>
+#include <SPI.h>
+#include <Wire.h>
+#endif
+
+#if defined(ESP_PLATFORM)
+#include <m5_hal/variants/frameworks/espidf/detail/espidf_version.hpp>
+#endif
+
+#include <cstddef>
+#include <cstdint>
+
+namespace m5hal_build_check::v1 {
+namespace detail {
+
+namespace bus   = ::m5::hal::v1::bus;
+namespace data  = ::m5::hal::v1::data;
+namespace error = ::m5::hal::v1::error;
+namespace i2c   = ::m5::hal::v1::i2c;
+namespace spi   = ::m5::hal::v1::spi;
+namespace types = ::m5::hal::v1::types;
+namespace uart  = ::m5::hal::v1::uart;
+
+class DummyI2CBus : public i2c::I2CBus {
+public:
+    ::m5::stl::expected<void, error::error_t> init(const bus::BusConfig& config) override
+    {
+        if (config.getBusKind() != types::bus_kind_t::I2C) {
+            return ::m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+        }
+        _config = static_cast<const i2c::I2CBusConfig&>(config);
+        return {};
+    }
+
+    ::m5::stl::expected<void, error::error_t> release(void) override
+    {
+        return {};
+    }
+
+    ::m5::stl::expected<size_t, error::error_t> transfer(bus::Accessor* owner, const i2c::I2CMasterAccessConfig& cfg,
+                                                         const i2c::TransferDesc& desc, data::Source* tx,
+                                                         data::Sink* rx) override
+    {
+        (void)owner;
+        (void)cfg;
+        size_t done = desc.prefix_len;
+        while (tx != nullptr && !tx->eof()) {
+            auto span = tx->peek(16);
+            if (!span.has_value()) {
+                return ::m5::stl::make_unexpected(span.error());
+            }
+            if (span->size == 0) {
+                break;
+            }
+            done += span->size;
+            auto advanced = tx->advance(span->size);
+            if (!advanced.has_value()) {
+                return ::m5::stl::make_unexpected(advanced.error());
+            }
+        }
+        while (rx != nullptr && !rx->closed()) {
+            auto span = rx->reserve(16);
+            if (!span.has_value()) {
+                return ::m5::stl::make_unexpected(span.error());
+            }
+            if (span->size == 0) {
+                break;
+            }
+            done += span->size;
+            auto committed = rx->commit(span->size);
+            if (!committed.has_value()) {
+                return ::m5::stl::make_unexpected(committed.error());
+            }
+        }
+        return done;
+    }
+};
+
+class DummySPIBus : public spi::SPIBus {
+public:
+    ::m5::stl::expected<void, error::error_t> init(const bus::BusConfig& config) override
+    {
+        if (config.getBusKind() != types::bus_kind_t::SPI) {
+            return ::m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+        }
+        _config = static_cast<const spi::SPIBusConfig&>(config);
+        return {};
+    }
+
+    ::m5::stl::expected<void, error::error_t> release(void) override
+    {
+        return {};
+    }
+
+    ::m5::stl::expected<void, error::error_t> beginTransaction(bus::Accessor* owner,
+                                                               const spi::SPIMasterAccessConfig& cfg) override
+    {
+        (void)owner;
+        (void)cfg;
+        return {};
+    }
+
+    ::m5::stl::expected<void, error::error_t> endTransaction(bus::Accessor* owner,
+                                                             const spi::SPIMasterAccessConfig& cfg) override
+    {
+        (void)owner;
+        (void)cfg;
+        return {};
+    }
+
+    ::m5::stl::expected<size_t, error::error_t> transfer(bus::Accessor* owner, const spi::SPIMasterAccessConfig& cfg,
+                                                         const spi::TransferDesc& desc, data::Source* tx,
+                                                         data::Sink* rx) override
+    {
+        (void)owner;
+        (void)cfg;
+        (void)desc;
+        size_t done = 0;
+        while (tx != nullptr && !tx->eof()) {
+            auto span = tx->peek(16);
+            if (!span.has_value()) {
+                return ::m5::stl::make_unexpected(span.error());
+            }
+            if (span->size == 0) {
+                break;
+            }
+            done += span->size;
+            auto advanced = tx->advance(span->size);
+            if (!advanced.has_value()) {
+                return ::m5::stl::make_unexpected(advanced.error());
+            }
+        }
+        while (rx != nullptr && !rx->closed()) {
+            auto span = rx->reserve(16);
+            if (!span.has_value()) {
+                return ::m5::stl::make_unexpected(span.error());
+            }
+            if (span->size == 0) {
+                break;
+            }
+            done += span->size;
+            auto committed = rx->commit(span->size);
+            if (!committed.has_value()) {
+                return ::m5::stl::make_unexpected(committed.error());
+            }
+        }
+        return done;
+    }
+};
+
+class DummyUARTBus : public uart::UARTBus {
+public:
+    ::m5::stl::expected<void, error::error_t> init(const bus::BusConfig& config) override
+    {
+        if (config.getBusKind() != types::bus_kind_t::UART) {
+            return ::m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+        }
+        _config = static_cast<const uart::UARTBusConfig&>(config);
+        return {};
+    }
+
+    ::m5::stl::expected<void, error::error_t> release(void) override
+    {
+        return {};
+    }
+
+    ::m5::stl::expected<size_t, error::error_t> write(bus::Accessor* owner, const uart::UARTAccessConfig& cfg,
+                                                      data::Source* tx, size_t len) override
+    {
+        (void)owner;
+        (void)cfg;
+        size_t done = 0;
+        while (tx != nullptr && !tx->eof() && done < len) {
+            auto span = tx->peek(len - done);
+            if (!span.has_value()) {
+                return ::m5::stl::make_unexpected(span.error());
+            }
+            if (span->size == 0) {
+                break;
+            }
+            done += span->size;
+            auto advanced = tx->advance(span->size);
+            if (!advanced.has_value()) {
+                return ::m5::stl::make_unexpected(advanced.error());
+            }
+        }
+        return done;
+    }
+
+    ::m5::stl::expected<size_t, error::error_t> read(bus::Accessor* owner, const uart::UARTAccessConfig& cfg,
+                                                     data::Sink* rx, size_t len) override
+    {
+        (void)owner;
+        (void)cfg;
+        size_t done = 0;
+        while (rx != nullptr && !rx->closed() && done < len) {
+            auto span = rx->reserve(len - done);
+            if (!span.has_value()) {
+                return ::m5::stl::make_unexpected(span.error());
+            }
+            if (span->size == 0) {
+                break;
+            }
+            done += span->size;
+            auto committed = rx->commit(span->size);
+            if (!committed.has_value()) {
+                return ::m5::stl::make_unexpected(committed.error());
+            }
+        }
+        return done;
+    }
+
+    ::m5::stl::expected<size_t, error::error_t> readableBytes(bus::Accessor* owner,
+                                                              const uart::UARTAccessConfig& cfg) override
+    {
+        (void)owner;
+        (void)cfg;
+        return size_t{0};
+    }
+};
+
+template <typename T>
+inline void useResult(const T& value)
+{
+    (void)value;
+}
+
+}  // namespace detail
+
+inline void compileCommonApiSurface(void)
+{
+    uint8_t tx[]  = {0x10, 0x20, 0x30, 0x40};
+    uint8_t rx[4] = {};
+
+    detail::DummyI2CBus i2c_bus;
+    detail::i2c::I2CBusConfig i2c_bus_cfg{22, 21};
+    detail::useResult(i2c_bus.init(i2c_bus_cfg));
+    detail::i2c::I2CMasterAccessConfig i2c_cfg;
+    i2c_cfg.i2c_addr               = 0x3C;
+    i2c_cfg.freq                   = 400000;
+    i2c_cfg.timeout_ms             = 25;
+    i2c_cfg.register_address_bytes = 2;
+    detail::i2c::I2CMasterAccessor i2c_dev{i2c_bus, i2c_cfg};
+    detail::useResult(i2c_dev.setConfig(i2c_cfg));
+    detail::useResult(i2c_dev.transfer(detail::i2c::TransferDesc{uint8_t{0x00}},
+                                       detail::data::ConstDataSpan{tx, sizeof(tx)},
+                                       detail::data::DataSpan{rx, sizeof(rx)}));
+    detail::useResult(i2c_dev.write(detail::data::ConstDataSpan{tx, sizeof(tx)}));
+    detail::useResult(i2c_dev.read(detail::data::DataSpan{rx, sizeof(rx)}));
+    detail::useResult(i2c_dev.write(tx, sizeof(tx)));
+    detail::useResult(i2c_dev.read(rx, sizeof(rx)));
+    detail::useResult(i2c_dev.writeRegister(uint8_t{0x01}, uint8_t{0x55}));
+    detail::useResult(i2c_dev.writeRegister(uint16_t{0x1234}, tx, sizeof(tx)));
+    detail::useResult(i2c_dev.readRegister(uint8_t{0x02}, rx, sizeof(rx)));
+    detail::useResult(i2c_dev.readRegister(0x1234, detail::data::DataSpan{rx, sizeof(rx)}));
+    detail::useResult(i2c_dev.readRegister(0x1234));
+    detail::useResult(i2c_dev.probe());
+
+    detail::DummySPIBus spi_bus;
+    detail::spi::SPIBusConfig spi_bus_cfg;
+    spi_bus_cfg.pin_clk  = 18;
+    spi_bus_cfg.pin_mosi = 23;
+    spi_bus_cfg.pin_miso = 19;
+    detail::useResult(spi_bus.init(spi_bus_cfg));
+    detail::spi::SPIMasterAccessConfig spi_cfg;
+    spi_cfg.pin_cs                = 5;
+    spi_cfg.freq                  = 40000000;
+    spi_cfg.timeout_ms            = 50;
+    spi_cfg.spi_mode              = 0;
+    spi_cfg.spi_order             = 0;
+    spi_cfg.spi_command_length    = 8;
+    spi_cfg.spi_address_length    = 16;
+    spi_cfg.spi_read_dummy_cycle  = 8;
+    spi_cfg.spi_write_dummy_cycle = 0;
+    spi_cfg.spi_data_mode         = detail::spi::spi_data_mode_t::spi_fullduplex;
+    detail::spi::SPIMasterAccessor spi_dev{spi_bus, spi_cfg};
+    detail::useResult(spi_dev.setConfig(spi_cfg));
+    detail::useResult(spi_dev.beginTransaction());
+    detail::useResult(spi_dev.transfer(detail::spi::TransferDesc{}, detail::data::ConstDataSpan{tx, sizeof(tx)},
+                                       detail::data::DataSpan{rx, sizeof(rx)}));
+    detail::data::MemorySource spi_source{detail::data::ConstDataSpan{tx, sizeof(tx)}};
+    detail::data::MemorySink spi_sink{detail::data::DataSpan{rx, sizeof(rx)}};
+    detail::data::LimitedSource limited_source{&spi_source, sizeof(tx)};
+    detail::data::LimitedSink limited_sink{&spi_sink, sizeof(rx)};
+    detail::useResult(spi_dev.transfer(detail::spi::TransferDesc{}, &limited_source, &limited_sink, sizeof(tx)));
+    detail::useResult(spi_dev.write(detail::data::ConstDataSpan{tx, sizeof(tx)}));
+    detail::useResult(spi_dev.read(detail::data::DataSpan{rx, sizeof(rx)}));
+    detail::useResult(spi_dev.write(tx, sizeof(tx)));
+    detail::useResult(spi_dev.read(rx, sizeof(rx)));
+    detail::useResult(spi_dev.writeCommand(uint32_t{0x2C}));
+    detail::useResult(spi_dev.writeCommand(detail::data::ConstDataSpan{tx, 1}));
+    detail::useResult(spi_dev.writeCommandAddress(uint32_t{0x0B}, uint32_t{0x001234}));
+    detail::useResult(spi_dev.writeCommandData(uint32_t{0x2C}, detail::data::ConstDataSpan{tx, sizeof(tx)}));
+    detail::useResult(spi_dev.writeCommandAddressData(uint32_t{0x0C}, uint32_t{0x001234},
+                                                      detail::data::ConstDataSpan{tx, sizeof(tx)}));
+    detail::useResult(spi_dev.readCommandData(uint32_t{0x0F}, detail::data::DataSpan{rx, sizeof(rx)}));
+    detail::useResult(
+        spi_dev.readCommandAddressData(uint32_t{0x0F}, uint32_t{0x001234}, detail::data::DataSpan{rx, sizeof(rx)}));
+    detail::useResult(spi_dev.sendDummyClock(8));
+    detail::useResult(spi_dev.endTransaction());
+
+    detail::DummyUARTBus uart_bus;
+    detail::uart::UARTBusConfig uart_bus_cfg;
+    uart_bus_cfg.pin_tx = 17;
+    uart_bus_cfg.pin_rx = 16;
+    detail::useResult(uart_bus.init(uart_bus_cfg));
+    detail::uart::UARTAccessConfig uart_cfg;
+    uart_cfg.baud_rate             = 921600;
+    uart_cfg.first_byte_timeout_ms = 10;
+    uart_cfg.inter_byte_timeout_ms = 2;
+    uart_cfg.write_timeout_ms      = 10;
+    uart_cfg.data_bits             = 8;
+    uart_cfg.stop_bits             = 1;
+    uart_cfg.parity                = detail::uart::parity_t::none;
+    detail::uart::UARTAccessor uart_dev{uart_bus, uart_cfg};
+    detail::useResult(uart_dev.setConfig(uart_cfg));
+    detail::useResult(uart_dev.write(detail::data::ConstDataSpan{tx, sizeof(tx)}));
+    detail::useResult(uart_dev.read(detail::data::DataSpan{rx, sizeof(rx)}));
+    detail::data::MemorySource uart_source{detail::data::ConstDataSpan{tx, sizeof(tx)}};
+    detail::data::MemorySink uart_sink{detail::data::DataSpan{rx, sizeof(rx)}};
+    detail::useResult(uart_dev.write(uart_source, sizeof(tx)));
+    detail::useResult(uart_dev.read(uart_sink, sizeof(rx)));
+    detail::useResult(uart_dev.write(tx, sizeof(tx)));
+    detail::useResult(uart_dev.read(rx, sizeof(rx)));
+    detail::useResult(uart_dev.readableBytes());
+}
+
+#if defined(ARDUINO)
+inline void compileArduinoApiSurface(void)
+{
+    namespace i2c_arduino  = ::m5::hal::v1::i2c::variant::arduino;
+    namespace spi_arduino  = ::m5::hal::v1::spi::variant::arduino;
+    namespace uart_arduino = ::m5::hal::v1::uart::variant::arduino;
+
+    i2c_arduino::BusConfig i2c_cfg{&Wire, 22, 21};
+    spi_arduino::BusConfig spi_cfg;
+    spi_cfg.spi = &SPI;
+    uart_arduino::BusConfig uart_cfg;
+    uart_cfg.serial = &Serial1;
+
+    static_assert(sizeof(i2c_arduino::Bus) > 0, "Arduino I2C Bus alias must be visible");
+    static_assert(sizeof(spi_arduino::Bus) > 0, "Arduino SPI Bus alias must be visible");
+    static_assert(sizeof(uart_arduino::Bus) > 0, "Arduino UART Bus alias must be visible");
+    detail::useResult(i2c_cfg);
+    detail::useResult(spi_cfg);
+    detail::useResult(uart_cfg);
+}
+#endif
+
+#if defined(ESP_PLATFORM)
+inline void compileEspidfApiSurface(void)
+{
+#if M5HAL_ESPIDF_I2C_HAS_MASTER
+    namespace i2c_espidf = ::m5::hal::v1::i2c::variant::espidf;
+    i2c_espidf::BusConfig i2c_cfg{22, 21};
+    static_assert(sizeof(i2c_espidf::Bus) > 0, "ESP-IDF I2C Bus alias must be visible");
+    detail::useResult(i2c_cfg);
+#endif
+
+#if M5HAL_ESPIDF_SPI_HAS_MASTER
+    namespace spi_espidf = ::m5::hal::v1::spi::variant::espidf;
+    spi_espidf::BusConfig spi_cfg;
+    static_assert(sizeof(spi_espidf::Bus) > 0, "ESP-IDF SPI Bus alias must be visible");
+    detail::useResult(spi_cfg);
+#endif
+
+    namespace uart_espidf = ::m5::hal::v1::uart::variant::espidf;
+    uart_espidf::BusConfig uart_cfg;
+    static_assert(sizeof(uart_espidf::Bus) > 0, "ESP-IDF UART Bus alias must be visible");
+    detail::useResult(uart_cfg);
+}
+#endif
+
+#if defined(ESP_PLATFORM)
+// Chip-level GPIO capabilities (PinBackup / ScopedPinBackup) are exposed under
+// the public `m5::hal::v1::gpio` namespace directly from the platform layer,
+// independent of which variant wins the GPIO HAL flat injection. Referencing
+// them here via the public flat name keeps CI honest about that exposure
+// (it would catch a regression where the symbols stop resolving).
+inline void compileGpioCapabilityApiSurface(void)
+{
+    namespace gpio  = ::m5::hal::v1::gpio;
+    namespace types = ::m5::hal::v1::types;
+
+    static_assert(sizeof(gpio::PinBackup) > 0, "PinBackup must be visible under m5::hal::v1::gpio");
+    static_assert(sizeof(gpio::ScopedPinBackup) > 0, "ScopedPinBackup must be visible under m5::hal::v1::gpio");
+
+    gpio::PinBackup backup{types::gpio_number_t{21}};
+    backup.setPin(types::gpio_number_t{22});
+    detail::useResult(backup.getPin());
+    backup.backup();
+    backup.backup(types::gpio_number_t{23});
+    backup.restore();
+
+    gpio::ScopedPinBackup guard{types::gpio_number_t{21}};
+    detail::useResult(guard.getPin());
+    detail::useResult(guard.armed());
+    gpio::ScopedPinBackup moved{static_cast<gpio::ScopedPinBackup&&>(guard)};  // move-only
+    moved.dismiss();
+}
+#endif
+
+#if M5HAL_FRAMEWORK_HAS_POSIX
+// Host POSIX UART variant surface. On a plain POSIX host build posix is the
+// flat-injected UART provider; this references its variant-qualified alias to
+// keep CI honest about the exposure. Compile/surface only: it never opens a
+// device (no open()/attach()), so it is safe to run in CI.
+inline void compilePosixApiSurface(void)
+{
+    namespace uart_posix = ::m5::hal::v1::uart::variant::posix;
+
+    static_assert(sizeof(uart_posix::Bus) > 0, "POSIX UART Bus alias must be visible");
+
+    uart_posix::Bus bus;
+    uart_posix::BusConfig uart_cfg;
+    uart_cfg.device_path = nullptr;  // lazy open; nothing is opened here
+    detail::useResult(bus.init(uart_cfg));
+    detail::useResult(bus.nativeHandle());
+}
+#endif
+
+inline void compileApiSurface(void)
+{
+    compileCommonApiSurface();
+#if defined(ARDUINO)
+    compileArduinoApiSurface();
+#endif
+#if defined(ESP_PLATFORM)
+    compileEspidfApiSurface();
+    compileGpioCapabilityApiSurface();
+#endif
+#if M5HAL_FRAMEWORK_HAS_POSIX
+    compilePosixApiSurface();
+#endif
+}
+
+}  // namespace m5hal_build_check::v1
+
+#endif

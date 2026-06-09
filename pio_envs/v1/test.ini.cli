@@ -1,0 +1,44 @@
+; =============================================================================
+; M5HAL — v1 embedded tests
+;
+; `test/v1/native/` は host 上で完結する gtest。
+; `test/v1/embedded/` は実機・実配線を使い、テストコード自身が PASS/FAIL を
+; 判定する PlatformIO Unity test。
+;
+; 使い方:
+;   pio test -e v1_test_esp32_arduino_software_spi_wire
+;   pio test -e v1_test_esp32_arduino_software_spi_wire_jumper
+;   pio test -e v1_test_esp32s3_arduino_software_spi_wire
+; =============================================================================
+
+[env:v1_test_esp32_arduino_software_spi_wire]
+extends = common_esp32dev, common_arduino
+test_framework = unity
+test_filter = v1/embedded/bus/test_software_spi_wire
+test_build_src = true
+build_flags =
+    ${common_esp32.build_flags}
+    -DM5HAL_TEST_SOFTWARE_SPI_FREQ=2000
+
+[env:v1_test_esp32_arduino_software_spi_wire_jumper]
+extends = env:v1_test_esp32_arduino_software_spi_wire
+build_flags =
+    ${common_esp32.build_flags}
+    -DM5HAL_TEST_SOFTWARE_SPI_FREQ=2000
+    -DM5HAL_TEST_SOFTWARE_SPI_CAPTURE_CLK=32
+    -DM5HAL_TEST_SOFTWARE_SPI_CAPTURE_MOSI=33
+    -DM5HAL_TEST_SOFTWARE_SPI_CAPTURE_DC=25
+    -DM5HAL_TEST_SOFTWARE_SPI_CAPTURE_CS=26
+
+[env:v1_test_esp32s3_arduino_software_spi_wire]
+extends = common_esp32s3dev, common_arduino
+test_framework = unity
+test_filter = v1/embedded/bus/test_software_spi_wire
+test_build_src = true
+build_flags =
+    ${common_esp32.build_flags}
+    -DM5HAL_TEST_SOFTWARE_SPI_FREQ=2000
+    -DM5HAL_TEST_SOFTWARE_SPI_PIN_CLK=12
+    -DM5HAL_TEST_SOFTWARE_SPI_PIN_MOSI=11
+    -DM5HAL_TEST_SOFTWARE_SPI_PIN_DC=9
+    -DM5HAL_TEST_SOFTWARE_SPI_PIN_CS=10

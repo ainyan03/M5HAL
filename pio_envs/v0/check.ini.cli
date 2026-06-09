@@ -1,0 +1,64 @@
+; =============================================================================
+; M5HAL — v0 系統 build check envs
+;
+; 公開 entry <M5HAL.hpp> shim 経由 (= 既存 v0 caller の互換 path)。
+; 対応 stub: test/v0/stub/build_check_{native,arduino,espidf}.cpp
+;
+; 命名: v0_<purpose>_<chip>[_<framework>]  (version prefix を先頭に置く)
+;
+; 使い方:
+;   pio run -e v0_check_native
+;   pio run -e v0_check_esp32_arduino
+;   pio run -e v0_check_esp32_espidf4
+;   pio run -e v0_check_esp32_espidf6
+; =============================================================================
+
+[env:v0_check_native]
+extends = common_native
+build_src_filter = +<*> +<../test/v0/stub/build_check_native.cpp>
+
+[env:v0_check_esp32_arduino]
+extends = common_esp32dev, common_arduino
+build_src_filter = +<*> +<../test/v0/stub/build_check_arduino.cpp>
+
+[env:v0_check_esp32_espidf]
+extends = common_esp32dev_espidf5, common_espidf
+build_src_filter = +<*> +<../test/v0/stub/build_check_espidf.cpp>
+
+[env:v0_check_esp32_espidf4]
+extends = common_esp32dev_espidf4, common_espidf
+build_src_filter = +<*> +<../test/v0/stub/build_check_espidf.cpp>
+
+[env:v0_check_esp32_espidf6]
+extends = common_esp32dev_espidf6, common_espidf
+build_src_filter = +<*> +<../test/v0/stub/build_check_espidf.cpp>
+
+[env:v0_check_esp32s3_arduino]
+extends = common_esp32s3dev, common_arduino
+build_src_filter = +<*> +<../test/v0/stub/build_check_arduino.cpp>
+
+[env:v0_check_esp32s3_espidf]
+extends = common_esp32s3dev_espidf5, common_espidf
+build_src_filter = +<*> +<../test/v0/stub/build_check_espidf.cpp>
+
+[env:v0_check_esp32s3_espidf6]
+extends = common_esp32s3dev_espidf6, common_espidf
+build_src_filter = +<*> +<../test/v0/stub/build_check_espidf.cpp>
+
+[env:v0_check_esp32c3_arduino]
+extends = common_esp32c3dev, common_arduino
+build_src_filter = +<*> +<../test/v0/stub/build_check_arduino.cpp>
+
+[env:v0_check_esp32c3_espidf]
+extends = common_esp32c3dev, common_espidf
+build_src_filter = +<*> +<../test/v0/stub/build_check_espidf.cpp>
+
+[env:v0_check_esp32c6_espidf]
+extends = common_esp32c6dev, common_espidf
+build_src_filter = +<*> +<../test/v0/stub/build_check_espidf.cpp>
+
+; NOTE: esp32h2 / esp32p4 用の env は platform espressif32 v6.12.0 が riscv
+; toolchain 選択を c3/c6 のみハードコードしているため未追加。 platform 自体の
+; アップグレード (例: pioarduino/espressif32) と board file 整備が前提。
+; idf_component.yml / hal/v0/platforms/espressif/esp32h2/ 等は ESP-IDF
+; Component Registry 経由の consumer 向けに残してある。

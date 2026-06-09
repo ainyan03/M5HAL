@@ -1,0 +1,37 @@
+; =============================================================================
+; M5HAL — v1 HIL (hardware-in-the-loop) envs: host POSIX UART <-> ESP32 echo
+;
+; HIL tests live in experiments/v1/test/<name>/{device,host}/ and run via `pio run`
+; (NOT `pio test`, whose discovery is locked to test_dir). The host driver is a
+; gtest binary built with `pio run` and then executed directly.
+;
+; This is a *.ini.cli file: it is NOT auto-loaded (extra_configs only globs
+; *.ini). Load it for a run by pointing M5HAL_PIO_EXTRA_CONFIG at it (no copy):
+;   export M5HAL_PIO_EXTRA_CONFIG=pio_envs/v1/hil.ini.cli
+; The runner experiments/v1/test/hil-run.sh sets this for you.
+;
+; Setup (M5Stack Core BASIC, classic ESP32): the echo firmware drives UART0
+; (GPIO1=TX / GPIO3=RX = the USB bridge) via M5HAL UART, echo-only, no logging.
+; No extra wiring: the existing USB cable is the echo channel.
+;
+; Manual run:
+;   export M5HAL_PIO_EXTRA_CONFIG=pio_envs/v1/hil.ini.cli
+;   pio run -e v1_hil_uart_echo_device_esp32 -t upload                 # flash device
+;   pio run -e v1_hil_uart_echo_host                                   # build host
+;   M5HAL_POSIX_UART_PORT=/dev/cu.usbserial-XXXX \
+;     .pio/build/v1_hil_uart_echo_host/program
+;   (M5HAL_POSIX_UART_BAUD optional, default 115200. For a high-baud run also
+;    flash with PLATFORMIO_BUILD_FLAGS="-DM5HAL_HIL_ECHO_BAUD=<baud>".)
+; Or one-shot: experiments/v1/test/hil-run.sh uart_echo [port] [baud]
+; =============================================================================
+
+[env:v1_hil_uart_echo_device_esp32]
+extends = common_esp32dev, common_arduino
+build_src_filter = +<*> +<../experiments/v1/test/uart_echo/device/uart_echo.cpp>
+build_flags =
+    ${common_esp32.build_flags}
+    -DCORE_DEBUG_LEVEL=0
+
+[env:v1_hil_uart_echo_host]
+extends = common_native, test_fw
+build_src_filter = +<*> +<../experiments/v1/test/uart_echo/host/uart_echo.cpp>

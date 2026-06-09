@@ -1,0 +1,83 @@
+; =============================================================================
+; M5HAL — v1 系統 build check envs
+;
+; <M5HAL_v1.hpp> 直接 include (= M5HALCore singleton + M5_Hal reference 変数、
+; S9a 採用後の新 API)。 espidf 環境は xtensa toolchain での Magic Static +
+; ctor 副作用 + reference 変数 eager init の link / startup 挙動を build
+; check 段階で fence する用途 (実機 startup 確認は S9a 受入条件 11 で別途)。
+;
+; 対応 stub: test/v1/stub/build_check_{native,arduino,espidf}.cpp
+; 共通 API surface: test/v1/build_check/build_check.hpp
+;   examples は利用者向けに単独完結・読みやすさを優先する。 CI の compile fence は
+;   build_check.hpp へ API 利用形を集約し、native test と framework stub から共有する。
+;
+; 命名: v1_<purpose>_<chip>[_<framework>][_<variant>]  (version prefix を先頭に置く)
+;
+; 使い方:
+;   pio run -e v1_check_native
+;   pio run -e v1_check_esp32_espidf
+;   pio run -e v1_check_esp32_espidf4
+;   pio run -e v1_check_esp32_espidf6
+;   pio run -e v1_check_native_inline      (inline flip fence)
+; =============================================================================
+
+[env:v1_check_native]
+extends = common_native
+build_src_filter = +<*> +<../test/v1/stub/build_check_native.cpp>
+
+[env:v1_check_esp32_arduino]
+extends = common_esp32dev, common_arduino
+build_src_filter = +<*> +<../test/v1/stub/build_check_arduino.cpp>
+
+[env:v1_check_esp32_espidf]
+extends = common_esp32dev_espidf5, common_espidf
+build_src_filter = +<*> +<../test/v1/stub/build_check_espidf.cpp>
+
+[env:v1_check_esp32_espidf4]
+extends = common_esp32dev_espidf4, common_espidf
+build_src_filter = +<*> +<../test/v1/stub/build_check_espidf.cpp>
+
+[env:v1_check_esp32_espidf6]
+extends = common_esp32dev_espidf6, common_espidf
+build_src_filter = +<*> +<../test/v1/stub/build_check_espidf.cpp>
+
+[env:v1_check_esp32s3_arduino]
+extends = common_esp32s3dev, common_arduino
+build_src_filter = +<*> +<../test/v1/stub/build_check_arduino.cpp>
+
+[env:v1_check_esp32s3_espidf]
+extends = common_esp32s3dev_espidf5, common_espidf
+build_src_filter = +<*> +<../test/v1/stub/build_check_espidf.cpp>
+
+[env:v1_check_esp32s3_espidf6]
+extends = common_esp32s3dev_espidf6, common_espidf
+build_src_filter = +<*> +<../test/v1/stub/build_check_espidf.cpp>
+
+[env:v1_check_esp32c3_arduino]
+extends = common_esp32c3dev, common_arduino
+build_src_filter = +<*> +<../test/v1/stub/build_check_arduino.cpp>
+
+[env:v1_check_esp32c3_espidf]
+extends = common_esp32c3dev, common_espidf
+build_src_filter = +<*> +<../test/v1/stub/build_check_espidf.cpp>
+
+[env:v1_check_esp32c6_espidf]
+extends = common_esp32c6dev, common_espidf
+build_src_filter = +<*> +<../test/v1/stub/build_check_espidf.cpp>
+
+; NOTE: esp32h2 / esp32p4 用の env は platform espressif32 v6.12.0 が riscv
+; toolchain 選択を c3/c6 のみハードコードしているため未追加。 platform 自体の
+; アップグレード (例: pioarduino/espressif32) と board file 整備が前提。
+
+; --- v1 inline flip build check ---------------------------------------------
+; Forces M5HAL_V0_INLINE=0 + M5HAL_V1_INLINE=1 (default は逆) で build。
+; v1 を inline 化した時に m5::hal::* lookup が壊れないことを CI で fence。
+; v0 source は inline 前提で書かれているため build 対象外 (M5HAL_v0.cpp 除外)。
+; See spec/design/v0_v1_coexistence.md for the inline namespace switch policy.
+[env:v1_check_native_inline]
+extends = common_native
+build_flags =
+    ${common_native.build_flags}
+    -DM5HAL_V0_INLINE=0
+    -DM5HAL_V1_INLINE=1
+build_src_filter = +<*> -<M5HAL_v0.cpp> +<../test/v1/stub/build_check_v1inline.cpp>

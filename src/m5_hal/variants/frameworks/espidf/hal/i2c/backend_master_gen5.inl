@@ -1,0 +1,253 @@
+#ifndef M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_I2C_BACKEND_MASTER_GEN5_INL
+#define M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_I2C_BACKEND_MASTER_GEN5_INL
+
+#include "i2c.hpp"
+
+#if defined(ESP_PLATFORM) && M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5
+
+#include "backend_master_write_buffer.inl"
+
+#include <esp_err.h>
+
+namespace m5::variants::frameworks::espidf::hal::v1::i2c {
+
+namespace {
+
+::m5::hal::v1::error::error_t mapEspErr(::esp_err_t err)
+{
+    switch (err) {
+        case ESP_OK:
+            return ::m5::hal::v1::error::error_t::OK;
+        case ESP_ERR_INVALID_ARG:
+        case ESP_ERR_INVALID_STATE:
+            return ::m5::hal::v1::error::error_t::INVALID_ARGUMENT;
+        case ESP_ERR_TIMEOUT:
+            return ::m5::hal::v1::error::error_t::TIMEOUT_ERROR;
+        case ESP_ERR_NOT_FOUND:
+            return ::m5::hal::v1::error::error_t::I2C_NO_ACK;
+        default:
+            return ::m5::hal::v1::error::error_t::I2C_BUS_ERROR;
+    }
+}
+
+::i2c_addr_bit_len_t addressBitLen(bool address_is_10bit)
+{
+    return address_is_10bit ? I2C_ADDR_BIT_LEN_10 : I2C_ADDR_BIT_LEN_7;
+}
+
+bool isValidAddress(const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg)
+{
+    return cfg.address_is_10bit ? (cfg.i2c_addr <= 0x03FFu) : (cfg.i2c_addr <= 0x007Fu);
+}
+
+}  // namespace
+
+::m5::hal::v1::error::error_t Bus::attach(::i2c_master_bus_handle_t bus_handle)
+{
+    if (bus_handle == nullptr) {
+        return ::m5::hal::v1::error::error_t::INVALID_ARGUMENT;
+    }
+    if (_bus_handle != nullptr) {
+        (void)release();
+    }
+    _bus_handle = bus_handle;
+    _owns_bus   = false;
+    return ::m5::hal::v1::error::error_t::OK;
+}
+
+m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const ::m5::hal::v1::bus::BusConfig& config)
+{
+    if (config.getBusKind() != ::m5::hal::v1::types::bus_kind_t::I2C) {
+        return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
+    }
+    const auto& i2c_config = static_cast<const BusConfig&>(config);
+    _config                = i2c_config;
+    if (_config.pin_scl < 0 || _config.pin_sda < 0) {
+        return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
+    }
+    if (_bus_handle != nullptr) {
+        (void)release();
+    }
+
+    ::i2c_master_bus_config_t bus_config    = {};
+    bus_config.i2c_port                     = i2c_config.i2c_port;
+    bus_config.scl_io_num                   = static_cast<::gpio_num_t>(_config.pin_scl);
+    bus_config.sda_io_num                   = static_cast<::gpio_num_t>(_config.pin_sda);
+    bus_config.clk_source                   = I2C_CLK_SRC_DEFAULT;
+    bus_config.glitch_ignore_cnt            = 7;
+    bus_config.flags.enable_internal_pullup = 1;
+
+    auto err    = ::i2c_new_master_bus(&bus_config, &_bus_handle);
+    auto mapped = mapEspErr(err);
+    if (::m5::hal::v1::error::isError(mapped)) {
+        _bus_handle = nullptr;
+        return m5::stl::make_unexpected(mapped);
+    }
+    _owns_bus = true;
+    return {};
+}
+
+m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::release(void)
+{
+    auto removed = removeDevice();
+    if (!removed.has_value()) {
+        return m5::stl::make_unexpected(removed.error());
+    }
+
+    if (_bus_handle != nullptr && _owns_bus) {
+        auto err    = ::i2c_del_master_bus(_bus_handle);
+        auto mapped = mapEspErr(err);
+        _bus_handle = nullptr;
+        _owns_bus   = false;
+        if (::m5::hal::v1::error::isError(mapped)) {
+            return m5::stl::make_unexpected(mapped);
+        }
+        return {};
+    }
+    _bus_handle = nullptr;
+    _owns_bus   = false;
+    return {};
+}
+
+m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::removeDevice(void)
+{
+    if (_dev_handle == nullptr) {
+        return {};
+    }
+
+    auto mapped           = mapEspErr(::i2c_master_bus_rm_device(_dev_handle));
+    _dev_handle           = nullptr;
+    _dev_addr             = 0;
+    _dev_freq             = 0;
+    _dev_scl_wait_us      = 0;
+    _dev_address_is_10bit = false;
+    if (::m5::hal::v1::error::isError(mapped)) {
+        return m5::stl::make_unexpected(mapped);
+    }
+    return {};
+}
+
+m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::ensureDevice(
+    const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg)
+{
+    const uint32_t scl_wait_us = cfg.timeout_ms * 1000u;
+    if (_dev_handle != nullptr && _dev_addr == cfg.i2c_addr && _dev_freq == cfg.freq &&
+        _dev_scl_wait_us == scl_wait_us && _dev_address_is_10bit == cfg.address_is_10bit) {
+        return {};
+    }
+
+    auto removed = removeDevice();
+    if (!removed.has_value()) {
+        return m5::stl::make_unexpected(removed.error());
+    }
+
+    ::i2c_device_config_t dev_config = {};
+    dev_config.dev_addr_length       = addressBitLen(cfg.address_is_10bit);
+    dev_config.device_address        = cfg.i2c_addr;
+    dev_config.scl_speed_hz          = cfg.freq;
+    dev_config.scl_wait_us           = scl_wait_us;
+
+    auto err    = ::i2c_master_bus_add_device(_bus_handle, &dev_config, &_dev_handle);
+    auto mapped = mapEspErr(err);
+    if (::m5::hal::v1::error::isError(mapped)) {
+        _dev_handle = nullptr;
+        return m5::stl::make_unexpected(mapped);
+    }
+
+    _dev_addr             = cfg.i2c_addr;
+    _dev_freq             = cfg.freq;
+    _dev_scl_wait_us      = scl_wait_us;
+    _dev_address_is_10bit = cfg.address_is_10bit;
+    return {};
+}
+
+m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
+    ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg,
+    const ::m5::hal::v1::i2c::TransferDesc& desc, ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
+{
+    (void)owner;
+    if (_bus_handle == nullptr) {
+        return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
+    }
+    if (cfg.freq == 0 || !isValidAddress(cfg)) {
+        return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
+    }
+
+    detail::TempWriteBuffer write_bytes;
+    auto built = write_bytes.build(::m5::hal::v1::data::ConstDataSpan{desc.prefix, desc.prefix_len}, tx);
+    if (!built.has_value()) {
+        return m5::stl::make_unexpected(built.error());
+    }
+
+    const bool have_tx = !write_bytes.empty();
+    const bool have_rx = (rx != nullptr);
+    const int timeout  = static_cast<int>(cfg.timeout_ms);
+
+    if (!have_tx && !have_rx) {
+        if (cfg.address_is_10bit) {
+            return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
+        }
+        auto err    = ::i2c_master_probe(_bus_handle, cfg.i2c_addr, timeout);
+        auto mapped = mapEspErr(err);
+        if (::m5::hal::v1::error::isError(mapped)) {
+            return m5::stl::make_unexpected(mapped);
+        }
+        return size_t{0};
+    }
+
+    auto ensured = ensureDevice(cfg);
+    if (!ensured.has_value()) {
+        return m5::stl::make_unexpected(ensured.error());
+    }
+
+    size_t total = write_bytes.size();
+
+    auto finish = [&](::esp_err_t result) -> m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> {
+        auto result_map = mapEspErr(result);
+        if (::m5::hal::v1::error::isError(result_map)) {
+            return m5::stl::make_unexpected(result_map);
+        }
+        return total;
+    };
+
+    if (!have_rx) {
+        auto err = ::i2c_master_transmit(_dev_handle, write_bytes.data(), write_bytes.size(), timeout);
+        return finish(err);
+    }
+
+    auto rsv = rx->reserve(SIZE_MAX);
+    if (!rsv.has_value()) {
+        return m5::stl::make_unexpected(rsv.error());
+    }
+    auto rx_span = rsv.value();
+    if (rx_span.size == 0) {
+        return finish(ESP_OK);
+    }
+
+    ::esp_err_t err = ESP_OK;
+    if (have_tx && cfg.use_restart) {
+        err = ::i2c_master_transmit_receive(_dev_handle, write_bytes.data(), write_bytes.size(), rx_span.data,
+                                            rx_span.size, timeout);
+    } else {
+        if (have_tx) {
+            err = ::i2c_master_transmit(_dev_handle, write_bytes.data(), write_bytes.size(), timeout);
+        }
+        if (err == ESP_OK) {
+            err = ::i2c_master_receive(_dev_handle, rx_span.data, rx_span.size, timeout);
+        }
+    }
+    if (err == ESP_OK) {
+        auto com = rx->commit(rx_span.size);
+        if (!com.has_value()) {
+            return m5::stl::make_unexpected(com.error());
+        }
+        total += rx_span.size;
+    }
+    return finish(err);
+}
+
+}  // namespace m5::variants::frameworks::espidf::hal::v1::i2c
+
+#endif
+
+#endif
