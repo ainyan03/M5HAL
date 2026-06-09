@@ -35,12 +35,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Pin a recent IDF that supports the entire family incl. h2/p4. More
+        # Pin a recent IDF that supports the whole family incl. h2/p4. More
         # versions (release-v5.4, release-v5.3 ...) can be added; a dynamic
         # matrix driven by Espressif's idf_versions.js (as in upstream
         # LovyanGFX) is a possible follow-up.
+        #
+        # Targets: every ESP32-family chip release-v5.5 supports.
         idf: ['release-v5.5']
-        target: [esp32, esp32s3, esp32c3, esp32c6, esp32p4, esp32h2]
+        target: [esp32, esp32s2, esp32s3, esp32c2, esp32c3, esp32c5, esp32c6, esp32c61, esp32h2, esp32p4]
     steps:
       - name: Checkout M5HAL
         uses: actions/checkout@v6

@@ -24,6 +24,21 @@
 #include <soc/gpio_periph.h>  // GPIO_PIN_MUX_REG[]
 #include <soc/io_mux_reg.h>
 
+// IO_MUX register lookup, generic across the whole ESP32 family.
+//
+// soc/gpio_periph.h declares GPIO_PIN_MUX_REG[] (pin -> IO_MUX register address)
+// and the soc component defines it for most chips. ESP-IDF stopped shipping the
+// array on chips whose IO_MUX GPIO registers are laid out contiguously (esp32c5
+// / esp32c61, and presumably future ones), where it would be redundant. We
+// re-declare it as a WEAK reference: on chips that ship the array — including the
+// original ESP32, whose pin -> pad map is genuinely non-linear — it binds to the
+// real symbol; on chips that dropped it the weak reference resolves to null and
+// we compute the address from the contiguous IO_MUX block instead. This keeps
+// the selection generic (no per-chip CONFIG_IDF_TARGET_* list to maintain when a
+// new chip ships). Verified across the family: where the array is absent,
+// IO_MUX_GPIOn_REG == IO_MUX_GPIO0_REG + 4*n.
+extern "C" const uint32_t GPIO_PIN_MUX_REG[] __attribute__((weak));
+
 namespace m5::variants::platforms::espressif::esp32::hal::v1::gpio {
 
 // Routing-state backup for one MCU pin. `backup()` is explicit (the ctor
@@ -59,7 +74,7 @@ public:
             return;
         }
 
-        _io_mux_gpio_reg   = *reinterpret_cast<volatile uint32_t*>(GPIO_PIN_MUX_REG[pin]);
+        _io_mux_gpio_reg   = *reinterpret_cast<volatile uint32_t*>(ioMuxReg(pin));
         _gpio_pin_reg      = *reinterpret_cast<volatile uint32_t*>(GPIO_PIN0_REG + (pin * 4));
         _gpio_func_out_reg = *reinterpret_cast<volatile uint32_t*>(GPIO_FUNC0_OUT_SEL_CFG_REG + (pin * 4));
 #if defined(GPIO_ENABLE1_REG)
@@ -110,7 +125,7 @@ public:
         if (_in_func_num >= 0) {
             ::GPIO.func_in_sel_cfg[_in_func_num].val = _gpio_func_in_reg;
         }
-        *reinterpret_cast<volatile uint32_t*>(GPIO_PIN_MUX_REG[pin])                  = _io_mux_gpio_reg;
+        *reinterpret_cast<volatile uint32_t*>(ioMuxReg(pin))                          = _io_mux_gpio_reg;
         *reinterpret_cast<volatile uint32_t*>(GPIO_PIN0_REG + (pin * 4))              = _gpio_pin_reg;
         *reinterpret_cast<volatile uint32_t*>(GPIO_FUNC0_OUT_SEL_CFG_REG + (pin * 4)) = _gpio_func_out_reg;
 
@@ -128,6 +143,14 @@ public:
     }
 
 private:
+    // Address of the IO_MUX configuration register for MCU pin `pin`. Uses the
+    // soc lookup array where it links (see the weak-decl note above), else the
+    // contiguous IO_MUX block.
+    static uint32_t ioMuxReg(size_t pin)
+    {
+        return GPIO_PIN_MUX_REG ? GPIO_PIN_MUX_REG[pin] : (IO_MUX_GPIO0_REG + static_cast<uint32_t>(pin) * 4u);
+    }
+
     uint32_t _io_mux_gpio_reg   = 0;
     uint32_t _gpio_pin_reg      = 0;
     uint32_t _gpio_func_out_reg = 0;
