@@ -55,7 +55,8 @@ public:
 
     void setPin(gpio_number_t pin)
     {
-        _pin_num = pin;
+        _pin_num  = pin;
+        _captured = false;
     }
     gpio_number_t getPin() const
     {
@@ -66,6 +67,7 @@ public:
     void backup()
     {
         _in_func_num = -1;
+        _captured    = false;
         if (_pin_num < 0 || ::m5::hal::v1::types::extractSlot(_pin_num) != 0) {
             return;  // invalid or non-MCU (expander) pin -> nothing to save
         }
@@ -104,6 +106,7 @@ public:
                 _in_func_num      = static_cast<int16_t>(func_num);
             }
         }
+        _captured = true;
     }
     void backup(gpio_number_t pin)
     {
@@ -114,7 +117,7 @@ public:
     // Write the saved registers back, returning the pin to its prior role.
     void restore() const
     {
-        if (_pin_num < 0 || ::m5::hal::v1::types::extractSlot(_pin_num) != 0) {
+        if (!_captured || _pin_num < 0 || ::m5::hal::v1::types::extractSlot(_pin_num) != 0) {
             return;
         }
         const size_t pin = ::m5::hal::v1::types::extractLocalPin(_pin_num);
@@ -141,6 +144,10 @@ public:
             *enable_reg &= ~mask;
         }
     }
+    bool captured() const
+    {
+        return _captured;
+    }
 
 private:
     // Address of the IO_MUX configuration register for MCU pin `pin`. Uses the
@@ -158,6 +165,7 @@ private:
     int16_t _in_func_num        = -1;
     gpio_number_t _pin_num      = -1;
     bool _gpio_enable           = false;
+    bool _captured              = false;
 };
 
 // RAII scope guard around PinBackup: captures the pin's routing state on
@@ -178,7 +186,7 @@ public:
     explicit ScopedPinBackup(gpio_number_t pin) : _backup{pin}
     {
         _backup.backup();
-        _armed = true;
+        _armed = _backup.captured();
     }
 
     ScopedPinBackup(const ScopedPinBackup&)            = delete;
@@ -217,6 +225,10 @@ public:
     bool armed() const
     {
         return _armed;
+    }
+    bool captured() const
+    {
+        return _backup.captured();
     }
     gpio_number_t getPin() const
     {

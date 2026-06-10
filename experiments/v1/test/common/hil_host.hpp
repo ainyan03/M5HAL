@@ -72,7 +72,7 @@ inline uart::UARTAccessConfig ioConfig(uint32_t baud)
 
 // Accumulate exactly `len` bytes (the peer may deliver them in chunks). Returns
 // the count actually read (== len on success).
-inline size_t readExact(uart::UARTAccessor& dev, uint8_t* dst, size_t len, int max_reads)
+inline size_t readExact(uart::UARTRxAccessor& dev, uint8_t* dst, size_t len, int max_reads)
 {
     size_t got = 0;
     for (int i = 0; i < max_reads && got < len; ++i) {
@@ -90,7 +90,7 @@ inline size_t readExact(uart::UARTAccessor& dev, uint8_t* dst, size_t len, int m
 
 // Read and discard everything pending until the line is idle for one timeout.
 // Clears boot-ROM noise / stale bytes before a clean exchange.
-inline void drain(uart::UARTAccessor& dev)
+inline void drain(uart::UARTRxAccessor& dev)
 {
     uint8_t scratch[256];
     for (int i = 0; i < 64; ++i) {
@@ -123,17 +123,18 @@ inline bool openSynced(uart::Bus& bus, const char* port, uint32_t baud)
     sync_cfg.first_byte_timeout_ms = 150;
     sync_cfg.inter_byte_timeout_ms = 30;
     sync_cfg.write_timeout_ms      = 300;
-    uart::UARTAccessor dev{bus, sync_cfg};
+    uart::UARTTxAccessor tx{bus, sync_cfg};
+    uart::UARTRxAccessor rx_dev{bus, sync_cfg};
 
     static const uint8_t marker[] = {0xA5, 0x5A, 0xC3, 0x3C};
     for (int attempt = 0; attempt < 24; ++attempt) {
-        drain(dev);
-        if (!dev.write(data::ConstDataSpan{marker, sizeof(marker)}).has_value()) {
+        drain(rx_dev);
+        if (!tx.write(data::ConstDataSpan{marker, sizeof(marker)}).has_value()) {
             continue;
         }
-        uint8_t rx[sizeof(marker)] = {};
-        size_t got                 = readExact(dev, rx, sizeof(marker), 6);
-        if (got == sizeof(marker) && ::memcmp(rx, marker, sizeof(marker)) == 0) {
+        uint8_t echoed[sizeof(marker)] = {};
+        size_t got                     = readExact(rx_dev, echoed, sizeof(marker), 6);
+        if (got == sizeof(marker) && ::memcmp(echoed, marker, sizeof(marker)) == 0) {
             return true;
         }
     }

@@ -27,10 +27,10 @@ M5HAL v1 のコード記述に関する規約をまとめる。 全体構造は 
 C++17 **nested namespace specifier** で宣言する:
 
 ```cpp
-namespace m5::variants::frameworks::arduino::hal::i2c {
-using namespace ::m5::hal;  // resolve unqualified interface::/types::/bus:: refs
+namespace m5::variants::frameworks::arduino::hal::v1::i2c {
+using namespace ::m5::hal::v1;  // resolve unqualified types::/bus:: refs
 ...
-}  // namespace m5::variants::frameworks::arduino::hal::i2c
+}  // namespace m5::variants::frameworks::arduino::hal::v1::i2c
 ```
 
 - 旧来の `namespace m5 { namespace ... { ... } }` の入れ子は使わない
@@ -49,7 +49,7 @@ using namespace ::m5::hal;  // resolve unqualified interface::/types::/bus:: ref
 | ローカル変数・引数 | lower_snake_case | `delay_cycle`, `cb_obj` |
 | 定数 (constexpr) | 用途に応じる (`kCamelCase` または `UPPER_SNAKE_CASE`) | `kDefaultTimeoutMs` |
 | enum class 値 | **基本** UpperCamelCase。 **例外として** エラーコード等 C 互換 / POSIX 慣習を意識する定数群は UPPER_SNAKE_CASE 許容 | `BusKind::I2C`, `GpioMode::Output` / 許容例: `error_t::OK`, `error_t::I2C_NO_ACK` |
-| 機能・設定マクロ | `M5HAL_` プレフィックス (アンダースコアなし) + UPPER_SNAKE_CASE | `M5HAL_TARGET_PLATFORM_NUMBER`, `M5HAL_ASSERT` |
+| 機能・設定マクロ | `M5HAL_` プレフィックス (アンダースコアなし) + UPPER_SNAKE_CASE。 世代間で値が異なり得るものは `M5HAL_V1_` で世代分離 | `M5HAL_V1_TARGET_PLATFORM_NUMBER`, `M5HAL_ASSERT` |
 | ヘッダガード | `M5_HAL_<PATH>_HPP` (`M5_HAL_` = アンダースコアあり、 パスベース) | `M5_HAL_TYPES_HPP`, `M5_HAL_GPIO_GROUP_HPP_` |
 
 ### 先頭アンダースコア方式の制約
@@ -140,7 +140,7 @@ RAII 型:
 
 M5HAL のマクロは用途で 2 系統に分かれる (実態に基づく規約):
 
-- **機能・設定マクロは `M5HAL_` プレフィックス** (アンダースコアなし) + UPPER_SNAKE_CASE — 機能フラグ・外部定義の上書き・assert 等。 例: `M5HAL_FRAMEWORK_HAS_*`, `M5HAL_PLATFORM_NUMBER_*`, `M5HAL_VARIANT_CURRENT_*`, `M5HAL_ASSERT`
+- **機能・設定マクロは `M5HAL_` プレフィックス** (アンダースコアなし) + UPPER_SNAKE_CASE — 機能フラグ・外部定義の上書き・assert 等。 例: `M5HAL_FRAMEWORK_HAS_*`, `M5HAL_V1_PLATFORM_NUMBER_*`, `M5HAL_VARIANT_CURRENT_*`, `M5HAL_ASSERT`。 世代間で値が異なり得るものは `M5HAL_V1_` で世代分離する (無印は凍結 v0 が所有。 [../design/v0_v1_coexistence.md](../design/v0_v1_coexistence.md) §制約)
 - **ヘッダガードは `M5_HAL_<PATH>_HPP` プレフィックス** (`M5_HAL_` = アンダースコアあり、 ファイルパスベース) — 機能マクロの `M5HAL_` と区別する。 例: `M5_HAL_TYPES_HPP`, `M5_HAL_GPIO_GROUP_HPP_`, `M5_HAL_ASSERT_HPP`
 - 内部用途のマクロは末尾アンダースコアを付けて区別する (例: `M5HAL_VARIANT_CURRENT_*_`)
 
@@ -172,7 +172,7 @@ variant 機構の実装に関する規則。 全体像は [../design/variants.md
 抽象基底の命名は **具象 (variant 側) と衝突しない形を選ぶ**。 v1 では 2 パターンを許容する:
 
 - **`I` プレフィックス採用** — 抽象基底と具象が同じ namespace 内で同じ概念名を共有しやすい場合に採用する。 例:
-  - `m5::hal::v1::gpio::IGPIO` (抽象) ↔ `m5::variants::frameworks::arduino::hal::gpio::GPIO` (具象)
+  - `m5::hal::v1::gpio::IGPIO` (抽象) ↔ `m5::variants::frameworks::arduino::hal::v1::gpio::GPIO` (具象)
   - `m5::hal::v1::gpio::IPort` (抽象) ↔ 同 namespace 内の `Port` (具象)
 - **プレフィックスなし** — 具象が kind / role プレフィックスで自然に区別できる場合に採用する。 例:
   - `m5::hal::v1::bus::Bus` (抽象) ↔ `m5::hal::v1::i2c::I2CBus` (具象、 kind プレフィックスで区別)
@@ -183,10 +183,10 @@ variant 機構の実装に関する規則。 全体像は [../design/variants.md
 
 ### variant 名前空間
 
-- variant 具象は `m5::variants::{frameworks,platforms}::<name>[::<chip>]::hal::*` 配下に配置 (variant は層横断のメタ階層、 各 variant 内の `hal::` が HAL 層への提供物)
-- ディレクトリ階層と一致 (例: `src/m5_hal/variants/frameworks/arduino/hal/i2c/i2c.hpp` 内の宣言は `m5::variants::frameworks::arduino::hal::i2c::*`)
-- variant 内では `hal { ... }` 冒頭に `using namespace ::m5::hal;` を置ける
-- `m5::hal::types::*` は `::m5::hal::types::*` の fully qualified 形式で書く
+- variant 具象は `m5::variants::{frameworks,platforms}::<name>[::<chip>]::hal::v1::*` 配下に配置 (variant は層横断のメタ階層、 各 variant 内の `hal::v1::` が HAL 層への提供物)
+- ディレクトリ階層と一致 (例: `src/m5_hal/variants/frameworks/arduino/hal/i2c/i2c.hpp` 内の宣言は `m5::variants::frameworks::arduino::hal::v1::i2c::*`)
+- variant 内では必要に応じて `using namespace ::m5::hal::v1;` を置ける
+- `m5::hal::v1::types::*` は `::m5::hal::v1::types::*` の fully qualified 形式で書く
 - `using namespace` による flat 注入は `_macro/offer_all.inl` のみで行う
 
 ## アサーション・ロギング

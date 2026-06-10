@@ -1,6 +1,6 @@
 
-#ifndef M5_HAL_ERROR_HPP
-#define M5_HAL_ERROR_HPP
+#ifndef M5_HAL_V0_ERROR_HPP
+#define M5_HAL_V0_ERROR_HPP
 
 #include <stdint.h>
 

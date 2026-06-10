@@ -11,6 +11,8 @@ pio run -e v1_exp_bench_arduino
 pio run -e HowToUse_I2C_esp32
 pio run -e HowToUse_SPI_esp32
 pio run -e HowToUse_UART_esp32
+pio run -e HowToUse_UARTEcho_esp32
+pio run -e HowToUse_Bytecode_esp32
 ```
 
 The remaining check/test/advanced experiment envs are CLI/CI-only
@@ -30,6 +32,7 @@ copying and nothing to clean up. Unset, it expands to empty and is ignored.
 ## CLI-only env groups (`*.ini.cli`)
 
 - `v0/check.ini.cli`: v0 header/build compatibility checks
+- `v0v1/check.ini.cli`: v0+v1 same-TU coexistence checks on device targets
 - `v1/check.ini.cli`: v1 header/build compatibility and shared API-surface checks
 - `v1/test.ini.cli`: native and embedded test envs
 - `v1/experiments_advanced.ini.cli`: focused benchmarks, logic-analyzer sketches, and backend smoke tests

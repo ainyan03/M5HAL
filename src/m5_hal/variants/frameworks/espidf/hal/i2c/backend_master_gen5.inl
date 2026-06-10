@@ -23,6 +23,8 @@ namespace {
             return ::m5::hal::v1::error::error_t::INVALID_ARGUMENT;
         case ESP_ERR_TIMEOUT:
             return ::m5::hal::v1::error::error_t::TIMEOUT_ERROR;
+        case ESP_ERR_NO_MEM:
+            return ::m5::hal::v1::error::error_t::OUT_OF_RESOURCE;
         case ESP_ERR_NOT_FOUND:
             return ::m5::hal::v1::error::error_t::I2C_NO_ACK;
         default:

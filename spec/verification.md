@@ -8,12 +8,13 @@ M5HAL v1 開発で使う検証コマンドとその運用詳細を示す。
 
 | カテゴリ | 用途 | コマンド |
 |---|---|---|
-| native 単体 | gtest による I2C / SPI / Source/Sink / TransferDesc の単体テスト | `pio test -e test_native` |
+| native 単体 | gtest による v1 core / GPIO / I2C / SPI / UART / Memory / Source/Sink / frame codec / bytecode の単体テスト | `pio test -e test_native` |
 | SPI API 単体 | SPI Accessor API skeleton の狭い確認 | `pio test -e test_native -f v1/native/bus/test_spi_api` |
-| クロスチェック v0 | v0 公開 entry の ESP32 / ESP32-S3 × Arduino / ESP-IDF + native 計 5 環境 | `pio run -e v0_check_native -e v0_check_esp32_arduino -e v0_check_esp32_espidf -e v0_check_esp32s3_arduino -e v0_check_esp32s3_espidf` |
-| クロスチェック v1 | v1 公開 entry と主要 API surface の native / Arduino / ESP-IDF ビルド | `pio run -e v1_check_native -e v1_check_esp32_arduino -e v1_check_esp32_espidf -e v1_check_esp32s3_arduino -e v1_check_esp32s3_espidf` |
-| v1 inline flip fence | `m5::hal::*` が v1 に resolve される構成の確認 | `pio run -e v1_check_native_inline` |
-| examples build | `examples/v1/HowToUse/I2C` / `SPI` / `UART` の ESP32 / ESP32-S3 ビルド | `pio run -e HowToUse_I2C_esp32 -e HowToUse_I2C_esp32s3 -e HowToUse_SPI_esp32 -e HowToUse_SPI_esp32s3 -e HowToUse_UART_esp32 -e HowToUse_UART_esp32s3` |
+| クロスチェック v0 | v0 公開 entry の native + ESP32/S3/C3/C6 Arduino/ESP-IDF build fence | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v0/check.ini.cli pio run -e v0_check_native -e v0_check_esp32_arduino -e v0_check_esp32_espidf -e v0_check_esp32_espidf4 -e v0_check_esp32_espidf6 -e v0_check_esp32s3_arduino -e v0_check_esp32s3_espidf -e v0_check_esp32s3_espidf6 -e v0_check_esp32c3_arduino -e v0_check_esp32c3_espidf -e v0_check_esp32c6_espidf` |
+| クロスチェック v1 | v1 公開 entry と主要 API surface の native + ESP32/S3/C3/C6 Arduino/ESP-IDF build fence | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v1/check.ini.cli pio run -e v1_check_native -e v1_check_esp32_arduino -e v1_check_esp32_espidf -e v1_check_esp32_espidf4 -e v1_check_esp32_espidf6 -e v1_check_esp32s3_arduino -e v1_check_esp32s3_espidf -e v1_check_esp32s3_espidf6 -e v1_check_esp32c3_arduino -e v1_check_esp32c3_espidf -e v1_check_esp32c6_espidf` |
+| v1 inline flip fence | `m5::hal::*` が v1 に resolve される構成の確認 | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v1/check.ini.cli pio run -e v1_check_native_inline` |
+| v0/v1 共存 fence (device) | 同一 TU で両エントリを include し、 include ガードの世代分離と platform checker の macro 名前空間分離 (v0 = 無印 / v1 = `M5HAL_V1_`) を device build で保証 (native 側は `test_coexist_include`) | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v0v1/check.ini.cli pio run -e v0v1_check_esp32_arduino -e v0v1_check_esp32s3_arduino -e v0v1_check_esp32_espidf` |
+| examples build | `examples/v1/HowToUse/I2C` / `SPI` / `UART` / `UARTEcho` の ESP32 / ESP32-S3 ビルド + `Bytecode` (Core BASIC 前提、ESP32 のみ) | `pio run -e HowToUse_I2C_esp32 -e HowToUse_I2C_esp32s3 -e HowToUse_SPI_esp32 -e HowToUse_SPI_esp32s3 -e HowToUse_UART_esp32 -e HowToUse_UART_esp32s3 -e HowToUse_UARTEcho_esp32 -e HowToUse_UARTEcho_esp32s3 -e HowToUse_Bytecode_esp32` |
 | I2C variant 実機切替 | BoardMenu で Arduino / Software / ESP-IDF I2C backend を切り替えて scan / register read | `pio run -e v1_exp_menu_arduino -t upload` |
 | software SPI logic analyzer | software SPI の SCLK/MOSI/CS/DC wire activity smoke test | `pio run -e v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino` |
 | software SPI 5MHz / NDEBUG | software SPI の高周波設定と `M5HAL_ASSERT` 無効化の比較 | `pio run -e v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino_5mhz -e v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino_5mhz_ndebug` |
@@ -24,7 +25,7 @@ M5HAL v1 開発で使う検証コマンドとその運用詳細を示す。
 | M5UU 破壊検出 | M5UnitUnified との互換性確認 | 下記参照 |
 | clang-format | コードフォーマット検証 | 下記参照 |
 
-> **env 命名規則**: check/test/experiment は `<v0|v1>_<purpose>_<chip>[_<framework>][_<variant>]`。 公開 examples は GUI 左ペインでの識別性を優先し、 `HowToUse_<Kind>_<chip>` を使う。
+> **env 命名規則**: check/test/experiment は `<v0|v1|v0v1>_<purpose>_<chip>[_<framework>][_<variant>]` (`v0v1` = 両世代共存 fence)。 公開 examples は GUI 左ペインでの識別性を優先し、 `HowToUse_<Kind>_<chip>` を使う。
 
 ## CI
 
@@ -48,13 +49,14 @@ CI の v1 compile fence は公開 examples を流用しない。 examples は Ar
 これにより I2C / SPI / UART の accessor sugar、Source/Sink overload、Arduino /
 ESP-IDF variant config の公開名が examples と独立して壊れていないことを確認する。
 
-### 公式 ESP-IDF コンポーネントビルド (全 chip family)
+### 公式 ESP-IDF コンポーネントビルド (全 ESP32 family)
 
 PlatformIO の `espressif32` platform は board file の都合で一部 chip (esp32-h2 /
-esp32-p4) をビルドできないが、 **公式 ESP-IDF 本体は M5HAL の全対象 chip
-(`idf_component.yml` の `targets:` = esp32 / s3 / c3 / c6 / **p4 / h2**) を
-サポートする**。 そこで権威ある全機種検証として、 公式 `espressif/idf` toolchain で
-M5HAL を **ESP-IDF コンポーネントとしてビルド**する lane を持つ。
+esp32-p4 など) をビルドできないが、 **公式 ESP-IDF 本体は M5HAL の対象 chip
+(`idf_component.yml` の `targets:` = esp32 / esp32s2 / esp32s3 / esp32c2 /
+esp32c3 / esp32c5 / esp32c6 / esp32c61 / esp32h2 / esp32p4) をサポートする**。
+そこで権威ある全機種検証として、 公式 `espressif/idf` toolchain で M5HAL を
+**ESP-IDF コンポーネントとしてビルド**する lane を持つ。
 
 `test/idf_component_build/` が consumer プロジェクト。 `idf.py set-target <chip> build`
 で M5HAL と M5Utility を `EXTRA_COMPONENT_DIRS` から component 登録し

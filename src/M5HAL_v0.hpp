@@ -13,10 +13,9 @@
 // so existing `m5::hal::Foo` references resolve to v0 symbols and
 // legacy code needs no edits.
 //
-// To use the new v1 API, include `<M5HAL_v1.hpp>`. Mixing this header
-// and `M5HAL_v1.hpp` inside the same translation unit collides on the
-// shared macros (`M5HAL_FRAMEWORK_*` / `M5HAL_TARGET_PLATFORM_*`), so
-// each intermediate library MUST pick one. Details:
+// To use the new v1 API, include `<M5HAL_v1.hpp>`. v0 and v1 entry
+// headers may coexist in the same translation unit, but each intermediate
+// library should still make its intended generation explicit. Details:
 // spec/design/v0_v1_coexistence.md.
 // =============================================================================
 

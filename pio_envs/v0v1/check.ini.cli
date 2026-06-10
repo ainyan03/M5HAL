@@ -1,0 +1,28 @@
+; =============================================================================
+; M5HAL — v0/v1 共存 build check envs
+;
+; 同一 TU で <M5HAL_v0.hpp> と <M5HAL_v1.hpp> の両方を include する device
+; 向け fence。include ガードの世代分離と platform checker のマクロ名前空間
+; 分離 (v0 = 無印 M5HAL_TARGET_PLATFORM_*, v1 = M5HAL_V1_TARGET_PLATFORM_*)
+; を build で保証する。native 側の同種 fence は test_coexist_include (gtest)。
+; 対応 stub: test/v1/stub/build_check_coexist_{arduino,espidf}.cpp
+;
+; 命名: v0v1_check_<chip>_<framework>  (version prefix を先頭に置く)
+;
+; 使い方:
+;   pio run -e v0v1_check_esp32_arduino
+;   pio run -e v0v1_check_esp32s3_arduino
+;   pio run -e v0v1_check_esp32_espidf
+; =============================================================================
+
+[env:v0v1_check_esp32_arduino]
+extends = common_esp32dev, common_arduino
+build_src_filter = +<*> +<../test/v1/stub/build_check_coexist_arduino.cpp>
+
+[env:v0v1_check_esp32s3_arduino]
+extends = common_esp32s3dev, common_arduino
+build_src_filter = +<*> +<../test/v1/stub/build_check_coexist_arduino.cpp>
+
+[env:v0v1_check_esp32_espidf]
+extends = common_esp32dev_espidf5, common_espidf
+build_src_filter = +<*> +<../test/v1/stub/build_check_coexist_espidf.cpp>

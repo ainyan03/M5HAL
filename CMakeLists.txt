@@ -30,9 +30,9 @@ if(COMMAND idf_component_register)
     # esp_driver_gpio fix (commit 67e314f).
     if("${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}" VERSION_GREATER_EQUAL "5.3")
         set(m5hal_gpio_req esp_driver_gpio)
-        set(m5hal_i2c_req esp_driver_i2c)
         set(m5hal_spi_req esp_driver_spi)
         set(m5hal_uart_req esp_driver_uart)
+        set(m5hal_i2c_req esp_driver_i2c driver)
     else()
         set(m5hal_gpio_req driver)
         set(m5hal_i2c_req driver)
@@ -40,6 +40,13 @@ if(COMMAND idf_component_register)
         set(m5hal_uart_req driver)
     endif()
 
+    # I2C is special on IDF v5.3+: the default backend uses esp_driver_i2c
+    # (driver/i2c_master.h), while M5HAL_CONFIG_IDF_I2C_LEGACY=1 switches the
+    # C++ headers to driver/i2c.h. That config is usually a compiler definition,
+    # not a CMake variable visible while REQUIRES is computed, so the component
+    # declares both public dependencies. The C++ feature selection still compiles
+    # exactly one backend.
+    #
     # v0/v1 coexistence: register two translation units (M5HAL_v0.cpp and
     # M5HAL_v1.cpp) separately. The shared macros (M5HAL_FRAMEWORK_HAS_* /
     # M5HAL_TARGET_PLATFORM_*) collide between v0 and v1, so they cannot be

@@ -138,8 +138,11 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
         if (header.size) {
             size_t w = _wire->write(header.data, header.size);
             if (w != header.size) {
-                _wire->endTransmission(true);
-                return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::I2C_BUS_ERROR);
+                // Wire only buffers here; a short write means the local TX
+                // buffer is full, not a wire fault. Wire has no abort, so the
+                // release below transmits the partial buffer (best effort).
+                (void)_wire->endTransmission(true);
+                return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::BUFFER_OVERFLOW);
             }
             total += w;
         }
@@ -159,8 +162,9 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
                 }
                 size_t w = _wire->write(span.data, span.size);
                 if (w != span.size) {
-                    _wire->endTransmission(true);
-                    return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::I2C_BUS_ERROR);
+                    // Local TX buffer full (see the header-write comment).
+                    (void)_wire->endTransmission(true);
+                    return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::BUFFER_OVERFLOW);
                 }
                 auto adv = tx->advance(w);
                 if (!adv.has_value()) {
@@ -190,7 +194,11 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
             size_t got = _wire->requestFrom(static_cast<uint8_t>(cfg.i2c_addr), static_cast<size_t>(rx_span.size),
                                             static_cast<size_t>(true));
             if (got != rx_span.size) {
-                return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::I2C_BUS_ERROR);
+                // Zero bytes back means the address byte was NACKed (no
+                // device answered); a partial count is a transfer that broke
+                // mid-read. Wire exposes no finer diagnostics than this.
+                return m5::stl::make_unexpected(got == 0 ? ::m5::hal::v1::error::error_t::I2C_NO_ACK
+                                                         : ::m5::hal::v1::error::error_t::I2C_BUS_ERROR);
             }
             for (size_t i = 0; i < rx_span.size; ++i) {
                 int b = _wire->read();

@@ -41,7 +41,7 @@ the default.
 
 M5HAL adopts a coexistence strategy so that existing v0 consumers keep
 using their code unchanged while the v1 API lives side-by-side in the same
-library. Two entry headers are provided:
+library. The entry headers are:
 
 | Header | Exposes | For |
 |---|---|---|
@@ -49,12 +49,13 @@ library. Two entry headers are provided:
 | `<M5HAL_v0.hpp>` | `m5::hal::*` (= v0, via `inline namespace v0`) | Code that explicitly opts into the v0 (legacy) API |
 | `<M5HAL_v1.hpp>` | `m5::hal::v1::*` | Code that explicitly opts into the v1 API |
 
-- **Pick one per translation unit.** The headers share macro names
-  (`M5HAL_FRAMEWORK_HAS_*`, `M5HAL_TARGET_PLATFORM_*`), so an intermediate
-  library should include either a v0 entry (`<M5HAL.hpp>` shim or
-  `<M5HAL_v0.hpp>` direct) **or** `<M5HAL_v1.hpp>` in each `.cpp`. A single
-  sketch can still compose libraries that use different headers — each TU
-  just needs to include only one of them.
+- **Both entries may share a translation unit.** Include guards and the
+  platform-detection macros are generation-separated (v0 owns the
+  unprefixed `M5HAL_TARGET_PLATFORM_*` names, v1 uses
+  `M5HAL_V1_TARGET_PLATFORM_*`), so one `.cpp` may include both a v0 entry
+  (`<M5HAL.hpp>` shim or `<M5HAL_v0.hpp>` direct) and `<M5HAL_v1.hpp>`,
+  e.g. while migrating that file gradually. An intermediate library should
+  still make its intended generation explicit per TU for readability.
 - **Switching the default later.** `M5HAL_V0_INLINE` (defined in
   `src/m5_hal_config.hpp`, defaults to `1` while the major version is `0`)
   controls whether v0 is exposed as `inline namespace v0`. When the
@@ -134,3 +135,12 @@ UART also follows the same Bus / Accessor shape. Start with
 [`examples/v1/HowToUse/UART`](examples/v1/HowToUse/UART/) for an Arduino
 sketch that uses USB Serial for logs and `Serial1` as the M5HAL UART bus.
 Connect TX to RX to confirm loopback receive without another UART device.
+[`examples/v1/HowToUse/UARTEcho`](examples/v1/HowToUse/UARTEcho/) goes one
+step further: it echoes everything received back to the sender through the
+`StreamSink` adapter, showing how the accessors compose with the
+Source / Sink stream model.
+
+[`examples/v1/HowToUse/Bytecode`](examples/v1/HowToUse/Bytecode/) drives
+GPIO, I2C, and SPI from bytecode scripts written out as plain byte arrays
+(the "init sequence as a const table" pattern), executed on the buttons of
+an M5Stack Core BASIC.

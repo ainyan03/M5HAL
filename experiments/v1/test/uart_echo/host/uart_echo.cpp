@@ -54,38 +54,44 @@ protected:
 
 TEST_F(UartEcho, EchoesSmallPayload)
 {
-    uart::UARTAccessor dev{bus_, hil::ioConfig(baud_)};
+    auto cfg = hil::ioConfig(baud_);
+    uart::UARTTxAccessor tx_dev{bus_, cfg};
+    uart::UARTRxAccessor rx_dev{bus_, cfg};
     const uint8_t tx[] = {0x01, 0x02, 0x03, 0x04, 0x05};
-    ASSERT_TRUE(dev.write(data::ConstDataSpan{tx, sizeof(tx)}).has_value());
+    ASSERT_TRUE(tx_dev.write(data::ConstDataSpan{tx, sizeof(tx)}).has_value());
 
     uint8_t rx[sizeof(tx)] = {};
-    EXPECT_EQ(hil::readExact(dev, rx, sizeof(tx), 10), sizeof(tx));
+    EXPECT_EQ(hil::readExact(rx_dev, rx, sizeof(tx), 10), sizeof(tx));
     EXPECT_EQ(::memcmp(rx, tx, sizeof(tx)), 0);
 }
 
 TEST_F(UartEcho, EchoesBinaryIncludingNulAndNewline)
 {
-    uart::UARTAccessor dev{bus_, hil::ioConfig(baud_)};
+    auto cfg = hil::ioConfig(baud_);
+    uart::UARTTxAccessor tx_dev{bus_, cfg};
+    uart::UARTRxAccessor rx_dev{bus_, cfg};
     // Includes NUL, LF, CR, high bytes — must survive raw (no line discipline).
     const uint8_t tx[] = {0x00, 0x0A, 0x0D, 0xFF, 0x7F, 0x80, 0x00, 0x55};
-    ASSERT_TRUE(dev.write(data::ConstDataSpan{tx, sizeof(tx)}).has_value());
+    ASSERT_TRUE(tx_dev.write(data::ConstDataSpan{tx, sizeof(tx)}).has_value());
 
     uint8_t rx[sizeof(tx)] = {};
-    EXPECT_EQ(hil::readExact(dev, rx, sizeof(tx), 16), sizeof(tx));
+    EXPECT_EQ(hil::readExact(rx_dev, rx, sizeof(tx), 16), sizeof(tx));
     EXPECT_EQ(::memcmp(rx, tx, sizeof(tx)), 0);
 }
 
 TEST_F(UartEcho, EchoesLargePayloadInOrder)
 {
-    uart::UARTAccessor dev{bus_, hil::ioConfig(baud_)};
+    auto cfg = hil::ioConfig(baud_);
+    uart::UARTTxAccessor tx_dev{bus_, cfg};
+    uart::UARTRxAccessor rx_dev{bus_, cfg};
     std::vector<uint8_t> tx(512);
     for (size_t i = 0; i < tx.size(); ++i) {
         tx[i] = static_cast<uint8_t>(i * 7 + 1);
     }
-    ASSERT_TRUE(dev.write(data::ConstDataSpan{tx.data(), tx.size()}).has_value());
+    ASSERT_TRUE(tx_dev.write(data::ConstDataSpan{tx.data(), tx.size()}).has_value());
 
     std::vector<uint8_t> rx(tx.size());
-    EXPECT_EQ(hil::readExact(dev, rx.data(), rx.size(), 200), tx.size());
+    EXPECT_EQ(hil::readExact(rx_dev, rx.data(), rx.size(), 200), tx.size());
     EXPECT_EQ(::memcmp(rx.data(), tx.data(), tx.size()), 0);
 }
 

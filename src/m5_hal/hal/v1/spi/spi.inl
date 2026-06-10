@@ -127,7 +127,7 @@ m5::stl::expected<void, m5::hal::v1::error::error_t> SPIMasterAccessor::beginTra
 
     auto bt = getSPIBus().beginTransaction(this, _access_config);
     if (!bt.has_value()) {
-        (void)endAccess();
+        (void)endAccess();  // rollback; the primary (bt) error takes priority
         return m5::stl::make_unexpected(bt.error());
     }
 

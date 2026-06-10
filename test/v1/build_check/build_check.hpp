@@ -289,6 +289,7 @@ inline void compileCommonApiSurface(void)
     detail::data::MemorySink spi_sink{detail::data::DataSpan{rx, sizeof(rx)}};
     detail::data::LimitedSource limited_source{&spi_source, sizeof(tx)};
     detail::data::LimitedSink limited_sink{&spi_sink, sizeof(rx)};
+    detail::useResult(i2c_dev.transfer(detail::i2c::TransferDesc{}, &limited_source, &limited_sink));
     detail::useResult(spi_dev.transfer(detail::spi::TransferDesc{}, &limited_source, &limited_sink, sizeof(tx)));
     detail::useResult(spi_dev.write(detail::data::ConstDataSpan{tx, sizeof(tx)}));
     detail::useResult(spi_dev.read(detail::data::DataSpan{rx, sizeof(rx)}));
@@ -321,6 +322,8 @@ inline void compileCommonApiSurface(void)
     uart_cfg.parity                = detail::uart::parity_t::none;
     detail::uart::UARTAccessor uart_dev{uart_bus, uart_cfg};
     detail::useResult(uart_dev.setConfig(uart_cfg));
+    detail::useResult(uart_dev.beginAccess());
+    detail::useResult(uart_dev.endAccess());
     detail::useResult(uart_dev.write(detail::data::ConstDataSpan{tx, sizeof(tx)}));
     detail::useResult(uart_dev.read(detail::data::DataSpan{rx, sizeof(rx)}));
     detail::data::MemorySource uart_source{detail::data::ConstDataSpan{tx, sizeof(tx)}};
@@ -330,6 +333,85 @@ inline void compileCommonApiSurface(void)
     detail::useResult(uart_dev.write(tx, sizeof(tx)));
     detail::useResult(uart_dev.read(rx, sizeof(rx)));
     detail::useResult(uart_dev.readableBytes());
+
+    detail::uart::UARTTxAccessor uart_tx{uart_bus, uart_cfg};
+    detail::uart::UARTRxAccessor uart_rx{uart_bus, uart_cfg};
+    detail::useResult(uart_tx.setConfig(uart_cfg));
+    detail::useResult(uart_rx.setConfig(uart_cfg));
+    detail::useResult(uart_tx.beginTxAccess());
+    detail::useResult(uart_tx.endTxAccess());
+    detail::useResult(uart_rx.beginRxAccess());
+    detail::useResult(uart_rx.endRxAccess());
+    detail::useResult(uart_tx.write(tx, sizeof(tx)));
+    detail::useResult(uart_rx.read(rx, sizeof(rx)));
+    detail::useResult(uart_rx.readableBytes());
+
+    // Stream adapters: the RX/TX accessors bind to the minimal stream
+    // interfaces, and the adapters lift them into Source / Sink.
+    detail::data::StreamReader& stream_reader = uart_rx;
+    detail::data::StreamWriter& stream_writer = uart_tx;
+    uint8_t stream_scratch[8];
+    detail::data::StreamSource stream_source{stream_reader, detail::data::DataSpan{stream_scratch, 0}};
+    detail::data::StreamSink stream_sink{stream_writer, detail::data::DataSpan{stream_scratch, 0}};
+    detail::data::Source& stream_as_source = stream_source;
+    detail::data::Sink& stream_as_sink     = stream_sink;
+    // peek/reserve use max_len 1 (0 is a contract violation); the size-0
+    // scratch makes both return INVALID_ARGUMENT before any I/O happens.
+    detail::useResult(stream_as_source.peek(1));
+    detail::useResult(stream_as_source.advance(0));
+    (void)stream_as_source.eof();
+    (void)stream_source.buffered();
+    (void)stream_source.pendingSkip();
+    detail::useResult(stream_as_sink.reserve(1));
+    detail::useResult(stream_as_sink.commit(0));
+    (void)stream_as_sink.closed();
+
+    // Frame codec: pure encode/decode plus the Source/Sink-driven
+    // reader/writer. All calls below stay I/O-free (empty inputs).
+    namespace frame = ::m5::hal::v1::frame;
+    uint8_t frame_buf[frame::checkedFrameWireSize(1)];
+    detail::useResult(frame::encodeDelimiter(detail::data::DataSpan{frame_buf, sizeof(frame_buf)}));
+    detail::useResult(frame::encodeChecked(detail::data::DataSpan{frame_buf, sizeof(frame_buf)},
+                                           frame::Kind::control, detail::data::ConstDataSpan{}));
+    detail::useResult(
+        frame::encodeData(detail::data::DataSpan{frame_buf, sizeof(frame_buf)}, 0, detail::data::ConstDataSpan{}));
+    (void)frame::crc16CcittUpdate(0xFFFF, 0x00);
+    (void)frame::check16(detail::data::ConstDataSpan{frame_buf, sizeof(frame_buf)});
+    (void)frame::isCheckedKind(frame::Kind::data);
+    (void)frame::isKnownKind(0x01);
+    (void)frame::isDelimiter(detail::data::ConstDataSpan{});
+    frame::View frame_view;
+    (void)frame::decode(detail::data::ConstDataSpan{}, frame_view);  // need_more, no I/O
+    detail::data::MemorySource frame_src{detail::data::ConstDataSpan{}};
+    detail::data::MemorySink frame_snk{detail::data::DataSpan{}};
+    frame::FrameReader frame_reader{frame_src};
+    frame::FrameWriter frame_writer{frame_snk};
+    detail::useResult(frame_reader.next(frame_view));      // empty source -> END_OF_STREAM
+    detail::useResult(frame_writer.writeDelimiter());      // closed sink -> CLOSED
+
+    // Bytecode: encoder + runner surface. All calls stay I/O-free
+    // (closed sinks, empty scripts, no registered targets touched).
+    namespace bytecode = ::m5::hal::v1::bytecode;
+    uint8_t lenvar_buf[5];
+    (void)bytecode::encodeLenVar(lenvar_buf, bytecode::kMaxStoreSlots);
+    (void)bytecode::decodeLenVar(detail::data::ConstDataSpan{});
+    (void)bytecode::lenVarSize(0x1234);
+    detail::data::MemorySink bytecode_snk{detail::data::DataSpan{}};  // closed sink
+    bytecode::BytecodeEncoder bytecode_enc{bytecode_snk};
+    detail::useResult(bytecode_enc.delayMs(0));
+    detail::useResult(bytecode_enc.gpioWriteHigh(nullptr, 0));
+    detail::useResult(bytecode_enc.storeData(0, detail::data::ConstDataSpan{}));
+    detail::useResult(bytecode_enc.end());
+    bytecode::BytecodeRunner bytecode_runner;
+    detail::useResult(bytecode_runner.registerI2C(0, i2c_dev));
+    detail::useResult(bytecode_runner.registerUART(0, uart_dev));
+    detail::useResult(bytecode_runner.run(detail::data::ConstDataSpan{}));  // empty script -> no-op
+    (void)bytecode_runner.storedData(0);
+    (void)bytecode_runner.storedCount();
+    (void)bytecode_runner.statusReported();
+    (void)bytecode_runner.lastOffset();
+    (void)bytecode_runner.unknownSkipped();
+    detail::useResult(bytecode_runner.writeResponse(bytecode_snk, detail::error::error_t::OK));
 }
 
 #if defined(ARDUINO)
@@ -397,11 +479,13 @@ inline void compileGpioCapabilityApiSurface(void)
     detail::useResult(backup.getPin());
     backup.backup();
     backup.backup(types::gpio_number_t{23});
+    detail::useResult(backup.captured());
     backup.restore();
 
     gpio::ScopedPinBackup guard{types::gpio_number_t{21}};
     detail::useResult(guard.getPin());
     detail::useResult(guard.armed());
+    detail::useResult(guard.captured());
     gpio::ScopedPinBackup moved{static_cast<gpio::ScopedPinBackup&&>(guard)};  // move-only
     moved.dismiss();
 }

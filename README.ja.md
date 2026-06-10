@@ -129,3 +129,11 @@ UART も同じ Bus / Accessor の形で扱います。
 [`examples/v1/HowToUse/UART`](examples/v1/HowToUse/UART/) は、USB Serial をログ用、
 `Serial1` を M5HAL UART bus として使う Arduino sketch です。TX と RX を接続すると、
 外部 UART device なしで loopback 受信を確認できます。
+[`examples/v1/HowToUse/UARTEcho`](examples/v1/HowToUse/UARTEcho/) はその一歩先として、
+受信したバイトを `StreamSink` アダプタ経由でそのまま送信側へ返す echo sketch です。
+accessor を Source / Sink の stream モデルと組み合わせる方法を示します。
+
+[`examples/v1/HowToUse/Bytecode`](examples/v1/HowToUse/Bytecode/) は、GPIO / I2C / SPI の
+一連の操作を bytecode (byte 配列のまま sketch に記述) で表し、M5Stack Core BASIC の
+ボタン操作で実行するデモです。「初期化シーケンスを const テーブル化して再生する」
+使い方をそのまま示します。

@@ -72,7 +72,9 @@ struct DataSpan {
   - The span returned by `peek` is borrowed until the next `peek` or
     `advance` call.
   - `peek` returning a zero-length span signals end-of-stream
-    (`eof()` also becomes true).
+    (`eof()` also becomes true). Because of that, `peek(0)` is a
+    contract violation (`max_len` must be >= 1); the behavior is
+    derivation-defined.
   - `advance(N)` is an independent cursor operation, unrelated to the
     presence or size of any prior `peek`. Discarding bytes by repeated
     `advance` is a supported usage.
@@ -110,7 +112,9 @@ public:
   - The span returned by `reserve` is borrowed until the next
     `reserve` or `commit` call.
   - `reserve` returning a zero-length span signals end-of-writes
-    (`closed()` also becomes true).
+    (`closed()` also becomes true). Because of that, `reserve(0)` is a
+    contract violation (`max_len` must be >= 1); the behavior is
+    derivation-defined.
   - `commit(N)` reports the number of bytes written into the most
     recently reserved span. The caller MUST keep `N <= reserved size`.
   - Contract violations (oversized commit, commit without reserve,

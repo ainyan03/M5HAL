@@ -1431,7 +1431,7 @@ namespace stage2 {
 // directly.
 class StubBus : public m5::hal::v1::i2c::I2CBus {
 public:
-    const m5::hal::v1::bus::BusConfig& getConfig(void) const override
+    const m5::hal::v1::i2c::I2CBusConfig& getConfig(void) const override
     {
         return _config;
     }

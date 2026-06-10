@@ -29,6 +29,9 @@ static constexpr uint8_t REG_PROBE_R2 = 0x01;
 #define M5HAL_EXAMPLE_HOWTOUSEI2C_FREQ 100000
 #endif
 
+// m5hal::i2c::Bus resolves to the first backend the build offers
+// (framework scan order; see spec/design/variants.md). Uncomment a
+// variant::* alias below to force a specific backend instead.
 using ExampleI2CBus = m5hal::i2c::Bus;
 // using ExampleI2CBus = m5hal::i2c::variant::arduino::Bus;
 // using ExampleI2CBus = m5hal::i2c::variant::espidf::Bus;

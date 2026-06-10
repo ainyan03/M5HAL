@@ -28,6 +28,9 @@ constexpr int PIN_SPI_CS   = 5;
 #define M5HAL_EXAMPLE_HOWTOUSESPI_FREQ 1000000
 #endif
 
+// m5hal::spi::Bus resolves to the first backend the build offers
+// (framework scan order; see spec/design/variants.md). Uncomment a
+// variant::* alias below to force a specific backend instead.
 using ExampleSPIBus = m5hal::spi::Bus;
 // using ExampleSPIBus = m5hal::spi::variant::arduino::Bus;
 // using ExampleSPIBus = m5hal::spi::variant::espidf::Bus;

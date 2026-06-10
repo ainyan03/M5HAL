@@ -180,7 +180,8 @@ struct I2CMasterAccessor : public bus::Accessor {
      */
     I2CMasterAccessor(I2CBus& bus, const I2CMasterAccessConfig& access_config);
 
-    const bus::AccessConfig& getConfig(void) const override
+    /*! @brief Covariant override: every accessor returns its concrete config. */
+    const I2CMasterAccessConfig& getConfig(void) const override
     {
         return _access_config;
     }
@@ -223,6 +224,16 @@ struct I2CMasterAccessor : public bus::Accessor {
     m5::stl::expected<size_t, m5::hal::v1::error::error_t> transfer(const TransferDesc& desc,
                                                                     data::ConstDataSpan tx_bytes,
                                                                     data::DataSpan rx_bytes);
+
+    /*!
+      @brief Source/Sink overload for streaming callers.
+
+      Mirrors the bus entry point (and the SPI accessor's equivalent
+      overload). `tx` / `rx` are nullable; the span sugar above
+      delegates here.
+     */
+    m5::stl::expected<size_t, m5::hal::v1::error::error_t> transfer(const TransferDesc& desc, data::Source* tx,
+                                                                    data::Sink* rx);
 
     /*!
       @name Span-based write / read sugars.
@@ -427,7 +438,7 @@ protected:
   a device without building one themselves.
  */
 struct I2CBus : public bus::Bus {
-    const bus::BusConfig& getConfig(void) const override
+    const I2CBusConfig& getConfig(void) const override
     {
         return _config;
     }

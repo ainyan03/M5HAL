@@ -1,6 +1,14 @@
 #ifndef M5_HAL_FRAMEWORK_CHECKER_HPP
 #define M5_HAL_FRAMEWORK_CHECKER_HPP
 
+// ARDUINO / FREERTOS / SDL are also defined, with the SAME names, by the
+// frozen hal/v0/framework_checker.hpp. Identical-token redefinition is
+// well-formed, so sharing is intentional — but any edit here that changes
+// those three definitions breaks the contract and shows up as a
+// redefinition warning in the coexist fences (test_coexist_include,
+// v0v1_check_*). v1-only additions (ESPIDF, POSIX, ...) are free.
+// See spec/design/v0_v1_coexistence.md §制約.
+
 #if defined(ARDUINO)
 #define M5HAL_FRAMEWORK_HAS_ARDUINO 1
 #else

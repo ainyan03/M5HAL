@@ -15,6 +15,11 @@ namespace m5::hal::v1::error {
   Negative values indicate failures. `OK` (0) and `ASYNC_RUNNING` (1) are
   non-failure states. UPPER_SNAKE_CASE follows the POSIX-style convention
   documented in coding_style.md §Naming.
+
+  The `int8_t` underlying type is load-bearing: the bytecode wire
+  format (spec/design/bytecode.md, `report_error` / `report_complete`)
+  carries error codes as a single i8 byte. Do not widen the type or
+  add values outside -128..127.
  */
 enum class ErrorType : int8_t {
     ASYNC_RUNNING    = 1,    ///< Operation accepted and still running asynchronously.

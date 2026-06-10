@@ -44,6 +44,7 @@ public:
   - stream 系 Source: 内部に **skip 予約** として保持し、 データが届くたびに自動消費される (caller の while ループを不要にする)
   - メモリ系 Source: 不足分を破棄し end-of-stream へ遷移
 - **`eof()`**: 「これ以上データは来ない」 final state の問い合わせ。 caller は advance 後に `eof()` を確認することで skip 不足を検知できる
+- **`peek(0)` は契約違反**: 空 span = end-of-stream 表明と衝突するため、 `max_len` は 1 以上であること。 違反時の挙動は派生実装定義 (size 検証は不要、 debug assert 任意 — Sink の契約違反と同じ扱い)。 `Sink::reserve(0)` も同様
 
 ## Sink の契約
 
@@ -129,6 +130,9 @@ stream / frame / remote 系で必要になる粒度は v1 `error_t` に追加済
 | `MemorySink` | 同上 | 固定 `DataSpan` に書き込む基本実装 |
 | `LimitedSource` | `hal/data/limited.hpp` | base となる Source を「先頭 N byte だけ」 に制限する装飾。 base が先に eof になればその時点で eof |
 | `LimitedSink` | 同上 | base となる Sink を「N byte だけ」 に制限する装飾。 ringbuffer 等の容量不明 / 無限 Sink から「N byte だけ受信」 を実現するのが典型用途 |
+| `StreamReader` / `StreamWriter` | `hal/data/stream.hpp` | pull/push 型バイトストリームの最小能力を表す抽象 (§Stream アダプタ)。 UART split accessor 等の transport が実装する |
+| `StreamSource` | 同上 | `StreamReader` を Source に持ち上げるアダプタ。 caller 提供 scratch で `peek` の借用契約を実現 |
+| `StreamSink` | 同上 | `StreamWriter` を Sink に持ち上げるアダプタ。 `reserve` は scratch を貸し出し、 `commit` で write へパススルー |
 
 ### Limited 装飾の意義 (partial transfer)
 
@@ -153,11 +157,42 @@ bus.transfer(&accessor, cfg, desc, nullptr, &rx);
 
 代替案として transfer に長さ引数を追加せず、 装飾型で長さ制限を与える。
 
+## Stream アダプタ (StreamReader / StreamWriter / StreamSource / StreamSink)
+
+consume 型のバイトストリーム (UART 受信、 将来の TCP / remote transport 等) を Source / Sink として消費可能にするアダプタ群 (`hal/data/stream.hpp`)。
+
+### 最小ストリームインタフェース
+
+transport 側は以下の最小能力だけを実装する:
+
+```cpp
+struct StreamReader {   // pull 側
+    expected<size_t, error_t> read(DataSpan dst);   // 実装側の timeout 規約でブロック。 0 = 期限内に未着
+    expected<size_t, error_t> readableBytes();      // ブロックせず読める byte 数
+};
+struct StreamWriter {   // push 側
+    expected<size_t, error_t> write(ConstDataSpan src);  // 受理 byte 数を返す (timeout で短い write があり得る)
+};
+```
+
+UART の split accessor (`UARTTxAccessor` / `UARTRxAccessor`、 [uart.md](uart.md)) はこのインタフェースを実装する。
+
+### アダプタの契約
+
+`Source::peek` は借用 API (連続 peek で prefix 不変) のため、 consume 型ストリームの上に直接は実装できない。 `StreamSource` は **caller 提供の非所有 scratch buffer** に peek 済み・未 advance のバイトを保持してこれを実現する。
+
+- **timeout は error、 EOF ではない**: データ未着のまま実装側 timeout が切れた `peek` は `TIMEOUT_ERROR` を返す (空 span は契約上 end-of-stream 確定のため使わない)。 `TIMEOUT_ERROR` は recoverable で、 caller は再 peek してよい。 `eof()` が true になるのは detached (null reader) 構築時のみ
+- **ブロッキング規約**: 要求 (`max_len`) をバッファで満たせない `peek` は、 不足分を実装側 read で 1 回ブロックして補充する (UART なら first_byte / inter_byte timeout 準拠)。 timeout 経過後は届いた分だけの短い span を返し、 バッファが空のままのときのみ `TIMEOUT_ERROR`。 要求が既にバッファ内にあれば即座に返る。 ブロックさせたくない caller は先に `readableBytes` を確認し、 その分だけ peek する
+- **peek 上限 = scratch 容量**: `peek(max_len)` は scratch 容量までしか返さない (契約は「最大 max_len」 なので適合)。 consumer は短い peek を前提に書く
+- **skip 予約**: バッファを超える `advance` は超過分を予約として保持し、 readable な分を即時読み捨て、 残りは後続の `peek` / `advance` が自動消費する (§Source の stream 系規約)
+- **`StreamSink` はパススルー**: `reserve` は scratch を貸し出し (連続 reserve は同一 span で冪等)、 `commit(N)` が scratch 先頭 N byte を `write` する。 writer が N byte 未満しか受理しなかった場合は `IO_ERROR`。 detached (null writer) への `commit` は黙って捨てず `CLOSED` を返す
+
 ## 配置と命名 (namespace 1:1)
 
 - 抽象 (`Source`, `Sink`, `ConstDataSpan`, `DataSpan`) は `src/m5_hal/hal/v1/data.hpp` (namespace `m5::hal::v1::data`)
 - 具象 (`MemorySource`, `MemorySink`) は `src/m5_hal/hal/v1/data/memory.hpp` (同 namespace `m5::hal::v1::data`)
 - 装飾派生 (`LimitedSource`, `LimitedSink`) は `src/m5_hal/hal/v1/data/limited.hpp` (同 namespace `m5::hal::v1::data`)
+- Stream アダプタ (`StreamReader`, `StreamWriter`, `StreamSource`, `StreamSink`) は `src/m5_hal/hal/v1/data/stream.hpp` (同 namespace `m5::hal::v1::data`)
 - 一時バッファ所有 (`memory::TempBuffer`) は [memory.md](memory.md) (namespace `m5::hal::v1::memory`)。 `MemorySource` / `MemorySink` は非所有 view のままとし、所有権を混ぜない。
 - **ファイル名 (拡張子除く) は namespace 末尾と一致** が原則: `data.hpp` ⇔ `…::data` namespace
 - 別 namespace を与えたい派生は `data/<sub>/` のようにディレクトリで階層化する (`hal/v1/data/io.hpp` のように「`data` フォルダ内に別概念を意味するファイル名」 は避ける)

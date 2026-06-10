@@ -121,7 +121,7 @@ TEST(UARTAccessor, WriteConsumesSource)
     ASSERT_EQ(bus.tx_recorded.size(), sizeof(payload));
     EXPECT_EQ(bus.tx_recorded[0], 0x11);
     EXPECT_EQ(bus.tx_recorded[2], 0x33);
-    EXPECT_EQ(bus.last_owner, &dev);
+    EXPECT_EQ(bus.last_owner, &dev.tx());
     EXPECT_EQ(bus.last_cfg.baud_rate, 921600u);
 }
 
@@ -167,6 +167,64 @@ TEST(UARTAccessor, SetConfigRejectsInsideAccess)
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     ASSERT_TRUE(dev.endAccess().has_value());
+}
+
+TEST(UARTTxRxAccessor, SplitAccessorsUseSeparateChannels)
+{
+    RecordingUARTBus bus;
+    m5::hal::v1::uart::UARTAccessConfig cfg;
+    m5::hal::v1::uart::UARTTxAccessor tx{bus, cfg};
+    m5::hal::v1::uart::UARTRxAccessor rx{bus, cfg};
+
+    ASSERT_TRUE(tx.beginTxAccess(0).has_value());
+    ASSERT_TRUE(rx.beginRxAccess(0).has_value());
+    EXPECT_TRUE(tx.inTxAccess());
+    EXPECT_TRUE(rx.inRxAccess());
+
+    ASSERT_TRUE(rx.endRxAccess().has_value());
+    ASSERT_TRUE(tx.endTxAccess().has_value());
+}
+
+TEST(UARTBus, SameChannelContentionStillReportsBusy)
+{
+    RecordingUARTBus bus;
+    m5::hal::v1::uart::UARTAccessConfig cfg;
+    m5::hal::v1::uart::UARTTxAccessor tx1{bus, cfg};
+    m5::hal::v1::uart::UARTTxAccessor tx2{bus, cfg};
+    m5::hal::v1::uart::UARTRxAccessor rx{bus, cfg};
+
+    ASSERT_TRUE(tx1.beginTxAccess(0).has_value());
+    auto tx2_result = tx2.beginTxAccess(0);
+    ASSERT_FALSE(tx2_result.has_value());
+    EXPECT_EQ(tx2_result.error(), m5::hal::v1::error::error_t::BUSY);
+
+    auto rx_result = rx.beginRxAccess(0);
+    ASSERT_TRUE(rx_result.has_value());
+    ASSERT_TRUE(rx.endRxAccess().has_value());
+    ASSERT_TRUE(tx1.endTxAccess().has_value());
+}
+
+TEST(UARTAccessor, FacadeSessionLocksBothChannels)
+{
+    RecordingUARTBus bus;
+    m5::hal::v1::uart::UARTAccessConfig cfg;
+    m5::hal::v1::uart::UARTAccessor dev{bus, cfg};
+    m5::hal::v1::uart::UARTTxAccessor other_tx{bus, cfg};
+    m5::hal::v1::uart::UARTRxAccessor other_rx{bus, cfg};
+
+    ASSERT_TRUE(dev.beginAccess(0).has_value());
+    EXPECT_TRUE(dev.inAccess());
+
+    auto tx_result = other_tx.beginTxAccess(0);
+    ASSERT_FALSE(tx_result.has_value());
+    EXPECT_EQ(tx_result.error(), m5::hal::v1::error::error_t::BUSY);
+
+    auto rx_result = other_rx.beginRxAccess(0);
+    ASSERT_FALSE(rx_result.has_value());
+    EXPECT_EQ(rx_result.error(), m5::hal::v1::error::error_t::BUSY);
+
+    ASSERT_TRUE(dev.endAccess().has_value());
+    EXPECT_FALSE(dev.inAccess());
 }
 
 int main(int argc, char** argv)

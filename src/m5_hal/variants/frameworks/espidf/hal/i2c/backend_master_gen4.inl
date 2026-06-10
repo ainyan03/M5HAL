@@ -23,6 +23,8 @@ namespace {
             return ::m5::hal::v1::error::error_t::INVALID_ARGUMENT;
         case ESP_ERR_TIMEOUT:
             return ::m5::hal::v1::error::error_t::TIMEOUT_ERROR;
+        case ESP_ERR_NO_MEM:
+            return ::m5::hal::v1::error::error_t::OUT_OF_RESOURCE;
         case ESP_FAIL:
             return ::m5::hal::v1::error::error_t::I2C_NO_ACK;
         default:
@@ -130,7 +132,7 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
     if (!have_tx && !have_rx) {
         auto cmd = ::i2c_cmd_link_create();
         if (cmd == nullptr) {
-            return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::UNKNOWN_ERROR);
+            return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::OUT_OF_RESOURCE);
         }
         (void)::i2c_master_start(cmd);
         (void)::i2c_master_write_byte(cmd, static_cast<uint8_t>((cfg.i2c_addr << 1) | I2C_MASTER_WRITE), true);

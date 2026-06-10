@@ -34,9 +34,19 @@ jobs:
             envs: -e v0_check_esp32_espidf -e v0_check_esp32s3_espidf -e v1_check_esp32_espidf -e v1_check_esp32s3_espidf
           - name: ESP-IDF 4 compatibility checks
             envs: -e v0_check_esp32_espidf4 -e v1_check_esp32_espidf4
+          # Forward probes against the unreleased IDF 6 toolchain: failures
+          # warn but do not gate. Flip soft_fail off once an IDF 6 stable
+          # release exists and these envs build green on it.
           - name: ESP-IDF 6 forward probes
             envs: -e v0_check_esp32_espidf6 -e v1_check_esp32_espidf6 -e v1_check_esp32s3_espidf6
             soft_fail: "true"
+          # Both public entries in one device TU: guards the generation-
+          # separated include guards and the v0/v1 platform-checker macro
+          # namespaces (native equivalent lives in test_coexist_include).
+          - name: coexistence checks
+            envs: -e v0v1_check_esp32_arduino -e v0v1_check_esp32s3_arduino -e v0v1_check_esp32_espidf
+          - name: examples build
+            envs: -e HowToUse_I2C_esp32 -e HowToUse_I2C_esp32s3 -e HowToUse_SPI_esp32 -e HowToUse_SPI_esp32s3 -e HowToUse_UART_esp32 -e HowToUse_UART_esp32s3 -e HowToUse_UARTEcho_esp32 -e HowToUse_UARTEcho_esp32s3 -e HowToUse_Bytecode_esp32
     steps:
       - name: Checkout M5HAL
         uses: actions/checkout@v6

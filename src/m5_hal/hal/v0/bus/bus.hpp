@@ -1,6 +1,6 @@
 
-#ifndef M5_HAL_BUS_HPP_
-#define M5_HAL_BUS_HPP_
+#ifndef M5_HAL_V0_BUS_HPP_
+#define M5_HAL_V0_BUS_HPP_
 
 #include "../interface/gpio.hpp"
 #include "../interface/io.hpp"

@@ -1,5 +1,5 @@
-#ifndef M5_HAL_GPIO_GPIO_HPP_
-#define M5_HAL_GPIO_GPIO_HPP_
+#ifndef M5_HAL_V0_GPIO_GPIO_HPP_
+#define M5_HAL_V0_GPIO_GPIO_HPP_
 
 #include "../interface/gpio.hpp"
 

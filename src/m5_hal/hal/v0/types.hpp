@@ -1,6 +1,6 @@
 
-#ifndef M5_HAL_TYPES_HPP
-#define M5_HAL_TYPES_HPP
+#ifndef M5_HAL_V0_TYPES_HPP
+#define M5_HAL_V0_TYPES_HPP
 
 #include <stdint.h>
 #include <stddef.h>

@@ -125,10 +125,10 @@ private:
         if (!_buffer) {
             _buffer = ::m5::hal::v1::memory::TempBuffer{::m5::hal::v1::memory::defaultAllocator(), new_capacity};
             if (!_buffer) {
-                return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::UNKNOWN_ERROR);
+                return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::OUT_OF_RESOURCE);
             }
         } else if (!_buffer.reallocate(new_capacity)) {
-            return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::UNKNOWN_ERROR);
+            return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::OUT_OF_RESOURCE);
         }
         _capacity = new_capacity;
         return {};

@@ -6,7 +6,7 @@ v0 API 利用者が v1 API に移行する際の指針を示す。
 
 - 既存コードをそのまま使い続ける場合は `<M5HAL.hpp>` または `<M5HAL_v0.hpp>` を使う
 - v1 API を使う場合は `<M5HAL_v1.hpp>` を使う
-- v0 と v1 は同一ライブラリ内で共存するが、 **同一 translation unit ではどちらか一方だけ**を使う
+- v0 と v1 は同一ライブラリ内で共存し、 **同一 translation unit での両エントリ include も可能** (移行途中のファイル等。 [design/v0_v1_coexistence.md](../design/v0_v1_coexistence.md) §エントリヘッダ)。 ただし可読性のため、 通常は TU ごとに使う世代を明示する
 - v1 への移行は、 旧 API の置き換えではなく **新しい API 体系への移行** として扱う
 
 ## ヘッダ選択
@@ -34,7 +34,7 @@ v0 API 利用者が v1 API に移行する際の指針を示す。
 | `error::error_t` / `error::isError` / `error::isOk` | `hal/error.hpp` | cross-cutting な型 |
 | `types::PeripheralType` / `types::BusType` / `types::GpioMode` | `hal/types.hpp` | 命名維持 |
 | `types::gpio_number_t` | `hal/types.hpp` | pin 指定の基本型 |
-| `M5HAL_TARGET_PLATFORM_*` / `M5HAL_FRAMEWORK_HAS_*` | 各 `_checker.hpp` | variant 機構で利用 |
+| `M5HAL_V1_TARGET_PLATFORM_*` / `M5HAL_FRAMEWORK_HAS_*` | 各 `_checker.hpp` | variant 機構で利用。 platform 系は世代分離のため `M5HAL_V1_` プレフィックス (無印は v0 が所有) |
 
 ## 再構成される要素
 
@@ -67,7 +67,7 @@ v0 API 利用者が v1 API に移行する際の指針を示す。
 ## 移行時の確認項目
 
 1. include しているヘッダが v0 か v1 かを明示する
-2. 同一 TU で v0 / v1 を混在させない
+2. 同一 TU で v0 / v1 を併用する場合は `design/v0_v1_coexistence.md` の前提を満たす
 3. 旧 I/O 抽象を `Source` / `Sink` に置き換える
 4. 旧 I2C 操作を `transfer` または v1 sugar に置き換える
 5. 旧 GPIO 抽象を `Pin` / `IPort` / `GPIOGroup` ベースへ置き換える

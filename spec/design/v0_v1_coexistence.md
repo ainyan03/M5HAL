@@ -66,13 +66,23 @@ src/
 | `M5HAL_v0.hpp` | 明示的に v0 を選ぶコード | v0 (= `m5::hal::*`) |
 | `M5HAL_v1.hpp` | 明示的に v1 を選ぶコード | v1 (= `m5::hal::v1::*`) |
 
-同一 sketch 内での併用はできるが、 同一 TU ではどちらか一方に絞る。
+同一 sketch 内での併用が可能。 同一 TU での両エントリ include も安全: include ガードの世代分離に加え、 platform checker の macro 名前空間も世代分離されている (v0 = 無印 `M5HAL_TARGET_PLATFORM_*`、 v1 = `M5HAL_V1_TARGET_PLATFORM_*`)。 fence は native が `test_coexist_include` (gtest)、 device が `v0v1_check_*` env (esp32 / esp32s3 の arduino + espidf ビルドで両エントリを 1 TU に include し、 static_assert で双方の macro 値を検査)。
 
 ## 制約
 
 - v0 と v1 は namespace 分離により ODR 衝突しない
-- macro 名はライブラリ全体で共有されるため、 `M5HAL_` プレフィックスで統一する
+- macro 名はライブラリ全体で共有されるため、 `M5HAL_` プレフィックスで統一する (include ガードも同様で、 v0 側は `M5_HAL_V0_` プレフィックスにより v1 と衝突しない。 同一 TU での両エントリ include は `test_coexist_include` と `v0v1_check_*` が fence)
+- 世代間で値が異なり得る macro は名前ごと世代分離する: platform checker は v0 = 無印、 v1 = `M5HAL_V1_` プレフィックス
+- 両世代が同名で定義する macro (`M5HAL_FRAMEWORK_HAS_ARDUINO` / `_FREERTOS` / `_SDL`、 `M5HAL_STATIC_MACRO_*`) は **定義を token 単位で同一に保つ**こと (同一定義の再定義は規格上無害)。 v0 側は凍結のため、 この同一性維持の義務は v1 側の編集にかかる — 逸脱すると coexist fence のビルドで redefinition warning として現れる
 - cross-cutting な型は v0 / v1 のそれぞれが同名型を持つ
+
+## v0 の既知制限 (凍結対象)
+
+v0 は公開互換のための凍結ツリーであり、 以下の制限は修正せず v1 への移行で解消する:
+
+- **対応 chip**: v0 の platform checker が知るのは ESP32 (無印) / S2 / S3 / C3 / C6 / H2 / P4 系の当時の一覧まで。 それ以降の新 chip (C5 / C61 等) は generic fallback で動作し、 platform 固有最適化は乗らない。 新 chip の一次対応は v1 のみ
+- **software I2C / SPI**: 複数インスタンス管理と排他制御が未整備 (単一インスタンス前提)。 ソース内の TODO は凍結のため対応しない
+- **エラーコード**: 細分化されていない (I2C 系 + 汎用のみ)。 詳細な分類は v1 `error_t` を使う
 
 ## 関連
 

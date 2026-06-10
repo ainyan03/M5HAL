@@ -5,6 +5,7 @@
 
 #if defined(ESP_PLATFORM)
 
+#include <esp_err.h>
 #include <freertos/FreeRTOS.h>
 
 namespace m5::variants::frameworks::espidf::hal::v1::uart {
@@ -21,8 +22,10 @@ namespace {
             return ::m5::hal::v1::error::error_t::INVALID_ARGUMENT;
         case ESP_ERR_TIMEOUT:
             return ::m5::hal::v1::error::error_t::TIMEOUT_ERROR;
+        case ESP_ERR_NO_MEM:
+            return ::m5::hal::v1::error::error_t::OUT_OF_RESOURCE;
         default:
-            return ::m5::hal::v1::error::error_t::UNKNOWN_ERROR;
+            return ::m5::hal::v1::error::error_t::IO_ERROR;
     }
 }
 
@@ -177,7 +180,7 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::write(::m5::hal::v
         }
         const int written = ::uart_write_bytes(_port, span.value().data, span.value().size);
         if (written < 0) {
-            return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::UNKNOWN_ERROR);
+            return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::IO_ERROR);
         }
         auto advanced = tx->advance(static_cast<size_t>(written));
         if (!advanced.has_value()) {
@@ -215,7 +218,7 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::read(::m5::hal::v1
         const auto timeout = done == 0 ? ticks(cfg.first_byte_timeout_ms) : ticks(cfg.inter_byte_timeout_ms);
         const int read     = ::uart_read_bytes(_port, span.value().data, span.value().size, timeout);
         if (read < 0) {
-            return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::UNKNOWN_ERROR);
+            return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::IO_ERROR);
         }
         if (read == 0) {
             break;

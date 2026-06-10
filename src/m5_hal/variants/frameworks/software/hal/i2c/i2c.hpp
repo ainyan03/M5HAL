@@ -127,7 +127,7 @@ public:
     {
         _lines  = &lines;
         _timing = timing;
-        _error  = ::m5::hal::v1::error::error_t::UNKNOWN_ERROR;
+        _error  = ::m5::hal::v1::error::error_t::OK;
         _state  = State::ReleaseScl;
         _clock.reset(now_nsec);
     }
@@ -213,7 +213,7 @@ private:
     MasterLineDriver* _lines = nullptr;
     MasterTiming _timing;
     MasterServiceTiming _clock;
-    ::m5::hal::v1::error::error_t _error = ::m5::hal::v1::error::error_t::UNKNOWN_ERROR;
+    ::m5::hal::v1::error::error_t _error = ::m5::hal::v1::error::error_t::OK;
     State _state                         = State::Idle;
 };
 
@@ -245,7 +245,7 @@ public:
         _bit_index = 0;
         _bit_mask  = 0x80;
         _acked     = false;
-        _error     = ::m5::hal::v1::error::error_t::UNKNOWN_ERROR;
+        _error     = ::m5::hal::v1::error::error_t::OK;
         _state     = State::RaiseClock;
         _clock.reset(now_nsec);
         _lines->writeSda(bitValue());
@@ -391,7 +391,7 @@ private:
     MasterServiceTiming _clock;
     State _state                         = State::Idle;
     State _after_stretch                 = State::Idle;
-    ::m5::hal::v1::error::error_t _error = ::m5::hal::v1::error::error_t::UNKNOWN_ERROR;
+    ::m5::hal::v1::error::error_t _error = ::m5::hal::v1::error::error_t::OK;
     uint8_t _byte                        = 0;
     uint8_t _bit_index                   = 0;
     uint8_t _bit_mask                    = 0x80;
@@ -416,7 +416,7 @@ public:
     {
         _lines  = &lines;
         _timing = timing;
-        _error  = ::m5::hal::v1::error::error_t::UNKNOWN_ERROR;
+        _error  = ::m5::hal::v1::error::error_t::OK;
         _state  = State::PullSdaLow;
         _clock.reset(now_nsec);
     }
@@ -524,7 +524,7 @@ private:
     MasterServiceTiming _clock;
     State _state                         = State::Idle;
     State _after_stretch                 = State::Idle;
-    ::m5::hal::v1::error::error_t _error = ::m5::hal::v1::error::error_t::UNKNOWN_ERROR;
+    ::m5::hal::v1::error::error_t _error = ::m5::hal::v1::error::error_t::OK;
 };
 
 class ReadByteService : public ::m5::hal::v1::service::IService {
@@ -555,7 +555,7 @@ public:
         _byte           = 0;
         _bit_index      = 0;
         _bit_mask       = 0x80;
-        _error          = ::m5::hal::v1::error::error_t::UNKNOWN_ERROR;
+        _error          = ::m5::hal::v1::error::error_t::OK;
         _state          = State::ReleaseSda;
         _clock.reset(now_nsec);
     }
@@ -700,7 +700,7 @@ private:
     MasterServiceTiming _clock;
     State _state                         = State::Idle;
     State _after_stretch                 = State::Idle;
-    ::m5::hal::v1::error::error_t _error = ::m5::hal::v1::error::error_t::UNKNOWN_ERROR;
+    ::m5::hal::v1::error::error_t _error = ::m5::hal::v1::error::error_t::OK;
     uint8_t _byte                        = 0;
     uint8_t _bit_index                   = 0;
     uint8_t _bit_mask                    = 0x80;
@@ -715,27 +715,27 @@ public:
     void beginStart(MasterLineDriver& lines, const MasterTiming& timing, ::m5::hal::v1::service::tick_nsec_t now_nsec)
     {
         _operation = Operation::Start;
-        _error     = ::m5::hal::v1::error::error_t::UNKNOWN_ERROR;
+        _error     = ::m5::hal::v1::error::error_t::OK;
         _start.begin(lines, timing, now_nsec);
     }
     void beginWriteByte(MasterLineDriver& lines, const MasterTiming& timing, uint8_t byte,
                         ::m5::hal::v1::service::tick_nsec_t now_nsec)
     {
         _operation = Operation::WriteByte;
-        _error     = ::m5::hal::v1::error::error_t::UNKNOWN_ERROR;
+        _error     = ::m5::hal::v1::error::error_t::OK;
         _write.begin(lines, timing, byte, now_nsec);
     }
     void beginReadByte(MasterLineDriver& lines, const MasterTiming& timing, bool ack_after_read,
                        ::m5::hal::v1::service::tick_nsec_t now_nsec)
     {
         _operation = Operation::ReadByte;
-        _error     = ::m5::hal::v1::error::error_t::UNKNOWN_ERROR;
+        _error     = ::m5::hal::v1::error::error_t::OK;
         _read.begin(lines, timing, ack_after_read, now_nsec);
     }
     void beginStop(MasterLineDriver& lines, const MasterTiming& timing, ::m5::hal::v1::service::tick_nsec_t now_nsec)
     {
         _operation = Operation::Stop;
-        _error     = ::m5::hal::v1::error::error_t::UNKNOWN_ERROR;
+        _error     = ::m5::hal::v1::error::error_t::OK;
         _stop.begin(lines, timing, now_nsec);
     }
     void beginAddress(MasterLineDriver& lines, const MasterTiming& timing, uint8_t addr_byte,
@@ -746,7 +746,7 @@ public:
         _operation = Operation::Address;
         _phase     = Phase::Start;
         _byte      = addr_byte;
-        _error     = ::m5::hal::v1::error::error_t::UNKNOWN_ERROR;
+        _error     = ::m5::hal::v1::error::error_t::OK;
         _start.begin(lines, timing, now_nsec);
     }
     void beginWriteBuffer(MasterLineDriver& lines, const MasterTiming& timing, const uint8_t* data, size_t len,
@@ -759,7 +759,7 @@ public:
         _tx_data   = data;
         _length    = len;
         _index     = 0;
-        _error     = ::m5::hal::v1::error::error_t::UNKNOWN_ERROR;
+        _error     = ::m5::hal::v1::error::error_t::OK;
         _write.begin(lines, timing, data[0], now_nsec);
     }
     void beginReadBuffer(MasterLineDriver& lines, const MasterTiming& timing, uint8_t* data, size_t len, bool last_nack,
@@ -773,7 +773,7 @@ public:
         _length    = len;
         _index     = 0;
         _last_nack = last_nack;
-        _error     = ::m5::hal::v1::error::error_t::UNKNOWN_ERROR;
+        _error     = ::m5::hal::v1::error::error_t::OK;
         _read.begin(lines, timing, ackAfterRead(0), now_nsec);
     }
 
@@ -949,7 +949,7 @@ private:
     Phase _phase                         = Phase::Idle;
     MasterLineDriver* _lines             = nullptr;
     const MasterTiming* _timing          = nullptr;
-    ::m5::hal::v1::error::error_t _error = ::m5::hal::v1::error::error_t::UNKNOWN_ERROR;
+    ::m5::hal::v1::error::error_t _error = ::m5::hal::v1::error::error_t::OK;
     StartConditionService _start;
     WriteByteService _write;
     ReadByteService _read;

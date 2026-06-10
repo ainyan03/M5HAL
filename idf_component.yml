@@ -8,7 +8,9 @@ dependencies:
   idf: ">=4.4"
   m5stack/M5Utility:
     git: https://github.com/m5stack/M5Utility.git
-    version: main
+    # Pin a released tag instead of `main` so component builds are
+    # reproducible (library.json requires >=0.1.0 for the same reason).
+    version: "0.1.0"
 
 targets:
   - esp32

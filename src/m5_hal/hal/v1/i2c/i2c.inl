@@ -28,6 +28,14 @@ m5::stl::expected<size_t, m5::hal::v1::error::error_t> I2CMasterAccessor::transf
                                                                                    data::ConstDataSpan tx_bytes,
                                                                                    data::DataSpan rx_bytes)
 {
+    data::MemorySource tx_src{tx_bytes};
+    data::MemorySink rx_dst{rx_bytes};
+    return transfer(desc, (tx_bytes.size > 0) ? &tx_src : nullptr, (rx_bytes.size > 0) ? &rx_dst : nullptr);
+}
+
+m5::stl::expected<size_t, m5::hal::v1::error::error_t> I2CMasterAccessor::transfer(const TransferDesc& desc,
+                                                                                   data::Source* tx, data::Sink* rx)
+{
     // Wrap the body in beginAccess / endAccess for mutual exclusion.
     // When the outer caller already holds a `ScopedAccess` or an
     // explicit `beginAccess`, the depth counter prevents a double lock.
@@ -35,11 +43,17 @@ m5::stl::expected<size_t, m5::hal::v1::error::error_t> I2CMasterAccessor::transf
     if (!ba.has_value()) {
         return m5::stl::make_unexpected(ba.error());
     }
-    data::MemorySource tx_src{tx_bytes};
-    data::MemorySink rx_dst{rx_bytes};
-    auto result = getI2CBus().transfer(this, _access_config, desc, (tx_bytes.size > 0) ? &tx_src : nullptr,
-                                       (rx_bytes.size > 0) ? &rx_dst : nullptr);
-    (void)endAccess();
+    auto result = getI2CBus().transfer(this, _access_config, desc, tx, rx);
+    // Same release-error policy as the UART/SPI accessors: the transfer
+    // error wins, but a clean transfer must not hide a broken release
+    // (depth-counter corruption would otherwise go unnoticed).
+    auto ea = endAccess();
+    if (!result.has_value()) {
+        return result;
+    }
+    if (!ea.has_value()) {
+        return m5::stl::make_unexpected(ea.error());
+    }
     return result;
 }
 

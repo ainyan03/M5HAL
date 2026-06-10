@@ -24,8 +24,10 @@ namespace {
             return ::m5::hal::v1::error::error_t::INVALID_ARGUMENT;
         case ESP_ERR_TIMEOUT:
             return ::m5::hal::v1::error::error_t::TIMEOUT_ERROR;
+        case ESP_ERR_NO_MEM:
+            return ::m5::hal::v1::error::error_t::OUT_OF_RESOURCE;
         default:
-            return ::m5::hal::v1::error::error_t::UNKNOWN_ERROR;
+            return ::m5::hal::v1::error::error_t::IO_ERROR;
     }
 }
 

@@ -63,9 +63,10 @@ void setup()
 
 void loop()
 {
-    m5hal::uart::UARTAccessor uart{uart_bus, uart_cfg};
+    m5hal::uart::UARTTxAccessor uart_tx{uart_bus, uart_cfg};
+    m5hal::uart::UARTRxAccessor uart_rx{uart_bus, uart_cfg};
 
-    auto readable = uart.readableBytes();
+    auto readable = uart_rx.readableBytes();
     if (!readable.has_value() || readable.value() == 0) {
         return;
     }
@@ -75,9 +76,9 @@ void loop()
     if (want > sizeof(buf)) {
         want = sizeof(buf);
     }
-    auto got = uart.read(buf, want);
+    auto got = uart_rx.read(buf, want);
     if (!got.has_value() || got.value() == 0) {
         return;
     }
-    (void)uart.write(buf, got.value());  // echo back verbatim
+    (void)uart_tx.write(buf, got.value());  // echo back verbatim
 }

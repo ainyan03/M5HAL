@@ -26,6 +26,9 @@ constexpr int PIN_UART_RX = 16;
 #define M5HAL_EXAMPLE_HOWTOUSEUART_BAUD 115200
 #endif
 
+// m5hal::uart::Bus resolves to the first backend the build offers
+// (framework scan order; see spec/design/variants.md). Uncomment the
+// variant::* alias below to force a specific backend instead.
 using ExampleUARTBus = m5hal::uart::Bus;
 // using ExampleUARTBus = m5hal::uart::variant::arduino::Bus;
 
@@ -42,7 +45,8 @@ static void printError(const char* label, m5hal::error::error_t error)
 
 static void writeLine(const char* text)
 {
-    auto r = m5hal::uart::UARTAccessor{uart_bus, uart_cfg}.write(reinterpret_cast<const uint8_t*>(text), strlen(text));
+    m5hal::uart::UARTTxAccessor uart_tx{uart_bus, uart_cfg};
+    auto r = uart_tx.write(reinterpret_cast<const uint8_t*>(text), strlen(text));
     if (!r.has_value()) {
         printError("uart write", r.error());
         return;
@@ -50,10 +54,13 @@ static void writeLine(const char* text)
     Serial.printf("uart write: %u bytes\n", static_cast<unsigned>(r.value()));
 }
 
+// To consume received bytes as a `data::Source` (or feed the TX side as a
+// `data::Sink`), wrap the accessor with the StreamSource / StreamSink
+// adapters — see the UARTEcho example and spec/design/data_io.md.
 static void readEcho(void)
 {
-    m5hal::uart::UARTAccessor uart{uart_bus, uart_cfg};
-    auto readable = uart.readableBytes();
+    m5hal::uart::UARTRxAccessor uart_rx{uart_bus, uart_cfg};
+    auto readable = uart_rx.readableBytes();
     if (!readable.has_value()) {
         printError("uart readableBytes", readable.error());
         return;
@@ -69,7 +76,7 @@ static void readEcho(void)
         want = sizeof(rx);
     }
 
-    auto r = uart.read(rx, want);
+    auto r = uart_rx.read(rx, want);
     if (!r.has_value()) {
         printError("uart read", r.error());
         return;

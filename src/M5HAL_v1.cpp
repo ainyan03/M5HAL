@@ -1,15 +1,17 @@
 
 #include "M5HAL_v1.hpp"
 #include "m5_hal/hal/v1/bus/bus.inl"
+#include "m5_hal/hal/v1/bytecode/bytecode.inl"
+#include "m5_hal/hal/v1/frame/frame.inl"
 #include "m5_hal/hal/v1/i2c/i2c.inl"
 #include "m5_hal/hal/v1/memory/pool.inl"
 #include "m5_hal/hal/v1/memory/allocator.inl"
 #include "m5_hal/hal/v1/spi/spi.inl"
 #include "m5_hal/hal/v1/uart/uart.inl"
 
-#define M5HAL_STATIC_MACRO_PATH_IMPL M5HAL_STATIC_MACRO_CONCAT(M5HAL_TARGET_PLATFORM_PATH, hal.inl)
+#define M5HAL_STATIC_MACRO_PATH_IMPL M5HAL_STATIC_MACRO_CONCAT(M5HAL_V1_TARGET_PLATFORM_PATH, hal.inl)
 
-#if M5HAL_TARGET_PLATFORM_NUMBER != 0
+#if M5HAL_V1_TARGET_PLATFORM_NUMBER != 0
 #include M5HAL_STATIC_MACRO_PATH_IMPL
 #endif
 

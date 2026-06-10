@@ -148,6 +148,11 @@ int waitFd(int fd, bool for_write, uint32_t timeout_ms)
     return r;
 }
 
+::m5::hal::v1::error::error_t posixIOError()
+{
+    return ::m5::hal::v1::error::error_t::IO_ERROR;
+}
+
 }  // namespace
 
 bool Bus::baudToSpeed(uint32_t baud, uint32_t& out_speed)
@@ -191,7 +196,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::release(void)
     }
     int fd = ::open(device_path, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) {
-        return ::m5::hal::v1::error::error_t::UNKNOWN_ERROR;
+        return posixIOError();
     }
     _fd      = fd;
     _owns_fd = true;
@@ -240,7 +245,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::applyConfig(
         }
         int fd = ::open(_device_path, O_RDWR | O_NOCTTY | O_NONBLOCK);
         if (fd < 0) {
-            return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::UNKNOWN_ERROR);
+            return m5::stl::make_unexpected(posixIOError());
         }
         _fd      = fd;
         _owns_fd = true;
@@ -263,7 +268,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::applyConfig(
 
     struct termios tio;
     if (::tcgetattr(_fd, &tio) != 0) {
-        return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::UNKNOWN_ERROR);
+        return m5::stl::make_unexpected(posixIOError());
     }
     ::cfmakeraw(&tio);
     // A rate without a B* constant (macOS high baud) gets a placeholder here; the
@@ -300,7 +305,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::applyConfig(
     tio.c_cc[VTIME] = 0;
 
     if (::tcsetattr(_fd, TCSANOW, &tio) != 0) {
-        return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::UNKNOWN_ERROR);
+        return m5::stl::make_unexpected(posixIOError());
     }
 #if defined(__APPLE__)
     // Set a baud that termios has no B* constant for (e.g. 0.5/1/2/3 Mbaud).
@@ -355,7 +360,7 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::write(::m5::hal::v
                 }
                 break;  // write timeout
             }
-            return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::UNKNOWN_ERROR);
+            return m5::stl::make_unexpected(posixIOError());
         }
         if (n == 0) {
             break;
@@ -388,7 +393,7 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::read(::m5::hal::v1
         const uint32_t timeout = (done == 0) ? cfg.first_byte_timeout_ms : cfg.inter_byte_timeout_ms;
         int ready              = waitFd(_fd, false, timeout);
         if (ready < 0) {
-            return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::UNKNOWN_ERROR);
+            return m5::stl::make_unexpected(posixIOError());
         }
         if (ready == 0) {
             break;  // timed out waiting for (more) data
@@ -405,7 +410,7 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::read(::m5::hal::v1
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
                 continue;
             }
-            return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::UNKNOWN_ERROR);
+            return m5::stl::make_unexpected(posixIOError());
         }
         if (n == 0) {
             break;  // EOF / hang-up

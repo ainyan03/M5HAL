@@ -215,7 +215,7 @@ protected:
   variant overrides them.
  */
 struct SPIBus : public bus::Bus {
-    const bus::BusConfig& getConfig(void) const override
+    const SPIBusConfig& getConfig(void) const override
     {
         return _config;
     }

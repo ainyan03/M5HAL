@@ -1,5 +1,5 @@
-#ifndef M5_HAL_HPP
-#define M5_HAL_HPP
+#ifndef M5_HAL_V1_HPP
+#define M5_HAL_V1_HPP
 
 #include "m5_hal_config.hpp"  // M5HAL_INLINE_V1
 #include <M5Utility.hpp>
@@ -32,15 +32,18 @@ M5HAL_INLINE_V1 namespace v1
 #include "./m5_hal/hal/v1/data.hpp"
 #include "./m5_hal/hal/v1/data/memory.hpp"
 #include "./m5_hal/hal/v1/data/limited.hpp"
+#include "./m5_hal/hal/v1/data/stream.hpp"
+#include "./m5_hal/hal/v1/frame/frame.hpp"
+#include "./m5_hal/hal/v1/bytecode/bytecode.hpp"
 
 #define M5HAL_STATIC_MACRO_STRING(x) #x
 // clang-format off
 #define M5HAL_STATIC_MACRO_CONCAT(x, y) M5HAL_STATIC_MACRO_STRING(x/y)
 // clang-format on
 
-#define M5HAL_STATIC_MACRO_PATH_HEADER M5HAL_STATIC_MACRO_CONCAT(M5HAL_TARGET_PLATFORM_PATH, hal.hpp)
+#define M5HAL_STATIC_MACRO_PATH_HEADER M5HAL_STATIC_MACRO_CONCAT(M5HAL_V1_TARGET_PLATFORM_PATH, hal.hpp)
 
-#if M5HAL_TARGET_PLATFORM_NUMBER != 0
+#if M5HAL_V1_TARGET_PLATFORM_NUMBER != 0
 #include M5HAL_STATIC_MACRO_PATH_HEADER
 #endif
 
@@ -87,8 +90,8 @@ M5HAL_INLINE_V1 namespace v1
 #include "./m5_hal/variants/frameworks/stub/hal.hpp"
 
 // 1. platform _offer.hpp scan
-#define M5HAL_STATIC_MACRO_PATH_OFFER M5HAL_STATIC_MACRO_CONCAT(M5HAL_TARGET_PLATFORM_PATH, _offer.hpp)
-#if M5HAL_TARGET_PLATFORM_NUMBER != 0
+#define M5HAL_STATIC_MACRO_PATH_OFFER M5HAL_STATIC_MACRO_CONCAT(M5HAL_V1_TARGET_PLATFORM_PATH, _offer.hpp)
+#if M5HAL_V1_TARGET_PLATFORM_NUMBER != 0
 #define M5HAL_VARIANT_PLATFORM_ 1
 #include M5HAL_STATIC_MACRO_PATH_OFFER
 #include "./m5_hal/_macro/offer_all.inl"
