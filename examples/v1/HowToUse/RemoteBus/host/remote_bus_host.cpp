@@ -32,7 +32,6 @@
 
 namespace m5hal      = m5::hal::v1;
 namespace posix_uart = m5hal::uart::variant::posix;  // the posix UART variant alias
-using m5hal::error::error_t;
 
 int main(int argc, char** argv)
 {
