@@ -66,6 +66,9 @@
 | stream 終端 | end-of-stream | `error_t::END_OF_STREAM` |
 | checksum 不一致 | checksum error | `error_t::CHECKSUM_ERROR` |
 | protocol 違反 | protocol error | `error_t::PROTOCOL_ERROR` |
+| 切断 | disconnected | `error_t::DISCONNECTED` (remote transport 喪失) |
+| リモート内部エラー | remote fault | `error_t::REMOTE_FAULT` (未知のリモートコードの写像先含む) |
+| 非対応 | unsupported | `error_t::UNSUPPORTED` (リモートが当該機能を持たない) |
 | 短絡終了 / early return | early exit / short-circuit return | エラー時の処理中断 |
 | no-op (release) | no-op in release builds | `M5HAL_ASSERT` の release 挙動 |
 | sentinel (番兵) | sentinel | `_lock_owner = nullptr` 等 |

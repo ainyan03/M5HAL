@@ -1,0 +1,680 @@
+#ifndef M5_HAL_REMOTE_REMOTE_HPP_
+#define M5_HAL_REMOTE_REMOTE_HPP_
+
+#include "../bytecode/bytecode.hpp"
+#include "../data.hpp"
+#include "../data/memory.hpp"
+#include "../data/stream.hpp"
+#include "../frame/frame.hpp"
+#include "../gpio/gpio.hpp"
+#include "../i2c/i2c.hpp"
+#include "../service/service.hpp"
+#include "../spi/spi.hpp"
+#include "../uart/uart.hpp"
+
+#include <M5Utility.hpp>
+
+#include <stddef.h>
+#include <stdint.h>
+
+// =============================================================================
+// Remote bus mechanism. The authoritative spec lives in spec/design/remote.md.
+//
+// Messages ride frame v1 `data` frames: the stream_id selects the remote
+// channel and the payload starts with a 2-byte header.
+//
+//   data frame payload : [TYPE:1][SEQ:1][BODY:0..238]
+//
+// TYPE low nibble is the message type; bit7 = NORESP (fire-and-forget
+// request), bit6 = MORE (chunk continuation, reserved, always 0 in this
+// version). Unknown types and set reserved bits are silently dropped by
+// the receiver.
+//
+// The host side (RemoteSession + proxy buses such as RemoteI2CBus) sends
+// bytecode scripts as requests; the device side (Server, usually polled
+// through RemoteServerService) executes them on a BytecodeRunner and
+// returns the response script. What is registered on the server's runner
+// is exactly what a remote peer can reach (registration = allowlist).
+// =============================================================================
+
+/*!
+  @namespace m5::hal::v1::remote
+  @brief Remote bus mechanism: message layer, server endpoint, proxy buses.
+ */
+namespace m5::hal::v1::remote {
+
+constexpr uint8_t kProtocolVersion = 1;     ///< hello/hello_resp proto_ver.
+constexpr uint8_t kDefaultStreamId = 0x00;  ///< Remote message channel (spec §stream_id registry).
+
+constexpr size_t kHeaderSize     = 2;                                     ///< TYPE + SEQ.
+constexpr size_t kMaxMessageSize = frame::kMaxDataPayload;                ///< 240.
+constexpr size_t kMaxBodySize    = frame::kMaxDataPayload - kHeaderSize;  ///< 238.
+/*! @brief Guaranteed per-transfer receive-data limit (response script overhead subtracted). */
+constexpr size_t kMaxTransferRx = 230;
+/*! @brief Round-trip margin added on top of remote-side UART timeouts (spec §UART proxy). */
+constexpr uint32_t kRemoteUartTimeoutMarginMs = 250;
+
+enum class MessageType : uint8_t {
+    hello      = 0x0,  ///< host -> device, empty body.
+    hello_resp = 0x1,  ///< device -> host, capability list.
+    request    = 0x2,  ///< host -> device, body = bytecode script.
+    response   = 0x3,  ///< device -> host, body = response script.
+    error      = 0x4,  ///< device -> host, body = [error:i8][detail...].
+    ping       = 0x5,  ///< host -> device, empty body.
+    pong       = 0x6,  ///< device -> host, empty body.
+    event      = 0x7,  ///< reserved (push notifications, future version).
+};
+
+constexpr uint8_t kTypeNorespBit    = 0x80;  ///< Fire-and-forget request flag.
+constexpr uint8_t kTypeMoreBit      = 0x40;  ///< Chunk continuation (reserved, must be 0).
+constexpr uint8_t kTypeReservedBits = 0x30;  ///< Must be 0 in this version.
+constexpr uint8_t kTypeKindMask     = 0x0F;
+
+/*!
+  @brief Map a remote-reported i8 error code into the local error_t.
+
+  Codes this build does not know fold into `REMOTE_FAULT`, so a newer
+  server never breaks an older host (spec §error mapping).
+ */
+constexpr m5::hal::v1::error::error_t mapRemoteError(int8_t code)
+{
+    return (code >= static_cast<int8_t>(m5::hal::v1::error::error_t::UNSUPPORTED) &&
+            code <= static_cast<int8_t>(m5::hal::v1::error::error_t::ASYNC_RUNNING))
+               ? static_cast<m5::hal::v1::error::error_t>(code)
+               : m5::hal::v1::error::error_t::REMOTE_FAULT;
+}
+
+/*! @brief Capability summary carried by `hello_resp`. */
+struct Capabilities {
+    struct BusEntry {
+        types::bus_kind_t kind = types::bus_kind_t::UNKNOWN;
+        uint8_t bus_id         = 0;
+    };
+    static constexpr size_t kMaxEntries = 3 * bytecode::kMaxBusBindings;
+
+    uint8_t proto_ver = 0;
+    bool has_gpio     = false;
+    size_t bus_count  = 0;
+    BusEntry buses[kMaxEntries];
+};
+
+// ---- device side ------------------------------------------------------------
+
+/*!
+  @brief Passive remote endpoint: executes request scripts, builds replies.
+
+  The Server owns a BytecodeRunner; `registerI2C` / `registerSPI` /
+  `registerUART` / `setGPIOGroup` forward to it and record the entry for
+  the `hello` capability list. Registration doubles as the allowlist —
+  nothing else is reachable from the wire. To expose GPIO selectively,
+  register a dedicated GPIOGroup holding only the pins to publish (see
+  spec/design/remote.md §safety boundary).
+
+  Execution policy (spec §server execution model): scripts are executed
+  only from complete, CHECK16-verified frames; before running, the script
+  is scanned once and rejected with `report_error(INVALID_ARGUMENT)` when
+  its total `delay_ms` exceeds `Config::max_delay_ms` or a
+  `bus_configure` carries a timeout above `Config::max_bus_timeout_ms` —
+  the worst-case blocking time of one `service()` call stays bounded by
+  those two knobs.
+
+  `response_scratch` (>= kMaxMessageSize) is caller-provided and holds
+  one outgoing message while it is framed.
+ */
+class Server {
+public:
+    struct Config {
+        uint32_t max_delay_ms       = 100;   ///< Total delay_ms budget per script.
+        uint32_t max_bus_timeout_ms = 1000;  ///< Upper bound for timeouts carried by bus_configure.
+    };
+
+    explicit Server(data::DataSpan response_scratch) : _runner{memory::defaultAllocator()}, _scratch{response_scratch}
+    {
+    }
+    Server(data::DataSpan response_scratch, const Config& config, memory::Allocator& alloc = memory::defaultAllocator())
+        : _runner{alloc}, _scratch{response_scratch}, _config{config}
+    {
+    }
+
+    m5::stl::expected<void, m5::hal::v1::error::error_t> registerI2C(uint8_t bus_id, i2c::I2CMasterAccessor& acc);
+    m5::stl::expected<void, m5::hal::v1::error::error_t> registerSPI(uint8_t bus_id, spi::SPIMasterAccessor& acc);
+    m5::stl::expected<void, m5::hal::v1::error::error_t> registerUART(uint8_t bus_id, uart::UARTAccessor& acc);
+    void setGPIOGroup(gpio::GPIOGroup& group)
+    {
+        _runner.setGPIOGroup(group);
+        _has_gpio = true;
+    }
+
+    /*! @brief Direct access to the underlying runner (delay fn injection, ...). */
+    bytecode::BytecodeRunner& runner()
+    {
+        return _runner;
+    }
+
+    /*!
+      @brief Level 1: execute one script and write the response script into `out`.
+
+      Returns the status the response reports (`OK` or the failing
+      instruction's error). Sink errors while writing the response come
+      back through the expected error path.
+     */
+    m5::stl::expected<m5::hal::v1::error::error_t, m5::hal::v1::error::error_t> processScript(
+        data::ConstDataSpan script, data::Sink& out);
+
+    /*!
+      @brief Level 2: handle one already-de-framed remote message.
+
+      Replies (response / error / hello_resp / pong) are framed into
+      `out` as `data` frames on `stream_id`. Unknown message types and
+      reserved bits are dropped (`droppedCount()`); a NORESP request
+      stores its failure as the pending error, delivered just before the
+      next synchronous reply. Errors returned by this call are transport
+      (Sink) failures only.
+     */
+    m5::stl::expected<void, m5::hal::v1::error::error_t> processMessage(uint8_t type, uint8_t seq,
+                                                                        data::ConstDataSpan body,
+                                                                        frame::FrameWriter& out, uint8_t stream_id);
+
+    /*! @brief Messages dropped for forward compatibility (unknown type / reserved bits). */
+    size_t droppedCount() const
+    {
+        return _dropped;
+    }
+    bool hasPendingError() const
+    {
+        return _pending_valid;
+    }
+
+private:
+    struct ExecOutcome {
+        m5::hal::v1::error::error_t status = m5::hal::v1::error::error_t::OK;
+        size_t offset                      = 0;      // offending offset when prescan rejected
+        bool ran                           = false;  // runner.run() was invoked (slots/offset are its own)
+    };
+
+    ExecOutcome execute(data::ConstDataSpan script);
+    m5::hal::v1::error::error_t prescan(data::ConstDataSpan script, size_t& offset) const;
+    m5::stl::expected<void, m5::hal::v1::error::error_t> sendMessage(frame::FrameWriter& out, uint8_t stream_id,
+                                                                     uint8_t type, uint8_t seq,
+                                                                     data::ConstDataSpan body);
+    m5::stl::expected<void, m5::hal::v1::error::error_t> flushPendingError(frame::FrameWriter& out, uint8_t stream_id,
+                                                                           uint8_t seq);
+    m5::stl::expected<void, m5::hal::v1::error::error_t> recordCapability(types::bus_kind_t kind, uint8_t bus_id);
+
+    bytecode::BytecodeRunner _runner;
+    data::DataSpan _scratch;
+    Config _config;
+
+    Capabilities::BusEntry _caps[Capabilities::kMaxEntries];
+    size_t _cap_count = 0;
+    bool _has_gpio    = false;
+
+    bool _pending_valid                        = false;
+    m5::hal::v1::error::error_t _pending_error = m5::hal::v1::error::error_t::OK;
+    size_t _dropped                            = 0;
+};
+
+/*!
+  @brief Cooperative poll adapter: feeds a Server from a Source/Sink pair.
+
+  Register on a `service::ServiceRunner`; each `service()` call drains the
+  frames that are already available and returns. The rx accessor under
+  `rx` SHOULD be configured with a zero (or tiny) first-byte timeout —
+  a `StreamSource::peek` blocks up to that timeout when idle, which would
+  stall every poll (spec §server execution model).
+
+  Frames that are not remote messages (other kinds, other stream_ids,
+  bodies shorter than the header) are ignored; resync events from the
+  FrameReader are counted (`resyncCount()`).
+ */
+class RemoteServerService : public service::IService {
+public:
+    RemoteServerService(Server& server, data::Source& rx, data::Sink& tx, uint8_t stream_id = kDefaultStreamId)
+        : _server{&server}, _reader{rx}, _writer{tx}, _stream_id{stream_id}
+    {
+    }
+
+    service::ServiceResult service(const service::ServiceContext& ctx) override;
+
+    size_t resyncCount() const
+    {
+        return _resync;
+    }
+
+private:
+    static constexpr size_t kMaxFramesPerPoll = 4;
+
+    Server* _server = nullptr;
+    frame::FrameReader _reader;
+    frame::FrameWriter _writer;
+    uint8_t _stream_id = kDefaultStreamId;
+    size_t _resync     = 0;
+};
+
+// ---- host side --------------------------------------------------------------
+
+/*!
+  @brief Host endpoint: sends requests, awaits and decodes the replies.
+
+  Construct over an rx Source / tx Sink pair (typically StreamSource /
+  StreamSink over UART accessors; the rx scratch must lend
+  `frame::kMaxWireSize` bytes). One session is one point-to-point link.
+
+  `request()` sends a script and blocks until the matching-SEQ response
+  arrives or `Config::response_timeout_ms` passes. The response script
+  runs on the session's own runner: received data is in
+  `runner().storedData(id)`, and a remote-reported failure is folded
+  into the returned error (after `mapRemoteError`). On timeout the next
+  outgoing message is preceded by a delimiter so the server's FrameReader
+  resynchronizes (spec §timeout / resync); the session never retransmits
+  on its own.
+
+  `error` messages (a NORESP failure delivered before a synchronous
+  reply, or a protocol-level rejection) are recorded and readable via
+  `lastRemoteError()` until `clearRemoteError()`.
+
+  `event` messages are reserved: they are passed to the handler installed
+  with `setEventHandler` (dropped when none), so a future push-capable
+  server stays compatible with this host loop.
+ */
+class RemoteSession {
+public:
+    struct Config {
+        uint8_t stream_id            = kDefaultStreamId;
+        uint32_t response_timeout_ms = 1000;
+    };
+
+    using event_handler_t = void (*)(void* ctx, uint8_t seq, data::ConstDataSpan body);
+
+    RemoteSession(data::Source& rx, data::Sink& tx) : _reader{rx}, _writer{tx}, _runner{memory::defaultAllocator()}
+    {
+    }
+    RemoteSession(data::Source& rx, data::Sink& tx, const Config& config,
+                  memory::Allocator& alloc = memory::defaultAllocator())
+        : _reader{rx}, _writer{tx}, _runner{alloc}, _config{config}
+    {
+    }
+
+    /*! @brief Exchange hello / hello_resp and cache the capabilities. */
+    m5::stl::expected<Capabilities, m5::hal::v1::error::error_t> hello();
+    /*! @brief Liveness probe (ping / pong). */
+    m5::stl::expected<void, m5::hal::v1::error::error_t> ping();
+
+    /*!
+      @brief Send a request script and await its response.
+
+      The response script is executed on `runner()`; a remote-reported
+      error becomes this call's error. `script.size` must be
+      <= kMaxBodySize.
+     */
+    m5::stl::expected<void, m5::hal::v1::error::error_t> request(data::ConstDataSpan script);
+
+    /*! @brief Fire-and-forget request (NORESP). Failures surface as a later remote error. */
+    m5::stl::expected<void, m5::hal::v1::error::error_t> requestNoResponse(data::ConstDataSpan script);
+
+    /*! @brief Runner that executed the most recent response script. */
+    bytecode::BytecodeRunner& runner()
+    {
+        return _runner;
+    }
+
+    /*! @brief Last `error` message payload (OK when none arrived). */
+    m5::hal::v1::error::error_t lastRemoteError() const
+    {
+        return _last_remote_error;
+    }
+    void clearRemoteError()
+    {
+        _last_remote_error = m5::hal::v1::error::error_t::OK;
+    }
+
+    /*! @brief Capabilities from the most recent successful `hello()`. */
+    const Capabilities& capabilities() const
+    {
+        return _caps;
+    }
+
+    void setEventHandler(event_handler_t handler, void* ctx)
+    {
+        _event_handler = handler;
+        _event_ctx     = ctx;
+    }
+
+    /*!
+      @brief Start a fresh connection on the same objects.
+
+      Clears the sequence counter, the pending-resync and disconnected
+      flags, the recorded remote error, and the cached capabilities.
+      Call after the transport reconnects (or while probing connection
+      candidates) — handles are per-connection (spec §timeout / resync),
+      and reset() is what begins the next connection.
+     */
+    void reset()
+    {
+        _next_seq          = 0;
+        _resync_pending    = false;
+        _disconnected      = false;
+        _last_remote_error = m5::hal::v1::error::error_t::OK;
+        _reply_len         = 0;
+        _caps              = Capabilities{};
+    }
+
+    /*!
+      @name Response-timeout accessors.
+
+      Connection utilities probe with a short timeout and restore the
+      configured value once established.
+      @{
+     */
+    uint32_t responseTimeoutMs() const
+    {
+        return _config.response_timeout_ms;
+    }
+    void setResponseTimeout(uint32_t ms)
+    {
+        _config.response_timeout_ms = ms;
+    }
+    /*! @} */
+
+private:
+    enum class AwaitKind : uint8_t { response, hello_resp, pong };
+
+    m5::stl::expected<void, m5::hal::v1::error::error_t> sendMessage(uint8_t type, uint8_t seq,
+                                                                     data::ConstDataSpan body);
+    m5::stl::expected<void, m5::hal::v1::error::error_t> awaitReply(AwaitKind kind, uint8_t seq);
+
+    frame::FrameReader _reader;
+    frame::FrameWriter _writer;
+    bytecode::BytecodeRunner _runner;
+    Config _config;
+
+    uint8_t _next_seq    = 0;
+    bool _resync_pending = false;
+    bool _disconnected   = false;
+
+    m5::hal::v1::error::error_t _last_remote_error = m5::hal::v1::error::error_t::OK;
+    Capabilities _caps;
+
+    event_handler_t _event_handler = nullptr;
+    void* _event_ctx               = nullptr;
+
+    // hello_resp body is copied here so it survives the next frame read.
+    uint8_t _reply_copy[kMaxBodySize] = {};
+    size_t _reply_len                 = 0;
+};
+
+/*!
+  @brief Wiring bundle: a host endpoint built directly on a transport's
+         `StreamReader` / `StreamWriter` pair.
+
+  The Stream interfaces (spec/design/data_io.md §Stream アダプタ) are the
+  transport seam of the remote stack: anything that can read and write
+  bytes plugs in here, UART accessors today, a TCP stream tomorrow.
+  RemoteLink owns the Stream adapters, their scratch buffers, and the
+  `RemoteSession`, replacing the per-call boilerplate.
+
+  This is a convenience (sugar) tier: unlike the core classes it OWNS
+  its scratch (2 x `frame::kMaxWireSize`). Callers that want full buffer
+  control keep composing `StreamSource` / `StreamSink` / `RemoteSession`
+  by hand.
+
+  Establishing the connection (which transport candidate actually hosts
+  a remote server) is the next layer up: see the per-transport connect
+  utilities, e.g. `connectRemoteSerial` in the posix UART variant.
+ */
+class RemoteLink {
+public:
+    RemoteLink(data::StreamReader& rx, data::StreamWriter& tx,
+               const RemoteSession::Config& config = RemoteSession::Config{})
+        : _src{rx, data::DataSpan{_rx_scratch, sizeof(_rx_scratch)}},
+          _snk{tx, data::DataSpan{_tx_scratch, sizeof(_tx_scratch)}},
+          _session{_src, _snk, config}
+    {
+    }
+
+    RemoteSession& session()
+    {
+        return _session;
+    }
+
+    /*!
+      @brief Start a fresh connection: drop stale buffered input and
+             reset the session.
+
+      Combines `StreamSource::discardBuffered` (a peer's boot noise or
+      a previous candidate's leftovers must not desynchronize the frame
+      reader) with `RemoteSession::reset()`. Bytes still queued in the
+      underlying transport are not touched — flush those at the
+      transport level when needed (the posix connect utility does).
+     */
+    void reset()
+    {
+        _src.discardBuffered();
+        _session.reset();
+    }
+
+private:
+    // Declaration order is initialization order: scratch first.
+    uint8_t _rx_scratch[frame::kMaxWireSize] = {};
+    uint8_t _tx_scratch[frame::kMaxWireSize] = {};
+    data::StreamSource _src;
+    data::StreamSink _snk;
+    RemoteSession _session;
+};
+
+/*!
+  @brief I2C bus proxy: a local `i2c::I2CBus` whose transfers run remotely.
+
+  Callers use it exactly like a local bus — build an
+  `I2CMasterAccessor` on top and every sugar (write / read /
+  writeRegister / probe) works, because the single `transfer` override
+  marshals one self-contained script (`bus_configure` + `bus_transfer`)
+  per call (spec §host side). There is no remote lock: atomicity across
+  multiple transfers is out of scope for this version.
+
+  Size limits (spec §size limits): the receive length is capped at
+  `kMaxTransferRx`; a tx payload that does not fit the request script is
+  rejected. Both yield `INVALID_ARGUMENT` before anything is sent.
+
+  `remote_bus_id` selects the server-side registered bus (see the
+  `hello` capability list).
+ */
+struct RemoteI2CBus : public i2c::I2CBus {
+    RemoteI2CBus(RemoteSession& session, uint8_t remote_bus_id) : _session{&session}, _remote_bus_id{remote_bus_id}
+    {
+    }
+
+    /*! @brief Local bookkeeping only — the physical bus is configured server-side. */
+    m5::stl::expected<void, m5::hal::v1::error::error_t> init(const bus::BusConfig& config) override;
+    m5::stl::expected<void, m5::hal::v1::error::error_t> release(void) override
+    {
+        return {};
+    }
+
+    m5::stl::expected<size_t, m5::hal::v1::error::error_t> transfer(bus::Accessor* owner,
+                                                                    const i2c::I2CMasterAccessConfig& cfg,
+                                                                    const i2c::TransferDesc& desc, data::Source* tx,
+                                                                    data::Sink* rx) override;
+
+private:
+    RemoteSession* _session = nullptr;
+    uint8_t _remote_bus_id  = 0;
+};
+
+/*!
+  @brief SPI bus proxy: a local `spi::SPIBus` whose transfers run remotely.
+
+  Same shape as `RemoteI2CBus`: one self-contained script
+  (`bus_configure` + `bus_transfer`) per transfer, size caps checked
+  before sending. The CS / transaction window is realized server-side by
+  the registered accessor for each transfer; the local
+  `beginTransaction` / `endTransaction` stay no-ops (the base defaults),
+  so a CS window spanning multiple transfers is not supported — compose
+  command / address / data through one `TransferDesc` instead.
+ */
+struct RemoteSPIBus : public spi::SPIBus {
+    RemoteSPIBus(RemoteSession& session, uint8_t remote_bus_id) : _session{&session}, _remote_bus_id{remote_bus_id}
+    {
+    }
+
+    /*! @brief Local bookkeeping only — the physical bus is configured server-side. */
+    m5::stl::expected<void, m5::hal::v1::error::error_t> init(const bus::BusConfig& config) override;
+    m5::stl::expected<void, m5::hal::v1::error::error_t> release(void) override
+    {
+        return {};
+    }
+
+    m5::stl::expected<size_t, m5::hal::v1::error::error_t> transfer(bus::Accessor* owner,
+                                                                    const spi::SPIMasterAccessConfig& cfg,
+                                                                    const spi::TransferDesc& desc, data::Source* tx,
+                                                                    data::Sink* rx) override;
+
+private:
+    RemoteSession* _session = nullptr;
+    uint8_t _remote_bus_id  = 0;
+};
+
+/*!
+  @brief UART bus proxy: a local `uart::UARTBus` whose I/O runs remotely.
+
+  `write` / `read` each marshal one self-contained script. Semantics
+  that differ from a local UART (spec §UART proxy):
+  - `read` requests at most `kMaxTransferRx` bytes per call (a larger
+    `len` is clamped — UART reads may return short anyway); the remote
+    short-read count is preserved through the response slot.
+  - `write` returns the requested length on success; bytecode v1 carries
+    no written-count back, so a remote short write is not distinguishable
+    (the failing case still reports through `report_error`).
+  - `readableBytes` is UNSUPPORTED (no opcode); poll with `read` and a
+    small remote `first_byte_timeout_ms` instead.
+  - The session response timeout is raised per call to cover the remote
+    read/write timeouts (`first_byte + len * inter_byte + margin` for
+    reads, `write_timeout + margin` for writes) and restored after.
+ */
+struct RemoteUARTBus : public uart::UARTBus {
+    RemoteUARTBus(RemoteSession& session, uint8_t remote_bus_id) : _session{&session}, _remote_bus_id{remote_bus_id}
+    {
+    }
+
+    /*! @brief Local bookkeeping only — the physical bus is configured server-side. */
+    m5::stl::expected<void, m5::hal::v1::error::error_t> init(const bus::BusConfig& config) override;
+    m5::stl::expected<void, m5::hal::v1::error::error_t> release(void) override
+    {
+        return {};
+    }
+
+    m5::stl::expected<size_t, m5::hal::v1::error::error_t> write(bus::Accessor* owner,
+                                                                 const uart::UARTAccessConfig& cfg, data::Source* tx,
+                                                                 size_t len) override;
+    m5::stl::expected<size_t, m5::hal::v1::error::error_t> read(bus::Accessor* owner, const uart::UARTAccessConfig& cfg,
+                                                                data::Sink* rx, size_t len) override;
+    m5::stl::expected<size_t, m5::hal::v1::error::error_t> readableBytes(bus::Accessor* owner,
+                                                                         const uart::UARTAccessConfig& cfg) override;
+
+private:
+    m5::stl::expected<size_t, m5::hal::v1::error::error_t> runScript(data::ConstDataSpan script,
+                                                                     uint32_t required_timeout_ms);
+
+    RemoteSession* _session = nullptr;
+    uint8_t _remote_bus_id  = 0;
+};
+
+class RemoteGPIO;
+
+/*!
+  @brief IPort implementation backing `RemoteGPIO` (one flat bank).
+
+  The encoded pin number is the local pin index itself; all hooks
+  forward to the owning RemoteGPIO's wire operations.
+ */
+class RemotePort : public gpio::IPort {
+public:
+    explicit RemotePort(RemoteGPIO& owner) : _owner{&owner}
+    {
+    }
+
+protected:
+    void _writePinEncoded(uint32_t encoded_num, bool v) override;
+    bool _readPinEncoded(uint32_t encoded_num) override;
+    void _setPinModeEncoded(uint32_t encoded_num, ::m5::hal::v1::types::gpio_mode_t mode) override;
+    ::m5::hal::v1::types::gpio_local_pin_t _toLocalPin(uint32_t encoded_num) const override
+    {
+        return static_cast<::m5::hal::v1::types::gpio_local_pin_t>(encoded_num);
+    }
+    uint32_t _fromLocalPin(::m5::hal::v1::types::gpio_local_pin_t pin_index) const override
+    {
+        return pin_index;
+    }
+
+private:
+    RemoteGPIO* _owner = nullptr;
+};
+
+/*!
+  @brief GPIO proxy: an `IGPIO` whose pins live on the remote device.
+
+  Register it on a host-side `GPIOGroup` slot exactly like an I/O
+  expander; the resulting `Pin` handles work unchanged, and their
+  identity rides on the `IPort*` (no per-pin HAL context needed).
+
+  Wire numbering: a local pin index `n` maps to the REMOTE device's
+  `makeGpioNumber(remote_slot, n)` — host slot and remote slot are
+  independent number spaces, and this proxy is where they convert
+  (spec §GPIO proxy).
+
+  Error path: the `IPort` hooks return void/bool, so
+  - `write` / `setMode` go out as NORESP scripts; a server-side failure
+    parks as the pending error and surfaces via
+    `session.lastRemoteError()` after the next synchronous exchange,
+  - `read` is a synchronous RPC; on failure it returns `false` and the
+    error is observable on the session likewise.
+
+  Handles never go stale: a transport drop makes operations fail (and
+  reads return false) until the session is re-established; the Pin /
+  registry stay valid (spec §timeout / resync).
+ */
+class RemoteGPIO : public gpio::IGPIO {
+public:
+    RemoteGPIO(RemoteSession& session, uint16_t pin_count, ::m5::hal::v1::types::gpio_slot_t remote_slot = 0)
+        : _port{*this}, _session{&session}, _pin_count{pin_count}, _remote_slot{remote_slot}
+    {
+    }
+
+    gpio::IPort* portForPin(::m5::hal::v1::types::gpio_local_pin_t pin_index) const override
+    {
+        return isValid(pin_index) ? &_port : nullptr;
+    }
+    gpio::IPort* getPort(uint8_t portNumber) const override
+    {
+        return portNumber == 0 ? &_port : nullptr;
+    }
+    uint16_t getPinCount() const override
+    {
+        return _pin_count;
+    }
+    uint8_t getPortCount() const override
+    {
+        return 1;
+    }
+
+private:
+    void wireWrite(uint32_t local_pin, bool v);
+    bool wireRead(uint32_t local_pin);
+    void wireSetMode(uint32_t local_pin, ::m5::hal::v1::types::gpio_mode_t mode);
+    ::m5::hal::v1::types::gpio_number_t remoteNumber(uint32_t local_pin) const
+    {
+        return ::m5::hal::v1::types::makeGpioNumber(_remote_slot,
+                                                    static_cast<::m5::hal::v1::types::gpio_local_pin_t>(local_pin));
+    }
+
+    mutable RemotePort _port;
+    RemoteSession* _session                        = nullptr;
+    uint16_t _pin_count                            = 0;
+    ::m5::hal::v1::types::gpio_slot_t _remote_slot = 0;
+
+    friend class RemotePort;
+};
+
+}  // namespace m5::hal::v1::remote
+
+#endif

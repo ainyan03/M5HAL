@@ -45,6 +45,8 @@ src/m5_hal/variants/
       _offer.hpp
       hal.hpp / hal.inl
       hal/uart/uart.{hpp,inl}  UARTBus + 実装 (termios serial)
+      hal/uart/ports.{hpp,inl}          ポート列挙 (listSerialPorts)
+      hal/uart/remote_connect.{hpp,inl} remote 接続確立 (列挙 × hello)
     stub/
       _offer.hpp              実装済み no-op capability だけ申告
       hal.hpp                 no-op 具象 (inline 定義のみ、 hal.inl 不要)

@@ -35,6 +35,7 @@ M5HAL_INLINE_V1 namespace v1
 #include "./m5_hal/hal/v1/data/stream.hpp"
 #include "./m5_hal/hal/v1/frame/frame.hpp"
 #include "./m5_hal/hal/v1/bytecode/bytecode.hpp"
+#include "./m5_hal/hal/v1/remote/remote.hpp"
 
 #define M5HAL_STATIC_MACRO_STRING(x) #x
 // clang-format off

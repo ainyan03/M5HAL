@@ -3,6 +3,7 @@
 #include "m5_hal/hal/v1/bus/bus.inl"
 #include "m5_hal/hal/v1/bytecode/bytecode.inl"
 #include "m5_hal/hal/v1/frame/frame.inl"
+#include "m5_hal/hal/v1/remote/remote.inl"
 #include "m5_hal/hal/v1/i2c/i2c.inl"
 #include "m5_hal/hal/v1/memory/pool.inl"
 #include "m5_hal/hal/v1/memory/allocator.inl"

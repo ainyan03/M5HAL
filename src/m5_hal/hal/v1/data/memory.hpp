@@ -102,6 +102,12 @@ public:
         return _cursor >= _buf.size;
     }
 
+    /*! @brief Total bytes committed so far (the encoded length when used as a build target). */
+    size_t written() const
+    {
+        return _cursor;
+    }
+
 private:
     DataSpan _buf;
     size_t _cursor = 0;

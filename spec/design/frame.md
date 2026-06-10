@@ -47,6 +47,8 @@ delimiter     : [0x00][0x55]
 
 codec が意味解釈するのは `data` の stream_id 規則と padding / delimiter のみ。予約 kind のフレームも CHECK16 検証と透過運搬は行う (kind body は解釈しない)。フロー制御等の意味論は将来の mux / transport 層の仕様で定める。
 
+`data` の stream_id の割当規約 (リモートメッセージチャネル = 0x00 等) は [remote.md](remote.md) §stream_id レジストリが定める。
+
 ## decode の意味論
 
 `decode(src, view)` は `DecodeResult{status, consumed}` を返す。**非 ok もストリーム処理の正常系** (padding 読み飛ばし、破損からの resync) なので、error path ではなく status で表す。
@@ -115,5 +117,6 @@ auto r = reader.next(view);   // expected<DecodeResult, error_t>
 ## 関連
 
 - Source/Sink 契約: [data_io.md](data_io.md) (§Stream アダプタ含む)
+- 本 codec 上のリモートメッセージ層: [remote.md](remote.md)
 - UART アクセサとの接続: [uart.md](uart.md)
 - 検証: [../verification.md](../verification.md) (native gtest `test_frame_codec` / posix UART end-to-end)

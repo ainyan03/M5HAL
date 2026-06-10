@@ -21,6 +21,7 @@
 | Bus / Accessor の基本設計を知る | [design/bus_accessor.md](design/bus_accessor.md), [design/data_io.md](design/data_io.md), [design/transfer_desc.md](design/transfer_desc.md) |
 | ストリームのフレーム化を知る | [design/frame.md](design/frame.md), [design/data_io.md](design/data_io.md) §Stream アダプタ |
 | HAL 操作の bytecode 化を知る | [design/bytecode.md](design/bytecode.md) |
+| リモートバス機構を知る | [design/remote.md](design/remote.md) (下層: frame / bytecode / data_io) |
 | I2C / SPI / UART を実装・レビューする | [design/i2c.md](design/i2c.md), [design/spi.md](design/spi.md), [design/uart.md](design/uart.md), [verification.md](verification.md) |
 | GPIO / variant を実装・レビューする | [design/gpio.md](design/gpio.md), [design/variants.md](design/variants.md), [reference/directory-layout.md](reference/directory-layout.md) |
 | ビルド時の挙動を設定する (`M5HAL_CONFIG_*`) | [design/configuration.md](design/configuration.md) |

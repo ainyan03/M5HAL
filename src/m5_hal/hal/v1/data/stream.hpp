@@ -190,6 +190,23 @@ public:
         return _pending_skip;
     }
 
+    /*!
+      @brief Drop everything buffered in the adapter (and any pending
+             skip reservation).
+
+      Connection-start flush: discards stale bytes (e.g. a peer's boot
+      noise) so the next `peek` starts from fresh input. Only the
+      adapter's own buffer is affected — bytes still queued in the
+      underlying transport are NOT touched; flush those at the
+      transport level (e.g. `tcflush`) when a full flush is needed.
+      Any span borrowed from a previous `peek` is invalidated.
+     */
+    void discardBuffered(void)
+    {
+        _head = _filled = 0;
+        _pending_skip   = 0;
+    }
+
 private:
     // Consume the skip reservation. `blocking` selects one reader-paced
     // blocking read per missing chunk (peek path) vs. draining only what

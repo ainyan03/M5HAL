@@ -22,7 +22,9 @@
 #include <termios.h>  // for the B<rate> baud constants checked in AcceptsHighBaudRates
 #include <unistd.h>
 
+#include <atomic>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -442,6 +444,337 @@ TEST(PosixUART, BytecodeRoundtripOverFramedUART)
     EXPECT_EQ(::memcmp(stored.data, payload, sizeof(payload)), 0);
     EXPECT_TRUE(host_runner.statusReported());
     EXPECT_EQ(host_runner.reportedStatus(), error::error_t::OK);
+}
+
+// Full remote-bus end-to-end over a real posix UART: RemoteSession +
+// RemoteI2CBus proxy on the host (pty master, raw fd), Server +
+// RemoteServerService behind the posix UART variant on the device (pty
+// slave). Single-threaded: the host-side reader pumps the device
+// service once before each blocking read, the same interleave the
+// in-memory loopback tests use.
+TEST(PosixUART, RemoteSessionEndToEndOverPty)
+{
+    namespace bus     = ::m5::hal::v1::bus;
+    namespace frame   = ::m5::hal::v1::frame;
+    namespace i2c     = ::m5::hal::v1::i2c;
+    namespace remote  = ::m5::hal::v1::remote;
+    namespace service = ::m5::hal::v1::service;
+    namespace types   = ::m5::hal::v1::types;
+
+    // Minimal device-side I2C hardware stand-in: answers reads with a
+    // pattern and records the marshalled target address.
+    struct StubI2CBus : public i2c::I2CBus {
+        uint16_t last_addr = 0;
+        error::error_t result = error::error_t::OK;
+
+        m5::stl::expected<void, error::error_t> init(const bus::BusConfig&) override
+        {
+            return {};
+        }
+        m5::stl::expected<size_t, error::error_t> transfer(bus::Accessor*, const i2c::I2CMasterAccessConfig& cfg,
+                                                           const i2c::TransferDesc& desc, data::Source* tx,
+                                                           data::Sink* rx) override
+        {
+            last_addr = cfg.i2c_addr;
+            if (error::isError(result)) {
+                return m5::stl::make_unexpected(result);
+            }
+            size_t total = desc.prefix_len;
+            if (tx != nullptr) {
+                while (!tx->eof()) {
+                    auto p = tx->peek(64);
+                    if (!p.has_value() || p.value().size == 0) {
+                        break;
+                    }
+                    total += p.value().size;
+                    (void)tx->advance(p.value().size);
+                }
+            }
+            if (rx != nullptr) {
+                auto rsv = rx->reserve(SIZE_MAX);
+                if (!rsv.has_value()) {
+                    return m5::stl::make_unexpected(rsv.error());
+                }
+                for (size_t i = 0; i < rsv.value().size; ++i) {
+                    rsv.value().data[i] = static_cast<uint8_t>(0x60 + i);
+                }
+                (void)rx->commit(rsv.value().size);
+                total += rsv.value().size;
+            }
+            return total;
+        }
+    };
+
+    PtyPair pty;
+    ASSERT_TRUE(pty.open());
+
+    // --- device endpoint (pty slave via the posix UART variant) ---
+    uart::variant::posix::Bus dev_bus;
+    ASSERT_EQ(dev_bus.attach(pty.slave), error::error_t::OK);
+    auto dev_cfg = makeConfig();
+    // Tiny first-byte timeout: the server poll must not stall when idle
+    // (spec/design/remote.md, server execution model).
+    dev_cfg.first_byte_timeout_ms = 2;
+    dev_cfg.inter_byte_timeout_ms = 2;
+    uart::UARTAccessor dev{dev_bus, dev_cfg};
+    ASSERT_TRUE(dev.setConfig(dev_cfg).has_value());
+
+    uint8_t dev_rx_scratch[frame::kMaxWireSize] = {};
+    uint8_t dev_tx_scratch[frame::kMaxWireSize] = {};
+    data::StreamSource dev_src{dev.rx(), data::DataSpan{dev_rx_scratch, sizeof(dev_rx_scratch)}};
+    data::StreamSink dev_snk{dev.tx(), data::DataSpan{dev_tx_scratch, sizeof(dev_tx_scratch)}};
+
+    StubI2CBus stub_bus;
+    i2c::I2CMasterAccessConfig stub_acc_cfg;
+    i2c::I2CMasterAccessor stub_acc{stub_bus, stub_acc_cfg};
+
+    uint8_t server_scratch[remote::kMaxMessageSize] = {};
+    remote::Server server{data::DataSpan{server_scratch, sizeof(server_scratch)}};
+    ASSERT_TRUE(server.registerI2C(0, stub_acc).has_value());
+    remote::RemoteServerService server_service{server, dev_src, dev_snk};
+
+    // --- host endpoint (pty master, raw fd + device pump) ---
+    struct MasterReader : public data::StreamReader {
+        int fd                              = -1;
+        remote::RemoteServerService* device = nullptr;
+
+        m5::stl::expected<size_t, error::error_t> read(data::DataSpan dst) override
+        {
+            device->service(service::ServiceContext{});  // let the peer make progress
+            if (!waitReadable(fd, 100)) {
+                return size_t{0};
+            }
+            ssize_t n = ::read(fd, dst.data, dst.size);
+            return n < 0 ? m5::stl::expected<size_t, error::error_t>{
+                               m5::stl::make_unexpected(error::error_t::IO_ERROR)}
+                         : m5::stl::expected<size_t, error::error_t>{static_cast<size_t>(n)};
+        }
+        m5::stl::expected<size_t, error::error_t> readableBytes(void) override
+        {
+            return waitReadable(fd, 0) ? size_t{1} : size_t{0};
+        }
+    };
+    struct MasterWriter : public data::StreamWriter {
+        int fd = -1;
+        m5::stl::expected<size_t, error::error_t> write(data::ConstDataSpan src) override
+        {
+            ssize_t n = ::write(fd, src.data, src.size);
+            return n < 0 ? m5::stl::expected<size_t, error::error_t>{
+                               m5::stl::make_unexpected(error::error_t::IO_ERROR)}
+                         : m5::stl::expected<size_t, error::error_t>{static_cast<size_t>(n)};
+        }
+    };
+
+    MasterReader host_reader;
+    host_reader.fd     = pty.master;
+    host_reader.device = &server_service;
+    MasterWriter host_writer;
+    host_writer.fd = pty.master;
+
+    uint8_t host_rx_scratch[frame::kMaxWireSize] = {};
+    uint8_t host_tx_scratch[frame::kMaxWireSize] = {};
+    data::StreamSource host_src{host_reader, data::DataSpan{host_rx_scratch, sizeof(host_rx_scratch)}};
+    data::StreamSink host_snk{host_writer, data::DataSpan{host_tx_scratch, sizeof(host_tx_scratch)}};
+
+    remote::RemoteSession session{host_src, host_snk};
+
+    // hello: the capability list names the registered I2C bus.
+    auto caps = session.hello();
+    ASSERT_TRUE(caps.has_value());
+    EXPECT_EQ(caps.value().proto_ver, remote::kProtocolVersion);
+    ASSERT_EQ(caps.value().bus_count, 1u);
+    EXPECT_EQ(caps.value().buses[0].kind, types::bus_kind_t::I2C);
+    EXPECT_EQ(caps.value().buses[0].bus_id, 0);
+
+    // The proxy behaves like a local bus: register read over the wire.
+    remote::RemoteI2CBus proxy{session, 0};
+    i2c::I2CMasterAccessConfig acc_cfg;
+    acc_cfg.i2c_addr = 0x68;
+    i2c::I2CMasterAccessor acc{proxy, acc_cfg};
+
+    uint8_t rx[4] = {};
+    auto r        = acc.readRegister(uint8_t{0x75}, rx, sizeof(rx));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(stub_bus.last_addr, 0x68);
+    for (size_t i = 0; i < sizeof(rx); ++i) {
+        EXPECT_EQ(rx[i], static_cast<uint8_t>(0x60 + i));
+    }
+
+    // A remote bus error folds into the local expected error path.
+    stub_bus.result = error::error_t::I2C_NO_ACK;
+    auto p          = acc.probe();
+    ASSERT_FALSE(p.has_value());
+    EXPECT_EQ(p.error(), error::error_t::I2C_NO_ACK);
+    stub_bus.result = error::error_t::OK;
+    EXPECT_TRUE(acc.probe().has_value());
+}
+
+// connectRemoteSerial (remote_connect.hpp), explicit-path route over a
+// pty: the host endpoint opens the pty slave BY PATH (exactly what the
+// utility does with a real adapter), while a background thread serves a
+// remote Server on the master end. The auto-discovery route is
+// deliberately NOT exercised here - it would open the test machine's
+// real serial ports and DTR-reset whatever boards are attached; its
+// building blocks (listSerialPorts, open, hello) are covered separately.
+TEST(PosixUART, ConnectRemoteSerialExplicitPathOverPty)
+{
+    namespace bus        = ::m5::hal::v1::bus;
+    namespace frame      = ::m5::hal::v1::frame;
+    namespace i2c        = ::m5::hal::v1::i2c;
+    namespace remote     = ::m5::hal::v1::remote;
+    namespace service    = ::m5::hal::v1::service;
+    namespace posix_uart = uart::variant::posix;
+
+    PtyPair pty;
+    ASSERT_TRUE(pty.open());
+    char slave_path[128] = {};
+    {
+        const char* name = ::ptsname(pty.master);
+        ASSERT_NE(name, nullptr);
+        ::snprintf(slave_path, sizeof(slave_path), "%s", name);
+    }
+
+    // Device endpoint on the master fd (raw, no termios).
+    struct FdReader : public data::StreamReader {
+        int fd = -1;
+        m5::stl::expected<size_t, error::error_t> read(data::DataSpan dst) override
+        {
+            if (!waitReadable(fd, 5)) {
+                return size_t{0};
+            }
+            ssize_t n = ::read(fd, dst.data, dst.size);
+            return n < 0 ? m5::stl::expected<size_t, error::error_t>{
+                               m5::stl::make_unexpected(error::error_t::IO_ERROR)}
+                         : m5::stl::expected<size_t, error::error_t>{static_cast<size_t>(n)};
+        }
+        m5::stl::expected<size_t, error::error_t> readableBytes(void) override
+        {
+            return waitReadable(fd, 0) ? size_t{1} : size_t{0};
+        }
+    };
+    struct FdWriter : public data::StreamWriter {
+        int fd = -1;
+        m5::stl::expected<size_t, error::error_t> write(data::ConstDataSpan src) override
+        {
+            ssize_t n = ::write(fd, src.data, src.size);
+            return n < 0 ? m5::stl::expected<size_t, error::error_t>{
+                               m5::stl::make_unexpected(error::error_t::IO_ERROR)}
+                         : m5::stl::expected<size_t, error::error_t>{static_cast<size_t>(n)};
+        }
+    };
+    struct StubI2CBus : public i2c::I2CBus {
+        m5::stl::expected<void, error::error_t> init(const bus::BusConfig&) override
+        {
+            return {};
+        }
+        m5::stl::expected<size_t, error::error_t> transfer(bus::Accessor*, const i2c::I2CMasterAccessConfig&,
+                                                           const i2c::TransferDesc& desc, data::Source*,
+                                                           data::Sink*) override
+        {
+            return desc.prefix_len;
+        }
+    };
+
+    FdReader dev_reader;
+    dev_reader.fd = pty.master;
+    FdWriter dev_writer;
+    dev_writer.fd                               = pty.master;
+    uint8_t dev_rx_scratch[frame::kMaxWireSize] = {};
+    uint8_t dev_tx_scratch[frame::kMaxWireSize] = {};
+    data::StreamSource dev_src{dev_reader, data::DataSpan{dev_rx_scratch, sizeof(dev_rx_scratch)}};
+    data::StreamSink dev_snk{dev_writer, data::DataSpan{dev_tx_scratch, sizeof(dev_tx_scratch)}};
+
+    StubI2CBus stub_bus;
+    i2c::I2CMasterAccessConfig stub_acc_cfg;
+    i2c::I2CMasterAccessor stub_acc{stub_bus, stub_acc_cfg};
+    uint8_t server_scratch[remote::kMaxMessageSize] = {};
+    remote::Server server{data::DataSpan{server_scratch, sizeof(server_scratch)}};
+    ASSERT_TRUE(server.registerI2C(0, stub_acc).has_value());
+    remote::RemoteServerService server_service{server, dev_src, dev_snk};
+
+    std::atomic<bool> stop{false};
+    std::thread dev_thread([&] {
+        // Boot noise first: a freshly reset ESP32 streams its ROM log
+        // before the sketch serves. The connect utility must flush this
+        // (per-attempt) instead of letting the frame reader resync
+        // through it and swallow the real hello_resp — the field
+        // failure this reproduces.
+        const char boot_noise[] =
+            "ets Jul 29 2019 12:21:46\r\n\r\nrst:0x1 (POWERON_RESET),boot:0x17 "
+            "(SPI_FAST_FLASH_BOOT)\r\nload:0x3fff0030,len:1184\r\nentry 0x400805e4\r\n";
+        (void)::write(pty.master, boot_noise, sizeof(boot_noise) - 1);
+        while (!stop.load()) {
+            server_service.service(service::ServiceContext{});
+        }
+    });
+
+    posix_uart::SerialRemoteEndpoint ep{115200};
+    posix_uart::ConnectOptions opt;
+    opt.path             = slave_path;
+    opt.hello_timeout_ms = 300;
+    auto caps            = posix_uart::connectRemoteSerial(ep, opt);
+
+    stop.store(true);
+    dev_thread.join();
+
+    ASSERT_TRUE(caps.has_value());
+    EXPECT_STREQ(ep.devicePath(), slave_path);
+    EXPECT_EQ(caps.value().proto_ver, remote::kProtocolVersion);
+    ASSERT_EQ(caps.value().bus_count, 1u);
+    // The probe timeout was restored to the configured default.
+    EXPECT_EQ(ep.link.session().responseTimeoutMs(), 1000u);
+}
+
+TEST(PosixUART, ConnectRemoteSerialMissingPathReportsIoError)
+{
+    namespace posix_uart = uart::variant::posix;
+    posix_uart::SerialRemoteEndpoint ep;
+    posix_uart::ConnectOptions opt;
+    opt.path            = "/dev/m5hal-no-such-port";
+    opt.strong_attempts = 1;
+    auto r              = posix_uart::connectRemoteSerial(ep, opt);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), error::error_t::IO_ERROR);
+    EXPECT_STREQ(ep.devicePath(), "");
+}
+
+// Serial-port enumeration (ports.hpp): the pure ranking heuristic per
+// platform, and a smoke run of the real /dev scan (its content is
+// host-dependent, so only the invariants are asserted).
+TEST(PosixUART, SerialPortNameRanking)
+{
+    namespace posix_uart = uart::variant::posix;
+#if defined(__APPLE__)
+    EXPECT_EQ(posix_uart::rankSerialPortName("cu.usbserial-1410"), 0);
+    EXPECT_EQ(posix_uart::rankSerialPortName("cu.usbmodem401"), 0);
+    EXPECT_EQ(posix_uart::rankSerialPortName("cu.SLAB_USBtoUART"), 1);
+    EXPECT_EQ(posix_uart::rankSerialPortName("cu.Bluetooth-Incoming-Port"), 2);
+    EXPECT_EQ(posix_uart::rankSerialPortName("cu.debug-console"), 2);
+    EXPECT_EQ(posix_uart::rankSerialPortName("tty.usbserial-1410"), -1);  // dial-in side: not a candidate
+    EXPECT_EQ(posix_uart::rankSerialPortName("ttyS0"), -1);
+#else
+    EXPECT_EQ(posix_uart::rankSerialPortName("ttyUSB0"), 0);
+    EXPECT_EQ(posix_uart::rankSerialPortName("ttyACM3"), 0);
+    EXPECT_EQ(posix_uart::rankSerialPortName("ttyS0"), -1);
+    EXPECT_EQ(posix_uart::rankSerialPortName("cu.usbserial-1410"), -1);
+#endif
+    EXPECT_EQ(posix_uart::rankSerialPortName(nullptr), -1);
+}
+
+TEST(PosixUART, ListSerialPortsSmoke)
+{
+    namespace posix_uart = uart::variant::posix;
+    posix_uart::SerialPortInfo ports[8];
+    const size_t n = posix_uart::listSerialPorts(ports, sizeof(ports) / sizeof(ports[0]));
+    ASSERT_LE(n, sizeof(ports) / sizeof(ports[0]));
+    for (size_t i = 0; i < n; ++i) {
+        EXPECT_NE(ports[i].path[0], '\0');
+        if (i > 0) {
+            EXPECT_LE(ports[i - 1].rank, ports[i].rank);  // best candidates first
+        }
+    }
+    EXPECT_EQ(posix_uart::listSerialPorts(nullptr, 4), 0u);
+    EXPECT_EQ(posix_uart::listSerialPorts(ports, 0), 0u);
 }
 
 TEST(PosixUART, OpenMissingDeviceReportsIoError)

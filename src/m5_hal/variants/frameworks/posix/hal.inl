@@ -3,3 +3,5 @@
 // self-contained for its kind.
 
 #include "hal/uart/uart.inl"
+#include "hal/uart/ports.inl"
+#include "hal/uart/remote_connect.inl"

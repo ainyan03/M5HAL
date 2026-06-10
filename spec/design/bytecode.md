@@ -74,7 +74,7 @@ auto chip_id  = runner.storedData(7);               // gpio_read / bus_transfer 
 - **dispatch 先は事前登録制**: `registerI2C/SPI/UART(bus_id, accessor&)` 各 4 枠 + `setGPIOGroup`。未登録のターゲットを指す命令は `INVALID_ARGUMENT`
 - **store スロット**: ラベル付き 8 枠 (`memory::TempBuffer` 所有)。`run` 開始時に全クリア。同一 `store_id` への再書き込みは上書き、9 個目の異なるラベルは `OUT_OF_RESOURCE`
 - **エラー方針**: 最初に失敗した命令で停止しエラーを返す。`lastOffset()` がその命令の byte offset。応答化 (report) は呼び出し側が `writeResponse` で行う
-- **実行は同期**: `delay_ms` を含む全命令が呼び出しスレッドをブロックする。長い delay 入りスクリプトは runner (remote server なら poll ループ) を専有する。非同期・協調実行は将来の統合層の論点
+- **実行は同期**: `delay_ms` を含む全命令が呼び出しスレッドをブロックする。長い delay 入りスクリプトは runner (remote server なら poll ループ) を専有する。remote server 側の実行時間の制限規約は [remote.md](remote.md) §server の実行モデルが定める
 - **ストリーミング実行の前提**: 命令は Source が 1 回の `peek` で貸せるサイズであること (`StreamSource` なら scratch ≥ 最大命令長)。命令の続きが timeout 期間を丸ごと待っても届かない場合は `BUFFER_UNDERFLOW` で停止する (途中再開は不可。`StreamSource` の peek は不足分を timeout までブロックして待つため、バイト間ギャップ程度では失敗しない)
 
 ## 対称パイプライン (応答も bytecode)
@@ -110,12 +110,12 @@ BytecodeRunner::run       ←frame─  BytecodeRunner::writeResponse
 | 長さ前置なしの命令形式 | 未知 opcode でストリーム全体が解釈不能になり前方互換を持てない |
 | 応答の Sink 直行ストリーミング | ローカル実行者が応答スクリプトの自前パースを強いられる。スロット + `storedData(id)` が簡潔 |
 | Device 層 dispatch | v1 の dispatch 先は Accessor + TransferDesc。Device 抽象は HAL スコープ外 |
-| bus 生成 (init/deinit) / 購読・イベント | バス生成ファクトリと通知機構が必要で、remote 統合層の設計判断と不可分。opcode 値のみ予約 |
+| bus 生成 (init/deinit) / 購読・イベント | バス生成ファクトリと通知機構が必要。リモートバス機構 ([remote.md](remote.md)) でも bus は server 側静的登録で足りると判定し、init/deinit は引き続き値のみ予約。購読・イベントは remote の将来拡張 (push) で意味論を定める |
 | Simple/Compound の 2 クラス命令 | 全命令が size 前置で自己記述なら不要。「無視されては困る」は critical フラグで表現 |
 
 ## 関連
 
 - 実例: [`examples/v1/HowToUse/Bytecode`](../../examples/v1/HowToUse/Bytecode/) — byte 配列で記述した GPIO/I2C/SPI スクリプトをボタン操作で実行する sketch (M5Stack Core BASIC)
-- フレーム化と remote 搬送: [frame.md](frame.md) (kind=`data` の kind_body にスクリプトを載せる)
+- フレーム化と remote 搬送: [frame.md](frame.md) (kind=`data` の kind_body にスクリプトを載せる)、メッセージ層は [remote.md](remote.md)
 - Source/Sink 契約: [data_io.md](data_io.md)
 - 検証: [../verification.md](../verification.md) (native gtest `test_bytecode` / posix UART ミニ remote 往復)

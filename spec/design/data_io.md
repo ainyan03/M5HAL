@@ -186,6 +186,7 @@ UART の split accessor (`UARTTxAccessor` / `UARTRxAccessor`、 [uart.md](uart.m
 - **peek 上限 = scratch 容量**: `peek(max_len)` は scratch 容量までしか返さない (契約は「最大 max_len」 なので適合)。 consumer は短い peek を前提に書く
 - **skip 予約**: バッファを超える `advance` は超過分を予約として保持し、 readable な分を即時読み捨て、 残りは後続の `peek` / `advance` が自動消費する (§Source の stream 系規約)
 - **`StreamSink` はパススルー**: `reserve` は scratch を貸し出し (連続 reserve は同一 span で冪等)、 `commit(N)` が scratch 先頭 N byte を `write` する。 writer が N byte 未満しか受理しなかった場合は `IO_ERROR`。 detached (null writer) への `commit` は黙って捨てず `CLOSED` を返す
+- **接続開始時の flush**: `StreamSource::discardBuffered()` がアダプタ内のバッファ済みバイトと skip 予約を破棄する (相手のブートノイズや前回接続の残骸を次の peek に持ち越さないための入口。 [remote.md](remote.md) §接続ユーティリティが利用)。 transport 側の受信キューは対象外 — 完全な flush が要る場合は transport レベル (posix なら `tcflush`) と併用する。 過去の peek で借用した span は無効化される
 
 ## 配置と命名 (namespace 1:1)
 

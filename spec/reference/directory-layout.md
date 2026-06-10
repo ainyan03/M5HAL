@@ -49,6 +49,7 @@ src/
         data/stream.hpp
         frame/frame.{hpp,inl}
         bytecode/bytecode.{hpp,inl}
+        remote/remote.{hpp,inl}
         memory/allocator.{hpp,inl}
         memory/pool.{hpp,inl}
         service/service.hpp

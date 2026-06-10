@@ -137,6 +137,12 @@ Arduino backend は `HardwareSerial::flush()` を使う。
   `B460800`〜`B4000000` の定数経由、 macOS は B230400 超を `IOSSIOSPEED` ioctl で任意 baud 設定
   （いずれも 3 Mbaud を実機実績 — Core BASIC v2.7 の CH9102 ↔ MacBook）。round-trip は pty を
   使った native gtest で検証 (`test/v1/native/bus/test_posix_uart`)。
+  ポート列挙ユーティリティ `listSerialPorts` / `rankSerialPortName` (`hal/uart/ports.hpp`) が
+  ホストのシリアルポート候補を有力順に返す (macOS: `cu.usbserial*`/`cu.usbmodem*` 優先、
+  Linux: `/dev/serial/by-id` 優先)。名前ヒューリスティクスは候補出しまでで、確定は呼び出し側の
+  プロトコル疎通で行う — リモートバスの確立は `connectRemoteSerial`
+  (`hal/uart/remote_connect.hpp`、[remote.md](remote.md) §接続ユーティリティ) がこの列挙と
+  `hello` を合成する。
 
 ## 今後
 

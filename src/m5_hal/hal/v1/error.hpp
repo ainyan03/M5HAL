@@ -39,6 +39,9 @@ enum class ErrorType : int8_t {
     END_OF_STREAM    = -13,  ///< Stream reached a clean end condition.
     CHECKSUM_ERROR   = -14,  ///< Frame or payload integrity check failed.
     PROTOCOL_ERROR   = -15,  ///< Well-formed bytes violated the protocol state / semantics.
+    DISCONNECTED     = -16,  ///< Transport to a remote endpoint was lost.
+    REMOTE_FAULT     = -17,  ///< The remote endpoint reported an internal failure (or an unknown code).
+    UNSUPPORTED      = -18,  ///< The remote endpoint does not support the requested capability.
 };
 using error_t = ErrorType;
 
