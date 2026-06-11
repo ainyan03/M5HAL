@@ -240,9 +240,9 @@ I2C と同じく、各 proxy はローカルのインタフェースを実装す
 
 | 層 | 役割 | 置き場所 |
 |---|---|---|
-| 候補列挙 | 名前ヒューリスティクスで接続先候補を有力順に出す | 各 transport の variant (posix は `listSerialPorts`、[uart.md](uart.md)) |
+| 候補列挙 | 名前ヒューリスティクスで接続先候補を有力順に出す | 各 transport の variant (posix serial は `listSerialPorts` [uart.md](uart.md)。TCP は接続先を名前で指すため不要) |
 | 配線バンドル `RemoteLink` | `StreamReader`/`StreamWriter` → Stream アダプタ → `RemoteSession` の定型配線 | remote コア (transport 非依存) |
-| 確立ユーティリティ | 候補列挙 × `hello` 疎通の合成ループ。**正しい相手かはプロトコルが決める** (名前は候補を出すだけ) | 各 transport の variant (posix は `connectRemoteSerial`) |
+| 確立ユーティリティ | 候補列挙 × `hello` 疎通の合成ループ。**正しい相手かはプロトコルが決める** (名前は候補を出すだけ) | 各 transport の variant (posix は `connectRemoteSerial` / `connectRemoteTcp`) |
 
 - `RemoteLink` は **scratch を内蔵する利便 (sugar) 層** (2 × `kMaxWireSize`)。バッファ管理を自分で
   行いたい呼び出し側は従来どおり `StreamSource` / `StreamSink` / `RemoteSession` を直接組む
@@ -262,9 +262,34 @@ I2C と同じく、各 proxy はローカルのインタフェースを実装す
   RUN モードリセット (DTR 解除 → RTS で EN をパルス) を打ち、毎回アプリケーション起動状態から
   hello を試行する (起動 ~1 秒は有力候補へのリトライで吸収)。modem 線を持たないポート (pty 等) では
   no-op。接続でリセットされては困る相手には `ConnectOptions::hardware_reset = false`
-- transport を増やす場合 (TCP 等) は、候補列挙と確立ユーティリティをその variant に追加するだけでよい
+- transport を増やす場合は、候補列挙と確立ユーティリティをその variant に追加するだけでよい
   (`RemoteLink` 以上は不変)。マルチノード discovery への発展は「最初の応答者で確定」を
   「応答者を収集」に広げる形で同じ骨格に載る
+
+### TCP transport (posix host)
+
+TCP は bus kind ではなく **transport**: ソケットが `StreamReader` / `StreamWriter` を直接実装し
+(host = posix variant / device = espidf variant の `TcpStream`)、frame 層から上は無改修で載る
+(Bus / Accessor / offer 申告は作らない — ソケットはペリフェラルではない)。frame 層の CRC / resync は
+TCP では冗長だが、層の transport 非依存を優先してそのまま維持する。espidf variant は BSD ソケット
+API のみで書かれ、arduino-esp32 でもそのまま使える (framework 差 = WiFi 起動部のみ = example 責務)。
+
+- 確立は `connectRemoteTcp(TcpRemoteEndpoint&, "host:port", TcpConnectOptions)`。TCP は接続先を
+  名前で一意に指すため候補列挙は不要で、connect → `RemoteLink::reset()` → hello のみ。
+  IPv6 リテラルはブラケット形式 (`"[fe80::1]:5555"`)
+- エラーの 2 区分はシリアルと同じ意味論: **到達できない** (refused / unreachable / connect
+  timeout) = `IO_ERROR`、**到達したが hello に応答しない** = `TIMEOUT_ERROR` (ソケットは閉じて返す)
+- シリアルと違い、接続時のハードウェアリセットも boot ノイズの flush も存在しない
+  (相手は既に起動して listen しており、新しいソケットに stale バイトは乗らない)
+- `TcpStream::read` は相手の切断 (orderly shutdown) を `CLOSED` として報告できる
+  (シリアル線には無い区別)。切断後の再接続は connect からやり直す (ハンドルは接続単位)
+- 接続トポロジは **device = サーバ (listen → 1 接続 accept → serve)、host = クライアント**。
+  Server が単一セッション前提のため多重接続は非対応。切断検出で accept ループへ戻る。
+  接続ごとに Stream アダプタと `RemoteServerService` を作り直す (frame 同期状態を持ち越さない)。
+  Server 本体 (登録 = allowlist) は接続をまたいで永続する
+- 実例: [`experiments/v1/RemoteMenu`](../../experiments/v1/RemoteMenu/) — device 側は同一ソースの
+  build flag 差で UART/TCP を切り替える (env `v1_exp_remote_tcp_*`)。host プログラムも共用で、
+  第 1 引数 `tcp:<host>:<port>` が TCP を選ぶ (確立後のコードは transport を区別しない)
 
 ## 安全境界
 
@@ -302,8 +327,14 @@ I2C と同じく、各 proxy はローカルのインタフェースを実装す
 
 ## 関連
 
-- 実例: [`examples/v1/HowToUse/RemoteBus`](../../examples/v1/HowToUse/RemoteBus/) — device 側 sketch (M5Stack Core BASIC、内蔵 I2C と許可リスト化したボタン GPIO を公開) + PC 側ホストプログラム (`host/remote_bus_host.cpp`)。接続は `SerialRemoteEndpoint` + `connectRemoteSerial` の 2 行 (§接続ユーティリティ)、以降リモートスキャン / レジスタ読み / リモートボタンの変化監視ループ
-- 実例: [`examples/v1/HowToUse/RemoteI2S`](../../examples/v1/HowToUse/RemoteI2S/) — device 側 sketch (M5Stack Core2 V1.1、内蔵スピーカーの I2S TX を公開) + PC 側ホストプログラム (`host/remote_i2s_host.cpp`)。PC から 440Hz 正弦波を `RemoteI2SBus` で連続 write し、§stream credit の NORESP 連射 + credit フロー制御でリモート再生する
+- 実例: [`experiments/v1/RemoteMenu`](../../experiments/v1/RemoteMenu/) — 統合ハーネス。device 側
+  (`device/remote_menu_device.cpp`) は内蔵 I2C + 許可リスト化したボタン GPIO を公開し、Core2 V1.1
+  (AXP2101 検出時) では内蔵スピーカーの I2S TX も公開する。transport は UART0 / WiFi TCP を build
+  flag で選択。PC 側 (`host/remote_menu_host.cpp`) は stdin メニュー CLI で、リモートスキャン /
+  レジスタ読み / GPIO 書き込み (allowlist 拒否の実演) / ボタン push イベント監視 / `RemoteI2SBus`
+  による正弦波ストリーミング (§stream credit の NORESP 連射 + credit フロー制御) / credit 会計
+  ソークを選択実行する。接続は `SerialRemoteEndpoint` + `connectRemoteSerial` または
+  `TcpRemoteEndpoint` + `connectRemoteTcp` の 2 行 (§接続ユーティリティ)
 - 下層仕様: [data_io.md](data_io.md) / [frame.md](frame.md) / [bytecode.md](bytecode.md)
 - バス / GPIO 抽象: [bus_accessor.md](bus_accessor.md), [i2c.md](i2c.md), [gpio.md](gpio.md)
 - 検証: [../verification.md](../verification.md) (native gtest `test_remote` / posix pty end-to-end)

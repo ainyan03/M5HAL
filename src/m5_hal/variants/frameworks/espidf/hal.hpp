@@ -5,11 +5,13 @@
 // self-contained: `ESP_PLATFORM` gating, namespace scaffolding, and
 // the `using namespace ::m5::hal::v1;` resolver all live inside the
 // per-kind file. This hub is a thin file that only lists the kinds
-// this variant offers.
+// this variant offers; the tcp/ files are a remote-bus TRANSPORT, not
+// a bus kind, so they appear here but not in _offer.hpp.
 #include "hal/gpio/gpio.hpp"
 #include "hal/i2c/i2c.hpp"
 #include "hal/spi/spi.hpp"
 #include "hal/uart/uart.hpp"
 #include "hal/i2s/i2s.hpp"
+#include "hal/tcp/tcp.hpp"
 
 #endif

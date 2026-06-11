@@ -30,3 +30,34 @@ build_flags =
     ${common_esp32.build_flags}
     -DM5HAL_EXPERIMENT_SOFTWARE_SPI_FREQ=5000000
     -DNDEBUG
+
+; --- RemoteMenu の WiFi/TCP transport 版 (decisions/024) ---
+; WiFi 資格情報は環境変数 M5HAL_WIFI_SSID / M5HAL_WIFI_PASS から define へ注入
+; する (未設定でもビルドは通る = build fence。実機は要設定)。GUI からは外す。
+; UART transport 版と PC 側メニューは GUI-facing (pio_envs/v1/experiments.ini)。
+
+; arduino + WiFi.begin(): espidf variant の TcpListener/TcpStream (BSD ソケット、
+; ESP_PLATFORM ゲート) が arduino framework でそのまま使えることのフェンス。
+; lib_deps の WiFi は PIO の LDF が src_dir 外ソースの include を見ないための
+; 明示 (${common.lib_deps} の継承を忘れると M5Utility が外れる)。
+[env:v1_exp_remote_tcp_arduino]
+extends = common_esp32dev, common_arduino
+build_src_filter = +<*> +<../experiments/v1/RemoteMenu/device/remote_menu_device.cpp>
+lib_deps =
+    ${common.lib_deps}
+    WiFi
+build_flags =
+    ${common_esp32.build_flags}
+    -DM5HAL_EXPERIMENT_REMOTE_TCP
+    '-DM5HAL_EXPERIMENT_WIFI_SSID="${sysenv.M5HAL_WIFI_SSID}"'
+    '-DM5HAL_EXPERIMENT_WIFI_PASS="${sysenv.M5HAL_WIFI_PASS}"'
+
+; espidf + esp_wifi (WIFI_PS_NONE)、Core2 V1.1 で I2S 公開。
+[env:v1_exp_remote_tcp_idf5]
+extends = common_esp32dev_espidf5, common_espidf
+build_src_filter = +<*> +<../experiments/v1/RemoteMenu/device/remote_menu_device.cpp>
+build_flags =
+    ${common_esp32.build_flags}
+    -DM5HAL_EXPERIMENT_REMOTE_TCP
+    '-DM5HAL_EXPERIMENT_WIFI_SSID="${sysenv.M5HAL_WIFI_SSID}"'
+    '-DM5HAL_EXPERIMENT_WIFI_PASS="${sysenv.M5HAL_WIFI_PASS}"'

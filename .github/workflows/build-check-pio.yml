@@ -46,7 +46,16 @@ jobs:
           - name: coexistence checks
             envs: -e v0v1_check_esp32_arduino -e v0v1_check_esp32s3_arduino -e v0v1_check_esp32_espidf
           - name: examples build
-            envs: -e HowToUse_I2C_esp32 -e HowToUse_I2C_esp32s3 -e HowToUse_SPI_esp32 -e HowToUse_SPI_esp32s3 -e HowToUse_UART_esp32 -e HowToUse_UART_esp32s3 -e HowToUse_UARTEcho_esp32 -e HowToUse_UARTEcho_esp32s3 -e HowToUse_Bytecode_esp32 -e HowToUse_RemoteBus_esp32 -e HowToUse_RemoteBusHost_native -e HowToUse_I2SAudio_esp32s3 -e HowToUse_I2SAudio_esp32 -e HowToUse_RemoteI2S_esp32 -e HowToUse_RemoteI2SHost_native
+            envs: -e HowToUse_I2C_esp32 -e HowToUse_I2C_esp32s3 -e HowToUse_SPI_esp32 -e HowToUse_SPI_esp32s3 -e HowToUse_UART_esp32 -e HowToUse_UART_esp32s3 -e HowToUse_UARTEcho_esp32 -e HowToUse_UARTEcho_esp32s3 -e HowToUse_Bytecode_esp32 -e HowToUse_I2SAudio_esp32s3 -e HowToUse_I2SAudio_esp32
+          # The remote-bus harness (experiments/v1/RemoteMenu) replaces the
+          # former HowToUse_Remote* examples. This entry is the only fence for
+          # the arduino-framework socket layer (espidf-variant TcpListener /
+          # TcpStream behind the ESP_PLATFORM gate) and for the native host
+          # menu, so it must not be dropped from the matrix. The TCP envs live
+          # in experiments_advanced.ini.cli, hence the extra_config override.
+          - name: remote harness build
+            envs: -e v1_exp_remote_arduino -e v1_exp_remote_idf5 -e v1_exp_remote_host -e v1_exp_remote_tcp_arduino -e v1_exp_remote_tcp_idf5
+            extra_config: pio_envs/v1/experiments_advanced.ini.cli
     steps:
       - name: Checkout M5HAL
         uses: actions/checkout@v6
@@ -86,10 +95,11 @@ jobs:
 
       # check envs live in *.ini.cli (kept out of the PlatformIO GUI). Load them
       # via M5HAL_PIO_EXTRA_CONFIG (platformio.ini's ${sysenv.*} hook) — no copy.
+      # Matrix entries that need a different *.ini.cli set extra_config.
       - name: Build fences
         working-directory: M5HAL
         env:
-          M5HAL_PIO_EXTRA_CONFIG: pio_envs/*/check.ini.cli
+          M5HAL_PIO_EXTRA_CONFIG: ${{ matrix.extra_config || 'pio_envs/*/check.ini.cli' }}
         run: pio run ${{ matrix.envs }}
 
       - name: Run test_native

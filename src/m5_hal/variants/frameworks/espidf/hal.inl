@@ -8,3 +8,4 @@
 #include "hal/spi/spi.inl"
 #include "hal/uart/uart.inl"
 #include "hal/i2s/i2s.inl"
+#include "hal/tcp/tcp.inl"

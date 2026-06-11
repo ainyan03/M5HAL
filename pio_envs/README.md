@@ -8,6 +8,8 @@ GUI-facing operation menu envs and the user example envs:
 pio run -e v1_exp_menu_arduino
 pio run -e v1_exp_menu_idf5
 pio run -e v1_exp_bench_arduino
+pio run -e v1_exp_remote_idf5
+pio run -e v1_exp_remote_host
 pio run -e HowToUse_I2C_esp32
 pio run -e HowToUse_SPI_esp32
 pio run -e HowToUse_UART_esp32
@@ -26,7 +28,7 @@ copying and nothing to clean up. Unset, it expands to empty and is ignored.
 
 ## GUI-visible env groups (`*.ini`)
 
-- `v1/experiments.ini`: short M5Stack BASIC operation / benchmark menus
+- `v1/experiments.ini`: short M5Stack BASIC operation / benchmark menus and the remote-bus harness (device + PC menu)
 - `v1/examples.ini`: public v1 examples for users
 
 ## CLI-only env groups (`*.ini.cli`)
@@ -35,7 +37,7 @@ copying and nothing to clean up. Unset, it expands to empty and is ignored.
 - `v0v1/check.ini.cli`: v0+v1 same-TU coexistence checks on device targets
 - `v1/check.ini.cli`: v1 header/build compatibility and shared API-surface checks
 - `v1/test.ini.cli`: native and embedded test envs
-- `v1/experiments_advanced.ini.cli`: focused benchmarks, logic-analyzer sketches, and backend smoke tests
+- `v1/experiments_advanced.ini.cli`: focused benchmarks, logic-analyzer sketches, backend smoke tests, and the WiFi/TCP variants of the remote-bus harness (`v1_exp_remote_tcp_*`, kept out of the GUI because they expect WiFi credentials)
 
 ## Enabling on demand
 

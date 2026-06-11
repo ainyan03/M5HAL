@@ -11,12 +11,15 @@
 ```bash
 pio run -e v1_exp_menu_arduino
 pio run -e v1_exp_bench_arduino
+pio run -e v1_exp_remote_idf5      # リモートバスサーバ (device)
+pio run -e v1_exp_remote_host      # リモートバス CLI メニュー (PC)
 ```
 
 PlatformIO GUI に表示される experiment env は、目視選択しやすいように
-`v1_exp_menu_*` と `v1_exp_bench_*` の短い入口に絞る。 通常の M5Stack BASIC 実機確認は `menu` から
+`v1_exp_menu_*` / `v1_exp_bench_*` / `v1_exp_remote_*` の短い入口に絞る。 通常の M5Stack BASIC 実機確認は `menu` から
 I2C / SPI / GPIO の小操作をボタンで選び、性能測定は `bench` から
-timer / memory などの測定項目を選ぶ。 `arduino` は Arduino framework、
+timer / memory などの測定項目を選ぶ。 リモートバス機構の実機確認は `remote` の
+device を焼き、PC 側の `remote_host` メニューから操作する。 `arduino` は Arduino framework、
 `idf4` / `idf5` / `idf6` は純 ESP-IDF framework で世代差を見るための env。
 
 利用者向け examples は公開入口として GUI に表示する。 高度な単機能測定 env、check/test env は `*.ini.cli` に退避している。
@@ -30,11 +33,13 @@ timer / memory などの測定項目を選ぶ。 `arduino` は Arduino framework
 
 - `experiments/v1/BoardMenu`: M5Stack BASIC 上でボタン操作により GPIO / I2C / SPI の小操作を選んで実行する統合ハーネス。
 - `experiments/v1/BenchmarkMenu`: M5Stack BASIC 上でボタン操作により timer / memory allocator などの性能測定を実行する統合ハーネス。
+- `experiments/v1/RemoteMenu`: リモートバス機構 (spec/design/remote.md) の統合ハーネス。device 側サーバ + PC 側 stdin メニュー CLI。詳細は後述。
 
 ### Advanced / CLI-only (`*.ini.cli`, not GUI)
 
 - `experiments/v1/I2CHotPathBenchmark`: software I2C の write/read hot path を synthetic line driver で測る。
 - `experiments/v1/SoftwareSPILogicAnalyzer`: software SPI の SCLK/MOSI/CS/DC をロジアナで確認する。
+- `experiments/v1/RemoteMenu` の WiFi/TCP transport 版 env (`v1_exp_remote_tcp_*`): WiFi 資格情報が前提のため GUI から外している (experiments_advanced.ini.cli)。
 
 timer / cycle counter の呼び出しコストは `BenchmarkMenu` の Timer benchmark、
 I2C backend 切り替え (Arduino / Software / ESP-IDF) の実機確認は `BoardMenu` の
@@ -129,6 +134,49 @@ scheduler suspend / atomic_flag spin の lock/unlock 固定費を比較する。
 `Fragmentation` は pool を 1 block 確保で埋めた後に一部を解放し、
 `usedBlocks()` / `largestFreeRun()` の変化を見る。 `Pool exhaustion` は pool を満杯にした状態で
 temp allocation が fallback に回る時のコストを見る。
+
+## リモートバス統合ハーネス (RemoteMenu)
+
+`RemoteMenu` はリモートバス機構 ([spec/design/remote.md](../spec/design/remote.md)、
+decisions/022-024) の常設受入ハーネス。 旧 examples の Remote 系 4 sketch + host 2 本
+(RemoteBus / RemoteBusTcp / RemoteI2S / RemoteI2STcp) をここに一本化した。
+
+- **device** (`RemoteMenu/device/remote_menu_device.cpp`): 内蔵 I2C (`SDA=21/SCL=22`、bus_id 0) と
+  allowlist 化した GPIO {39,38,37} を公開する。 Core2 V1.1 (AXP2101 を I2C probe で検出) では
+  内蔵スピーカーの I2S TX (bus_id 1) も公開する。 AXP2101 が見つからない基板 (Core BASIC 等) では
+  I2S を一切構成しない — `GPIO12/0/2` は M-BUS に露出しており 12 はブートストラップピンのため、
+  誤駆動を避ける安全ゲート。
+- **host** (`RemoteMenu/host/remote_menu_host.cpp`): stdin メニューの CLI。 caps / ping (RTT) /
+  I2C scan / レジスタ read / GPIO スナップショット / gpio-write (allowlist 拒否の実演) /
+  push イベント監視 (watch) / 正弦波ストリーミング (tone、`hz=0` で無音) /
+  credit 会計ソーク (soak、終了時に avg vs 公称と credit 沈降の判定サマリ) を選択実行する。
+
+```bash
+# UART transport (espidf、3 Mbaud。Core2 V1.1 なら I2S も公開される)
+pio run -e v1_exp_remote_idf5 -t upload
+pio run -e v1_exp_remote_host
+.pio/build/v1_exp_remote_host/program <port> 3000000
+
+# UART transport (arduino、115200。I2S なし = arduino-esp32 2.x に IDF gen5 I2S が無い)
+pio run -e v1_exp_remote_arduino -t upload
+.pio/build/v1_exp_remote_host/program            # 自動探索 (115200)
+
+# WiFi/TCP transport (資格情報は環境変数から define へ注入)
+M5HAL_WIFI_SSID="myssid" M5HAL_WIFI_PASS="mypass" \
+M5HAL_PIO_EXTRA_CONFIG="pio_envs/v1/experiments_advanced.ini.cli" \
+  pio run -e v1_exp_remote_tcp_idf5 -t upload    # または v1_exp_remote_tcp_arduino
+.pio/build/v1_exp_remote_host/program tcp:<board-ip>:5555
+```
+
+transport (UART/TCP) と framework (arduino/espidf) は同一ソースの build flag 差で切り替わる。
+`v1_exp_remote_tcp_arduino` は「espidf variant の TcpListener/TcpStream (BSD ソケット、
+`ESP_PLATFORM` ゲート) が arduino framework でそのまま使える」ことの build fence を兼ねる。
+
+**WiFi ゼロコスト対照**: M5HAL 自体は `<WiFi.h>` / esp_wifi を一切 include しないため、WiFi を
+使わない sketch のバイナリには WiFi スタックが入らない。 `v1_exp_remote_arduino` (WiFi include
+なし) と `v1_exp_remote_tcp_arduino` (同一 TU + WiFi) の ELF を `nm` / `size` で比較すると実測
+できる (flash 差 ~482 KB、WiFi 非使用側の wifi シンボルは arduino core 自前の wrapper ~73 B のみ。
+decisions/024)。
 
 ## software SPI ロジアナ確認
 
