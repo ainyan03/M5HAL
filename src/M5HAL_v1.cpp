@@ -9,6 +9,7 @@
 #include "m5_hal/hal/v1/memory/allocator.inl"
 #include "m5_hal/hal/v1/spi/spi.inl"
 #include "m5_hal/hal/v1/uart/uart.inl"
+#include "m5_hal/hal/v1/i2s/i2s.inl"
 
 #define M5HAL_STATIC_MACRO_PATH_IMPL M5HAL_STATIC_MACRO_CONCAT(M5HAL_V1_TARGET_PLATFORM_PATH, hal.inl)
 

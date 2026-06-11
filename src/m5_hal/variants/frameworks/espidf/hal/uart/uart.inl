@@ -101,6 +101,14 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const ::m5::hal
     if (::m5::hal::v1::error::isError(mapped)) {
         return m5::stl::make_unexpected(mapped);
     }
+    // Fire the rx interrupt earlier than the driver default (~100/128 bytes).
+    // At multi-Mbaud rates the default leaves the ISR less than ~100 us of
+    // headroom before the hardware FIFO overflows; concurrent DMA interrupt
+    // load (e.g. I2S) was observed to trip that on hardware, leaving rx
+    // stalled. Half-full doubles the margin at negligible interrupt cost.
+    // (Threshold-only setters: uart_intr_config would overwrite the whole
+    // interrupt enable mask and break the driver's tx handling.)
+    (void)::uart_set_rx_full_threshold(_port, 64);
     _installed  = true;
     _configured = false;
     return {};

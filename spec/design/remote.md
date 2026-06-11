@@ -54,7 +54,7 @@ data frame の payload : [TYPE:1][SEQ:1][BODY:0..238]
 | `error` | 0x4 | device → host | `[error:i8][detail...]` (detail は前方互換の末尾拡張枠、本版は空) |
 | `ping` | 0x5 | host → device | 空 |
 | `pong` | 0x6 | device → host | 空 |
-| `event` | 0x7 | device → host | **予約** (push 通知。意味論は将来版で定める) |
+| `event` | 0x7 | device → host | push 通知。BODY = bytecode script (§push イベント) |
 | — | 0x8-0xF | — | 予約 |
 
 未知の種別、または予約 bit が 0 でないメッセージは**受信側が黙って破棄**する (新旧実装の混在で安全側に倒す)。
@@ -63,7 +63,7 @@ data frame の payload : [TYPE:1][SEQ:1][BODY:0..238]
 
 - 8 bit 循環。host 発のメッセージ (`hello` / `request` / `ping`) ごとに採番する
 - device は対応する応答 (`hello_resp` / `response` / `error` / `pong`) に**同じ SEQ を返す**。host は SEQ 不一致の応答を破棄する
-- `event` (将来) は device 管理の独立した採番とする
+- `event` は device 管理の独立した採番 (8 bit 循環、情報提供のみ — 照合には使わない)
 
 ### hello — 最小能力交換
 
@@ -107,6 +107,95 @@ frame v1 の data payload 上限 240 から、メッセージ BODY は **238 byt
 - server は service runner ([m5_hal/hal/v1/service](../../src/m5_hal/hal/v1/service/service.hpp)) に登録する poll 型を正本とする。**server 用 rx accessor は first_byte timeout を 0 または極小に構成する** (StreamSource の peek は不足分を timeout までブロックするため、既定値のままではアイドル poll が停止する)
 - rx scratch (≥ `frame::kMaxWireSize` = 257) と応答バッファ (≥ 257) は呼び出し側が提供する。応答 script がバッファに収まらない場合は `report_error(BUFFER_OVERFLOW)` のみの応答に差し替える
 
+## push イベント (GPIO 変化通知)
+
+host のポーリングなしに、device 側の GPIO 変化を `event` メッセージで通知する仕組み。
+**イベント本体も bytecode script** (対称設計): `evt_gpio_state` は非 critical opcode なので、
+購読機構を持たない古い host も安全に読み飛ばせる。
+
+### wire
+
+| opcode | payload | 意味 |
+|---|---|---|
+| `gpio_subscribe` (0x24) | `([gpio_num:u16])*` | 列挙ピンを購読に追加 (重複は冪等)。購読時点のレベルを基準とし、**以後の変化から**通知する |
+| `gpio_unsubscribe` (0x25) | `([gpio_num:u16])*` (空 = 全解除) | 購読解除 |
+| `evt_gpio_state` (0x60) | `([gpio_num:u16][level:u8])*` | 変化したピンと新レベル (複数ピンの同時変化は 1 命令にバッチされ得る) |
+
+- `event` メッセージの BODY = `evt_gpio_state` 命令を含む script。payload の末尾拡張は前方互換
+  (エッジフィルタ等は将来 `gpio_subscribe` payload の拡張で追加する)
+- subscribe の失敗は通常の response で返る: 購読枠の枯渇 = `OUT_OF_RESOURCE`、未登録ピン =
+  `INVALID_ARGUMENT`、購読機構を持たない server (handler 未設定の runner) = `UNSUPPORTED`
+- **注意 — 本 opcode 定義以前の server**: 0x24/0x25 は値が非 critical なので、subscribe を知らない
+  古い server は黙ってスキップし応答は OK になる (イベントは来ない)。対応有無の機械的判別が
+  必要になったら `hello_resp` の末尾拡張 (feature bits) で扱う
+
+### 意味論
+
+- **検出は server の poll**: `RemoteServerService` の poll サイクルごとに購読ピンを読み、
+  前回値と異なれば event を送る。**poll 幅より短いパルスは取りこぼす** (エッジ割り込みではない。
+  ISR ベースの検出は将来ユニット)。通知は**変化のみ・両エッジ** (エッジ指定なし)
+- **通知はベストエフォート**: event は応答確認を持たず、送信失敗時の再送もない。
+  確実性が要る読み出しは従来どおり同期 `gpio_read` を使う
+- **購読は接続単位**: `hello` (新しい接続の開始) で server の購読テーブルはクリアされる。
+  再接続した host は subscribe をやり直す
+- host 側は `RemoteSession::poll()` (アイドル時) と応答待ちループ (要求中) の両方で event を
+  受信し、event script を自分の runner で実行する。`evt_gpio_state` の通知先は runner に登録した
+  ハンドラ (未登録なら黙って無視)。ハンドラが受け取る `gpio_num` は**リモート側の番号空間**
+
+## stream credit (連続書き込みのフロー制御)
+
+I2S 再生のような**連続ストリーム書き込み**は、同期 request/response のロックステップでは
+RTT 律速で帯域が出ない。そこで NORESP の書き込みを連射し、device 側バッファの状態を
+credit として返すフロー制御をメッセージ層に置く (frame 層の予約 kind `credit` /
+`credit_delta` は将来の mux/リンク層用に温存し、ここでは使わない)。
+
+### wire
+
+| opcode | payload | 意味 |
+|---|---|---|
+| `bus_write_stream` (0xB0, critical) | `[kind:1][bus_id:1][data...]` | 登録済み stream 系バス (現在 I2S) への書き込み。data 長は命令 size から自己記述。通常 **NORESP** で送る |
+| `bus_stream_status` (0xB1, critical) | `[kind:1][bus_id:1][store_id:1]` | 応答スロットに `[free:u32][submitted:u32]` (LE) を格納。credit の初期化・再同期に使う |
+| `evt_stream_credit` (0x61, 非 critical) | `[kind:1][bus_id:1][free:u32][submitted:u32]` | (イベント) device 側バッファの空きと累積受理量のスナップショット |
+
+書き込み系 2 op が **critical** なのは意図的: これらを知らない古い server に黙殺されると
+「応答は OK なのに無音」という追いにくい障害になるため、即 `PROTOCOL_ERROR` で検出させる
+(イベント 0x61 は 0x60 と同じく非 critical — 知らない host は安全に読み飛ばす)。
+
+### credit の意味論 — 絶対値ペアによる自己回復
+
+- device は binding ごとに **`submitted` = これまで受理した累積バイト数** (mod 2^32) を持ち、
+  `free` = いまブロックせず受理できる量 ([i2s.md](i2s.md) の `writableBytes`) とのペアで報告する
+- host は自分の累積送信量 `sent` (mod 2^32) を持ち、報告を受けるたびに
+  **`credit = free − (sent − submitted)`** を再計算する。`sent − submitted` =
+  リンク上を飛行中でまだ device に受理されていない量 (u32 の modular 減算で wrap 安全)
+- host は credit の範囲でのみ `bus_write_stream` を送る。これにより device 側では
+  到着時点で必ずバッファに収まる
+- **差分でなく絶対値**なので、イベントが失われても次のイベント/status で完全に回復する
+  (累積ドリフトしない)。再接続・再構成時は `bus_stream_status` で `sent = submitted` に同期する
+- **消失した write の回収**: NORESP write 自体も CRC 不合格・受信溢れで破棄され得る。消失分は
+  `sent − submitted` を恒久的に膨らませ credit を収縮させるため、host は**同期
+  `bus_stream_status` の応答受領時点で必ず `sent = submitted` に再基準化する** — in-order
+  リンクでは、応答は「それ以前に送った write は全て処理済みか消失済み」を保証するので、
+  応答時点の in-flight は 0 である。これにより定期再同期が消失からの回復点を兼ねる
+- **イベント送出は server の poll**: 前回イベント時点からの消費量 (Δsubmitted + Δfree で
+  capacity なしに計算できる) が閾値以上になったとき送る。ベストエフォート (GPIO イベントと
+  同じ lossy 許容)。`hello` でイベント送出の管理状態はクリアされる (購読テーブルと同様、接続単位)
+- **in-flight 窓**: host は credit に加えて未確認送信量 (`sent − submitted`) に上限を課す
+  (`RemoteI2SBus::setStreamWindow`、既定 16 KiB)。credit は device の DMA 空きしか表さず、
+  全 credit の一括バーストは device の UART 受信リング / FIFO を限界まで押し込み得る
+  (実機で受信停止を誘発)。窓があってもスループットは落ちない — credit イベントが DMA
+  排出レートで窓を補充し続けるため。窓の下限は
+  `2 × イベント閾値 + レート × イベント到達遅延の上限` (実測例: 48 KB/s ストリームは
+  4 KiB 窓で公称レートを維持)。device の UART 受信リングは窓以上に取る
+- **credit 待ちの poll は 1 フレームずつ**: 窓/credit 枯渇で待つ側は「1 フレーム処理したら
+  即 credit を再評価」しなければならない。イベントが rx timeout より速い周期で届き続ける
+  リンクでは、複数フレームを束ねてブロッキング drain する poll が送信側を到着ペースで
+  捕獲し (フレーム間で都度 first_byte timeout まで待つため)、その間 device が排出し切って
+  ストップ&ウェイト化する — 小さいバッファ構成ほど顕著にレートが崩壊する
+- **credit 違反** (空きを超える書き込みが届いた) は `BUFFER_OVERFLOW`。NORESP 書き込みの
+  失敗なので pending error として次の同期交換で host に届く。**underrun はエラーではない**
+  (device は無音を出力し続ける — [i2s.md](i2s.md))
+
 ## kind 別 proxy の意味論
 
 I2C と同じく、各 proxy はローカルのインタフェースを実装する。kind 固有の差分:
@@ -127,6 +216,12 @@ I2C と同じく、各 proxy はローカルのインタフェースを実装す
     `write_timeout_ms + マージン` (write) まで一時的に引き上げ、呼び出し後に復元する。
     server 側は実行前検査でこれらの timeout を `max_bus_timeout_ms` 以下に制限している
     (§server の実行モデル) ため、合成後も有界
+- **I2S** (`RemoteI2SBus`): `write` は §stream credit に従い NORESP 連射 + credit 待ちで送る
+  (`write_timeout_ms` 内に送れた分を返す — short write はローカル同様正常)。`writableBytes` は
+  ホスト側 credit 推定値を返す (同期 RPC しない)。AccessConfig の変更は次の write の前に
+  `bus_configure` + `bus_stream_status` の同期 script で適用し、credit を再同期する。
+  device 側の `write_timeout_ms` は 0 (non-blocking) を送る — 待ち合わせは credit が担うため
+  server の poll を塞がない
 - **GPIO** (`RemoteGPIO` + 内蔵 `RemotePort`): ホスト側 `GPIOGroup` の空き slot に I/O expander と
   同じ作法で登録し ([gpio.md](gpio.md))、得られた `Pin` ハンドルはローカルと同一に振る舞う
   - **番号変換**: ホスト側 local pin `n` は wire 上でリモート側の `makeGpioNumber(remote_slot, n)`
@@ -194,9 +289,10 @@ I2C と同じく、各 proxy はローカルのインタフェースを実装す
 
 ## 将来拡張 (方向性のみ)
 
-- **push イベント**: `event` 種別 + 予約 opcode (`gpio_subscribe` / `gpio_unsubscribe` / `evt_gpio_state`)。イベント本体も bytecode script として送る対称設計を想定 — `evt_gpio_state` は非 critical opcode なので、購読しない古い host も安全に読み飛ばせる
 - **チャンク転送**: MORE bit による分割。230/238 byte 上限を超える転送に対応する
-- **flow control**: 予約 frame kind (`credit` / `credit_delta` 等) によるリンク層の仕様として定める。本メッセージ層は変更しない
+- **リンク層 flow control**: 連続書き込みのフロー制御は §stream credit (メッセージ層) で導入済み。
+  予約 frame kind (`credit` / `credit_delta` 等) は、複数 stream の mux / マルチノードが必要に
+  なった時点でリンク層の仕様として定める。本メッセージ層は変更しない
 
 ## 互換性と版管理
 
@@ -207,6 +303,7 @@ I2C と同じく、各 proxy はローカルのインタフェースを実装す
 ## 関連
 
 - 実例: [`examples/v1/HowToUse/RemoteBus`](../../examples/v1/HowToUse/RemoteBus/) — device 側 sketch (M5Stack Core BASIC、内蔵 I2C と許可リスト化したボタン GPIO を公開) + PC 側ホストプログラム (`host/remote_bus_host.cpp`)。接続は `SerialRemoteEndpoint` + `connectRemoteSerial` の 2 行 (§接続ユーティリティ)、以降リモートスキャン / レジスタ読み / リモートボタンの変化監視ループ
+- 実例: [`examples/v1/HowToUse/RemoteI2S`](../../examples/v1/HowToUse/RemoteI2S/) — device 側 sketch (M5Stack Core2 V1.1、内蔵スピーカーの I2S TX を公開) + PC 側ホストプログラム (`host/remote_i2s_host.cpp`)。PC から 440Hz 正弦波を `RemoteI2SBus` で連続 write し、§stream credit の NORESP 連射 + credit フロー制御でリモート再生する
 - 下層仕様: [data_io.md](data_io.md) / [frame.md](frame.md) / [bytecode.md](bytecode.md)
 - バス / GPIO 抽象: [bus_accessor.md](bus_accessor.md), [i2c.md](i2c.md), [gpio.md](gpio.md)
 - 検証: [../verification.md](../verification.md) (native gtest `test_remote` / posix pty end-to-end)

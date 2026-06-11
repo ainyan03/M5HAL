@@ -38,6 +38,7 @@ src/
         bus/bus.{hpp,inl}
         i2c/i2c.{hpp,inl}
         i2c/slave.hpp
+        i2s/i2s.{hpp,inl}
         spi/spi.{hpp,inl}
         uart/uart.{hpp,inl}
         gpio/gpio.hpp

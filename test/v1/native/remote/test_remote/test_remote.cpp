@@ -108,8 +108,8 @@ struct StubI2CBus : public i2c::I2CBus {
     size_t last_prefix_len = 0;
     std::vector<uint8_t> last_tx;
     size_t transfer_count = 0;
-    uint8_t rx_pattern    = 0xA0;          // rx byte i = rx_pattern + i
-    error_t result        = error_t::OK;   // forced outcome
+    uint8_t rx_pattern    = 0xA0;         // rx byte i = rx_pattern + i
+    error_t result        = error_t::OK;  // forced outcome
 
     m5::stl::expected<void, error_t> init(const bus::BusConfig& config) override
     {
@@ -372,6 +372,7 @@ TEST_F(Loopback, ForeignStreamIdIsIgnored)
 // ---- Stage B: SPI / UART / GPIO proxies ------------------------------------------
 
 namespace gpio  = ::m5::hal::v1::gpio;
+namespace i2s   = ::m5::hal::v1::i2s;
 namespace spi   = ::m5::hal::v1::spi;
 namespace uart_ = ::m5::hal::v1::uart;
 
@@ -857,12 +858,536 @@ TEST_F(Loopback, TimeoutThenResyncDelimiter)
     EXPECT_EQ(r.error(), error_t::TIMEOUT_ERROR);
 
     // The next outgoing message is preceded by a delimiter (00 55).
-    pump_enabled            = true;
-    const size_t mark       = to_server.size();
+    pump_enabled      = true;
+    const size_t mark = to_server.size();
     ASSERT_TRUE(fast_session.ping().has_value());
     ASSERT_GE(to_server.size(), mark + 2);
     EXPECT_EQ(to_server[mark], 0x00);
     EXPECT_EQ(to_server[mark + 1], 0x55);
+}
+
+// ---- Stage C: push event machinery -------------------------------------------
+
+// StageBLoopback has rec_gpio at server slot 0, pin_count 64.
+// The host registers RemoteGPIO at host slot 3.
+
+// Helper: pump the server_service once (used in poll() callback)
+// poll() on the session drives a single server_service pass which may
+// emit an event frame.  We wire this as the VecSource pump.
+
+// Note: StageBLoopback::pumpThunk already drives the server service once
+// per host_rx.peek() call. For poll() we need the server to be driven
+// too, which happens via the pump.
+
+TEST_F(StageBLoopback, SubscribeAndEventRoundtrip)
+{
+    // Install gpio event handler on host runner
+    types::gpio_number_t captured_pin = -1;
+    bool captured_level               = false;
+    session.runner().setGpioEventHandler(
+        [](void* ctx, types::gpio_number_t pin, bool level) {
+            auto* p    = static_cast<std::pair<types::gpio_number_t*, bool*>*>(ctx);
+            *p->first  = pin;
+            *p->second = level;
+        },
+        nullptr);
+    // Reinitialize with proper context
+    std::pair<types::gpio_number_t*, bool*> ctx{&captured_pin, &captured_level};
+    session.runner().setGpioEventHandler(
+        [](void* c, types::gpio_number_t pin, bool level) {
+            auto* p    = static_cast<std::pair<types::gpio_number_t*, bool*>*>(c);
+            *p->first  = pin;
+            *p->second = level;
+        },
+        &ctx);
+
+    // Register remote GPIO at host slot 3
+    remote::RemoteGPIO remote_gpio{session, 100, 0};
+    gpio::GPIOGroup host_group;
+    ASSERT_TRUE(host_group.addGPIO(&remote_gpio, 3).has_value());
+
+    // subscribe pin 13 (local pin on host slot 3 -> remote makeGpioNumber(0,13))
+    rec_gpio.read_value[13] = false;
+    ASSERT_TRUE(remote_gpio.subscribe(13).has_value());
+
+    // Change the level: server should detect and send event
+    rec_gpio.read_value[13] = true;
+
+    // poll() triggers server_service (via pump) which calls pollSubscriptions
+    auto r = session.poll();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_GE(r.value(), 1u);
+    EXPECT_EQ(captured_pin, types::makeGpioNumber(0, 13));
+    EXPECT_TRUE(captured_level);
+
+    // Change back
+    rec_gpio.read_value[13] = false;
+    captured_pin            = -1;
+    r                       = session.poll();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_GE(r.value(), 1u);
+    EXPECT_EQ(captured_pin, types::makeGpioNumber(0, 13));
+    EXPECT_FALSE(captured_level);
+}
+
+TEST_F(StageBLoopback, SubscribeBaselineIsCurrentLevel)
+{
+    types::gpio_number_t captured_pin = -1;
+    bool captured_level               = false;
+    std::pair<types::gpio_number_t*, bool*> ctx{&captured_pin, &captured_level};
+    session.runner().setGpioEventHandler(
+        [](void* c, types::gpio_number_t pin, bool level) {
+            auto* p    = static_cast<std::pair<types::gpio_number_t*, bool*>*>(c);
+            *p->first  = pin;
+            *p->second = level;
+        },
+        &ctx);
+
+    remote::RemoteGPIO remote_gpio{session, 100, 0};
+    gpio::GPIOGroup host_group;
+    ASSERT_TRUE(host_group.addGPIO(&remote_gpio, 3).has_value());
+
+    // subscribe with pin already high
+    rec_gpio.read_value[13] = true;
+    ASSERT_TRUE(remote_gpio.subscribe(13).has_value());
+
+    // poll without changing: no event expected
+    auto r = session.poll();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r.value(), 0u);
+    EXPECT_EQ(captured_pin, static_cast<types::gpio_number_t>(-1));
+
+    // Now change: event fires
+    rec_gpio.read_value[13] = false;
+    r                       = session.poll();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_GE(r.value(), 1u);
+    EXPECT_FALSE(captured_level);
+}
+
+TEST_F(StageBLoopback, NoChangeNoEvent)
+{
+    remote::RemoteGPIO remote_gpio{session, 100, 0};
+    gpio::GPIOGroup host_group;
+    ASSERT_TRUE(host_group.addGPIO(&remote_gpio, 3).has_value());
+
+    rec_gpio.read_value[13] = false;
+    ASSERT_TRUE(remote_gpio.subscribe(13).has_value());
+
+    // No change: poll returns 0
+    auto r = session.poll();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r.value(), 0u);
+}
+
+TEST_F(StageBLoopback, UnsubscribeStopsEvents)
+{
+    types::gpio_number_t captured_pin = -1;
+    std::pair<types::gpio_number_t*, bool*> ctx{&captured_pin, nullptr};
+    // Use a simpler handler that just records the pin
+    session.runner().setGpioEventHandler(
+        [](void* c, types::gpio_number_t pin, bool) { *static_cast<types::gpio_number_t*>(c) = pin; }, &captured_pin);
+
+    remote::RemoteGPIO remote_gpio{session, 100, 0};
+    gpio::GPIOGroup host_group;
+    ASSERT_TRUE(host_group.addGPIO(&remote_gpio, 3).has_value());
+
+    rec_gpio.read_value[13] = false;
+    ASSERT_TRUE(remote_gpio.subscribe(13).has_value());
+    ASSERT_TRUE(remote_gpio.unsubscribe(13).has_value());
+
+    rec_gpio.read_value[13] = true;
+    auto r                  = session.poll();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r.value(), 0u);
+    EXPECT_EQ(captured_pin, static_cast<types::gpio_number_t>(-1));
+}
+
+TEST_F(StageBLoopback, SubscriptionTableFull)
+{
+    remote::RemoteGPIO remote_gpio{session, 100, 0};
+    gpio::GPIOGroup host_group;
+    ASSERT_TRUE(host_group.addGPIO(&remote_gpio, 3).has_value());
+
+    // Subscribe kMaxSubscriptions pins (0..7): all should succeed
+    for (uint8_t p = 0; p < remote::Server::kMaxSubscriptions; ++p) {
+        ASSERT_TRUE(remote_gpio.subscribe(p).has_value()) << "pin " << (int)p;
+    }
+
+    // 9th subscription should fail with OUT_OF_RESOURCE
+    auto r = remote_gpio.subscribe(static_cast<types::gpio_local_pin_t>(remote::Server::kMaxSubscriptions));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), error_t::OUT_OF_RESOURCE);
+}
+
+TEST_F(StageBLoopback, HelloClearsSubscriptions)
+{
+    types::gpio_number_t captured_pin = -1;
+    session.runner().setGpioEventHandler(
+        [](void* c, types::gpio_number_t pin, bool) { *static_cast<types::gpio_number_t*>(c) = pin; }, &captured_pin);
+
+    remote::RemoteGPIO remote_gpio{session, 100, 0};
+    gpio::GPIOGroup host_group;
+    ASSERT_TRUE(host_group.addGPIO(&remote_gpio, 3).has_value());
+
+    rec_gpio.read_value[13] = false;
+    ASSERT_TRUE(remote_gpio.subscribe(13).has_value());
+
+    // hello clears server subscriptions
+    ASSERT_TRUE(session.hello().has_value());
+
+    // Change level: no event expected (subscription was cleared)
+    rec_gpio.read_value[13] = true;
+    auto r                  = session.poll();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r.value(), 0u);
+    EXPECT_EQ(captured_pin, static_cast<types::gpio_number_t>(-1));
+}
+
+TEST_F(Loopback, UnsupportedWithoutGpioGroup)
+{
+    // Loopback fixture has no GPIOGroup set on the server
+    remote::RemoteGPIO remote_gpio{session, 64, 0};
+    gpio::GPIOGroup host_group;
+    ASSERT_TRUE(host_group.addGPIO(&remote_gpio, 3).has_value());
+
+    auto r = remote_gpio.subscribe(5);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), error_t::UNSUPPORTED);
+}
+
+TEST(BytecodeRunnerSubscribe, PlainRunnerRejectsSubscribe)
+{
+    // A plain BytecodeRunner (no subscribe handler) should return UNSUPPORTED
+    bytecode::BytecodeRunner runner;
+    uint8_t script_buf[16];
+    data::MemorySink sink{data::DataSpan{script_buf, sizeof(script_buf)}};
+    bytecode::BytecodeEncoder enc{sink};
+    types::gpio_number_t pin = types::makeGpioNumber(0, 5);
+    ASSERT_TRUE(enc.gpioSubscribe(&pin, 1).has_value());
+    ASSERT_TRUE(enc.end().has_value());
+
+    auto r = runner.run(data::ConstDataSpan{script_buf, sink.written()});
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), error_t::UNSUPPORTED);
+}
+
+// ---- Stage I2S-1: stream credit ----------------------------------------------
+
+// Device-side stream bus stand-in: a fixed-capacity ring of `capacity`
+// bytes that DMA drains explicitly (drain()). `submitted` is the cumulative
+// accepted byte count (mod 2^32); a write accepts at most the current free
+// space (credit violations show up as a short accept -> BUFFER_OVERFLOW).
+struct StubI2SBus : public i2s::I2SBus {
+    uint32_t capacity  = 4096;
+    uint32_t in_buffer = 0;  // bytes currently pending in the "DMA buffer"
+    uint32_t submitted = 0;  // cumulative accepted (mod 2^32)
+    size_t write_calls = 0;
+    i2s::I2SAccessConfig last_cfg{};
+
+    // Seed the cumulative counters so wrap-boundary behavior can be tested.
+    void seed(uint32_t start)
+    {
+        submitted = start;
+    }
+    // Simulate DMA consuming `n` bytes (frees buffer space).
+    void drain(uint32_t n)
+    {
+        in_buffer -= (n < in_buffer ? n : in_buffer);
+    }
+    uint32_t freeBytes() const
+    {
+        return capacity - in_buffer;
+    }
+
+    m5::stl::expected<void, error_t> init(const bus::BusConfig& config) override
+    {
+        if (config.getBusKind() != types::bus_kind_t::I2S) {
+            return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
+        }
+        _config = static_cast<const i2s::I2SBusConfig&>(config);
+        return {};
+    }
+    m5::stl::expected<size_t, error_t> write(bus::Accessor*, const i2s::I2SAccessConfig& cfg, data::Source* tx,
+                                             size_t len) override
+    {
+        ++write_calls;
+        last_cfg = cfg;
+        // Drain tx fully (what actually arrived on the wire), accept up to
+        // the free space.
+        uint32_t arrived = 0;
+        while (tx != nullptr && !tx->eof() && arrived < len) {
+            auto p = tx->peek(len - arrived);
+            if (!p.has_value() || p.value().size == 0) {
+                break;
+            }
+            arrived += static_cast<uint32_t>(p.value().size);
+            (void)tx->advance(p.value().size);
+        }
+        const uint32_t space    = freeBytes();
+        const uint32_t accepted = arrived < space ? arrived : space;
+        in_buffer += accepted;
+        submitted += accepted;
+        return static_cast<size_t>(accepted);
+    }
+    m5::stl::expected<size_t, error_t> writableBytes(bus::Accessor*, const i2s::I2SAccessConfig&) override
+    {
+        return static_cast<size_t>(freeBytes());
+    }
+};
+
+struct StageI2SLoopback : public ::testing::Test {
+    std::vector<uint8_t> to_server;
+    std::vector<uint8_t> to_host;
+
+    VecSink host_tx{to_server};
+    VecSource host_rx{to_host};
+    VecSink server_tx{to_host};
+    VecSource server_rx{to_server};
+
+    StubI2SBus stub_i2s;
+    i2s::I2SAccessConfig i2s_acc_cfg{};
+    i2s::I2STxAccessor i2s_acc{stub_i2s, i2s_acc_cfg};
+
+    uint8_t server_scratch[remote::kMaxMessageSize]{};
+    remote::Server::Config server_cfg{};
+    remote::Server server{data::DataSpan{server_scratch, sizeof(server_scratch)}, server_cfg};
+    remote::RemoteServerService server_service{server, server_rx, server_tx};
+
+    remote::RemoteSession session{host_rx, host_tx};
+
+    // Auto-drain applied inside the pump before each service() pass, so DMA
+    // consumption is modeled deterministically: every pump frees `drain_per_pump`
+    // device-buffer bytes (0 = the device never drains).
+    uint32_t drain_per_pump = 0;
+    bool pump_enabled       = true;
+
+    static void pumpThunk(void* ctx)
+    {
+        auto* self = static_cast<StageI2SLoopback*>(ctx);
+        if (!self->pump_enabled) {
+            return;
+        }
+        if (self->drain_per_pump != 0) {
+            self->stub_i2s.drain(self->drain_per_pump);
+        }
+        self->server_service.service(service::ServiceContext{});
+    }
+
+    // Pump the server until everything the host queued has been processed.
+    // RemoteServerService drains up to kMaxFramesPerPoll frames per call, so a
+    // bounded number of passes flushes any backlog of NORESP writes.
+    void flushServer()
+    {
+        for (int i = 0; i < 64; ++i) {
+            server_service.service(service::ServiceContext{});
+        }
+    }
+
+    void SetUp() override
+    {
+        ASSERT_TRUE(server.registerI2S(0, i2s_acc).has_value());
+        host_rx.setPump(&pumpThunk, this);
+    }
+};
+
+TEST_F(StageI2SLoopback, HelloListsI2SBus)
+{
+    auto caps = session.hello();
+    ASSERT_TRUE(caps.has_value());
+    ASSERT_EQ(caps.value().bus_count, 1u);
+    EXPECT_EQ(caps.value().buses[0].kind, types::bus_kind_t::I2S);
+    EXPECT_EQ(caps.value().buses[0].bus_id, 0);
+}
+
+TEST_F(StageI2SLoopback, WriteConfiguresThenStreamsToServer)
+{
+    remote::RemoteI2SBus proxy{session, 0};
+    i2s::I2SAccessConfig cfg;
+    cfg.sample_rate_hz   = 44100;
+    cfg.bits_per_sample  = 16;
+    cfg.channels         = 2;
+    cfg.write_timeout_ms = 100;
+    i2s::I2STxAccessor acc{proxy, cfg};
+
+    std::vector<uint8_t> audio(64);
+    for (size_t i = 0; i < audio.size(); ++i) {
+        audio[i] = static_cast<uint8_t>(i);
+    }
+    auto w = acc.write(audio.data(), audio.size());
+    ASSERT_TRUE(w.has_value());
+    EXPECT_EQ(w.value(), audio.size());
+
+    // Pump the trailing NORESP bus_write_stream messages into the server.
+    flushServer();
+
+    // The configure carried through (device write_timeout forced to 0).
+    EXPECT_EQ(stub_i2s.last_cfg.sample_rate_hz, 44100u);
+    EXPECT_EQ(stub_i2s.last_cfg.write_timeout_ms, 0u);
+    // All bytes reached the device's DMA buffer.
+    EXPECT_EQ(stub_i2s.submitted, audio.size());
+    EXPECT_EQ(stub_i2s.in_buffer, audio.size());
+}
+
+TEST_F(StageI2SLoopback, LargeWriteSplitsIntoChunks)
+{
+    stub_i2s.capacity = 100000;  // plenty of credit
+    remote::RemoteI2SBus proxy{session, 0};
+    i2s::I2SAccessConfig cfg;
+    cfg.write_timeout_ms = 500;
+    i2s::I2STxAccessor acc{proxy, cfg};
+
+    std::vector<uint8_t> audio(1000, 0xAB);  // > one message body (238)
+    auto w = acc.write(audio.data(), audio.size());
+    ASSERT_TRUE(w.has_value());
+    EXPECT_EQ(w.value(), audio.size());
+
+    flushServer();
+    EXPECT_EQ(stub_i2s.submitted, audio.size());
+    EXPECT_GT(stub_i2s.write_calls, 1u);  // chunked across several messages
+}
+
+TEST_F(StageI2SLoopback, CreditExhaustionStallsThenResumesOnDrain)
+{
+    // Small device buffer: a write larger than the buffer cannot complete in
+    // one shot, so the host runs out of credit and stalls. The device drains
+    // (drain_per_pump) as the host polls; credit recovers — both through the
+    // server's pollStreamCredit event and the host's periodic status re-sync —
+    // and the stalled write finishes.
+    stub_i2s.capacity = 256;
+
+    remote::RemoteI2SBus proxy{session, 0};
+    i2s::I2SAccessConfig cfg;
+    cfg.write_timeout_ms = 5000;  // generous: rely on the drain, not the timeout
+    i2s::I2STxAccessor acc{proxy, cfg};
+
+    // 384 bytes > the 256 B buffer: the device drains 128 B per pump, so
+    // credit returns over several poll cycles and the write completes.
+    drain_per_pump = 128;
+    std::vector<uint8_t> audio(384, 0x22);
+    auto w = acc.write(audio.data(), audio.size());
+    ASSERT_TRUE(w.has_value());
+    EXPECT_EQ(w.value(), audio.size());  // all bytes sent once credit recovered
+    flushServer();
+    EXPECT_EQ(stub_i2s.submitted, audio.size());
+}
+
+TEST_F(StageI2SLoopback, CreditViolationSurfacesAsPendingError)
+{
+    // Force the device to accept less than the host sends by shrinking the
+    // device buffer behind the host's back (the host's credit estimate
+    // becomes stale). The short accept is a BUFFER_OVERFLOW pending error,
+    // delivered on the next synchronous exchange (status re-sync / ping).
+    stub_i2s.capacity = 1000000;  // host believes there is huge credit
+    remote::RemoteI2SBus proxy{session, 0};
+    i2s::I2SAccessConfig cfg;
+    cfg.write_timeout_ms = 50;
+    i2s::I2STxAccessor acc{proxy, cfg};
+
+    // Prime credit (config + status) with the large capacity.
+    std::vector<uint8_t> warm(4, 0x00);
+    ASSERT_TRUE(acc.write(warm.data(), warm.size()).has_value());
+    flushServer();
+
+    // Now shrink the device buffer so the next NORESP write overflows it.
+    stub_i2s.capacity = stub_i2s.in_buffer;  // zero real free space
+    std::vector<uint8_t> big(200, 0x33);
+    (void)acc.write(big.data(), big.size());  // some of this overflows server-side
+    flushServer();
+
+    // The pending BUFFER_OVERFLOW is delivered on the next synchronous call.
+    ASSERT_TRUE(session.ping().has_value());
+    EXPECT_EQ(session.lastRemoteError(), error_t::BUFFER_OVERFLOW);
+}
+
+TEST_F(StageI2SLoopback, CreditMathWrapsAroundU32Boundary)
+{
+    // Seed the device's cumulative submitted near the u32 boundary so the
+    // host's credit = free - (sent - submitted) exercises wrap arithmetic.
+    stub_i2s.capacity = 100000;
+    stub_i2s.seed(0xFFFFFF00u);
+
+    remote::RemoteI2SBus proxy{session, 0};
+    i2s::I2SAccessConfig cfg;
+    cfg.write_timeout_ms = 200;
+    i2s::I2STxAccessor acc{proxy, cfg};
+
+    // Write enough to roll `submitted` (and the host's `_sent`) past 2^32.
+    std::vector<uint8_t> audio(1024, 0x5A);
+    auto w = acc.write(audio.data(), audio.size());
+    ASSERT_TRUE(w.has_value());
+    EXPECT_EQ(w.value(), audio.size());
+    flushServer();
+    // submitted wrapped: 0xFFFFFF00 + 1024 = 0x000003FC (mod 2^32).
+    EXPECT_EQ(stub_i2s.submitted, static_cast<uint32_t>(0xFFFFFF00u + 1024u));
+    EXPECT_EQ(stub_i2s.in_buffer, 1024u);
+
+    // writableBytes (host estimate) stays sane after the wrap.
+    auto wb = acc.writableBytes();
+    ASSERT_TRUE(wb.has_value());
+    EXPECT_GT(wb.value(), 0u);
+}
+
+TEST_F(StageI2SLoopback, CreditPinnedAtZeroAfterFrameLossResolvesOnResync)
+{
+    // Focused regression for the credit-pinned-at-zero bug.
+    //
+    // Setup: capacity exactly fills with one write so the second write stalls
+    // on credit=0.  The first write's frames are discarded (lost) before the
+    // server processes them.  After kCreditResyncMs syncStatus() re-baselines
+    // _sent = _submitted and credit is restored.
+    //
+    // Timing: write_timeout_ms = 500 ms >> kCreditResyncMs (50 ms) so the
+    // resync fires well before the timeout, avoiding flakiness.
+
+    const size_t kBuf = 128;
+    stub_i2s.capacity = kBuf;  // exactly one write-chunk fills it
+
+    remote::RemoteI2SBus proxy{session, 0};
+    i2s::I2SAccessConfig cfg;
+    cfg.write_timeout_ms = 500;  // long enough for 50 ms resync + margin
+    i2s::I2STxAccessor acc{proxy, cfg};
+
+    // --- Prime: syncConfig (synchronous, pump active) sets _free=kBuf, _sent=0 ---
+    // Trigger syncConfig by doing a zero-effect write of 0 bytes:
+    // acc.write with size=0 does not actually send a NORESP, just configures.
+    // Actually size=0 would return immediately with done=0; we need to call
+    // syncConfig indirectly.  The easiest trigger is a dummy 1-byte write that
+    // also pumps normally.
+    std::vector<uint8_t> dummy(1, 0xDD);
+    ASSERT_TRUE(acc.write(dummy.data(), dummy.size()).has_value());
+    flushServer();
+    // After dummy: device submitted=1, in_buffer=1, free=kBuf-1.
+    // Proxy: _free=kBuf-1, _sent=1, _submitted=1, credit=kBuf-1.
+    ASSERT_EQ(stub_i2s.submitted, 1u);
+
+    // --- Write exactly (kBuf-1) bytes to fill the credit to zero ---
+    // in_flight before = 0, credit = kBuf-1.  Write kBuf-1 bytes:
+    // _sent += kBuf-1 → _sent = kBuf, in_flight = kBuf-1, credit = 0.
+    const size_t kFill = kBuf - 1;
+    const size_t mark  = to_server.size();
+    std::vector<uint8_t> fill_buf(kFill, 0xCC);
+    ASSERT_TRUE(acc.write(fill_buf.data(), fill_buf.size()).has_value());
+
+    // Discard the fill NORESP frame — server never receives it.
+    to_server.resize(mark);
+    ASSERT_EQ(stub_i2s.submitted, 1u);  // server unchanged
+
+    // --- Now credit = 0; the next write must stall and then self-heal ---
+    // write_timeout_ms=500 gives plenty of time for syncStatus at t=50 ms.
+    std::vector<uint8_t> payload(kFill, 0xEE);
+    auto w = acc.write(payload.data(), payload.size());
+    ASSERT_TRUE(w.has_value()) << "write timed out — syncStatus did not restore credit";
+    EXPECT_EQ(w.value(), kFill);
+    flushServer();
+
+    // Re-baseline means _sent = _submitted = 1 after syncStatus.
+    // Then payload (kFill bytes) is sent fresh and arrives at device.
+    // device submitted = 1 (dummy) + kFill (payload) = kBuf.
+    EXPECT_EQ(stub_i2s.submitted, 1u + kFill);
+
+    // The discarded fill_buf (0xCC) never arrived — only dummy (0xDD) and
+    // payload (0xEE) are in the device buffer.
 }
 
 }  // namespace

@@ -63,12 +63,27 @@
 #define M5HAL_ESPIDF_SPI_HAS_MASTER 0
 #endif
 
+// ESP-IDF I2S gen5 driver detection (driver/i2s_std.h, ESP-IDF v5.0+).
+// Only gen5 is supported; legacy gen4 (driver/i2s.h) is intentionally
+// excluded. Header presence alone is NOT sufficient: on SoCs without I2S
+// (e.g. esp32c2) the esp_driver_i2s headers are still on the include path
+// but do not compile, so SOC_I2S_SUPPORTED must also be checked.
+#if __has_include(<soc/soc_caps.h>)
+#include <soc/soc_caps.h>
+#endif
+#if __has_include(<driver/i2s_std.h>) && defined(SOC_I2S_SUPPORTED) && SOC_I2S_SUPPORTED
+#define M5HAL_ESPIDF_I2S_HAS_STD 1
+#else
+#define M5HAL_ESPIDF_I2S_HAS_STD 0
+#endif
+
 #else
 
 #define M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5 0
 #define M5HAL_ESPIDF_I2C_HAS_MASTER_GEN4 0
 #define M5HAL_ESPIDF_I2C_HAS_MASTER      0
 #define M5HAL_ESPIDF_SPI_HAS_MASTER      0
+#define M5HAL_ESPIDF_I2S_HAS_STD         0
 
 #endif
 

@@ -23,6 +23,7 @@ M5HAL_INLINE_V1 namespace v1
 #include "./m5_hal/hal/v1/i2c/slave.hpp"
 #include "./m5_hal/hal/v1/spi/spi.hpp"
 #include "./m5_hal/hal/v1/uart/uart.hpp"
+#include "./m5_hal/hal/v1/i2s/i2s.hpp"
 
 #include "./m5_hal/hal/v1/bus/bus.hpp"
 #include "./m5_hal/hal/v1/gpio/gpio.hpp"

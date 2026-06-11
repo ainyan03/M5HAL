@@ -30,13 +30,18 @@
 | `gpio_write_high` | 0x21 | `([gpio_num:u16])*` | ピン列を High |
 | `gpio_write_low` | 0x22 | `([gpio_num:u16])*` | ピン列を Low |
 | `gpio_read` | 0x23 | `[store_id:1]([gpio_num:u16])*` | ピン列を読み、LSB 詰めのビット列をスロットへ |
-| (予約) | 0x24 / 0x25 | — | gpio_subscribe / gpio_unsubscribe (イベント機構) |
+| `gpio_subscribe` | 0x24 | `([gpio_num:u16])*` | ピン列を変化通知の購読に追加 (実行環境が購読機構を持たない場合 UNSUPPORTED。意味論は [remote.md](remote.md) §push イベント) |
+| `gpio_unsubscribe` | 0x25 | `([gpio_num:u16])*` (空 = 全解除) | 購読解除 |
 | `store_data` | 0x40 | `[store_id:1][data...]` | (応答) データをスロットへ |
 | `report_error` | 0x41 | `[error:i8][offset:LenVar]` | (応答) エラーと発生位置 |
 | `report_complete` | 0x42 | `[status:i8]` | (応答) 完了通知 |
-| (予約) | 0x60 | — | evt_gpio_state (push イベント) |
+| `evt_gpio_state` | 0x60 | `([gpio_num:u16][level:u8])*` | (イベント) 変化したピンと新レベル。受信側 runner はハンドラ未登録なら黙って無視 |
+| `evt_stream_credit` | 0x61 | `[kind:1][bus_id:1][free:u32][submitted:u32]` | (イベント) stream 系バスの credit スナップショット。意味論は [remote.md](remote.md) §stream credit |
+| `bus_write_stream` | 0xB0 (critical) | `[kind:1][bus_id:1][data...]` | stream 系バス (現在 I2S) への書き込み。data 長は命令 size から自己記述。受理しきれない分は `BUFFER_OVERFLOW` |
+| `bus_stream_status` | 0xB1 (critical) | `[kind:1][bus_id:1][store_id:1]` | `[free:u32][submitted:u32]` (LE) をスロットへ。`submitted` は binding ごとの累積受理バイト数 (mod 2^32、runner が保持) |
 
-- `kind` は `types::bus_kind_t` の値 (I2C/SPI/UART)。`gpio_num` は統合 `gpio_number_t` 空間 (スロット込み) の u16 表現
+- `kind` は `types::bus_kind_t` の値 (I2C/SPI/UART/I2S)。`gpio_num` は統合 `gpio_number_t` 空間 (スロット込み) の u16 表現
+- 0xB0/0xB1 が critical (bit7) なのは、これらを知らない実行環境による黙殺 = 「応答 OK なのに無音」を `PROTOCOL_ERROR` で即検出するため ([remote.md](remote.md) §stream credit)
 - `store_id` は応答データのラベル (任意値)。`0xFF` は「読み捨て」
 - GPIO 命令がピン**列**を取るのは M5HAL の GPIO モデル (GPIOGroup → 個別 Pin) に合わせた形。port 一括の value/mask 形式は採らない
 
@@ -49,6 +54,7 @@ accessor の現在の config を起点に、既知フィールドだけ上書き
 | I2C | `freq:u32, timeout_ms:u32, i2c_addr:u16, flags:u8 (bit0=10bit, bit1=use_restart), register_address_bytes:u8` | 12 B |
 | SPI | `pin_cs:i16, freq:u32, timeout_ms:u32, data_mode:u8, mode:u8 (bit0-1=spi_mode, bit2=order), cmd_len:u8, addr_len:u8, read_dummy:u8, write_dummy:u8` | 16 B |
 | UART | `baud:u32, timeout_ms:u32, first_byte:u32, inter_byte:u32, write_timeout:u32, data_bits:u8, stop_bits:u8, parity:u8, invert:u8` | 24 B |
+| I2S | `sample_rate:u32, timeout_ms:u32, write_timeout:u32, bits_per_sample:u8, channels:u8` | 14 B |
 
 ### bus_transfer の meta
 
@@ -110,7 +116,7 @@ BytecodeRunner::run       ←frame─  BytecodeRunner::writeResponse
 | 長さ前置なしの命令形式 | 未知 opcode でストリーム全体が解釈不能になり前方互換を持てない |
 | 応答の Sink 直行ストリーミング | ローカル実行者が応答スクリプトの自前パースを強いられる。スロット + `storedData(id)` が簡潔 |
 | Device 層 dispatch | v1 の dispatch 先は Accessor + TransferDesc。Device 抽象は HAL スコープ外 |
-| bus 生成 (init/deinit) / 購読・イベント | バス生成ファクトリと通知機構が必要。リモートバス機構 ([remote.md](remote.md)) でも bus は server 側静的登録で足りると判定し、init/deinit は引き続き値のみ予約。購読・イベントは remote の将来拡張 (push) で意味論を定める |
+| bus 生成 (init/deinit) | バス生成ファクトリが必要。リモートバス機構 ([remote.md](remote.md)) でも bus は server 側静的登録で足りると判定し、init/deinit は引き続き値のみ予約 |
 | Simple/Compound の 2 クラス命令 | 全命令が size 前置で自己記述なら不要。「無視されては困る」は critical フラグで表現 |
 
 ## 関連

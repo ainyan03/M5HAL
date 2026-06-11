@@ -7,3 +7,4 @@
 #include "hal/i2c/i2c.inl"
 #include "hal/spi/spi.inl"
 #include "hal/uart/uart.inl"
+#include "hal/i2s/i2s.inl"

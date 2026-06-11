@@ -5,6 +5,7 @@
 #include "../data/memory.hpp"
 #include "../gpio/group.hpp"
 #include "../i2c/i2c.hpp"
+#include "../i2s/i2s.hpp"
 #include "../memory/allocator.hpp"
 #include "../spi/spi.hpp"
 #include "../types.hpp"
@@ -52,15 +53,19 @@ enum class OpCode : uint8_t {
     bus_configure = 0x10,  ///< [kind:1][bus_id:1][cfg payload]
     bus_transfer  = 0x11,  ///< [kind:1][bus_id:1][store_id:1][rx_len:LenVar][meta_size:1][meta][tx...]
     // 0x12 bus_init / 0x13 bus_deinit : reserved (bus lifecycle stays with the host app for now)
-    gpio_set_mode   = 0x20,  ///< [mode:1]([gpio_num:u16])*
-    gpio_write_high = 0x21,  ///< ([gpio_num:u16])*
-    gpio_write_low  = 0x22,  ///< ([gpio_num:u16])*
-    gpio_read       = 0x23,  ///< [store_id:1]([gpio_num:u16])* -> bits packed LSB-first
-    // 0x24 gpio_subscribe / 0x25 gpio_unsubscribe : reserved (event machinery)
-    store_data      = 0x40,  ///< [store_id:1][data...]          (response)
-    report_error    = 0x41,  ///< [error:i8][offset:LenVar]      (response)
-    report_complete = 0x42,  ///< [status:i8]                    (response)
-    // 0x60 evt_gpio_state : reserved (push events)
+    gpio_set_mode     = 0x20,  ///< [mode:1]([gpio_num:u16])*
+    gpio_write_high   = 0x21,  ///< ([gpio_num:u16])*
+    gpio_write_low    = 0x22,  ///< ([gpio_num:u16])*
+    gpio_read         = 0x23,  ///< [store_id:1]([gpio_num:u16])* -> bits packed LSB-first
+    gpio_subscribe    = 0x24,  ///< ([gpio_num:u16])*              (change-notification machinery)
+    gpio_unsubscribe  = 0x25,  ///< ([gpio_num:u16])*; empty = all
+    store_data        = 0x40,  ///< [store_id:1][data...]          (response)
+    report_error      = 0x41,  ///< [error:i8][offset:LenVar]      (response)
+    report_complete   = 0x42,  ///< [status:i8]                    (response)
+    evt_gpio_state    = 0x60,  ///< ([gpio_num:u16][level:u8])*    (event)
+    evt_stream_credit = 0x61,  ///< [kind:1][bus_id:1][free:u32][submitted:u32]   (event) stream credit snapshot
+    bus_write_stream  = 0xB0,  ///< [kind:1][bus_id:1][data...]                   (critical) write to a stream bus (I2S)
+    bus_stream_status = 0xB1,  ///< [kind:1][bus_id:1][store_id:1] -> [free:u32][submitted:u32] (critical)
 };
 
 /*! @brief Opcode bit7: an unknown critical opcode aborts instead of being skipped. */
@@ -117,6 +122,8 @@ public:
     m5::stl::expected<void, m5::hal::v1::error::error_t> configure(uint8_t bus_id,
                                                                    const spi::SPIMasterAccessConfig& cfg);
     m5::stl::expected<void, m5::hal::v1::error::error_t> configure(uint8_t bus_id, const uart::UARTAccessConfig& cfg);
+    /*! @brief Configure a registered I2S accessor (spec §stream credit). */
+    m5::stl::expected<void, m5::hal::v1::error::error_t> i2sConfig(uint8_t bus_id, const i2s::I2SAccessConfig& cfg);
 
     m5::stl::expected<void, m5::hal::v1::error::error_t> transfer(uint8_t bus_id, const i2c::TransferDesc& desc,
                                                                   data::ConstDataSpan tx, size_t rx_len,
@@ -135,6 +142,25 @@ public:
     m5::stl::expected<void, m5::hal::v1::error::error_t> gpioWriteLow(const types::gpio_number_t* pins, size_t count);
     m5::stl::expected<void, m5::hal::v1::error::error_t> gpioRead(uint8_t store_id, const types::gpio_number_t* pins,
                                                                   size_t count);
+    m5::stl::expected<void, m5::hal::v1::error::error_t> gpioSubscribe(const types::gpio_number_t* pins, size_t count);
+    /*! @brief `count == 0` encodes "unsubscribe all". */
+    m5::stl::expected<void, m5::hal::v1::error::error_t> gpioUnsubscribe(const types::gpio_number_t* pins,
+                                                                         size_t count);
+    /*! @brief Event payload: changed pins with their new levels (parallel arrays). */
+    m5::stl::expected<void, m5::hal::v1::error::error_t> evtGpioState(const types::gpio_number_t* pins,
+                                                                      const bool* levels, size_t count);
+
+    /*! @name Stream credit (spec §stream credit). @{ */
+    /*! @brief Write `data` to a stream bus (currently I2S). data length is self-described. */
+    m5::stl::expected<void, m5::hal::v1::error::error_t> busWriteStream(types::bus_kind_t kind, uint8_t bus_id,
+                                                                        const uint8_t* data, size_t len);
+    /*! @brief Query the stream bus credit ([free:u32][submitted:u32] into the slot). */
+    m5::stl::expected<void, m5::hal::v1::error::error_t> busStreamStatus(types::bus_kind_t kind, uint8_t bus_id,
+                                                                         uint8_t store_id);
+    /*! @brief Event: device-side credit snapshot (free + cumulative submitted). */
+    m5::stl::expected<void, m5::hal::v1::error::error_t> evtStreamCredit(types::bus_kind_t kind, uint8_t bus_id,
+                                                                         uint32_t free, uint32_t submitted);
+    /*! @} */
 
     m5::stl::expected<void, m5::hal::v1::error::error_t> storeData(uint8_t store_id, data::ConstDataSpan bytes);
     m5::stl::expected<void, m5::hal::v1::error::error_t> reportError(m5::hal::v1::error::error_t err, size_t offset);
@@ -198,6 +224,15 @@ public:
     m5::stl::expected<void, m5::hal::v1::error::error_t> registerI2C(uint8_t bus_id, i2c::I2CMasterAccessor& acc);
     m5::stl::expected<void, m5::hal::v1::error::error_t> registerSPI(uint8_t bus_id, spi::SPIMasterAccessor& acc);
     m5::stl::expected<void, m5::hal::v1::error::error_t> registerUART(uint8_t bus_id, uart::UARTAccessor& acc);
+    /*!
+      @brief Register an I2S TX accessor as a stream bus (spec §stream credit).
+
+      Carries a per-binding `submitted` counter — the cumulative bytes
+      accepted by `bus_write_stream` (mod 2^32). The counter lives with the
+      runner binding, so the absolute-value credit scheme holds for local
+      byte-array execution too (symmetric design).
+     */
+    m5::stl::expected<void, m5::hal::v1::error::error_t> registerI2S(uint8_t bus_id, i2s::I2STxAccessor& acc);
     void setGPIOGroup(gpio::GPIOGroup& group)
     {
         _gpio_group = &group;
@@ -207,6 +242,60 @@ public:
     {
         _delay_fn = fn;
     }
+
+    /*!
+      @name Subscription / event hooks (the remote push machinery).
+
+      The runner carries no subscription state itself; it only routes
+      the opcodes. `gpio_subscribe` / `gpio_unsubscribe` dispatch to the
+      subscribe handler (`subscribe` argument tells which; pins may be
+      empty for "unsubscribe all") and fail with `UNSUPPORTED` when no
+      handler is installed — the correct semantics for a local-only
+      runner. `evt_gpio_state` calls the event handler once per
+      (pin, level) entry and is silently ignored when none is installed.
+      @{
+     */
+    using gpio_subscribe_fn_t = m5::stl::expected<void, m5::hal::v1::error::error_t> (*)(
+        void* ctx, bool subscribe, const types::gpio_number_t* pins, size_t count);
+    using gpio_event_fn_t = void (*)(void* ctx, types::gpio_number_t pin, bool level);
+
+    void setGpioSubscribeHandler(gpio_subscribe_fn_t fn, void* ctx)
+    {
+        _gpio_subscribe_fn  = fn;
+        _gpio_subscribe_ctx = ctx;
+    }
+    void setGpioEventHandler(gpio_event_fn_t fn, void* ctx)
+    {
+        _gpio_event_fn  = fn;
+        _gpio_event_ctx = ctx;
+    }
+
+    /*!
+      @brief Receive-side dispatch for `evt_stream_credit` (spec §stream
+             credit). Routed to the handler once per event; silently
+             ignored when none is installed (same as `evt_gpio_state`).
+     */
+    using stream_credit_fn_t = void (*)(void* ctx, types::bus_kind_t kind, uint8_t bus_id, uint32_t free,
+                                        uint32_t submitted);
+    void setStreamCreditHandler(stream_credit_fn_t fn, void* ctx)
+    {
+        _stream_credit_fn  = fn;
+        _stream_credit_ctx = ctx;
+    }
+    /*! @} */
+
+    /*! @brief Result of `i2sStreamStatus` — the device-side credit snapshot. */
+    struct StreamStatus {
+        uint32_t free      = 0;  ///< Bytes writable now without blocking (writableBytes()).
+        uint32_t submitted = 0;  ///< Cumulative bytes accepted by this binding (mod 2^32).
+    };
+    /*!
+      @brief Non-script credit query for the server poll path: reads the
+             registered I2S accessor's `writableBytes()` and the binding's
+             cumulative `submitted`. Fails with `INVALID_ARGUMENT` when the
+             bus_id is out of range or has no I2S binding.
+     */
+    m5::stl::expected<StreamStatus, m5::hal::v1::error::error_t> i2sStreamStatus(uint8_t bus_id);
 
     /*! @brief Execute from any Source. Returns the consumed byte count. */
     m5::stl::expected<size_t, m5::hal::v1::error::error_t> run(data::Source& script);
@@ -267,6 +356,11 @@ private:
     m5::stl::expected<void, m5::hal::v1::error::error_t> opBusConfigure(data::ConstDataSpan payload);
     m5::stl::expected<void, m5::hal::v1::error::error_t> opBusTransfer(data::ConstDataSpan payload);
     m5::stl::expected<void, m5::hal::v1::error::error_t> opGpio(uint8_t opcode, data::ConstDataSpan payload);
+    m5::stl::expected<void, m5::hal::v1::error::error_t> opGpioSubscribe(uint8_t opcode, data::ConstDataSpan payload);
+    m5::stl::expected<void, m5::hal::v1::error::error_t> opEvtGpioState(data::ConstDataSpan payload);
+    m5::stl::expected<void, m5::hal::v1::error::error_t> opBusWriteStream(data::ConstDataSpan payload);
+    m5::stl::expected<void, m5::hal::v1::error::error_t> opBusStreamStatus(data::ConstDataSpan payload);
+    m5::stl::expected<void, m5::hal::v1::error::error_t> opEvtStreamCredit(data::ConstDataSpan payload);
     m5::stl::expected<void, m5::hal::v1::error::error_t> opStoreData(data::ConstDataSpan payload);
     m5::stl::expected<void, m5::hal::v1::error::error_t> opReport(uint8_t opcode, data::ConstDataSpan payload);
 
@@ -274,8 +368,17 @@ private:
     i2c::I2CMasterAccessor* _i2c[kMaxBusBindings] = {};
     spi::SPIMasterAccessor* _spi[kMaxBusBindings] = {};
     uart::UARTAccessor* _uart[kMaxBusBindings]    = {};
-    gpio::GPIOGroup* _gpio_group                  = nullptr;
-    delay_fn_t _delay_fn                          = nullptr;  // nullptr -> m5::utility::delay
+    i2s::I2STxAccessor* _i2s[kMaxBusBindings]     = {};
+    // Per-binding cumulative bytes accepted by bus_write_stream (mod 2^32).
+    uint32_t _stream_submitted[kMaxBusBindings] = {};
+    gpio::GPIOGroup* _gpio_group                = nullptr;
+    delay_fn_t _delay_fn                        = nullptr;  // nullptr -> m5::utility::delay
+    gpio_subscribe_fn_t _gpio_subscribe_fn      = nullptr;
+    void* _gpio_subscribe_ctx                   = nullptr;
+    gpio_event_fn_t _gpio_event_fn              = nullptr;
+    void* _gpio_event_ctx                       = nullptr;
+    stream_credit_fn_t _stream_credit_fn        = nullptr;
+    void* _stream_credit_ctx                    = nullptr;
 
     Slot _slots[kMaxStoreSlots];
     bool _status_reported                        = false;

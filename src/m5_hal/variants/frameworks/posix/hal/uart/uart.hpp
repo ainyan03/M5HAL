@@ -22,6 +22,15 @@ using namespace ::m5::hal::v1;
 struct BusConfig : public ::m5::hal::v1::uart::UARTBusConfig {
     const char* device_path = nullptr;
 
+    /*! Coalesce writes in user space and flush them in batches of up to this
+        many bytes (0 = write through immediately, the default). Each write()
+        syscall on a USB serial device costs a USB scheduling round trip, so
+        burst-heavy protocols (e.g. the remote bus stream writes, ~250 B per
+        frame) gain substantial throughput from batching. Any read path
+        (read / readableBytes) flushes pending bytes first, so a write-then-
+        await-reply pattern can never deadlock on buffered output. */
+    size_t tx_coalesce_bytes = 0;
+
     constexpr BusConfig(void) : ::m5::hal::v1::uart::UARTBusConfig{}
     {
     }
@@ -66,12 +75,22 @@ public:
 private:
     m5::stl::expected<void, ::m5::hal::v1::error::error_t> applyConfig(
         const ::m5::hal::v1::uart::UARTAccessConfig& cfg);
+    // Push one span to the fd, honouring EAGAIN + the write timeout.
+    m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> rawWrite(const uint8_t* data, size_t len,
+                                                                      uint32_t timeout_ms);
+    // Drain the coalescing buffer (no-op when empty / coalescing disabled).
+    m5::stl::expected<void, ::m5::hal::v1::error::error_t> flushCoalesced(uint32_t timeout_ms);
+
+    static constexpr size_t kCoalesceCapacity = 4096;
 
     const char* _device_path = nullptr;
+    size_t _tx_coalesce      = 0;  // from BusConfig::tx_coalesce_bytes (the base _config slices)
     int _fd                  = -1;
     bool _owns_fd            = false;
     bool _begun              = false;
     ::m5::hal::v1::uart::UARTAccessConfig _applied_cfg;
+    size_t _co_used = 0;
+    uint8_t _co_buf[kCoalesceCapacity];
 };
 
 }  // namespace m5::variants::frameworks::posix::hal::v1::uart

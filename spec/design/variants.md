@@ -34,6 +34,7 @@ src/m5_hal/variants/
       hal.hpp / hal.inl
       hal/gpio/gpio.hpp       GPIO 実装 (ESP-IDF GPIO driver)
       hal/i2c/i2c.{hpp,inl}   I2CBus + 実装 (ESP-IDF I2C master driver、 gen5/gen4 backend)
+      hal/i2s/i2s.{hpp,inl}   I2SBus + 実装 (ESP-IDF gen5 I2S standard driver)
       hal/spi/spi.{hpp,inl}   SPIBus + 実装 (ESP-IDF SPI master driver)
       hal/uart/uart.{hpp,inl}  UARTBus + 実装 (ESP-IDF UART driver)
     software/

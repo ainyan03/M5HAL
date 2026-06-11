@@ -42,9 +42,9 @@ v1 は、 バス抽象 / エラーハンドリング / I/O モデル / プラッ
 
 | 区分 | 内容 |
 |---|---|
-| **含める (現行 v1)** | I2C / SPI / UART / GPIO のバス抽象、 Arduino / ESP-IDF / software / POSIX UART の framework variant、 ESP32 family platform variant、 リモートバス機構 ([design/remote.md](design/remote.md)、 段階導入: 初回は同期 request/response + I2C proxy) |
-| **将来含める** | TCP / UDP / Wi-Fi 等の通信バス、 Zephyr framework variant、 リモートバス機構の拡張 (push イベント / flow control / マルチノード) |
-| **含めない (少なくとも初期は)** | ディスプレイ描画、 音声/画像のドメインロジック、 上位ライブラリ機能 |
+| **含める (現行 v1)** | I2C / SPI / UART / I2S / GPIO のバス抽象、 Arduino / ESP-IDF / software / POSIX UART の framework variant、 ESP32 family platform variant、 リモートバス機構 ([design/remote.md](design/remote.md)、 push イベントまで導入済み)。 I2S ([design/i2s.md](design/i2s.md)) は段階導入: 初回はローカル再生 = master TX のみ |
+| **将来含める** | TCP / UDP / Wi-Fi 等の通信バス、 Zephyr framework variant、 リモートバス機構の拡張 (flow control / マルチノード)、 I2S の RX (録音) |
+| **含めない (少なくとも初期は)** | ディスプレイ描画、 音声/画像のドメインロジック (raw PCM の搬送はバス抽象として含む)、 上位ライブラリ機能 |
 
 ## 成功条件
 

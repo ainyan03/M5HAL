@@ -99,47 +99,66 @@ int main(int argc, char** argv)
         }
     }
 
-    // Remote GPIO: the device publishes its buttons through an
-    // allowlisted GPIO group. Register the proxy on a host-side group
-    // slot (like an I/O expander) and the Pin handles work as usual —
-    // then watch them: each pin.read() below is a synchronous RPC to
-    // the board, logged on every state change.
+    // Remote GPIO, event-driven (spec/design/remote.md §push イベント):
+    // subscribe to the buttons once, then the DEVICE pushes an
+    // evt_gpio_state script whenever one changes — no per-pin polling
+    // RPCs. The host just pumps session.poll() and the registered
+    // handler logs each transition.
     if (caps.value().has_gpio) {
         m5hal::remote::RemoteGPIO remote_gpio{ep.link.session(), 40, 0};  // remote slot 0
         m5hal::gpio::GPIOGroup remote_pins;
         if (remote_pins.addGPIO(&remote_gpio, 0).has_value()) {
             const uint8_t buttons[] = {39, 38, 37};  // Core BASIC A / B / C
             const char* names[]     = {"A", "B", "C"};
-            m5hal::gpio::Pin pins[3];
-            bool last[3] = {};
+
+            // Pin handles still work for setup and the initial snapshot.
             for (size_t i = 0; i < 3; ++i) {
                 auto pin = remote_pins.tryGetPin(m5hal::types::makeGpioNumber(0, buttons[i]));
                 if (!pin.has_value()) {
                     ::fprintf(stderr, "button %s unavailable\n", names[i]);
                     return 1;
                 }
-                pins[i] = pin.value();
-                pins[i].setMode(m5hal::types::gpio_mode_t::Input);
-                last[i] = pins[i].read();
+                pin.value().setMode(m5hal::types::gpio_mode_t::Input);
+                ::printf("%s%s=%d", i == 0 ? "initial (pressed=0): " : " ", names[i], pin.value().read() ? 1 : 0);
             }
-            ::printf("watching buttons A/B/C over the remote bus (Ctrl+C to exit)\n");
-            ::printf("initial: A=%d B=%d C=%d (pressed=0)\n", last[0] ? 1 : 0, last[1] ? 1 : 0, last[2] ? 1 : 0);
+            ::printf("\n");
 
-            for (unsigned cycle = 0;; ++cycle) {
-                for (size_t i = 0; i < 3; ++i) {
-                    const bool v = pins[i].read();
-                    if (v != last[i]) {
-                        ::printf("button %s %s\n", names[i], v ? "released" : "pressed");
-                        last[i] = v;
+            // The event handler receives the REMOTE gpio_number space.
+            struct Ctx {
+                const uint8_t* buttons;
+                const char* const* names;
+            } ctx{buttons, names};
+            ep.link.session().runner().setGpioEventHandler(
+                [](void* c, m5hal::types::gpio_number_t pin, bool level) {
+                    auto* x             = static_cast<Ctx*>(c);
+                    const uint8_t local = static_cast<uint8_t>(m5hal::types::extractLocalPin(pin));
+                    for (size_t i = 0; i < 3; ++i) {
+                        if (x->buttons[i] == local) {
+                            ::printf("button %s %s\n", x->names[i], level ? "released" : "pressed");
+                            return;
+                        }
                     }
+                },
+                &ctx);
+
+            for (size_t i = 0; i < 3; ++i) {
+                auto s = remote_gpio.subscribe(buttons[i]);
+                if (!s.has_value()) {
+                    ::fprintf(stderr, "subscribe %s failed: %d\n", names[i], static_cast<int>(s.error()));
+                    return 1;
                 }
-                // Liveness check about once a second; a dropped link makes
-                // read() return false, which must not pass for "pressed".
-                if (cycle % 50 == 49 && !ep.link.session().ping().has_value()) {
+            }
+            ::printf("watching buttons A/B/C via push events (Ctrl+C to exit)\n");
+
+            // poll() blocks for at most the rx stream's own timeout when
+            // idle, so this loop self-paces; ping ~ every 2 s guards the
+            // link (events are best-effort and carry no liveness signal).
+            for (unsigned cycle = 0;; ++cycle) {
+                (void)ep.link.session().poll();
+                if (cycle % 20 == 19 && !ep.link.session().ping().has_value()) {
                     ::fprintf(stderr, "connection lost\n");
                     return 1;
                 }
-                ::usleep(20 * 1000);
             }
         }
     }

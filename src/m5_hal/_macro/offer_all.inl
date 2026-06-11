@@ -123,6 +123,35 @@ namespace m5 { namespace hal { namespace v1 { namespace spi {
 #endif  // M5HAL_VARIANT_CURRENT_HAS_HAL_SPI_
 
 // ---------------------------------------------------------------------
+// hal/i2s
+// ---------------------------------------------------------------------
+#if defined(M5HAL_VARIANT_CURRENT_HAS_HAL_I2S_) && M5HAL_VARIANT_CURRENT_HAS_HAL_I2S_
+
+namespace m5 { namespace hal { namespace v1 { namespace i2s { namespace variant {
+namespace M5HAL_VARIANT_CURRENT_ALIAS_ {
+    using namespace ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v1::i2s;
+}
+} } } } }  // namespace m5::hal::v1::i2s::variant
+
+#  if defined(M5HAL_VARIANT_PLATFORM_) && !defined(M5HAL_VARIANT_PLATFORM_I2S_BOUND_)
+#    define M5HAL_VARIANT_PLATFORM_I2S_BOUND_ 1
+namespace m5 { namespace hal { namespace v1 { namespace i2s { namespace variant {
+namespace platform {
+    using namespace ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v1::i2s;
+}
+} } } } }
+#  endif
+
+#  ifndef M5HAL_VARIANT_OFFER_I2S_BOUND_
+#    define M5HAL_VARIANT_OFFER_I2S_BOUND_ 1
+namespace m5 { namespace hal { namespace v1 { namespace i2s {
+    using namespace ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v1::i2s;
+} } } }
+#  endif
+
+#endif  // M5HAL_VARIANT_CURRENT_HAS_HAL_I2S_
+
+// ---------------------------------------------------------------------
 // hal/uart
 // ---------------------------------------------------------------------
 #if defined(M5HAL_VARIANT_CURRENT_HAS_HAL_UART_) && M5HAL_VARIANT_CURRENT_HAS_HAL_UART_
@@ -166,6 +195,9 @@ namespace m5 { namespace hal { namespace v1 { namespace uart {
 #endif
 #ifdef M5HAL_VARIANT_CURRENT_HAS_HAL_SPI_
 #  undef M5HAL_VARIANT_CURRENT_HAS_HAL_SPI_
+#endif
+#ifdef M5HAL_VARIANT_CURRENT_HAS_HAL_I2S_
+#  undef M5HAL_VARIANT_CURRENT_HAS_HAL_I2S_
 #endif
 #ifdef M5HAL_VARIANT_CURRENT_HAS_HAL_UART_
 #  undef M5HAL_VARIANT_CURRENT_HAS_HAL_UART_

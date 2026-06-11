@@ -5,8 +5,10 @@
 
 #if M5HAL_FRAMEWORK_HAS_POSIX
 
+#include <algorithm>
 #include <errno.h>
 #include <fcntl.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <termios.h>
@@ -174,6 +176,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const ::m5::hal
     const auto& uart_config = static_cast<const BusConfig&>(config);
     _config                 = uart_config;
     _device_path            = uart_config.device_path;  // termios open is lazy (first write/read)
+    _tx_coalesce            = uart_config.tx_coalesce_bytes;
     return {};
 }
 
@@ -331,31 +334,18 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::applyConfig(
     return {};
 }
 
-m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::write(::m5::hal::v1::bus::Accessor* owner,
-                                                                    const ::m5::hal::v1::uart::UARTAccessConfig& cfg,
-                                                                    ::m5::hal::v1::data::Source* tx, size_t len)
+m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::rawWrite(const uint8_t* data, size_t len,
+                                                                       uint32_t timeout_ms)
 {
-    (void)owner;
-    auto applied = applyConfig(cfg);
-    if (!applied.has_value()) {
-        return m5::stl::make_unexpected(applied.error());
-    }
     size_t done = 0;
-    while (tx != nullptr && !tx->eof() && done < len) {
-        auto span = tx->peek(len - done);
-        if (!span.has_value()) {
-            return m5::stl::make_unexpected(span.error());
-        }
-        if (span.value().size == 0) {
-            break;
-        }
-        ssize_t n = ::write(_fd, span.value().data, span.value().size);
+    while (done < len) {
+        ssize_t n = ::write(_fd, data + done, len - done);
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
             }
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                if (waitFd(_fd, true, cfg.write_timeout_ms) > 0) {
+                if (waitFd(_fd, true, timeout_ms) > 0) {
                     continue;
                 }
                 break;  // write timeout
@@ -365,11 +355,81 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::write(::m5::hal::v
         if (n == 0) {
             break;
         }
-        auto advanced = tx->advance(static_cast<size_t>(n));
+        done += static_cast<size_t>(n);
+    }
+    return done;
+}
+
+m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::flushCoalesced(uint32_t timeout_ms)
+{
+    if (_co_used == 0) {
+        return {};
+    }
+    const size_t pending = _co_used;
+    _co_used             = 0;  // reset first: a failed flush must not replay stale bytes
+    auto w               = rawWrite(_co_buf, pending, timeout_ms);
+    if (!w.has_value()) {
+        return m5::stl::make_unexpected(w.error());
+    }
+    if (w.value() != pending) {
+        return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::IO_ERROR);
+    }
+    return {};
+}
+
+m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::write(::m5::hal::v1::bus::Accessor* owner,
+                                                                    const ::m5::hal::v1::uart::UARTAccessConfig& cfg,
+                                                                    ::m5::hal::v1::data::Source* tx, size_t len)
+{
+    (void)owner;
+    auto applied = applyConfig(cfg);
+    if (!applied.has_value()) {
+        return m5::stl::make_unexpected(applied.error());
+    }
+    const size_t cap = _tx_coalesce == 0 ? 0 : std::min(_tx_coalesce, kCoalesceCapacity);
+    size_t done      = 0;
+    while (tx != nullptr && !tx->eof() && done < len) {
+        auto span = tx->peek(len - done);
+        if (!span.has_value()) {
+            return m5::stl::make_unexpected(span.error());
+        }
+        if (span.value().size == 0) {
+            break;
+        }
+        size_t n = 0;
+        if (cap == 0 || span.value().size >= cap) {
+            // Write-through (coalescing off, or the span alone fills a batch).
+            auto f = flushCoalesced(cfg.write_timeout_ms);
+            if (!f.has_value()) {
+                return m5::stl::make_unexpected(f.error());
+            }
+            auto w = rawWrite(span.value().data, span.value().size, cfg.write_timeout_ms);
+            if (!w.has_value()) {
+                return m5::stl::make_unexpected(w.error());
+            }
+            n = w.value();
+        } else {
+            if (_co_used + span.value().size > cap) {
+                auto f = flushCoalesced(cfg.write_timeout_ms);
+                if (!f.has_value()) {
+                    return m5::stl::make_unexpected(f.error());
+                }
+            }
+            ::memcpy(_co_buf + _co_used, span.value().data, span.value().size);
+            _co_used += span.value().size;
+            n = span.value().size;
+        }
+        if (n == 0) {
+            break;
+        }
+        auto advanced = tx->advance(n);
         if (!advanced.has_value()) {
             return m5::stl::make_unexpected(advanced.error());
         }
-        done += static_cast<size_t>(n);
+        done += n;
+        if (n < span.value().size) {
+            break;  // write timeout: report the short write
+        }
     }
     // No tcdrain(): the bytes are handed to the OS write buffer here, and
     // draining the line discipline can block indefinitely on a pty (the
@@ -386,6 +446,12 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::read(::m5::hal::v1
     auto applied = applyConfig(cfg);
     if (!applied.has_value()) {
         return m5::stl::make_unexpected(applied.error());
+    }
+    // A reader is about to wait on the peer: anything we coalesced must be
+    // on the wire first, or a write-then-await-reply exchange deadlocks.
+    auto flushed = flushCoalesced(cfg.write_timeout_ms);
+    if (!flushed.has_value()) {
+        return m5::stl::make_unexpected(flushed.error());
     }
     size_t done = 0;
     while (rx != nullptr && !rx->closed() && done < len) {
@@ -431,6 +497,12 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::readableBytes(
     auto applied = applyConfig(cfg);
     if (!applied.has_value()) {
         return m5::stl::make_unexpected(applied.error());
+    }
+    // Same rule as read(): a caller checking for a reply must not be waiting
+    // on bytes we have not pushed out yet.
+    auto flushed = flushCoalesced(cfg.write_timeout_ms);
+    if (!flushed.has_value()) {
+        return m5::stl::make_unexpected(flushed.error());
     }
     int avail = 0;
     if (::ioctl(_fd, FIONREAD, &avail) != 0 || avail < 0) {

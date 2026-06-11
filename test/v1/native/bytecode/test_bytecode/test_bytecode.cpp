@@ -25,6 +25,7 @@ namespace data     = ::m5::hal::v1::data;
 namespace error    = ::m5::hal::v1::error;
 namespace gpio     = ::m5::hal::v1::gpio;
 namespace i2c      = ::m5::hal::v1::i2c;
+namespace i2s      = ::m5::hal::v1::i2s;
 namespace spi      = ::m5::hal::v1::spi;
 namespace types    = ::m5::hal::v1::types;
 namespace uart     = ::m5::hal::v1::uart;
@@ -154,6 +155,48 @@ public:
     std::vector<uint8_t> rx_script;
 };
 
+// Stream-bus fake: accepts at most `accept_limit` bytes per write (the
+// rest is "dropped" so the runner sees a short accept), logs config, and
+// reports a programmable writableBytes.
+class StubI2SBus : public i2s::I2SBus {
+public:
+    m5::stl::expected<void, error_t> init(const bus::BusConfig& config) override
+    {
+        if (config.getBusKind() != types::bus_kind_t::I2S) {
+            return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
+        }
+        _config = static_cast<const i2s::I2SBusConfig&>(config);
+        return {};
+    }
+    m5::stl::expected<size_t, error_t> write(bus::Accessor*, const i2s::I2SAccessConfig& cfg, data::Source* tx,
+                                             size_t len) override
+    {
+        last_cfg = cfg;
+        // Drain everything from tx, but only "accept" up to accept_limit.
+        std::vector<uint8_t> buf;
+        while (tx != nullptr && !tx->eof() && buf.size() < len) {
+            auto p = tx->peek(len - buf.size());
+            if (!p.has_value() || p.value().size == 0) {
+                break;
+            }
+            buf.insert(buf.end(), p.value().data, p.value().data + p.value().size);
+            (void)tx->advance(p.value().size);
+        }
+        const size_t accepted = std::min(buf.size(), accept_limit);
+        written.insert(written.end(), buf.begin(), buf.begin() + static_cast<ptrdiff_t>(accepted));
+        return accepted;
+    }
+    m5::stl::expected<size_t, error_t> writableBytes(bus::Accessor*, const i2s::I2SAccessConfig&) override
+    {
+        return writable;
+    }
+
+    size_t accept_limit = static_cast<size_t>(-1);  // bytes accepted per write
+    size_t writable     = 4096;                     // writableBytes() report
+    std::vector<uint8_t> written;
+    i2s::I2SAccessConfig last_cfg{};
+};
+
 // Recording GPIO port: scripted read levels, logged writes / modes.
 class RecordingPort : public gpio::IPort {
 public:
@@ -277,15 +320,18 @@ struct Rig {
     CaptureI2CBus i2c_bus;
     CaptureSPIBus spi_bus;
     CaptureUARTBus uart_bus;
+    StubI2SBus i2s_bus;
     RecordingGPIO gpio_dev;
     gpio::GPIOGroup gpio_group{&gpio_dev};
 
     i2c::I2CMasterAccessConfig i2c_cfg{};
     spi::SPIMasterAccessConfig spi_cfg{};
     uart::UARTAccessConfig uart_cfg{};
+    i2s::I2SAccessConfig i2s_cfg{};
     i2c::I2CMasterAccessor i2c_acc{i2c_bus, i2c_cfg};
     spi::SPIMasterAccessor spi_acc{spi_bus, spi_cfg};
     uart::UARTAccessor uart_acc{uart_bus, uart_cfg};
+    i2s::I2STxAccessor i2s_acc{i2s_bus, i2s_cfg};
 
     bytecode::BytecodeRunner runner;
 
@@ -294,6 +340,7 @@ struct Rig {
         EXPECT_TRUE(runner.registerI2C(0, i2c_acc).has_value());
         EXPECT_TRUE(runner.registerSPI(0, spi_acc).has_value());
         EXPECT_TRUE(runner.registerUART(0, uart_acc).has_value());
+        EXPECT_TRUE(runner.registerI2S(0, i2s_acc).has_value());
         runner.setGPIOGroup(gpio_group);
         runner.setDelayFn(&countDelay);
     }
@@ -413,6 +460,178 @@ TEST(BytecodeRunner, UARTTransferTracksActualReadCount)
     ASSERT_EQ(rig.uart_bus.tx_bytes.size(), sizeof(tx));
     EXPECT_EQ(std::memcmp(rig.uart_bus.tx_bytes.data(), tx, sizeof(tx)), 0);
     EXPECT_EQ(rig.runner.storedData(4).size, 2u);  // short read keeps the actual count
+}
+
+// ============================================================================
+// Stream credit (I2S)
+// ============================================================================
+
+TEST(BytecodeStream, ConfigureDecodesI2S)
+{
+    Rig rig;
+    i2s::I2SAccessConfig cfg;
+    cfg.sample_rate_hz   = 48000;
+    cfg.timeout_ms       = 250;
+    cfg.write_timeout_ms = 0;
+    cfg.bits_per_sample  = 16;
+    cfg.channels         = 1;
+
+    uint8_t buf[64] = {};
+    data::MemorySink sink{data::DataSpan{buf, sizeof(buf)}};
+    bytecode::BytecodeEncoder enc{sink};
+    ASSERT_TRUE(enc.i2sConfig(0, cfg).has_value());
+    ASSERT_TRUE(enc.end().has_value());
+
+    ASSERT_TRUE(rig.runner.run(data::ConstDataSpan{buf, sink.written()}).has_value());
+    const auto& applied = static_cast<const i2s::I2SAccessConfig&>(rig.i2s_acc.getConfig());
+    EXPECT_EQ(applied.sample_rate_hz, 48000u);
+    EXPECT_EQ(applied.timeout_ms, 250u);
+    EXPECT_EQ(applied.write_timeout_ms, 0u);
+    EXPECT_EQ(applied.bits_per_sample, 16);
+    EXPECT_EQ(applied.channels, 1);
+}
+
+TEST(BytecodeStream, WriteStreamAccumulatesSubmitted)
+{
+    Rig rig;
+    const uint8_t a[] = {0x10, 0x20, 0x30, 0x40};
+    const uint8_t b[] = {0x50, 0x60};
+
+    uint8_t buf[64] = {};
+    data::MemorySink sink{data::DataSpan{buf, sizeof(buf)}};
+    bytecode::BytecodeEncoder enc{sink};
+    ASSERT_TRUE(enc.busWriteStream(types::bus_kind_t::I2S, 0, a, sizeof(a)).has_value());
+    ASSERT_TRUE(enc.busWriteStream(types::bus_kind_t::I2S, 0, b, sizeof(b)).has_value());
+    ASSERT_TRUE(enc.end().has_value());
+
+    ASSERT_TRUE(rig.runner.run(data::ConstDataSpan{buf, sink.written()}).has_value());
+    ASSERT_EQ(rig.i2s_bus.written.size(), sizeof(a) + sizeof(b));
+    EXPECT_EQ(rig.i2s_bus.written[0], 0x10);
+    EXPECT_EQ(rig.i2s_bus.written[5], 0x60);
+
+    // submitted accumulated across both writes.
+    auto st = rig.runner.i2sStreamStatus(0);
+    ASSERT_TRUE(st.has_value());
+    EXPECT_EQ(st.value().submitted, sizeof(a) + sizeof(b));
+}
+
+TEST(BytecodeStream, WriteStreamWrongKindIsInvalidArgument)
+{
+    Rig rig;
+    const uint8_t a[] = {0x01};
+    uint8_t buf[32]   = {};
+    data::MemorySink sink{data::DataSpan{buf, sizeof(buf)}};
+    bytecode::BytecodeEncoder enc{sink};
+    ASSERT_TRUE(enc.busWriteStream(types::bus_kind_t::UART, 0, a, sizeof(a)).has_value());
+    ASSERT_TRUE(enc.end().has_value());
+
+    auto r = rig.runner.run(data::ConstDataSpan{buf, sink.written()});
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), error_t::INVALID_ARGUMENT);
+}
+
+TEST(BytecodeStream, WriteStreamUnregisteredBindingIsInvalidArgument)
+{
+    Rig rig;  // only bus 0 has an I2S binding
+    const uint8_t a[] = {0x01};
+    uint8_t buf[32]   = {};
+    data::MemorySink sink{data::DataSpan{buf, sizeof(buf)}};
+    bytecode::BytecodeEncoder enc{sink};
+    ASSERT_TRUE(enc.busWriteStream(types::bus_kind_t::I2S, 2, a, sizeof(a)).has_value());  // in-range, unregistered
+    ASSERT_TRUE(enc.end().has_value());
+
+    auto r = rig.runner.run(data::ConstDataSpan{buf, sink.written()});
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), error_t::INVALID_ARGUMENT);
+}
+
+TEST(BytecodeStream, PartialAcceptReportsBufferOverflow)
+{
+    Rig rig;
+    rig.i2s_bus.accept_limit = 2;  // accept only 2 of the 4 bytes
+    const uint8_t a[]        = {0x10, 0x20, 0x30, 0x40};
+
+    uint8_t buf[32] = {};
+    data::MemorySink sink{data::DataSpan{buf, sizeof(buf)}};
+    bytecode::BytecodeEncoder enc{sink};
+    ASSERT_TRUE(enc.busWriteStream(types::bus_kind_t::I2S, 0, a, sizeof(a)).has_value());
+    ASSERT_TRUE(enc.end().has_value());
+
+    auto r = rig.runner.run(data::ConstDataSpan{buf, sink.written()});
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), error_t::BUFFER_OVERFLOW);
+    EXPECT_EQ(rig.runner.lastOffset(), 0u);
+    // The accepted portion still counted toward submitted.
+    auto st = rig.runner.i2sStreamStatus(0);
+    ASSERT_TRUE(st.has_value());
+    EXPECT_EQ(st.value().submitted, 2u);
+}
+
+TEST(BytecodeStream, StreamStatusStoresFreeAndSubmitted)
+{
+    Rig rig;
+    rig.i2s_bus.writable = 1234;
+    const uint8_t a[]    = {0x01, 0x02, 0x03};
+
+    uint8_t buf[64] = {};
+    data::MemorySink sink{data::DataSpan{buf, sizeof(buf)}};
+    bytecode::BytecodeEncoder enc{sink};
+    ASSERT_TRUE(enc.busWriteStream(types::bus_kind_t::I2S, 0, a, sizeof(a)).has_value());
+    ASSERT_TRUE(enc.busStreamStatus(types::bus_kind_t::I2S, 0, 5).has_value());
+    ASSERT_TRUE(enc.end().has_value());
+
+    ASSERT_TRUE(rig.runner.run(data::ConstDataSpan{buf, sink.written()}).has_value());
+    auto stored = rig.runner.storedData(5);
+    ASSERT_EQ(stored.size, 8u);
+    const uint32_t free      = stored.data[0] | (stored.data[1] << 8) | (stored.data[2] << 16) | (stored.data[3] << 24);
+    const uint32_t submitted = stored.data[4] | (stored.data[5] << 8) | (stored.data[6] << 16) | (stored.data[7] << 24);
+    EXPECT_EQ(free, 1234u);
+    EXPECT_EQ(submitted, 3u);
+}
+
+uint32_t g_credit_free          = 0;
+uint32_t g_credit_submitted     = 0;
+uint8_t g_credit_bus            = 0xFF;
+types::bus_kind_t g_credit_kind = types::bus_kind_t::UNKNOWN;
+int g_credit_calls              = 0;
+void captureCredit(void*, types::bus_kind_t kind, uint8_t bus_id, uint32_t free, uint32_t submitted)
+{
+    g_credit_kind      = kind;
+    g_credit_bus       = bus_id;
+    g_credit_free      = free;
+    g_credit_submitted = submitted;
+    ++g_credit_calls;
+}
+
+TEST(BytecodeStream, EvtStreamCreditDispatchesToHandler)
+{
+    bytecode::BytecodeRunner host;
+    g_credit_calls = 0;
+    host.setStreamCreditHandler(&captureCredit, nullptr);
+
+    uint8_t buf[32] = {};
+    data::MemorySink sink{data::DataSpan{buf, sizeof(buf)}};
+    bytecode::BytecodeEncoder enc{sink};
+    ASSERT_TRUE(enc.evtStreamCredit(types::bus_kind_t::I2S, 0, 0x11223344u, 0x55667788u).has_value());
+    ASSERT_TRUE(enc.end().has_value());
+
+    ASSERT_TRUE(host.run(data::ConstDataSpan{buf, sink.written()}).has_value());
+    EXPECT_EQ(g_credit_calls, 1);
+    EXPECT_EQ(g_credit_kind, types::bus_kind_t::I2S);
+    EXPECT_EQ(g_credit_bus, 0);
+    EXPECT_EQ(g_credit_free, 0x11223344u);
+    EXPECT_EQ(g_credit_submitted, 0x55667788u);
+}
+
+TEST(BytecodeStream, EvtStreamCreditWithoutHandlerIsIgnored)
+{
+    bytecode::BytecodeRunner host;  // no handler installed
+    uint8_t buf[32] = {};
+    data::MemorySink sink{data::DataSpan{buf, sizeof(buf)}};
+    bytecode::BytecodeEncoder enc{sink};
+    ASSERT_TRUE(enc.evtStreamCredit(types::bus_kind_t::I2S, 1, 10, 20).has_value());
+    ASSERT_TRUE(enc.end().has_value());
+    EXPECT_TRUE(host.run(data::ConstDataSpan{buf, sink.written()}).has_value());  // silently ignored
 }
 
 TEST(BytecodeRunner, GpioOpsReachThePins)

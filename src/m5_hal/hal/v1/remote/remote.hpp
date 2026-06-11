@@ -8,6 +8,7 @@
 #include "../frame/frame.hpp"
 #include "../gpio/gpio.hpp"
 #include "../i2c/i2c.hpp"
+#include "../i2s/i2s.hpp"
 #include "../service/service.hpp"
 #include "../spi/spi.hpp"
 #include "../uart/uart.hpp"
@@ -62,7 +63,7 @@ enum class MessageType : uint8_t {
     error      = 0x4,  ///< device -> host, body = [error:i8][detail...].
     ping       = 0x5,  ///< host -> device, empty body.
     pong       = 0x6,  ///< device -> host, empty body.
-    event      = 0x7,  ///< reserved (push notifications, future version).
+    event      = 0x7,  ///< device -> host, body = event script (push notifications).
 };
 
 constexpr uint8_t kTypeNorespBit    = 0x80;  ///< Fire-and-forget request flag.
@@ -90,7 +91,7 @@ struct Capabilities {
         types::bus_kind_t kind = types::bus_kind_t::UNKNOWN;
         uint8_t bus_id         = 0;
     };
-    static constexpr size_t kMaxEntries = 3 * bytecode::kMaxBusBindings;
+    static constexpr size_t kMaxEntries = 4 * bytecode::kMaxBusBindings;
 
     uint8_t proto_ver = 0;
     bool has_gpio     = false;
@@ -126,23 +127,30 @@ public:
     struct Config {
         uint32_t max_delay_ms       = 100;   ///< Total delay_ms budget per script.
         uint32_t max_bus_timeout_ms = 1000;  ///< Upper bound for timeouts carried by bus_configure.
+        /*! @brief Bytes a stream binding must drain before an `evt_stream_credit` is emitted. */
+        uint32_t stream_credit_threshold = 2048;
     };
 
     explicit Server(data::DataSpan response_scratch) : _runner{memory::defaultAllocator()}, _scratch{response_scratch}
     {
+        _runner.setGpioSubscribeHandler(&gpioSubscribeThunk, this);
     }
     Server(data::DataSpan response_scratch, const Config& config, memory::Allocator& alloc = memory::defaultAllocator())
         : _runner{alloc}, _scratch{response_scratch}, _config{config}
     {
+        _runner.setGpioSubscribeHandler(&gpioSubscribeThunk, this);
     }
 
     m5::stl::expected<void, m5::hal::v1::error::error_t> registerI2C(uint8_t bus_id, i2c::I2CMasterAccessor& acc);
     m5::stl::expected<void, m5::hal::v1::error::error_t> registerSPI(uint8_t bus_id, spi::SPIMasterAccessor& acc);
     m5::stl::expected<void, m5::hal::v1::error::error_t> registerUART(uint8_t bus_id, uart::UARTAccessor& acc);
+    /*! @brief Publish an I2S TX accessor as a stream bus (spec §stream credit). */
+    m5::stl::expected<void, m5::hal::v1::error::error_t> registerI2S(uint8_t bus_id, i2s::I2STxAccessor& acc);
     void setGPIOGroup(gpio::GPIOGroup& group)
     {
         _runner.setGPIOGroup(group);
-        _has_gpio = true;
+        _gpio_group = &group;
+        _has_gpio   = true;
     }
 
     /*! @brief Direct access to the underlying runner (delay fn injection, ...). */
@@ -185,12 +193,69 @@ public:
         return _pending_valid;
     }
 
+    /*!
+      @name GPIO change subscriptions (spec §push イベント).
+
+      The server owns the subscription table (`kMaxSubscriptions`); the
+      runner only routes `gpio_subscribe` / `gpio_unsubscribe` here.
+      Subscribing records the pin's current level and notifies from the
+      NEXT change on. `pollSubscriptions` reads every subscribed pin
+      and, when changes are found, emits ONE `event` message whose body
+      is an `evt_gpio_state` script batching them (best-effort: no ack,
+      no retransmission). Subscriptions are per-connection: `hello`
+      clears the table.
+      @{
+     */
+    static constexpr size_t kMaxSubscriptions = 8;
+
+    void clearSubscriptions();
+    size_t subscriptionCount() const
+    {
+        return _sub_count;
+    }
+    /*! @brief Poll subscribed pins; returns true when an event was emitted. */
+    m5::stl::expected<bool, m5::hal::v1::error::error_t> pollSubscriptions(frame::FrameWriter& out, uint8_t stream_id);
+    /*! @} */
+
+    /*!
+      @name Stream credit flow control (spec §stream credit).
+
+      Each registered I2S binding tracks the (free, submitted) snapshot of
+      the last emitted event. `pollStreamCredit` queries the runner's
+      `i2sStreamStatus` per binding and accumulates the bytes the device
+      drained since that snapshot — `consumed_delta = (submitted_now -
+      submitted_prev) + (free_now - free_prev)` (each term a u32-wrap diff,
+      the sum is non-negative). When the accumulation reaches
+      `Config::stream_credit_threshold` it emits ONE `evt_stream_credit`
+      event and resets the snapshot + accumulation (best-effort, lossy like
+      GPIO events). `hello` resets the management state (per-connection).
+      @{
+     */
+    void clearStreamCredit();
+    /*! @brief Poll stream bindings; returns true when an event was emitted. */
+    m5::stl::expected<bool, m5::hal::v1::error::error_t> pollStreamCredit(frame::FrameWriter& out, uint8_t stream_id);
+    /*! @} */
+
 private:
     struct ExecOutcome {
         m5::hal::v1::error::error_t status = m5::hal::v1::error::error_t::OK;
         size_t offset                      = 0;      // offending offset when prescan rejected
         bool ran                           = false;  // runner.run() was invoked (slots/offset are its own)
     };
+
+    struct Subscription {
+        types::gpio_number_t pin = -1;
+        bool last_level          = false;
+        bool active              = false;
+    };
+
+    // Runner-side hook: routes gpio_subscribe / gpio_unsubscribe here.
+    static m5::stl::expected<void, m5::hal::v1::error::error_t> gpioSubscribeThunk(void* ctx, bool subscribe,
+                                                                                   const types::gpio_number_t* pins,
+                                                                                   size_t count);
+    m5::stl::expected<void, m5::hal::v1::error::error_t> handleSubscribe(bool subscribe,
+                                                                         const types::gpio_number_t* pins,
+                                                                         size_t count);
 
     ExecOutcome execute(data::ConstDataSpan script);
     m5::hal::v1::error::error_t prescan(data::ConstDataSpan script, size_t& offset) const;
@@ -212,6 +277,21 @@ private:
     bool _pending_valid                        = false;
     m5::hal::v1::error::error_t _pending_error = m5::hal::v1::error::error_t::OK;
     size_t _dropped                            = 0;
+
+    gpio::GPIOGroup* _gpio_group = nullptr;  // set by setGPIOGroup (subscription reads)
+    Subscription _subs[kMaxSubscriptions];
+    size_t _sub_count  = 0;
+    uint8_t _event_seq = 0;
+
+    // Per-binding stream-credit tracking (one slot per I2S bus_id).
+    struct StreamCredit {
+        bool active        = false;  // an I2S binding is registered at this bus_id
+        bool primed        = false;  // snapshot has been seeded with a first reading
+        uint32_t free_prev = 0;
+        uint32_t sub_prev  = 0;
+        uint32_t accum     = 0;  // consumed bytes since the last emitted event
+    };
+    StreamCredit _stream[bytecode::kMaxBusBindings];
 };
 
 /*!
@@ -311,6 +391,27 @@ public:
 
     /*! @brief Fire-and-forget request (NORESP). Failures surface as a later remote error. */
     m5::stl::expected<void, m5::hal::v1::error::error_t> requestNoResponse(data::ConstDataSpan script);
+
+    /*!
+      @brief Drain frames that are already available, dispatching events.
+
+      Call this from the host's idle loop when subscriptions are active
+      (spec §push イベント): `event` messages are executed on `runner()`
+      — install the per-pin callback with
+      `runner().setGpioEventHandler(...)`. Events that arrive while a
+      request is awaiting its response are dispatched there as well, so
+      poll() is only needed for idle periods. Returns the number of
+      event messages dispatched; blocks at most for the rx stream's own
+      timeouts per frame.
+
+      `max_frames` bounds the frames consumed in one call. NOTE: each
+      frame read may block up to the rx first-byte timeout, so a caller
+      that has something better to do the moment one event lands (e.g. a
+      sender waiting on stream credit) must pass 1 — with a steady event
+      cadence shorter than the rx timeout, a larger bound turns poll()
+      into a frame-paced capture loop that starves the caller.
+     */
+    m5::stl::expected<size_t, m5::hal::v1::error::error_t> poll(size_t max_frames = 8);
 
     /*! @brief Runner that executed the most recent response script. */
     bytecode::BytecodeRunner& runner()
@@ -579,6 +680,102 @@ private:
     uint8_t _remote_bus_id  = 0;
 };
 
+/*!
+  @brief I2S bus proxy: a local `i2s::I2SBus` whose playback runs remotely.
+
+  `write` follows §stream credit: NORESP `bus_write_stream` bursts paced by
+  a host-side credit estimate, plus a credit wait. It returns the bytes
+  sent within `cfg.write_timeout_ms` (a short write is normal, same as a
+  local I2S). `writableBytes` returns the host-side credit estimate without
+  an RPC. An AccessConfig change is applied before the next write with a
+  synchronous `bus_configure` + `bus_stream_status` script that re-syncs
+  the credit baseline; the device-side `write_timeout_ms` is forced to 0
+  (non-blocking) so credit — not the server poll — does the waiting.
+
+  Credit math (spec §stream credit): the host keeps `_sent` (mod 2^32) and,
+  given the device's (free, submitted) report, computes
+  `credit = free - (_sent - submitted)` with u32-modular subtraction, so a
+  lost event self-heals on the next report.
+
+  The session's runner stream-credit handler is registered on construction
+  with `ctx = this`; only reports matching this proxy's kind/bus_id update
+  the estimate. NOTE: a single session backing multiple RemoteI2SBus
+  instances is not supported in this version (one handler slot per runner).
+ */
+struct RemoteI2SBus : public i2s::I2SBus {
+    RemoteI2SBus(RemoteSession& session, uint8_t remote_bus_id);
+
+    /*! @brief Local bookkeeping only — the physical bus is configured server-side. */
+    m5::stl::expected<void, m5::hal::v1::error::error_t> init(const bus::BusConfig& config) override;
+    m5::stl::expected<void, m5::hal::v1::error::error_t> release(void) override
+    {
+        return {};
+    }
+
+    m5::stl::expected<size_t, m5::hal::v1::error::error_t> write(bus::Accessor* owner, const i2s::I2SAccessConfig& cfg,
+                                                                 data::Source* tx, size_t len) override;
+    m5::stl::expected<size_t, m5::hal::v1::error::error_t> writableBytes(bus::Accessor* owner,
+                                                                         const i2s::I2SAccessConfig& cfg) override;
+
+    /*!
+      @brief Cap on un-acknowledged bytes in flight (the backpressure window).
+
+      Applied on top of the credit: even with credit available, at most this
+      many bytes are outstanding toward the device. The window bounds how hard
+      a burst can hit the device's UART rx ring, and (together with the
+      acknowledgement latency) sets the sustainable rate:
+      `rate <= window / feedback_latency`. Sizing rule (measured on a CH9102
+      USB bridge @3 Mbaud, macOS host): the floor is
+      `2 x stream_credit_threshold + rate x p99 event latency (~100 ms)` —
+      e.g. 24 kHz/16-bit mono (48 KB/s) holds its nominal rate down to a
+      4 KB window. The default covers every rate the link itself sustains
+      (~110 KB/s) with margin. Must be > 0; also keep it under the device's
+      UART rx ring size (a full-window burst must fit).
+     */
+    void setStreamWindow(uint32_t bytes)
+    {
+        _stream_window = bytes;
+    }
+    uint32_t streamWindow() const
+    {
+        return _stream_window;
+    }
+
+    static constexpr uint32_t kDefaultStreamWindow = 16384;
+
+private:
+    // Runner stream-credit handler: only our kind/bus_id updates the estimate.
+    static void streamCreditThunk(void* ctx, types::bus_kind_t kind, uint8_t bus_id, uint32_t free, uint32_t submitted);
+    void onCredit(uint32_t free, uint32_t submitted);
+
+    // (Re)apply the AccessConfig and re-sync the credit baseline with a
+    // synchronous bus_configure + bus_stream_status script.
+    m5::stl::expected<void, m5::hal::v1::error::error_t> syncConfig(const i2s::I2SAccessConfig& cfg);
+    // Ask the device for a fresh (free, submitted) snapshot synchronously.
+    m5::stl::expected<void, m5::hal::v1::error::error_t> syncStatus();
+
+    // Current host-side credit estimate (bytes the device can accept now).
+    uint32_t credit() const
+    {
+        // free - (sent - submitted), all u32-modular (spec §stream credit).
+        const uint32_t in_flight = _sent - _submitted;
+        return _free - in_flight;
+    }
+
+    RemoteSession* _session = nullptr;
+    uint8_t _remote_bus_id  = 0;
+
+    bool _configured = false;
+    i2s::I2SAccessConfig _applied_cfg{};
+
+    // Credit state (all mod 2^32 / wrap-safe).
+    uint32_t _sent      = 0;  // cumulative bytes the host has sent
+    uint32_t _submitted = 0;  // device's last-reported cumulative accepted bytes
+    uint32_t _free      = 0;  // device's last-reported writable bytes
+
+    uint32_t _stream_window = kDefaultStreamWindow;  // see setStreamWindow
+};
+
 class RemoteGPIO;
 
 /*!
@@ -639,6 +836,22 @@ public:
         : _port{*this}, _session{&session}, _pin_count{pin_count}, _remote_slot{remote_slot}
     {
     }
+
+    /*!
+      @name Change subscription sugar (spec §push イベント).
+
+      Builds the gpio_subscribe / gpio_unsubscribe script (with the
+      host-to-remote pin-number conversion) and sends it as a normal
+      request, so subscription failures (`OUT_OF_RESOURCE`,
+      `UNSUPPORTED`, ...) come back through the expected error path.
+      Events arrive via the session: install a handler with
+      `session.runner().setGpioEventHandler(...)` (it receives the
+      REMOTE gpio_number space) and pump `session.poll()` while idle.
+      @{
+     */
+    m5::stl::expected<void, m5::hal::v1::error::error_t> subscribe(::m5::hal::v1::types::gpio_local_pin_t local_pin);
+    m5::stl::expected<void, m5::hal::v1::error::error_t> unsubscribe(::m5::hal::v1::types::gpio_local_pin_t local_pin);
+    /*! @} */
 
     gpio::IPort* portForPin(::m5::hal::v1::types::gpio_local_pin_t pin_index) const override
     {
