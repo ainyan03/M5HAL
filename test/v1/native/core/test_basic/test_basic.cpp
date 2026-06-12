@@ -14,12 +14,12 @@ public:
     m5::hal::v1::service::ServiceResult service(const m5::hal::v1::service::ServiceContext& ctx) override
     {
         ++count;
-        last_now_nsec = ctx.now_nsec;
+        last_now_tick = ctx.now_tick;
         return _result;
     }
 
     int count                                       = 0;
-    m5::hal::v1::service::tick_nsec_t last_now_nsec = 0;
+    m5::hal::v1::service::tick_nsec_t last_now_tick = 0;
 
 private:
     m5::hal::v1::service::ServiceResult _result;
@@ -65,8 +65,8 @@ TEST(ServiceRunner, RunsRegisteredServicesInOrder)
     EXPECT_TRUE(runner.runOnce(1234));
     EXPECT_EQ(idle.count, 1);
     EXPECT_EQ(progress.count, 1);
-    EXPECT_EQ(idle.last_now_nsec, 1234u);
-    EXPECT_EQ(progress.last_now_nsec, 1234u);
+    EXPECT_EQ(idle.last_now_tick, 1234u);
+    EXPECT_EQ(progress.last_now_tick, 1234u);
 
     EXPECT_TRUE(runner.remove(idle));
     EXPECT_FALSE(runner.remove(idle));
@@ -75,15 +75,15 @@ TEST(ServiceRunner, RunsRegisteredServicesInOrder)
     EXPECT_TRUE(runner.runOnce(5678));
     EXPECT_EQ(idle.count, 1);
     EXPECT_EQ(progress.count, 2);
-    EXPECT_EQ(progress.last_now_nsec, 5678u);
+    EXPECT_EQ(progress.last_now_tick, 5678u);
 }
 
 TEST(ServiceTiming, WrapAwareElapsedAndReached)
 {
     using namespace m5::hal::v1::service;
 
-    EXPECT_EQ(elapsedNsec(10, 3), 7u);
-    EXPECT_EQ(elapsedNsec(3, 0xFFFFFFFEu), 5u);
+    EXPECT_EQ(elapsedTicks(10, 3), 7u);
+    EXPECT_EQ(elapsedTicks(3, 0xFFFFFFFEu), 5u);
 
     EXPECT_TRUE(hasReached(10, 10));
     EXPECT_TRUE(hasReached(11, 10));

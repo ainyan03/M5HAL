@@ -556,6 +556,28 @@ TEST(SPIMasterAccessor, SendDummyClockUsesTransferDesc)
     EXPECT_EQ(bus.calls[0].rx_len, 0u);
 }
 
+// Regression: writeCommandData(span) must reject spi_command_length == 0
+// rather than silently degrading to write(). Setting a command length is
+// mandatory for the command-sugar family; callers that want a plain write
+// must call write() directly.
+TEST(SPIMasterAccessor, WriteCommandDataSpanRejectsZeroCommandLength)
+{
+    StubSPIBus bus;
+    ASSERT_TRUE(bus.init(spi::SPIBusConfig{}).has_value());
+
+    spi::SPIMasterAccessConfig cfg;
+    // spi_command_length defaults to 0 — no command configured.
+    spi::SPIMasterAccessor accessor{bus, cfg};
+
+    const uint8_t tx[] = {0xDE, 0xAD};
+    auto result        = accessor.writeCommandData(data::ConstDataSpan{tx, sizeof(tx)});
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), error::error_t::INVALID_ARGUMENT);
+    // Nothing must have been sent to the bus.
+    EXPECT_TRUE(bus.calls.empty());
+}
+
 TEST(SPIBus, DefaultTransferReturnsNotImplemented)
 {
     spi::SPIBus bus;
@@ -599,6 +621,59 @@ TEST(SoftwareSPIBus, WriteDrivesCsDcClockAndMosi)
     EXPECT_EQ(countWrites(port.events, softPin(1), true), 1u);
     EXPECT_EQ(countWrites(port.events, softPin(3), false), 1u);
     EXPECT_EQ(countWrites(port.events, softPin(3), true), 1u);
+}
+
+// S16 D10 rejection boundary for the single-lane variants: multi-lane
+// modes (dual/quad/octal) are always NOT_IMPLEMENTED; half-duplex modes
+// are rejected only when one transfer carries BOTH tx and rx data
+// (full-duplex clocking would corrupt the response). One-directional
+// half-duplex transfers keep working — the DC-pin demos depend on them.
+TEST(SoftwareSPIBus, UnimplementedDataModesAreRejected)
+{
+    auto& gpio = softwareSpiGPIO();
+    m5::hal::v1::spi::variant::software::Bus bus;
+    spi::SPIBusConfig bus_cfg;
+    bus_cfg.pin_clk  = softPin(0);
+    bus_cfg.pin_miso = softPin(1);
+    bus_cfg.pin_mosi = softPin(2);
+    ASSERT_TRUE(bus.init(bus_cfg).has_value());
+    gpio._port.clear();
+
+    const uint8_t tx[] = {0x01};
+    uint8_t rx[1]      = {};
+
+    // Multi-lane: rejected even for a one-directional write.
+    {
+        spi::SPIMasterAccessConfig cfg;
+        cfg.freq          = 20000000;
+        cfg.spi_data_mode = spi::spi_data_mode_t::spi_quad_output;
+        spi::SPIMasterAccessor accessor{bus, cfg};
+        auto result = accessor.write(data::ConstDataSpan{tx, sizeof(tx)});
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), error::error_t::NOT_IMPLEMENTED);
+    }
+
+    // Half-duplex carrying both tx and rx data: rejected.
+    {
+        spi::SPIMasterAccessConfig cfg;
+        cfg.freq          = 20000000;
+        cfg.spi_data_mode = spi::spi_data_mode_t::spi_halfduplex;
+        spi::SPIMasterAccessor accessor{bus, cfg};
+        auto result =
+            accessor.transfer(spi::TransferDesc{}, data::ConstDataSpan{tx, sizeof(tx)}, data::DataSpan{rx, sizeof(rx)});
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), error::error_t::NOT_IMPLEMENTED);
+    }
+
+    // Half-duplex one-directional write: still works.
+    {
+        spi::SPIMasterAccessConfig cfg;
+        cfg.freq          = 20000000;
+        cfg.spi_data_mode = spi::spi_data_mode_t::spi_halfduplex_with_dc_pin;
+        spi::SPIMasterAccessor accessor{bus, cfg};
+        auto result = accessor.write(data::ConstDataSpan{tx, sizeof(tx)});
+        EXPECT_TRUE(result.has_value());
+    }
 }
 
 TEST(SoftwareSPIBus, ReadSamplesMiso)

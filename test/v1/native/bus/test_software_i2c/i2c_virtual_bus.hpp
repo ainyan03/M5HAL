@@ -20,9 +20,9 @@ public:
     {
         _runner = runner;
     }
-    void setNowNsec(m5::hal::v1::service::tick_nsec_t now_nsec)
+    void setNowTick(m5::hal::v1::service::fast_tick_t now_tick)
     {
-        _now_nsec = now_nsec;
+        _now_tick = now_tick;
     }
 
     void masterWriteScl(bool high)
@@ -104,12 +104,12 @@ private:
     void pump()
     {
         if (_runner != nullptr) {
-            (void)_runner->runOnce(_now_nsec);
+            (void)_runner->runOnce(_now_tick);
         }
     }
 
     ServiceRunner* _runner                      = nullptr;
-    m5::hal::v1::service::tick_nsec_t _now_nsec = 0;
+    m5::hal::v1::service::tick_nsec_t _now_tick = 0;
     bool _master_scl_low                        = false;
     bool _master_sda_low                        = false;
     bool _external_slave_scl_low                = false;

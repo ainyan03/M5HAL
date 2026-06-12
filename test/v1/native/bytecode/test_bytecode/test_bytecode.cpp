@@ -910,6 +910,76 @@ TEST(BytecodeRunner, RunsFromChunkedStream)
     EXPECT_EQ(rig.runner.storedData(3).size, 1u);
 }
 
+// ---- S16 D8: symmetric trust boundary -----------------------------------------
+
+TEST(BytecodeRunner, ReceiveOnlyRejectsExecutableOpcodes)
+{
+    // A receive-only runner (the host session's) must reject every
+    // executable opcode: a peer's script fills data and reports status,
+    // it never drives local buses, pins, or the clock.
+    Rig rig;
+    rig.runner.setReceiveOnly(true);
+
+    uint8_t script[32] = {};
+    data::MemorySink sink{data::DataSpan{script, sizeof(script)}};
+    bytecode::BytecodeEncoder enc{sink};
+    ASSERT_TRUE(enc.delayMs(0xFFFFFFFFu).has_value());  // 49-day stall if executed
+    ASSERT_TRUE(enc.end().has_value());
+
+    g_delay_total = 0;
+    auto r        = rig.runner.run(data::ConstDataSpan{script, sink.written()});
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), error_t::PROTOCOL_ERROR);
+    EXPECT_EQ(g_delay_total, 0u);  // the delay handler never ran
+
+    // Receive-side opcodes still execute.
+    uint8_t resp[32] = {};
+    data::MemorySink resp_sink{data::DataSpan{resp, sizeof(resp)}};
+    bytecode::BytecodeEncoder resp_enc{resp_sink};
+    const uint8_t payload[] = {0xAA};
+    ASSERT_TRUE(resp_enc.storeData(7, {payload, sizeof(payload)}).has_value());
+    ASSERT_TRUE(resp_enc.reportComplete(error_t::OK).has_value());
+    ASSERT_TRUE(resp_enc.end().has_value());
+    ASSERT_TRUE(rig.runner.run(data::ConstDataSpan{resp, resp_sink.written()}).has_value());
+    EXPECT_EQ(rig.runner.storedData(7).size, 1u);
+    EXPECT_TRUE(rig.runner.statusReported());
+}
+
+TEST(BytecodeRunner, RunEventPreservesRequestState)
+{
+    // An event script executed via runEvent must not clobber the stored
+    // slots or report state of the previous response — even when it
+    // (out of contract) carries store_data / report_* instructions.
+    bytecode::BytecodeRunner host;
+
+    uint8_t resp[32] = {};
+    data::MemorySink resp_sink{data::DataSpan{resp, sizeof(resp)}};
+    bytecode::BytecodeEncoder resp_enc{resp_sink};
+    const uint8_t payload[] = {0x11, 0x22};
+    ASSERT_TRUE(resp_enc.storeData(5, {payload, sizeof(payload)}).has_value());
+    ASSERT_TRUE(resp_enc.reportComplete(error_t::OK).has_value());
+    ASSERT_TRUE(resp_enc.end().has_value());
+    ASSERT_TRUE(host.run(data::ConstDataSpan{resp, resp_sink.written()}).has_value());
+    ASSERT_EQ(host.storedData(5).size, 2u);
+    ASSERT_TRUE(host.statusReported());
+
+    uint8_t evt[32] = {};
+    data::MemorySink evt_sink{data::DataSpan{evt, sizeof(evt)}};
+    bytecode::BytecodeEncoder evt_enc{evt_sink};
+    const uint8_t junk[] = {0xEE};
+    ASSERT_TRUE(evt_enc.storeData(5, {junk, sizeof(junk)}).has_value());
+    ASSERT_TRUE(evt_enc.reportError(error_t::UNKNOWN_ERROR, 9).has_value());
+    ASSERT_TRUE(evt_enc.end().has_value());
+    ASSERT_TRUE(host.runEvent(data::ConstDataSpan{evt, evt_sink.written()}).has_value());
+
+    // The request state survives untouched.
+    auto stored = host.storedData(5);
+    ASSERT_EQ(stored.size, 2u);
+    EXPECT_EQ(stored.data[0], 0x11);
+    EXPECT_TRUE(host.statusReported());
+    EXPECT_EQ(host.reportedStatus(), error_t::OK);
+}
+
 }  // namespace
 
 int main(int argc, char** argv)

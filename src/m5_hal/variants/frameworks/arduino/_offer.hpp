@@ -9,9 +9,8 @@
 // tokens (../variants/frameworks/arduino) would otherwise be reformatted
 // as a chain of C++ division operators, breaking the macro.
 
-#define M5HAL_VARIANT_CURRENT_ALIAS_     arduino
-#define M5HAL_VARIANT_CURRENT_BASE_PATH_ ../variants/frameworks/arduino
-#define M5HAL_VARIANT_CURRENT_BASE_NS_   variants::frameworks::arduino
+#define M5HAL_VARIANT_CURRENT_ALIAS_   arduino
+#define M5HAL_VARIANT_CURRENT_BASE_NS_ variants::frameworks::arduino
 
 #define M5HAL_VARIANT_CURRENT_HAS_HAL_GPIO_ 1
 #define M5HAL_VARIANT_CURRENT_HAS_HAL_I2C_  1

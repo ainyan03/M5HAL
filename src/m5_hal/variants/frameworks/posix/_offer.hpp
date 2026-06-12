@@ -13,9 +13,8 @@
 // solely on a POSIX host build; see frameworks/_checker.hpp
 // (M5HAL_FRAMEWORK_HAS_POSIX) for the gating and opt-out flag.
 
-#define M5HAL_VARIANT_CURRENT_ALIAS_     posix
-#define M5HAL_VARIANT_CURRENT_BASE_PATH_ ../variants/frameworks/posix
-#define M5HAL_VARIANT_CURRENT_BASE_NS_   variants::frameworks::posix
+#define M5HAL_VARIANT_CURRENT_ALIAS_   posix
+#define M5HAL_VARIANT_CURRENT_BASE_NS_ variants::frameworks::posix
 
 #define M5HAL_VARIANT_CURRENT_HAS_HAL_UART_ 1
 // clang-format on

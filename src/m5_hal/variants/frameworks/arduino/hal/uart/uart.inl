@@ -67,7 +67,16 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::release(void)
     (void)release();
     _serial   = &serial;
     _attached = true;
-    _begun    = true;
+    // _begun stays false: the first access MUST apply the accessor
+    // config (begin + timeout), exactly like init() does. The old
+    // `_begun = true` made the first apply a no-op whenever the
+    // accessor happened to ask for the default config — whether the
+    // attached serial got (re)configured depended on the config VALUE,
+    // which is the same class of trap as the i2c `_last_freq` sentinel
+    // this mirrors (S16 D10). Callers who configured the serial
+    // themselves should pass the same parameters in the accessor
+    // config; attach does not try to preserve an unknown foreign setup.
+    _begun = false;
     return ::m5::hal::v1::error::error_t::OK;
 }
 

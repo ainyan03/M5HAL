@@ -82,6 +82,8 @@ STOP
 - `desc.prefix_len == 0` かつ `tx == nullptr` の場合は write phase をスキップ (rx がある場合は ADDR|R から開始)
 - `rx == nullptr` の場合は read phase をスキップ
 - `desc.prefix_len == 0` かつ `tx == nullptr` かつ `rx == nullptr` の **全空** = **probe path** として扱う (下記)
+- 成功時の戻り値は **データ相のバイト数 (`tx + rx`) のみ**。`desc.prefix` は wire に送出されるが数えない (SPI の command/address 相と同じ分離。`readRegister(reg, buf, 4)` の成功は 4 を返す)
+- `I2CMasterAccessConfig::timeout_ms` は **転送 1 回の全体上限** (espidf の per-transfer 意味に全 backend を統一、S16 D10)。software はクロックストレッチ個別上限に加えて転送全体デッドラインを持ち、arduino は `Wire::setTimeOut` へ遅延適用する
 
 ### probe path
 
@@ -173,7 +175,7 @@ private:
 
 ## software I2C variant の実装方針
 
-`variants::frameworks::software` の I2C master は、 GPIO `Pin` を open-drain 相当で駆動する bit-bang 実装として扱う。 実装は START / STOP / byte write / byte read / transaction を小さな service に分け、 同期 runner から比較可能な 32-bit tick (`ServiceContext::now_nsec`) を渡して進める。 通常の同期 transfer path では `fastTick()` を使い、 `I2CMasterAccessConfig::freq` から得た half period を fast tick 単位へ変換する。 これにより `micros()` / `esp_timer_get_time()` の呼び出しコストを hot path から外す。 `ServiceContext::now_nsec` という field 名は historical に nsec 起点だが、実装上は service ごとに due 値と同じ単位で扱う。
+`variants::frameworks::software` の I2C master は、 GPIO `Pin` を open-drain 相当で駆動する bit-bang 実装として扱う。 実装は START / STOP / byte write / byte read / transaction を小さな service に分け、 同期 runner から比較可能な 32-bit tick (`ServiceContext::now_tick`) を渡して進める。 通常の同期 transfer path では `fastTick()` を使い、 `I2CMasterAccessConfig::freq` から得た half period を fast tick 単位へ変換する。 これにより `micros()` / `esp_timer_get_time()` の呼び出しコストを hot path から外す。 `now_tick` の単位は runner が選ぶ (同期 path = 生 `fastTick()`、 native test = 素の数値)。 service は due 値を同じ単位で持ち、 加算と mod 2^32 比較しかしない。
 
 write buffer は頻出経路なので、 `MasterTransactionService` 側に fast path を持つ。 具体的には `Operation::WriteBuffer` の dispatch を先頭で処理し、 byte write service を直接呼び、 2 byte 目以降は同じ line driver / timing を保持したまま byte state だけを restart する。 これは service 概念を維持したまま、 byte 列送信中の呼び出し層と分岐を減らすための最適化である。
 

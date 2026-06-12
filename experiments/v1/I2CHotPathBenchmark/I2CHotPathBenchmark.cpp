@@ -122,9 +122,9 @@ public:
 sw_i2c::MasterTiming makeTiming(uint32_t freq_hz)
 {
     sw_i2c::MasterTiming timing;
-    const uint64_t denom    = static_cast<uint64_t>(freq_hz) * 2ull;
-    timing.half_period_nsec = static_cast<service::tick_nsec_t>((1000000000ull + (denom / 2ull)) / denom);
-    timing.timeout_nsec     = 1000000000u;
+    const uint64_t denom = static_cast<uint64_t>(freq_hz) * 2ull;
+    timing.half_period   = static_cast<service::tick_nsec_t>((1000000000ull + (denom / 2ull)) / denom);
+    timing.timeout       = 1000000000u;
     return timing;
 }
 
@@ -133,8 +133,8 @@ sw_i2c::MasterTiming makeFastTickTiming(uint32_t freq_hz)
     const auto timing      = makeTiming(freq_hz);
     const auto fasttick_hz = service::fastTickFrequencyHz();
     sw_i2c::MasterTiming result;
-    result.half_period_nsec = service::nsecToFastTickCeil(timing.half_period_nsec, fasttick_hz);
-    result.timeout_nsec     = service::nsecToFastTickCeil(timing.timeout_nsec, fasttick_hz);
+    result.half_period = service::nsecToFastTickCeil(timing.half_period, fasttick_hz);
+    result.timeout     = service::nsecToFastTickCeil(timing.timeout, fasttick_hz);
     return result;
 }
 
@@ -171,22 +171,6 @@ BenchResult measureVirtualLineOps()
                        concrete.scl_rises,        concrete.writes,       concrete.reads};
 }
 
-BenchResult measureFastTickNsecLoop()
-{
-    uint32_t acc = 0;
-
-    const uint32_t start_cycles = readCycles();
-    const uint32_t start_usec   = static_cast<uint32_t>(m5::utility::micros());
-    for (uint32_t i = 0; i < kLoopIterations; ++i) {
-        acc += service::fastTickNsec();
-    }
-    const uint32_t end_usec   = static_cast<uint32_t>(m5::utility::micros());
-    const uint32_t end_cycles = readCycles();
-
-    g_sink32 += acc;
-    return BenchResult{end_cycles - start_cycles, end_usec - start_usec, kLoopIterations, 0, 0, 0, 0};
-}
-
 BenchResult measureFastTickLoop()
 {
     uint32_t acc = 0;
@@ -211,8 +195,8 @@ BenchResult measureForcedDueWriteBuffer()
     SyntheticLineDriver lines;
     sw_i2c::MasterTransactionService transaction;
     sw_i2c::MasterTiming timing;
-    timing.half_period_nsec = 0;
-    timing.timeout_nsec     = 1000000000u;
+    timing.half_period = 0;
+    timing.timeout     = 1000000000u;
 
     service::tick_nsec_t now = 0;
     transaction.beginWriteBuffer(lines, timing, payload, sizeof(payload), now);
@@ -221,7 +205,7 @@ BenchResult measureForcedDueWriteBuffer()
     const uint32_t start_cycles = readCycles();
     const uint32_t start_usec   = static_cast<uint32_t>(m5::utility::micros());
     for (;;) {
-        const auto r = transaction.service(service::ServiceContext{transaction.dueNsec()});
+        const auto r = transaction.service(service::ServiceContext{transaction.dueTick()});
         ++result.calls;
         if (r == service::ServiceResult::Idle) {
             ++result.idle_calls;
@@ -288,8 +272,8 @@ BenchResult measureForcedDueReadBuffer()
     SyntheticLineDriver lines;
     sw_i2c::MasterTransactionService transaction;
     sw_i2c::MasterTiming timing;
-    timing.half_period_nsec = 0;
-    timing.timeout_nsec     = 1000000000u;
+    timing.half_period = 0;
+    timing.timeout     = 1000000000u;
 
     service::tick_nsec_t now = 0;
     transaction.beginReadBuffer(lines, timing, payload, sizeof(payload), true, now);
@@ -298,7 +282,7 @@ BenchResult measureForcedDueReadBuffer()
     const uint32_t start_cycles = readCycles();
     const uint32_t start_usec   = static_cast<uint32_t>(m5::utility::micros());
     for (;;) {
-        const auto r = transaction.service(service::ServiceContext{transaction.dueNsec()});
+        const auto r = transaction.service(service::ServiceContext{transaction.dueTick()});
         ++result.calls;
         if (r == service::ServiceResult::Idle) {
             ++result.idle_calls;
@@ -385,7 +369,6 @@ void runBenchmark()
     Serial.printf("target software I2C freq: %lu Hz\n", static_cast<unsigned long>(kTargetFreqHz));
     Serial.printf("payload bytes: %lu\n", static_cast<unsigned long>(kPayloadBytes));
 
-    printResult("fastTickNsec loop", measureFastTickNsecLoop());
     printResult("fastTick loop", measureFastTickLoop());
     printResult("virtual line ops", measureVirtualLineOps());
     printResult("write buffer forced due", measureForcedDueWriteBuffer());

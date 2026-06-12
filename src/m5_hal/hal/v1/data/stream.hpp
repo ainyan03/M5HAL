@@ -295,7 +295,12 @@ public:
             return m5::stl::make_unexpected(wrote.error());
         }
         if (wrote.value() != N) {
-            return m5::stl::make_unexpected(m5::hal::v1::error::error_t::IO_ERROR);
+            // A short write's dominant cause is the writer's own write
+            // timeout — classify it as TIMEOUT_ERROR (retryable), symmetric
+            // with the read side, instead of a fatal-looking IO_ERROR
+            // (S16 D10). NOTE: bytes may sit half-flushed on the wire; the
+            // caller decides whether to resync/retransmit.
+            return m5::stl::make_unexpected(m5::hal::v1::error::error_t::TIMEOUT_ERROR);
         }
         return {};
     }

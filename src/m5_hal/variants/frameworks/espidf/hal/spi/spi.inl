@@ -170,11 +170,14 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const ::m5::hal
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
     const auto& spi_config = static_cast<const BusConfig&>(config);
-    _config                = spi_config;
-    _host                  = spi_config.host;
+    // Release the previous bus while `_host` still names the OLD host;
+    // adopting the new config first would free the wrong bus and leak
+    // the old one.
     if (_owns_bus) {
         (void)release();
     }
+    _config = spi_config;
+    _host   = spi_config.host;
 
     ::spi_bus_config_t bus_config = {};
     bus_config.mosi_io_num        = static_cast<int>(_config.pin_mosi);

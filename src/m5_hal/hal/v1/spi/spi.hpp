@@ -224,6 +224,23 @@ struct SPIBus : public bus::Bus {
                                                                                   const SPIMasterAccessConfig& cfg);
     virtual m5::stl::expected<void, m5::hal::v1::error::error_t> endTransaction(bus::Accessor* owner,
                                                                                 const SPIMasterAccessConfig& cfg);
+    /*!
+      @brief Core SPI transfer entry point.
+
+      Return-value contract (matches `I2CBus::transfer` since S16 D4):
+      the bus returns the byte count of the DATA phase only (`tx + rx`
+      as driven on the wire). The command / address phases encoded by
+      `desc` are NOT included here. Variant implementations MUST follow
+      this split, or the accessor layer double-counts.
+
+      Accessor sugars report "bytes of the caller's data argument that
+      were processed": `writeCommandData(span)` therefore adds the
+      command bytes back (the span includes them), while plain
+      `write`/`read`/`transfer` report the data phase as-is.
+
+      `tx` / `rx` are nullable (`nullptr` = no data for that direction).
+      The default implementation returns `NOT_IMPLEMENTED`.
+     */
     virtual m5::stl::expected<size_t, m5::hal::v1::error::error_t> transfer(bus::Accessor* owner,
                                                                             const SPIMasterAccessConfig& cfg,
                                                                             const TransferDesc& desc, data::Source* tx,

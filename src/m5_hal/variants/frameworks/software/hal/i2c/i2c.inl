@@ -72,35 +72,43 @@ uint32_t serviceFastTickFrequencyHz()
     return frequency_hz;
 }
 
-::m5::hal::v1::service::tick_nsec_t serviceNsecToTick(::m5::hal::v1::service::tick_nsec_t nsec)
+::m5::hal::v1::service::fast_tick_t serviceNsecToTick(::m5::hal::v1::service::tick_nsec_t nsec)
 {
     return ::m5::hal::v1::service::nsecToFastTickCeil(nsec, serviceFastTickFrequencyHz());
 }
 
-detail::MasterTiming serviceTimingFromNsec(const detail::MasterTiming& timing)
+detail::MasterTiming serviceTimingToTicks(const detail::MasterTiming& timing)
 {
     // Keep detail services generic, but run the synchronous software I2C path
     // in fastTick units so the hot loop does not pay fastTick->nsec conversion.
     detail::MasterTiming result;
-    result.half_period_nsec = serviceNsecToTick(timing.half_period_nsec);
-    result.timeout_nsec     = serviceNsecToTick(timing.timeout_nsec);
+    result.half_period = serviceNsecToTick(timing.half_period);
+    result.timeout     = serviceNsecToTick(timing.timeout);
     return result;
 }
 
-::m5::hal::v1::service::tick_nsec_t serviceNowTick()
+::m5::hal::v1::service::fast_tick_t serviceNowTick()
 {
     return ::m5::hal::v1::service::fastTick();
 }
 
 template <typename Service>
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> runErrorReportingService(Service& service)
+m5::stl::expected<void, ::m5::hal::v1::error::error_t> runErrorReportingService(
+    Service& service, ::m5::hal::v1::service::fast_tick_t deadline_tick)
 {
 #if !M5HAL_DEBUG_SOFTWARE_I2C_NO_WAIT
     uint32_t idle_spins = 0;
 #endif
     for (;;) {
         const auto now_tick = serviceNowTick();
-        auto result         = service.service(::m5::hal::v1::service::ServiceContext{now_tick});
+        // Whole-transfer deadline (S16 D10): `timeout_ms` bounds the
+        // ENTIRE transfer, matching the espidf backend's per-transfer
+        // semantics. Without this, only individual clock stretches were
+        // bounded and a transfer could stall indefinitely in aggregate.
+        if (::m5::hal::v1::service::hasReached(now_tick, deadline_tick)) {
+            return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::TIMEOUT_ERROR);
+        }
+        auto result = service.service(::m5::hal::v1::service::ServiceContext{now_tick});
         if (result == ::m5::hal::v1::service::ServiceResult::Done) {
             return {};
         }
@@ -114,7 +122,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> runErrorReportingService(
             }
             idle_spins                                                        = 0;
             constexpr ::m5::hal::v1::service::tick_nsec_t kYieldThresholdNsec = 1000000u;
-            const auto wait_tick = ::m5::hal::v1::service::elapsedNsec(service.dueNsec(), now_tick);
+            const auto wait_tick = ::m5::hal::v1::service::elapsedTicks(service.dueTick(), now_tick);
             if (wait_tick >= serviceNsecToTick(kYieldThresholdNsec)) {
                 std::this_thread::yield();
             }
@@ -127,22 +135,20 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> runErrorReportingService(
     }
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> sendAddressWithServices(::m5::hal::v1::gpio::Pin& scl,
-                                                                               ::m5::hal::v1::gpio::Pin& sda,
-                                                                               const detail::MasterTiming& timing,
-                                                                               uint8_t addr_byte)
+m5::stl::expected<void, ::m5::hal::v1::error::error_t> sendAddressWithServices(
+    ::m5::hal::v1::gpio::Pin& scl, ::m5::hal::v1::gpio::Pin& sda, const detail::MasterTiming& timing, uint8_t addr_byte,
+    ::m5::hal::v1::service::fast_tick_t deadline_tick)
 {
     PinMasterLineDriver lines{scl, sda};
     detail::MasterTransactionService transaction;
 
     transaction.beginAddress(lines, timing, addr_byte, serviceNowTick());
-    return runErrorReportingService(transaction);
+    return runErrorReportingService(transaction, deadline_tick);
 }
 
-m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> writeBytesWithService(::m5::hal::v1::gpio::Pin& scl,
-                                                                               ::m5::hal::v1::gpio::Pin& sda,
-                                                                               const detail::MasterTiming& timing,
-                                                                               const uint8_t* data, size_t len)
+m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> writeBytesWithService(
+    ::m5::hal::v1::gpio::Pin& scl, ::m5::hal::v1::gpio::Pin& sda, const detail::MasterTiming& timing,
+    const uint8_t* data, size_t len, ::m5::hal::v1::service::fast_tick_t deadline_tick)
 {
     PinMasterLineDriver lines{scl, sda};
     detail::MasterTransactionService transaction;
@@ -150,17 +156,16 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> writeBytesWithService(:
         return size_t{0};
     }
     transaction.beginWriteBuffer(lines, timing, data, len, serviceNowTick());
-    auto result = runErrorReportingService(transaction);
+    auto result = runErrorReportingService(transaction, deadline_tick);
     if (!result) {
         return m5::stl::make_unexpected(result.error());
     }
     return transaction.transferred();
 }
 
-m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> readBytesWithService(::m5::hal::v1::gpio::Pin& scl,
-                                                                              ::m5::hal::v1::gpio::Pin& sda,
-                                                                              const detail::MasterTiming& timing,
-                                                                              uint8_t* data, size_t len, bool last_nack)
+m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> readBytesWithService(
+    ::m5::hal::v1::gpio::Pin& scl, ::m5::hal::v1::gpio::Pin& sda, const detail::MasterTiming& timing, uint8_t* data,
+    size_t len, bool last_nack, ::m5::hal::v1::service::fast_tick_t deadline_tick)
 {
     PinMasterLineDriver lines{scl, sda};
     detail::MasterTransactionService transaction;
@@ -168,7 +173,7 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> readBytesWithService(::
         return size_t{0};
     }
     transaction.beginReadBuffer(lines, timing, data, len, last_nack, serviceNowTick());
-    auto result = runErrorReportingService(transaction);
+    auto result = runErrorReportingService(transaction, deadline_tick);
     if (!result) {
         return m5::stl::make_unexpected(result.error());
     }
@@ -182,7 +187,9 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> sendStopWithService(::m5:
     PinMasterLineDriver lines{scl, sda};
     detail::MasterTransactionService transaction;
     transaction.beginStop(lines, timing, serviceNowTick());
-    return runErrorReportingService(transaction);
+    // STOP is the cleanup path: give it its own small budget so a blown
+    // whole-transfer deadline still lets the bus be released cleanly.
+    return runErrorReportingService(transaction, serviceNowTick() + timing.timeout);
 }
 
 }  // anonymous namespace
@@ -196,20 +203,23 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const ::m5::hal
     _config = static_cast<const ::m5::hal::v1::i2c::I2CBusConfig&>(config);
 
     // BusConfig uses the single gpio_number_t path. Resolve through
-    // `M5HALCore::Gpio` (the singleton GPIOGroup) with
-    // `M5_Hal.Gpio.getPin(num)` and cache the resulting `Pin` into
-    // `_pin_scl` / `_pin_sda` so the transfer hot path skips the
-    // lookup.
+    // `M5HALCore::Gpio` (the singleton GPIOGroup) with the CHECKED
+    // `tryGetPin` — the pin numbers are caller input, so a bad value
+    // must come back through the expected path, not the assert/UB
+    // fast path of `getPin`. Cache the resulting `Pin` into
+    // `_pin_scl` / `_pin_sda` so the transfer hot path skips the lookup.
     if (_config.pin_scl < 0 || _config.pin_sda < 0) {
         M5_LIB_LOGE("software::i2c::Bus::init: pins not set");
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
-    _pin_scl = ::m5::hal::v1::M5_Hal.Gpio.getPin(_config.pin_scl);
-    _pin_sda = ::m5::hal::v1::M5_Hal.Gpio.getPin(_config.pin_sda);
-    if (!_pin_scl.isValid() || !_pin_sda.isValid()) {
+    auto scl_pin = ::m5::hal::v1::M5_Hal.Gpio.tryGetPin(_config.pin_scl);
+    auto sda_pin = ::m5::hal::v1::M5_Hal.Gpio.tryGetPin(_config.pin_sda);
+    if (!scl_pin.has_value() || !sda_pin.has_value()) {
         M5_LIB_LOGE("software::i2c::Bus::init: pin resolution failed");
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
+    _pin_scl = scl_pin.value();
+    _pin_sda = sda_pin.value();
     _pin_scl.setMode(::m5::hal::v1::types::gpio_mode_t::OutputOpenDrainPullup);
     _pin_scl.writeLow();
     _pin_sda.setMode(::m5::hal::v1::types::gpio_mode_t::OutputOpenDrainPullup);
@@ -232,11 +242,22 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
     if (!scl->isValid() || !sda->isValid()) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
+    // This bit-bang master drives 7-bit addressing only: reject a 10-bit
+    // request instead of silently truncating the address (which would
+    // address the wrong device). Same degradation as the espidf gen4
+    // backend.
+    if (cfg.address_is_10bit || cfg.i2c_addr > 0x007Fu) {
+        return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
+    }
     auto timing = detail::MasterTiming::fromConfig(cfg);
     if (!timing.has_value()) {
         return m5::stl::make_unexpected(timing.error());
     }
-    const auto service_timing = serviceTimingFromNsec(*timing);
+    const auto service_timing = serviceTimingToTicks(*timing);
+    // Whole-transfer deadline: cfg.timeout_ms bounds this entire transfer
+    // (espidf-equivalent per-transfer semantics, S16 D10). The per-stretch
+    // timeout inside MasterServiceTiming still applies on top.
+    const auto deadline_tick = serviceNowTick() + service_timing.timeout;
 
     // Pass `desc.prefix` into the legacy code path (header.data /
     // header.size) as a local `ConstDataSpan`. `desc` lives as a
@@ -249,7 +270,7 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
 
     auto write_addr = [&](bool read_bit) -> m5::stl::expected<void, ::m5::hal::v1::error::error_t> {
         uint8_t addr_byte = static_cast<uint8_t>((cfg.i2c_addr << 1) | (read_bit ? 1 : 0));
-        return sendAddressWithServices(*scl, *sda, service_timing, addr_byte);
+        return sendAddressWithServices(*scl, *sda, service_timing, addr_byte, deadline_tick);
     };
 
     bool have_tx = (tx != nullptr && !tx->eof());
@@ -280,12 +301,13 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
         }
         write_phase_open = true;
         if (header.size) {
-            auto w = writeBytesWithService(*scl, *sda, service_timing, header.data, header.size);
+            auto w = writeBytesWithService(*scl, *sda, service_timing, header.data, header.size, deadline_tick);
             if (!w) {
                 sendStopWithService(*scl, *sda, service_timing);
                 return m5::stl::make_unexpected(w.error());
             }
-            total += *w;
+            // Prefix bytes are NOT counted: the return value is the data
+            // phase only (tx + rx), matching SPI (S16 D4).
         }
         if (tx) {
             // Drain Source via peek/advance, writing each peeked chunk.
@@ -299,7 +321,7 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
                 if (span.size == 0) {
                     break;  // explicit end-of-stream
                 }
-                auto w = writeBytesWithService(*scl, *sda, service_timing, span.data, span.size);
+                auto w = writeBytesWithService(*scl, *sda, service_timing, span.data, span.size, deadline_tick);
                 if (!w) {
                     sendStopWithService(*scl, *sda, service_timing);
                     return m5::stl::make_unexpected(w.error());
@@ -333,7 +355,7 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
                 if (write_phase_open) sendStopWithService(*scl, *sda, service_timing);
                 return m5::stl::make_unexpected(wa.error());
             }
-            auto rd = readBytesWithService(*scl, *sda, service_timing, rx_span.data, rx_span.size, true);
+            auto rd = readBytesWithService(*scl, *sda, service_timing, rx_span.data, rx_span.size, true, deadline_tick);
             if (!rd) {
                 sendStopWithService(*scl, *sda, service_timing);
                 return m5::stl::make_unexpected(rd.error());

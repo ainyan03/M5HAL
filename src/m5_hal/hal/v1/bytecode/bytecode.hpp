@@ -97,7 +97,14 @@ constexpr size_t lenVarSize(size_t value)
     return value <= 0xFC ? 1 : (value <= 0xFFFF ? 3 : 5);
 }
 
-/*! @brief Write a LenVar; `dst` must hold `lenVarSize(value)` bytes. Returns bytes written. */
+/*!
+  @brief Write a LenVar; `dst` must hold `lenVarSize(value)` bytes. Returns bytes written.
+
+  The valid range is [0, 0xFFFFFFFE] (i.e. the full u32 space minus the
+  reserved marker 0xFF). On a 64-bit host, passing a value above 0xFFFFFFFF
+  silently truncates to the low 32 bits — this is a caller-contract violation.
+  The caller is responsible for ensuring the value fits in u32 before calling.
+ */
 size_t encodeLenVar(uint8_t* dst, size_t value);
 
 /*!
@@ -282,6 +289,12 @@ public:
         _stream_credit_fn  = fn;
         _stream_credit_ctx = ctx;
     }
+    /*! @brief Context registered with the stream-credit handler (`nullptr` when unset).
+        Lets a registrant unregister itself only while it still owns the slot. */
+    void* streamCreditHandlerCtx() const
+    {
+        return _stream_credit_ctx;
+    }
     /*! @} */
 
     /*! @brief Result of `i2sStreamStatus` — the device-side credit snapshot. */
@@ -301,6 +314,38 @@ public:
     m5::stl::expected<size_t, m5::hal::v1::error::error_t> run(data::Source& script);
     /*! @brief Execute straight from a local byte array. */
     m5::stl::expected<size_t, m5::hal::v1::error::error_t> run(data::ConstDataSpan script);
+
+    /*!
+      @brief Execute an EVENT script without disturbing request state.
+
+      Unlike `run`, this neither clears the stored slots nor resets the
+      report state, and `store_data` / `report_*` inside the script are
+      ignored — a poll-path event must not clobber the response data the
+      caller is still reading (S16 D8). Event dispatch (`evt_*` handlers)
+      works as in `run`.
+     */
+    m5::stl::expected<size_t, m5::hal::v1::error::error_t> runEvent(data::ConstDataSpan script);
+
+    /*!
+      @brief Restrict dispatch to receive-side opcodes.
+
+      With receive-only set, executable opcodes (`delay_ms`, `bus_*`,
+      `gpio_*`) are rejected with `PROTOCOL_ERROR`: a script received
+      FROM a peer must fill in data and report status, never drive the
+      local buses, pins, or clock (S16 D8 — trust is symmetric; a buggy
+      or hostile peer must not stall or actuate this side). Unknown
+      non-critical opcodes still skip for forward compatibility. The
+      host-side `RemoteSession` enables this on its runner; the
+      server's executing runner keeps the full set.
+     */
+    void setReceiveOnly(bool receive_only)
+    {
+        _receive_only = receive_only;
+    }
+    bool receiveOnly(void) const
+    {
+        return _receive_only;
+    }
 
     /*! @brief Stored bytes for `store_id`; empty span when the slot is unused. */
     data::ConstDataSpan storedData(uint8_t store_id) const;
@@ -364,6 +409,10 @@ private:
     m5::stl::expected<void, m5::hal::v1::error::error_t> opStoreData(data::ConstDataSpan payload);
     m5::stl::expected<void, m5::hal::v1::error::error_t> opReport(uint8_t opcode, data::ConstDataSpan payload);
 
+    // Shared instruction loop behind run()/runEvent(); state resets stay
+    // in the entry points.
+    m5::stl::expected<size_t, m5::hal::v1::error::error_t> runLoop(data::Source& script);
+
     memory::Allocator* _alloc                     = nullptr;
     i2c::I2CMasterAccessor* _i2c[kMaxBusBindings] = {};
     spi::SPIMasterAccessor* _spi[kMaxBusBindings] = {};
@@ -386,6 +435,8 @@ private:
     size_t _reported_offset                      = 0;
     size_t _last_offset                          = 0;
     size_t _unknown_skipped                      = 0;
+    bool _receive_only                           = false;  // reject executable opcodes (S16 D8)
+    bool _event_mode                             = false;  // runEvent(): store/report are ignored
 };
 
 }  // namespace m5::hal::v1::bytecode

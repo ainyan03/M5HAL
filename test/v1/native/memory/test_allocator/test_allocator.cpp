@@ -250,6 +250,34 @@ TEST(MemoryAllocator, PersistentReallocateUsesFallbackReallocator)
     EXPECT_EQ(FallbackCounters::free_count, 1u);
 }
 
+TEST(MemoryAllocator, PoolPointerReallocAcrossUsageMovesOutOfPool)
+{
+    Allocator alloc;
+    FallbackCounters::reset();
+    alloc.setFallback(&FallbackCounters::mallocFn, &FallbackCounters::reallocFn, &FallbackCounters::freeFn);
+
+    auto* p = static_cast<unsigned char*>(alloc.allocate(16, usage_t::temp));
+    ASSERT_NE(p, nullptr);
+    EXPECT_EQ(alloc.usedBlocks(), 1u);
+    std::memset(p, 0xA5, 16);
+
+    // Promoting a pool-owned buffer to persistent must NOT hand the pool
+    // pointer to the fallback reallocator (it is not a heap pointer);
+    // it must allocate at the destination, copy, and release the block.
+    auto* promoted = static_cast<unsigned char*>(alloc.reallocate(p, 16, 64, usage_t::persistent));
+    ASSERT_NE(promoted, nullptr);
+    EXPECT_EQ(FallbackCounters::realloc_count, 0u);
+    EXPECT_EQ(FallbackCounters::malloc_count, 1u);
+    EXPECT_EQ(FallbackCounters::last_usage, usage_t::persistent);
+    EXPECT_EQ(alloc.usedBlocks(), 0u);
+    for (size_t i = 0; i < 16; ++i) {
+        EXPECT_EQ(promoted[i], 0xA5);
+    }
+
+    alloc.deallocate(promoted);
+    EXPECT_EQ(FallbackCounters::free_count, 1u);
+}
+
 TEST(MemoryAllocator, DeallocateNullIsSafe)
 {
     Allocator alloc;
@@ -267,7 +295,43 @@ TEST(MemoryAllocator, DeallocateNullDoesNotCallFallback)
     EXPECT_EQ(FallbackCounters::free_count, 0u);
 }
 
-TEST(MemoryAllocator, NonBoundaryPointerDoesNotFreePoolBlock)
+// An invalid pointer inside the pool (interior pointer or double free)
+// must never reach the fallback `free` (heap corruption). Debug builds
+// assert; release builds ignore it. The death tests below pin down the
+// debug behaviour; the release branch checks the silent-ignore path.
+#if !defined(NDEBUG)
+TEST(MemoryAllocatorDeathTest, InteriorPoolPointerAsserts)
+{
+    Allocator alloc;
+    FallbackCounters::reset();
+    alloc.setFallback(&FallbackCounters::mallocFn, &FallbackCounters::freeNoop);
+
+    auto* p = static_cast<unsigned char*>(alloc.allocate(Allocator::tempBlockSize()));
+    ASSERT_NE(p, nullptr);
+
+    EXPECT_DEATH({ alloc.deallocate(p + 1); }, "invalid in-pool pointer");
+    EXPECT_EQ(FallbackCounters::free_count, 0u);
+
+    alloc.deallocate(p);
+    EXPECT_EQ(alloc.usedBlocks(), 0u);
+}
+
+TEST(MemoryAllocatorDeathTest, DoubleFreeOfPoolBlockAsserts)
+{
+    Allocator alloc;
+    FallbackCounters::reset();
+    alloc.setFallback(&FallbackCounters::mallocFn, &FallbackCounters::freeNoop);
+
+    auto* p = static_cast<unsigned char*>(alloc.allocate(Allocator::tempBlockSize()));
+    ASSERT_NE(p, nullptr);
+    alloc.deallocate(p);
+    EXPECT_EQ(alloc.usedBlocks(), 0u);
+
+    EXPECT_DEATH({ alloc.deallocate(p); }, "invalid in-pool pointer");
+    EXPECT_EQ(FallbackCounters::free_count, 0u);
+}
+#else
+TEST(MemoryAllocator, NonBoundaryPoolPointerIgnoredWithoutFallbackFree)
 {
     Allocator alloc;
     FallbackCounters::reset();
@@ -277,13 +341,13 @@ TEST(MemoryAllocator, NonBoundaryPointerDoesNotFreePoolBlock)
     ASSERT_NE(p, nullptr);
 
     alloc.deallocate(p + 1);
-    EXPECT_EQ(FallbackCounters::free_count, 1u);
-    EXPECT_EQ(FallbackCounters::last_freed, p + 1);
+    EXPECT_EQ(FallbackCounters::free_count, 0u);
     EXPECT_EQ(alloc.usedBlocks(), 1u);
 
     alloc.deallocate(p);
     EXPECT_EQ(alloc.usedBlocks(), 0u);
 }
+#endif  // !defined(NDEBUG)
 
 TEST(MemoryAllocator, MixedAllocateFreeReusesReleasedBlocks)
 {

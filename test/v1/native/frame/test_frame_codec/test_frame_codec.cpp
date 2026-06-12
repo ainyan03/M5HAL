@@ -23,9 +23,9 @@ using m5::hal::v1::data::DataSpan;
 using m5::hal::v1::data::MemorySink;
 using m5::hal::v1::data::MemorySource;
 using m5::hal::v1::data::StreamReader;
+using m5::hal::v1::data::StreamSink;
 using m5::hal::v1::data::StreamSource;
 using m5::hal::v1::data::StreamWriter;
-using m5::hal::v1::data::StreamSink;
 using error_t = m5::hal::v1::error::error_t;
 
 // Same scripted fakes as test_stream_adapter: `feed` makes bytes
@@ -272,9 +272,9 @@ TEST(FrameDecode, NeedMoreOnPartialInput)
 TEST(FrameDecode, SequentialFramesInOneBuffer)
 {
     std::array<uint8_t, 64> buf{};
-    size_t used   = 0;
-    auto delim    = frame::encodeDelimiter({buf.data(), buf.size()});
-    used         += delim.value();
+    size_t used = 0;
+    auto delim  = frame::encodeDelimiter({buf.data(), buf.size()});
+    used += delim.value();
     const uint8_t p1[] = {0x11};
     used += frame::encodeData({buf.data() + used, buf.size() - used}, 1, {p1, sizeof(p1)}).value();
     const uint8_t p2[] = {0x22, 0x33};
@@ -399,8 +399,8 @@ TEST(FrameReader, SkipsPaddingAndSurfacesInvalidThenRecovers)
     std::array<uint8_t, 64> wire{};
     size_t used = 0;
     // padding, padding, corrupt frame, good frame
-    wire[used++] = 0x00;
-    wire[used++] = 0x00;
+    wire[used++]      = 0x00;
+    wire[used++]      = 0x00;
     const uint8_t p[] = {0x42};
     auto corrupt      = frame::encodeData({wire.data() + used, wire.size() - used}, 1, {p, sizeof(p)});
     wire[used + 4] ^= 0xFF;  // corrupt the stream id byte
@@ -509,7 +509,7 @@ TEST(FrameWriter, ShortWriteAndArgumentErrors)
     const uint8_t payload[] = {1, 2, 3};
     auto written            = writer.writeData(1, {payload, sizeof(payload)});
     ASSERT_FALSE(written.has_value());
-    EXPECT_EQ(written.error(), error_t::IO_ERROR);  // StreamSink reports the short write
+    EXPECT_EQ(written.error(), error_t::TIMEOUT_ERROR);  // short write = retryable (S16 D10)
 
     std::array<uint8_t, 300> big{};
     auto invalid = writer.writeData(1, {big.data(), frame::kMaxDataPayload + 1});

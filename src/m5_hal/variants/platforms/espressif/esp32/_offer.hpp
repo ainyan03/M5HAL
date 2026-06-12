@@ -5,9 +5,8 @@
 // See frameworks/arduino/_offer.hpp for the rationale (including the
 // clang-format off rationale for the BASE_PATH_ value).
 
-#define M5HAL_VARIANT_CURRENT_ALIAS_     esp32
-#define M5HAL_VARIANT_CURRENT_BASE_PATH_ ../variants/platforms/espressif/esp32
-#define M5HAL_VARIANT_CURRENT_BASE_NS_   variants::platforms::espressif::esp32
+#define M5HAL_VARIANT_CURRENT_ALIAS_   esp32
+#define M5HAL_VARIANT_CURRENT_BASE_NS_ variants::platforms::espressif::esp32
 
 // Concrete Port / GPIO have been shipped under
 // platforms::espressif::esp32::hal::v1::gpio, so the capability is

@@ -111,11 +111,12 @@ class I2CSlaveService : public service::IService {
 public:
     static constexpr size_t kMaxObservedMasterAcks = 16;
 
+    // Construction is two-phase by design: there is no (lines, config)
+    // constructor because it would have to swallow init()'s expected —
+    // a rejected config (10-bit / address > 0x7F) would leave a silently
+    // inert service. Construct, then call init() and check its result
+    // (S16 D6).
     I2CSlaveService() = default;
-    I2CSlaveService(I2CSlaveLineDriver& lines, const I2CSlaveConfig& config)
-    {
-        init(lines, config);
-    }
 
     m5::stl::expected<void, error::error_t> init(I2CSlaveLineDriver& lines, const I2CSlaveConfig& config)
     {
@@ -143,6 +144,11 @@ public:
     void setMaxAckedWriteBytes(size_t count)
     {
         _max_acked_write_bytes = count;
+    }
+
+    size_t maxAckedWriteBytes() const
+    {
+        return _max_acked_write_bytes;
     }
 
     size_t receivedSize() const
@@ -268,21 +274,23 @@ public:
 protected:
     void resetProtocol()
     {
-        _state                 = State::Idle;
-        _prev_scl              = true;
-        _prev_sda              = true;
-        _is_address            = true;
-        _matched               = false;
-        _read_phase            = false;
-        _drive_ack             = false;
-        _master_ack            = false;
-        _byte                  = 0;
-        _bit_count             = 0;
-        _tx_index              = 0;
-        _rx_size               = 0;
-        _stop_count            = 0;
-        _master_ack_count      = 0;
-        _max_acked_write_bytes = static_cast<size_t>(-1);
+        _state            = State::Idle;
+        _prev_scl         = true;
+        _prev_sda         = true;
+        _is_address       = true;
+        _matched          = false;
+        _read_phase       = false;
+        _drive_ack        = false;
+        _master_ack       = false;
+        _byte             = 0;
+        _bit_count        = 0;
+        _tx_index         = 0;
+        _rx_size          = 0;
+        _stop_count       = 0;
+        _master_ack_count = 0;
+        // NOTE: _max_acked_write_bytes is CONFIGURATION, not protocol
+        // state — it survives init()/resetProtocol() so a value set
+        // before init() is not silently discarded (S16 D6).
         for (size_t i = 0; i < kMaxObservedMasterAcks; ++i) {
             _master_acks[i] = false;
         }

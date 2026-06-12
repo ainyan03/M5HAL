@@ -19,7 +19,7 @@ namespace {
 
 constexpr uint32_t kNsecPerSec = 1000000000u;
 
-m5::stl::expected<::m5::hal::v1::service::tick_nsec_t, ::m5::hal::v1::error::error_t> halfPeriodTick(
+m5::stl::expected<::m5::hal::v1::service::fast_tick_t, ::m5::hal::v1::error::error_t> halfPeriodTick(
     const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg)
 {
     if (cfg.freq == 0) {
@@ -298,7 +298,7 @@ public:
 
         uint_fast8_t edge_budget = 0;
         if (_phase != Phase::dummy) {
-            edge_budget = availableEdgeBudget(ctx.now_nsec);
+            edge_budget = availableEdgeBudget(ctx.now_tick);
             if (edge_budget == 0) {
                 return ::m5::hal::v1::service::ServiceResult::Idle;
             }
@@ -632,6 +632,26 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
     const ::m5::hal::v1::spi::TransferDesc& desc, ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
 {
     (void)owner;
+    // This variant bit-bangs a single-lane MOSI/MISO pair. Multi-lane
+    // modes (dual/quad/octal) are physically unimplemented: always
+    // reject. Half-duplex modes share the full-duplex wire shape as long
+    // as a transfer carries data in only ONE direction (the meta phase
+    // is already sent sequentially — the DC demos rely on that); what
+    // cannot be honored is half-duplex with BOTH tx and rx data, which
+    // full-duplex clocking would corrupt (S16 D10).
+    {
+        using ::m5::hal::v1::spi::spi_data_mode_t;
+        const auto mode       = cfg.spi_data_mode;
+        const bool multi_lane = mode == spi_data_mode_t::spi_dual_output || mode == spi_data_mode_t::spi_dual_io ||
+                                mode == spi_data_mode_t::spi_quad_output || mode == spi_data_mode_t::spi_quad_io ||
+                                mode == spi_data_mode_t::spi_octal_output || mode == spi_data_mode_t::spi_octal_io;
+        const bool half_duplex = mode == spi_data_mode_t::spi_halfduplex ||
+                                 mode == spi_data_mode_t::spi_halfduplex_with_dc_pin ||
+                                 mode == spi_data_mode_t::spi_halfduplex_with_dc_bit;
+        if (multi_lane || (half_duplex && tx != nullptr && !tx->eof() && rx != nullptr)) {
+            return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::NOT_IMPLEMENTED);
+        }
+    }
     if (!_pin_clk.isValid()) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }

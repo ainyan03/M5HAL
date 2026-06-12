@@ -7,9 +7,8 @@
 // macro so the next pass starts clean.
 //
 // Inputs (from the just-included _offer.hpp):
-//   M5HAL_VARIANT_CURRENT_ALIAS_     — variant short name used as alias namespace (e.g. arduino)
-//   M5HAL_VARIANT_CURRENT_BASE_PATH_ — variant base path (reserved, unused)
-//   M5HAL_VARIANT_CURRENT_BASE_NS_   — variant base namespace path (e.g. frameworks::arduino)
+//   M5HAL_VARIANT_CURRENT_ALIAS_   — variant short name used as alias namespace (e.g. arduino)
+//   M5HAL_VARIANT_CURRENT_BASE_NS_ — variant base namespace path (e.g. frameworks::arduino)
 //   M5HAL_VARIANT_CURRENT_HAS_HAL_*_ — capability flag(s)
 // Optional input (set by the M5HAL_v1.hpp scan loop, not the _offer.hpp):
 //   M5HAL_VARIANT_PLATFORM_          — 1 only while scanning a platform variant
@@ -185,7 +184,6 @@ namespace m5 { namespace hal { namespace v1 { namespace uart {
 // declared, so the next pass starts clean.
 // ---------------------------------------------------------------------
 #undef M5HAL_VARIANT_CURRENT_ALIAS_
-#undef M5HAL_VARIANT_CURRENT_BASE_PATH_
 #undef M5HAL_VARIANT_CURRENT_BASE_NS_
 #ifdef M5HAL_VARIANT_CURRENT_HAS_HAL_GPIO_
 #  undef M5HAL_VARIANT_CURRENT_HAS_HAL_GPIO_

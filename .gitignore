@@ -36,6 +36,7 @@
 
 # PlatformIO
 .pio/
+.pio-ci/
 
 # IDE
 .vscode/

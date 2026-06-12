@@ -105,9 +105,17 @@ split accessor は最小ストリーム I/O インタフェース (`data::Stream
 ## write semantics
 
 `write(tx, len)` は最大 `len` byte を `Source` から送信する。戻り値は driver
-へ受け渡した byte 数。ESP-IDF backend は送信後に `uart_wait_tx_done()` を
-呼び、`write_timeout_ms` 以内に物理 TX FIFO が drain されることを待つ。
-Arduino backend は `HardwareSerial::flush()` を使う。
+へ受け渡した byte 数。
+
+**完了保証の正準契約は ESP-IDF backend の意味 (timeout 付き物理 drain 待ち)**。
+他 backend は実装手段の制約により完全には一致しない。差は仕様として下表に固定する
+(S16 D10、2026-06-12 — 完全統一は不可能と判断し、契約表を正本とする):
+
+| backend | write 復帰タイミング | `write_timeout_ms` の扱い |
+|---|---|---|
+| ESP-IDF | `uart_wait_tx_done()` で物理 TX FIFO の drain まで | drain 待ちの上限。超過は `TIMEOUT_ERROR` |
+| Arduino | `HardwareSerial::flush()` で物理送信完了まで | **使われない** (flush に timeout 引数がなく無期限待ち)。利用者は baud と len から所要時間を見積もれる |
+| POSIX | OS の tx buffer へ受理された時点 (**drain しない**。await-reply パターンが buffered output でデッドロックしない設計上の選択) | 使われない |
 
 ## error semantics
 

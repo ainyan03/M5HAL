@@ -52,9 +52,10 @@ public:
     }
 
 private:
-    ::TwoWire* _wire    = nullptr;
-    bool _owns_wire     = false;
-    uint32_t _last_freq = 0;  // 0 sentinel: no setClock call has been made yet
+    ::TwoWire* _wire          = nullptr;
+    bool _owns_wire           = false;
+    uint32_t _last_freq       = 0;            // 0 sentinel: no setClock call has been made yet
+    uint32_t _last_timeout_ms = 0xFFFFFFFFu;  // sentinel: no setTimeOut call yet
 };
 
 }  // namespace m5::variants::frameworks::arduino::hal::v1::i2c

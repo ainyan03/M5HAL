@@ -226,8 +226,13 @@ m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::writeC
 m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::writeCommandData(data::ConstDataSpan tx_bytes)
 {
     const size_t command_bytes = transferBytesForBits(_access_config.spi_command_length);
+    // spi_command_length == 0 is an error: writeCommandData always requires a
+    // command phase. Callers that want a plain write should call write()
+    // directly. Silently falling through to write() here would make
+    // spi_command_length optional, contradicting the invariant that the
+    // command-sugar family mandates a configured command length.
     if (command_bytes == 0) {
-        return write(tx_bytes);
+        return m5::stl::make_unexpected(m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
     if (command_bytes > 4) {
         return m5::stl::make_unexpected(m5::hal::v1::error::error_t::INVALID_ARGUMENT);

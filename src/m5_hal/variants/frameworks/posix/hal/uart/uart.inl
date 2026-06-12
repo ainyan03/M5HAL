@@ -506,7 +506,7 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::readableBytes(
     }
     int avail = 0;
     if (::ioctl(_fd, FIONREAD, &avail) != 0 || avail < 0) {
-        return static_cast<size_t>(0);
+        return m5::stl::make_unexpected(posixIOError());
     }
     return static_cast<size_t>(avail);
 }

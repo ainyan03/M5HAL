@@ -195,17 +195,17 @@ TEST(SoftwareI2CMasterTiming, ConvertsFreqToNsecHalfPeriod)
     cfg.freq      = 100000;
     auto standard = MasterTiming::fromConfig(cfg);
     ASSERT_TRUE(standard.has_value());
-    EXPECT_EQ(standard->half_period_nsec, 5000u);
+    EXPECT_EQ(standard->half_period, 5000u);
 
     cfg.freq  = 400000;
     auto fast = MasterTiming::fromConfig(cfg);
     ASSERT_TRUE(fast.has_value());
-    EXPECT_EQ(fast->half_period_nsec, 1250u);
+    EXPECT_EQ(fast->half_period, 1250u);
 
     cfg.freq       = 1000000;
     auto fast_plus = MasterTiming::fromConfig(cfg);
     ASSERT_TRUE(fast_plus.has_value());
-    EXPECT_EQ(fast_plus->half_period_nsec, 500u);
+    EXPECT_EQ(fast_plus->half_period, 500u);
 }
 
 TEST(SoftwareI2CMasterTiming, RejectsInvalidFreqAndOversizedTimeout)
@@ -232,7 +232,7 @@ TEST(SoftwareI2CMasterStartCondition, AdvancesByNsecTicks)
 
     FakeMasterLineDriver lines;
     MasterTiming timing;
-    timing.half_period_nsec = 100;
+    timing.half_period = 100;
 
     StartConditionService start;
     start.begin(lines, timing, 1000);
@@ -241,7 +241,7 @@ TEST(SoftwareI2CMasterStartCondition, AdvancesByNsecTicks)
     ASSERT_EQ(lines.events.size(), size_t{1});
     EXPECT_EQ(lines.events[0].kind, FakeMasterLineDriver::EventKind::SCL);
     EXPECT_TRUE(lines.events[0].high);
-    EXPECT_EQ(start.dueNsec(), 1100u);
+    EXPECT_EQ(start.dueTick(), 1100u);
 
     EXPECT_EQ(start.service(m5::hal::v1::service::ServiceContext{1099}), m5::hal::v1::service::ServiceResult::Idle);
     EXPECT_EQ(lines.events.size(), size_t{1});
@@ -250,7 +250,7 @@ TEST(SoftwareI2CMasterStartCondition, AdvancesByNsecTicks)
     ASSERT_EQ(lines.events.size(), size_t{2});
     EXPECT_EQ(lines.events[1].kind, FakeMasterLineDriver::EventKind::SDA);
     EXPECT_FALSE(lines.events[1].high);
-    EXPECT_EQ(start.dueNsec(), 1200u);
+    EXPECT_EQ(start.dueTick(), 1200u);
 
     EXPECT_EQ(start.service(m5::hal::v1::service::ServiceContext{1200}), m5::hal::v1::service::ServiceResult::Done);
     ASSERT_EQ(lines.events.size(), size_t{3});
@@ -266,8 +266,8 @@ TEST(SoftwareI2CMasterStartCondition, WaitsForClockStretchRelease)
     FakeMasterLineDriver lines;
     lines.scl_read_high = false;
     MasterTiming timing;
-    timing.half_period_nsec = 100;
-    timing.timeout_nsec     = 1000;
+    timing.half_period = 100;
+    timing.timeout     = 1000;
 
     StartConditionService start;
     start.begin(lines, timing, 2000);
@@ -284,7 +284,7 @@ TEST(SoftwareI2CMasterStartCondition, WaitsForClockStretchRelease)
     lines.scl_read_high = true;
     EXPECT_EQ(start.service(m5::hal::v1::service::ServiceContext{2600}), m5::hal::v1::service::ServiceResult::Progress);
     EXPECT_EQ(start.state(), StartConditionService::State::PullSdaLow);
-    EXPECT_EQ(start.dueNsec(), 2700u);
+    EXPECT_EQ(start.dueTick(), 2700u);
 }
 
 TEST(SoftwareI2CMasterStartCondition, ReportsTimeoutWhenSclStaysLow)
@@ -294,8 +294,8 @@ TEST(SoftwareI2CMasterStartCondition, ReportsTimeoutWhenSclStaysLow)
     FakeMasterLineDriver lines;
     lines.scl_read_high = false;
     MasterTiming timing;
-    timing.half_period_nsec = 10;
-    timing.timeout_nsec     = 30;
+    timing.half_period = 10;
+    timing.timeout     = 30;
 
     StartConditionService start;
     start.begin(lines, timing, 3000);
@@ -317,7 +317,7 @@ TEST(SoftwareI2CMasterWriteByte, SendsBitsMsbFirstAndSamplesAck)
     FakeMasterLineDriver lines;
     lines.sda_read_high = false;  // slave ACK
     MasterTiming timing;
-    timing.half_period_nsec = 10;
+    timing.half_period = 10;
 
     WriteByteService writer;
     writer.begin(lines, timing, 0xA5, 1000);
@@ -329,7 +329,7 @@ TEST(SoftwareI2CMasterWriteByte, SendsBitsMsbFirstAndSamplesAck)
 
     m5::hal::v1::service::ServiceResult result = m5::hal::v1::service::ServiceResult::Idle;
     for (size_t i = 0; i < 32 && result != m5::hal::v1::service::ServiceResult::Done; ++i) {
-        result = writer.service(m5::hal::v1::service::ServiceContext{writer.dueNsec()});
+        result = writer.service(m5::hal::v1::service::ServiceContext{writer.dueTick()});
     }
 
     EXPECT_EQ(result, m5::hal::v1::service::ServiceResult::Done);
@@ -374,21 +374,21 @@ TEST(SoftwareI2CMasterWriteByte, KeepsClockPhaseWhenServiceRunsLate)
 
     FakeMasterLineDriver lines;
     MasterTiming timing;
-    timing.half_period_nsec = 10;
+    timing.half_period = 10;
 
     WriteByteService writer;
     writer.begin(lines, timing, 0x80, 1000);
 
-    EXPECT_EQ(writer.dueNsec(), 1010u);
+    EXPECT_EQ(writer.dueTick(), 1010u);
     EXPECT_EQ(writer.service(m5::hal::v1::service::ServiceContext{1013}),
               m5::hal::v1::service::ServiceResult::Progress);
     EXPECT_EQ(writer.state(), WriteByteService::State::LowerClock);
-    EXPECT_EQ(writer.dueNsec(), 1020u);
+    EXPECT_EQ(writer.dueTick(), 1020u);
 
     EXPECT_EQ(writer.service(m5::hal::v1::service::ServiceContext{1024}),
               m5::hal::v1::service::ServiceResult::Progress);
     EXPECT_EQ(writer.state(), WriteByteService::State::RaiseClock);
-    EXPECT_EQ(writer.dueNsec(), 1030u);
+    EXPECT_EQ(writer.dueTick(), 1030u);
 }
 
 TEST(SoftwareI2CMasterWriteByte, ResyncsClockPhaseWhenServiceRunsTooLate)
@@ -397,7 +397,7 @@ TEST(SoftwareI2CMasterWriteByte, ResyncsClockPhaseWhenServiceRunsTooLate)
 
     FakeMasterLineDriver lines;
     MasterTiming timing;
-    timing.half_period_nsec = 10;
+    timing.half_period = 10;
 
     WriteByteService writer;
     writer.begin(lines, timing, 0x80, 1000);
@@ -405,7 +405,7 @@ TEST(SoftwareI2CMasterWriteByte, ResyncsClockPhaseWhenServiceRunsTooLate)
     EXPECT_EQ(writer.service(m5::hal::v1::service::ServiceContext{1055}),
               m5::hal::v1::service::ServiceResult::Progress);
     EXPECT_EQ(writer.state(), WriteByteService::State::LowerClock);
-    EXPECT_EQ(writer.dueNsec(), 1065u);
+    EXPECT_EQ(writer.dueTick(), 1065u);
 }
 
 TEST(SoftwareI2CMasterWriteByte, ReportsNackAfterReturningClockLow)
@@ -415,14 +415,14 @@ TEST(SoftwareI2CMasterWriteByte, ReportsNackAfterReturningClockLow)
     FakeMasterLineDriver lines;
     lines.sda_read_high = true;  // slave NACK
     MasterTiming timing;
-    timing.half_period_nsec = 10;
+    timing.half_period = 10;
 
     WriteByteService writer;
     writer.begin(lines, timing, 0x00, 2000);
 
     m5::hal::v1::service::ServiceResult result = m5::hal::v1::service::ServiceResult::Idle;
     for (size_t i = 0; i < 32 && result != m5::hal::v1::service::ServiceResult::Error; ++i) {
-        result = writer.service(m5::hal::v1::service::ServiceContext{writer.dueNsec()});
+        result = writer.service(m5::hal::v1::service::ServiceContext{writer.dueTick()});
     }
 
     EXPECT_EQ(result, m5::hal::v1::service::ServiceResult::Error);
@@ -443,8 +443,8 @@ TEST(SoftwareI2CMasterWriteByte, WaitsForClockStretchRelease)
     lines.scl_read_high = false;
     lines.sda_read_high = false;
     MasterTiming timing;
-    timing.half_period_nsec = 10;
-    timing.timeout_nsec     = 100;
+    timing.half_period = 10;
+    timing.timeout     = 100;
 
     WriteByteService writer;
     writer.begin(lines, timing, 0x80, 1000);
@@ -464,7 +464,7 @@ TEST(SoftwareI2CMasterWriteByte, WaitsForClockStretchRelease)
     EXPECT_EQ(writer.service(m5::hal::v1::service::ServiceContext{1060}),
               m5::hal::v1::service::ServiceResult::Progress);
     EXPECT_EQ(writer.state(), WriteByteService::State::LowerClock);
-    EXPECT_EQ(writer.dueNsec(), 1070u);
+    EXPECT_EQ(writer.dueTick(), 1070u);
 }
 
 TEST(SoftwareI2CMasterWriteByte, ReportsTimeoutWhenClockStretchDoesNotRelease)
@@ -474,8 +474,8 @@ TEST(SoftwareI2CMasterWriteByte, ReportsTimeoutWhenClockStretchDoesNotRelease)
     FakeMasterLineDriver lines;
     lines.scl_read_high = false;
     MasterTiming timing;
-    timing.half_period_nsec = 10;
-    timing.timeout_nsec     = 30;
+    timing.half_period = 10;
+    timing.timeout     = 30;
 
     WriteByteService writer;
     writer.begin(lines, timing, 0x80, 2000);
@@ -499,7 +499,7 @@ TEST(SoftwareI2CMasterStopCondition, ReleasesSdaWhileSclHigh)
     FakeMasterLineDriver lines;
     lines.sda_read_high = true;
     MasterTiming timing;
-    timing.half_period_nsec = 10;
+    timing.half_period = 10;
 
     StopConditionService stop;
     stop.begin(lines, timing, 1000);
@@ -526,14 +526,14 @@ TEST(SoftwareI2CMasterStopCondition, ReportsBusErrorWhenSdaStaysLow)
     FakeMasterLineDriver lines;
     lines.sda_read_high = false;
     MasterTiming timing;
-    timing.half_period_nsec = 10;
+    timing.half_period = 10;
 
     StopConditionService stop;
     stop.begin(lines, timing, 2000);
 
     m5::hal::v1::service::ServiceResult result = m5::hal::v1::service::ServiceResult::Idle;
     for (size_t i = 0; i < 8 && result != m5::hal::v1::service::ServiceResult::Error; ++i) {
-        result = stop.service(m5::hal::v1::service::ServiceContext{stop.dueNsec()});
+        result = stop.service(m5::hal::v1::service::ServiceContext{stop.dueTick()});
     }
 
     EXPECT_EQ(result, m5::hal::v1::service::ServiceResult::Error);
@@ -548,8 +548,8 @@ TEST(SoftwareI2CMasterStopCondition, ReportsTimeoutWhenSclStaysLow)
     FakeMasterLineDriver lines;
     lines.scl_read_high = false;
     MasterTiming timing;
-    timing.half_period_nsec = 10;
-    timing.timeout_nsec     = 30;
+    timing.half_period = 10;
+    timing.timeout     = 30;
 
     StopConditionService stop;
     stop.begin(lines, timing, 3000);
@@ -570,7 +570,7 @@ TEST(SoftwareI2CMasterReadByte, SamplesBitsMsbFirstAndSendsAck)
 
     FakeMasterLineDriver lines;
     MasterTiming timing;
-    timing.half_period_nsec = 10;
+    timing.half_period = 10;
 
     ReadByteService reader;
     reader.begin(lines, timing, true, 1000);
@@ -582,7 +582,7 @@ TEST(SoftwareI2CMasterReadByte, SamplesBitsMsbFirstAndSendsAck)
         if (reader.state() == ReadByteService::State::SampleBit && sampled_bits < sizeof(bits)) {
             lines.sda_read_high = bits[sampled_bits++];
         }
-        result = reader.service(m5::hal::v1::service::ServiceContext{reader.dueNsec()});
+        result = reader.service(m5::hal::v1::service::ServiceContext{reader.dueTick()});
     }
 
     EXPECT_EQ(result, m5::hal::v1::service::ServiceResult::Done);
@@ -608,14 +608,14 @@ TEST(SoftwareI2CMasterReadByte, SendsNackAfterFinalByte)
     FakeMasterLineDriver lines;
     lines.sda_read_high = true;
     MasterTiming timing;
-    timing.half_period_nsec = 10;
+    timing.half_period = 10;
 
     ReadByteService reader;
     reader.begin(lines, timing, false, 2000);
 
     m5::hal::v1::service::ServiceResult result = m5::hal::v1::service::ServiceResult::Idle;
     for (size_t i = 0; i < 64 && result != m5::hal::v1::service::ServiceResult::Done; ++i) {
-        result = reader.service(m5::hal::v1::service::ServiceContext{reader.dueNsec()});
+        result = reader.service(m5::hal::v1::service::ServiceContext{reader.dueTick()});
     }
 
     EXPECT_EQ(result, m5::hal::v1::service::ServiceResult::Done);
@@ -635,26 +635,26 @@ TEST(SoftwareI2CMasterReadByte, KeepsClockPhaseWhenServiceRunsLate)
 
     FakeMasterLineDriver lines;
     MasterTiming timing;
-    timing.half_period_nsec = 10;
+    timing.half_period = 10;
 
     ReadByteService reader;
     reader.begin(lines, timing, true, 1000);
 
-    EXPECT_EQ(reader.dueNsec(), 1000u);
+    EXPECT_EQ(reader.dueTick(), 1000u);
     EXPECT_EQ(reader.service(m5::hal::v1::service::ServiceContext{1003}),
               m5::hal::v1::service::ServiceResult::Progress);
     EXPECT_EQ(reader.state(), ReadByteService::State::RaiseClock);
-    EXPECT_EQ(reader.dueNsec(), 1013u);
+    EXPECT_EQ(reader.dueTick(), 1013u);
 
     EXPECT_EQ(reader.service(m5::hal::v1::service::ServiceContext{1016}),
               m5::hal::v1::service::ServiceResult::Progress);
     EXPECT_EQ(reader.state(), ReadByteService::State::SampleBit);
-    EXPECT_EQ(reader.dueNsec(), 1023u);
+    EXPECT_EQ(reader.dueTick(), 1023u);
 
     EXPECT_EQ(reader.service(m5::hal::v1::service::ServiceContext{1028}),
               m5::hal::v1::service::ServiceResult::Progress);
     EXPECT_EQ(reader.state(), ReadByteService::State::RaiseClock);
-    EXPECT_EQ(reader.dueNsec(), 1033u);
+    EXPECT_EQ(reader.dueTick(), 1033u);
 }
 
 TEST(SoftwareI2CMasterReadByte, ResyncsClockPhaseWhenServiceRunsTooLate)
@@ -663,7 +663,7 @@ TEST(SoftwareI2CMasterReadByte, ResyncsClockPhaseWhenServiceRunsTooLate)
 
     FakeMasterLineDriver lines;
     MasterTiming timing;
-    timing.half_period_nsec = 10;
+    timing.half_period = 10;
 
     ReadByteService reader;
     reader.begin(lines, timing, true, 1000);
@@ -671,12 +671,12 @@ TEST(SoftwareI2CMasterReadByte, ResyncsClockPhaseWhenServiceRunsTooLate)
     EXPECT_EQ(reader.service(m5::hal::v1::service::ServiceContext{1000}),
               m5::hal::v1::service::ServiceResult::Progress);
     EXPECT_EQ(reader.state(), ReadByteService::State::RaiseClock);
-    EXPECT_EQ(reader.dueNsec(), 1010u);
+    EXPECT_EQ(reader.dueTick(), 1010u);
 
     EXPECT_EQ(reader.service(m5::hal::v1::service::ServiceContext{1055}),
               m5::hal::v1::service::ServiceResult::Progress);
     EXPECT_EQ(reader.state(), ReadByteService::State::SampleBit);
-    EXPECT_EQ(reader.dueNsec(), 1065u);
+    EXPECT_EQ(reader.dueTick(), 1065u);
 }
 
 TEST(SoftwareI2CMasterReadByte, ReportsTimeoutWhenClockStretchDoesNotRelease)
@@ -686,8 +686,8 @@ TEST(SoftwareI2CMasterReadByte, ReportsTimeoutWhenClockStretchDoesNotRelease)
     FakeMasterLineDriver lines;
     lines.scl_read_high = false;
     MasterTiming timing;
-    timing.half_period_nsec = 10;
-    timing.timeout_nsec     = 30;
+    timing.half_period = 10;
+    timing.timeout     = 30;
 
     ReadByteService reader;
     reader.begin(lines, timing, true, 3000);
@@ -709,17 +709,17 @@ TEST(SoftwareI2CMasterTransaction, RunsStartWriteReadAndStopPrimitives)
 
     FakeMasterLineDriver lines;
     MasterTiming timing;
-    timing.half_period_nsec = 10;
-    lines.sda_read_high     = false;  // ACK for write byte
+    timing.half_period  = 10;
+    lines.sda_read_high = false;  // ACK for write byte
 
     MasterTransactionService transaction;
     transaction.beginStart(lines, timing, 1000);
 
-    auto run_until_done = [&](uint32_t now_nsec) {
+    auto run_until_done = [&](uint32_t now_tick) {
         m5::hal::v1::service::ServiceResult result = m5::hal::v1::service::ServiceResult::Idle;
         for (size_t i = 0; i < 64 && result != m5::hal::v1::service::ServiceResult::Done; ++i) {
-            result = transaction.service(m5::hal::v1::service::ServiceContext{now_nsec});
-            now_nsec += 10;
+            result = transaction.service(m5::hal::v1::service::ServiceContext{now_tick});
+            now_tick += 10;
         }
         return result;
     };
@@ -734,9 +734,9 @@ TEST(SoftwareI2CMasterTransaction, RunsStartWriteReadAndStopPrimitives)
     lines.sda_read_high = true;
     transaction.beginReadByte(lines, timing, false, 3000);
     m5::hal::v1::service::ServiceResult result = m5::hal::v1::service::ServiceResult::Idle;
-    for (uint32_t now_nsec = 3000; now_nsec < 4000 && result != m5::hal::v1::service::ServiceResult::Done;
-         now_nsec += 10) {
-        result = transaction.service(m5::hal::v1::service::ServiceContext{now_nsec});
+    for (uint32_t now_tick = 3000; now_tick < 4000 && result != m5::hal::v1::service::ServiceResult::Done;
+         now_tick += 10) {
+        result = transaction.service(m5::hal::v1::service::ServiceContext{now_tick});
     }
     EXPECT_EQ(result, m5::hal::v1::service::ServiceResult::Done);
     EXPECT_EQ(transaction.byte(), 0xFF);
@@ -754,7 +754,7 @@ TEST(SoftwareI2CMasterTransaction, PropagatesPrimitiveErrors)
     FakeMasterLineDriver lines;
     lines.sda_read_high = true;  // NACK for write byte
     MasterTiming timing;
-    timing.half_period_nsec = 10;
+    timing.half_period = 10;
 
     MasterTransactionService transaction;
     transaction.beginWriteByte(lines, timing, 0x00, 1000);
@@ -776,13 +776,13 @@ TEST(SoftwareI2CMasterTransaction, RunsAddressAndBufferSequences)
     FakeMasterLineDriver lines;
     lines.sda_read_high = false;  // ACK for address/data bytes
     MasterTiming timing;
-    timing.half_period_nsec = 10;
+    timing.half_period = 10;
 
-    auto run_until_done = [](MasterTransactionService& transaction, uint32_t now_nsec) {
+    auto run_until_done = [](MasterTransactionService& transaction, uint32_t now_tick) {
         m5::hal::v1::service::ServiceResult result = m5::hal::v1::service::ServiceResult::Idle;
         for (size_t i = 0; i < 128 && result != m5::hal::v1::service::ServiceResult::Done; ++i) {
-            result = transaction.service(m5::hal::v1::service::ServiceContext{now_nsec});
-            now_nsec += 10;
+            result = transaction.service(m5::hal::v1::service::ServiceContext{now_tick});
+            now_tick += 10;
         }
         return result;
     };
@@ -981,6 +981,20 @@ TEST(I2CSlaveService, Rejects10BitAddressUntilImplemented)
     EXPECT_EQ(r.error(), m5::hal::v1::error::error_t::INVALID_ARGUMENT);
 }
 
+TEST(I2CSlaveService, MaxAckedWriteBytesSurvivesInit)
+{
+    // Configuration set before init() must survive it: resetProtocol()
+    // resets protocol state, not configuration (S16 D6).
+    service_proto::VirtualOpenDrainBus lines;
+    m5::hal::v1::i2c::I2CSlaveService slave;
+    slave.setMaxAckedWriteBytes(3);
+
+    m5::hal::v1::i2c::I2CSlaveConfig cfg;
+    cfg.address = 0x42;
+    ASSERT_TRUE(slave.init(lines, cfg).has_value());
+    EXPECT_EQ(slave.maxAckedWriteBytes(), 3u);
+}
+
 TEST(I2CSlaveDriverRegistration, RegistersAndRemovesDriverService)
 {
     class CountingService : public m5::hal::v1::service::IService {
@@ -1106,7 +1120,7 @@ TEST(SoftwareI2CBus, VirtualSlaveServiceReceivesWriteBytes)
     m5::hal::v1::i2c::TransferDesc desc{uint8_t{0xAB}};
     auto r = bus.transfer(nullptr, acc_cfg, desc, &tx_src, nullptr);
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(*r, size_t{3});
+    EXPECT_EQ(*r, size_t{2});  // data phase only (prefix not counted, S16 D4)
 
     const std::vector<uint8_t> expected{0xAB, 0x12, 0x34};
     EXPECT_EQ(slave.received(), expected);
@@ -1141,7 +1155,7 @@ TEST(SoftwareI2CBus, VirtualSlaveServiceSupportsWriteThenReadWithRestart)
     m5::hal::v1::i2c::TransferDesc desc{uint8_t{0x10}};
     auto r = bus.transfer(nullptr, acc_cfg, desc, nullptr, &rx_sink);
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(*r, size_t{3});
+    EXPECT_EQ(*r, size_t{2});  // data phase only (prefix not counted, S16 D4)
 
     const std::vector<uint8_t> expected_written{0x10};
     EXPECT_EQ(slave.received(), expected_written);
@@ -1216,7 +1230,7 @@ TEST(SoftwareI2CBus, VirtualSlaveServiceSupportsWriteThenReadWithoutRestart)
     m5::hal::v1::i2c::TransferDesc desc{uint8_t{0x20}};
     auto r = bus.transfer(nullptr, acc_cfg, desc, nullptr, &rx_sink);
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(*r, size_t{3});
+    EXPECT_EQ(*r, size_t{2});  // data phase only (prefix not counted, S16 D4)
 
     const std::vector<uint8_t> expected_written{0x20};
     EXPECT_EQ(slave.received(), expected_written);
@@ -1285,7 +1299,7 @@ TEST(SoftwareI2CBus, VirtualSlaveServicesShareBusByAddress)
     m5::hal::v1::i2c::TransferDesc desc{uint8_t{0x22}};
     auto r = bus.transfer(nullptr, acc_cfg, desc, &tx_src, nullptr);
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(*r, size_t{3});
+    EXPECT_EQ(*r, size_t{2});  // data phase only (prefix not counted, S16 D4)
 
     EXPECT_TRUE(slave42.received().empty());
     const std::vector<uint8_t> expected43{0x22, 0x33, 0x44};
@@ -1446,7 +1460,7 @@ public:
         last_desc       = desc;
         last_tx_was_set = (tx != nullptr);
         last_rx_was_set = (rx != nullptr);
-        size_t total    = desc.prefix_len;
+        size_t total    = 0;  // data phase only (S16 D4)
         if (tx) {
             // Drain the tx source and stash the bytes into the observation buffer.
             while (!tx->eof()) {

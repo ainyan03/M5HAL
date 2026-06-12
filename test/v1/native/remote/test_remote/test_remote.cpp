@@ -132,7 +132,7 @@ struct StubI2CBus : public i2c::I2CBus {
         if (error::isError(result)) {
             return m5::stl::make_unexpected(result);
         }
-        size_t total = desc.prefix_len;
+        size_t total = 0;  // data phase only (S16 D4)
         if (tx != nullptr) {
             while (!tx->eof()) {
                 auto p = tx->peek(64);
@@ -315,6 +315,93 @@ TEST_F(Loopback, NorespFailureArrivesAsPendingError)
     ASSERT_TRUE(session.ping().has_value());
     EXPECT_EQ(session.lastRemoteError(), error_t::INVALID_ARGUMENT);
     EXPECT_FALSE(server.hasPendingError());
+}
+
+// S16 D3 regression pair: the server clears its pending NORESP error as
+// soon as the error frame is SENT, so when that delivery crosses a
+// host-side timeout, the frame that eventually arrives carries the seq
+// of the timed-out exchange. It is the only copy — it must be recorded
+// no matter which host path drains it.
+
+TEST_F(Loopback, ErrorCrossingTimeoutIsRecordedBySubsequentRequest)
+{
+    remote::RemoteSession::Config scfg;
+    scfg.response_timeout_ms = 20;
+    remote::RemoteSession fast_session{host_rx, host_tx, scfg};
+
+    uint8_t script[32] = {};
+    data::MemorySink sink{data::DataSpan{script, sizeof(script)}};
+    bytecode::BytecodeEncoder enc{sink};
+    i2c::I2CMasterAccessConfig cfg;
+    ASSERT_TRUE(enc.configure(2, cfg).has_value());  // valid slot, nothing registered
+    ASSERT_TRUE(enc.end().has_value());
+    ASSERT_TRUE(fast_session.requestNoResponse(data::ConstDataSpan{script, sink.written()}).has_value());
+
+    // The server goes silent: the ping that would deliver the pending
+    // error times out host-side.
+    pump_enabled = false;
+    auto p1      = fast_session.ping();
+    ASSERT_FALSE(p1.has_value());
+    EXPECT_EQ(p1.error(), error_t::TIMEOUT_ERROR);
+    EXPECT_EQ(fast_session.lastRemoteError(), error_t::OK);  // nothing arrived yet
+
+    // The server catches up late: it processes the NORESP failure and the
+    // timed-out ping, emitting error + pong stamped with the OLD seq.
+    pump_enabled = true;
+    server_service.service(service::ServiceContext{});
+
+    // The next ping awaits a NEW seq; the late error frame read along the
+    // way must still land in lastRemoteError().
+    ASSERT_TRUE(fast_session.ping().has_value());
+    EXPECT_EQ(fast_session.lastRemoteError(), error_t::INVALID_ARGUMENT);
+    EXPECT_FALSE(server.hasPendingError());
+}
+
+TEST_F(Loopback, ErrorCrossingTimeoutIsRecordedByIdlePoll)
+{
+    remote::RemoteSession::Config scfg;
+    scfg.response_timeout_ms = 20;
+    remote::RemoteSession fast_session{host_rx, host_tx, scfg};
+
+    uint8_t script[32] = {};
+    data::MemorySink sink{data::DataSpan{script, sizeof(script)}};
+    bytecode::BytecodeEncoder enc{sink};
+    i2c::I2CMasterAccessConfig cfg;
+    ASSERT_TRUE(enc.configure(2, cfg).has_value());
+    ASSERT_TRUE(enc.end().has_value());
+    ASSERT_TRUE(fast_session.requestNoResponse(data::ConstDataSpan{script, sink.written()}).has_value());
+
+    pump_enabled = false;
+    auto p1      = fast_session.ping();
+    ASSERT_FALSE(p1.has_value());
+    EXPECT_EQ(p1.error(), error_t::TIMEOUT_ERROR);
+
+    pump_enabled = true;
+    server_service.service(service::ServiceContext{});
+
+    // An idle poll() drains the late error (and the stale pong): the
+    // error is recorded but does not count as an event.
+    auto polled = fast_session.poll();
+    ASSERT_TRUE(polled.has_value());
+    EXPECT_EQ(polled.value(), 0u);
+    EXPECT_EQ(fast_session.lastRemoteError(), error_t::INVALID_ARGUMENT);
+}
+
+TEST_F(Loopback, OversizedWireRxLenIsRejectedByPrescan)
+{
+    // The wire LenVar can spell a full u32 rx_len and the runner
+    // allocates it up front — the server prescan caps it
+    // (Config::max_transfer_rx, default 4096; S16 D8). Sent via a raw
+    // request: the host-side proxy limit (kMaxTransferRx) never sees it.
+    uint8_t script[32] = {};
+    data::MemorySink sink{data::DataSpan{script, sizeof(script)}};
+    bytecode::BytecodeEncoder enc{sink};
+    ASSERT_TRUE(enc.transfer(0, i2c::TransferDesc{}, data::ConstDataSpan{}, 8192, 1).has_value());
+    ASSERT_TRUE(enc.end().has_value());
+
+    auto r = session.request(data::ConstDataSpan{script, sink.written()});
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), error_t::INVALID_ARGUMENT);
 }
 
 TEST_F(Loopback, OversizedReceiveIsRejectedLocally)

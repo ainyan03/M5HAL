@@ -354,7 +354,7 @@ TEST(StreamSink, OversizedCommitIsBufferOverflow)
     EXPECT_TRUE(writer.written.empty());
 }
 
-TEST(StreamSink, ShortWriteIsIoError)
+TEST(StreamSink, ShortWriteIsTimeout)
 {
     FakeStreamWriter writer;
     writer.accept_limit = 2;
@@ -366,7 +366,9 @@ TEST(StreamSink, ShortWriteIsIoError)
     std::memset(reserved->data, 0xA5, 4);
     auto committed = snk.commit(4);
     ASSERT_FALSE(committed.has_value());
-    EXPECT_EQ(committed.error(), error_t::IO_ERROR);
+    // Short writes classify as TIMEOUT_ERROR (retryable), symmetric with
+    // the read side (S16 D10).
+    EXPECT_EQ(committed.error(), error_t::TIMEOUT_ERROR);
 }
 
 TEST(StreamSink, WriterErrorsPropagate)

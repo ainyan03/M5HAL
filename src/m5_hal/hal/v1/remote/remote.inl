@@ -28,8 +28,26 @@ inline bool u32FieldExceeds(data::ConstDataSpan cfg, size_t off, uint32_t limit)
 
 // ---- Server -----------------------------------------------------------------
 
+void Server::checkScratch()
+{
+    M5HAL_ASSERT(_scratch.data != nullptr && _scratch.size >= kMaxMessageSize,
+                 "Server: response_scratch must hold at least kMaxMessageSize (%u) bytes",
+                 static_cast<unsigned>(kMaxMessageSize));
+    if (_scratch.data == nullptr || _scratch.size < kMaxMessageSize) {
+        _scratch = data::DataSpan{};
+    }
+}
+
 m5::stl::expected<void, error_t> Server::recordCapability(types::bus_kind_t kind, uint8_t bus_id)
 {
+    // Idempotent: re-registering the same (kind, bus_id) pair is a no-op success
+    // so that Server::register* can be called multiple times without exhausting
+    // kMaxEntries (e.g. on reconnect).
+    for (size_t i = 0; i < _cap_count; ++i) {
+        if (_caps[i].kind == kind && _caps[i].bus_id == bus_id) {
+            return {};
+        }
+    }
     if (_cap_count >= Capabilities::kMaxEntries) {
         return m5::stl::make_unexpected(error_t::OUT_OF_RESOURCE);
     }
@@ -134,6 +152,17 @@ error_t Server::prescan(data::ConstDataSpan script, size_t& offset) const
                         break;
                 }
                 if (exceeded) {
+                    offset = instr_at;
+                    return error_t::INVALID_ARGUMENT;
+                }
+            }
+        } else if (opcode == static_cast<uint8_t>(bytecode::OpCode::bus_transfer)) {
+            // payload: [kind:1][bus_id:1][store_id:1][rx_len:LenVar]...
+            // (mirrors BytecodeRunner::opBusTransfer). Cap the up-front rx
+            // allocation a wire message can request (S16 D8).
+            if (payload.size > 3) {
+                const auto rx_len = bytecode::decodeLenVar(data::ConstDataSpan{payload.data + 3, payload.size - 3});
+                if (rx_len.valid && rx_len.consumed != 0 && rx_len.value > _config.max_transfer_rx) {
                     offset = instr_at;
                     return error_t::INVALID_ARGUMENT;
                 }
@@ -258,14 +287,17 @@ m5::stl::expected<void, error_t> Server::processMessage(uint8_t type, uint8_t se
             if (!f.has_value()) {
                 return f;
             }
-            if (_scratch.size < kHeaderSize) {
+            if (_scratch.size < kMaxMessageSize) {
                 return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
             }
             const ExecOutcome outcome = execute(body);
             // Build the response message in place: header + response script.
+            // The sink capacity is clamped to kMaxBodySize so the response
+            // always fits one data frame (writeData rejects payloads above
+            // kMaxDataPayload); an oversized scratch must not lift the cap.
             _scratch.data[0] = static_cast<uint8_t>(MessageType::response);
             _scratch.data[1] = seq;
-            data::MemorySink script_sink{data::DataSpan{_scratch.data + kHeaderSize, _scratch.size - kHeaderSize}};
+            data::MemorySink script_sink{data::DataSpan{_scratch.data + kHeaderSize, kMaxBodySize}};
             bool built = false;
             if (outcome.ran) {
                 built = _runner.writeResponse(script_sink, outcome.status).has_value();
@@ -275,8 +307,7 @@ m5::stl::expected<void, error_t> Server::processMessage(uint8_t type, uint8_t se
                 // not fit the scratch: degrade to a report-only script.
                 const error_t code =
                     outcome.ran ? error_t::BUFFER_OVERFLOW : outcome.status;  // spec §server execution model
-                script_sink =
-                    data::MemorySink{data::DataSpan{_scratch.data + kHeaderSize, _scratch.size - kHeaderSize}};
+                script_sink = data::MemorySink{data::DataSpan{_scratch.data + kHeaderSize, kMaxBodySize}};
                 bytecode::BytecodeEncoder enc{script_sink};
                 auto e = enc.reportError(code, outcome.ran ? 0 : outcome.offset);
                 if (e.has_value()) {
@@ -383,8 +414,8 @@ m5::stl::expected<void, error_t> Server::handleSubscribe(bool subscribe, const t
 
 m5::stl::expected<bool, error_t> Server::pollSubscriptions(frame::FrameWriter& out, uint8_t stream_id)
 {
-    if (_sub_count == 0) {
-        return false;
+    if (_sub_count == 0 || _scratch.size < kMaxMessageSize) {
+        return false;  // no subscriptions, or inert (scratch contract violated)
     }
 
     // Collect changed pins
@@ -419,10 +450,12 @@ m5::stl::expected<bool, error_t> Server::pollSubscriptions(frame::FrameWriter& o
         }
     }
 
-    // Build event message: _scratch[0] = TYPE event, _scratch[1] = _event_seq++
+    // Build event message: _scratch[0] = TYPE event, _scratch[1] = _event_seq++.
+    // Sink capacity is clamped to kMaxBodySize (one data frame), as in
+    // processMessage.
     _scratch.data[0] = static_cast<uint8_t>(MessageType::event);
     _scratch.data[1] = _event_seq++;
-    data::MemorySink script_sink{data::DataSpan{_scratch.data + 2, _scratch.size - 2}};
+    data::MemorySink script_sink{data::DataSpan{_scratch.data + kHeaderSize, kMaxBodySize}};
     bytecode::BytecodeEncoder enc{script_sink};
     auto e = enc.evtGpioState(changed_pins, changed_levels, changed_count);
     if (e.has_value()) {
@@ -431,7 +464,7 @@ m5::stl::expected<bool, error_t> Server::pollSubscriptions(frame::FrameWriter& o
     if (!e.has_value()) {
         return m5::stl::make_unexpected(e.error());
     }
-    const size_t msg_size = 2 + script_sink.written();
+    const size_t msg_size = kHeaderSize + script_sink.written();
     auto w                = out.writeData(stream_id, data::ConstDataSpan{_scratch.data, msg_size});
     if (!w.has_value()) {
         return m5::stl::make_unexpected(w.error());
@@ -452,6 +485,9 @@ void Server::clearStreamCredit()
 
 m5::stl::expected<bool, error_t> Server::pollStreamCredit(frame::FrameWriter& out, uint8_t stream_id)
 {
+    if (_scratch.size < kMaxMessageSize) {
+        return false;  // inert (scratch contract violated)
+    }
     bool emitted = false;
     for (uint8_t bus_id = 0; bus_id < bytecode::kMaxBusBindings; ++bus_id) {
         StreamCredit& sc = _stream[bus_id];
@@ -484,9 +520,10 @@ m5::stl::expected<bool, error_t> Server::pollStreamCredit(frame::FrameWriter& ou
         }
 
         // Emit one evt_stream_credit event (best-effort, like GPIO events).
+        // Sink capacity clamped to kMaxBodySize, as in processMessage.
         _scratch.data[0] = static_cast<uint8_t>(MessageType::event);
         _scratch.data[1] = _event_seq++;
-        data::MemorySink script_sink{data::DataSpan{_scratch.data + 2, _scratch.size - 2}};
+        data::MemorySink script_sink{data::DataSpan{_scratch.data + kHeaderSize, kMaxBodySize}};
         bytecode::BytecodeEncoder enc{script_sink};
         auto e = enc.evtStreamCredit(types::bus_kind_t::I2S, bus_id, free_now, sub_now);
         if (e.has_value()) {
@@ -495,7 +532,7 @@ m5::stl::expected<bool, error_t> Server::pollStreamCredit(frame::FrameWriter& ou
         if (!e.has_value()) {
             return m5::stl::make_unexpected(e.error());
         }
-        const size_t msg_size = 2 + script_sink.written();
+        const size_t msg_size = kHeaderSize + script_sink.written();
         auto w                = out.writeData(stream_id, data::ConstDataSpan{_scratch.data, msg_size});
         if (!w.has_value()) {
             return m5::stl::make_unexpected(w.error());
@@ -631,7 +668,13 @@ m5::stl::expected<void, error_t> RemoteSession::awaitReply(AwaitKind kind, uint8
         const uint8_t kind4 = type & kTypeKindMask;
         const data::ConstDataSpan body{msg + 2, msg_size - 2};
         if (kind4 == static_cast<uint8_t>(MessageType::error)) {
-            if (msg[1] == seq && body.size >= 1) {
+            // Record ANY error message regardless of its seq (S16 D3):
+            // the server clears its pending NORESP error once the frame
+            // is sent, so an error whose delivery crosses a host-side
+            // timeout carries the seq of the timed-out exchange — a
+            // seq filter here would drop it forever. lastRemoteError()
+            // is "the most recently observed remote error".
+            if (body.size >= 1) {
                 _last_remote_error = mapRemoteError(static_cast<int8_t>(body.data[0]));
             }
             continue;  // the synchronous reply still follows
@@ -640,9 +683,12 @@ m5::stl::expected<void, error_t> RemoteSession::awaitReply(AwaitKind kind, uint8
             if (_event_handler != nullptr) {
                 _event_handler(_event_ctx, msg[1], body);
             }
-            // Run event script through runner so evt_gpio_state reaches
-            // the registered gpio event handler (lossy: ignore run errors).
-            (void)_runner.run(body);
+            // Run the event script through the runner so evt_gpio_state
+            // reaches the registered gpio event handler (lossy: ignore
+            // run errors). runEvent keeps the request state intact —
+            // an event arriving here must not clobber the response the
+            // caller is about to read (S16 D8).
+            (void)_runner.runEvent(body);
             continue;
         }
         if (kind4 == want && msg[1] == seq) {
@@ -789,8 +835,20 @@ m5::stl::expected<size_t, error_t> RemoteSession::poll(size_t max_frames)
             if (_event_handler != nullptr) {
                 _event_handler(_event_ctx, msg[1], body);
             }
-            (void)_runner.run(body);
+            // runEvent: an idle-poll event must not clobber the stored
+            // data / report state of the previous request (S16 D8).
+            (void)_runner.runEvent(body);
             ++events;
+            continue;
+        }
+        if (kind4 == static_cast<uint8_t>(MessageType::error)) {
+            // An error frame that crossed a host-side timeout can land in
+            // an idle poll; record it like awaitReply does (S16 D3) — it
+            // is not counted as an event.
+            if (body.size >= 1) {
+                _last_remote_error = mapRemoteError(static_cast<int8_t>(body.data[0]));
+            }
+            continue;
         }
         // Other message types during idle poll are discarded
     }
@@ -863,7 +921,7 @@ m5::stl::expected<size_t, error_t> RemoteI2CBus::transfer(bus::Accessor* owner, 
     uint8_t script_buf[kMaxBodySize];
     data::MemorySink script_sink{data::DataSpan{script_buf, sizeof(script_buf)}};
     bytecode::BytecodeEncoder enc{script_sink};
-    const uint8_t store_id = (rx != nullptr) ? uint8_t{0} : bytecode::kDiscardStoreId;
+    const uint8_t store_id = (rx != nullptr) ? kDefaultStoreId : bytecode::kDiscardStoreId;
     auto e                 = enc.configure(_remote_bus_id, cfg);
     if (e.has_value()) {
         e = enc.transfer(_remote_bus_id, desc, data::ConstDataSpan{tx_buf, tx_len}, rx_len, store_id);
@@ -898,7 +956,9 @@ m5::stl::expected<size_t, error_t> RemoteI2CBus::transfer(bus::Accessor* owner, 
         }
         rx_got = stored.size;
     }
-    return desc.prefix_len + tx_len + rx_got;
+    // Data phase only, like every local I2C backend (S16 D4): the prefix
+    // is not counted.
+    return tx_len + rx_got;
 }
 
 // ---- RemoteSPIBus -------------------------------------------------------------
@@ -962,7 +1022,7 @@ m5::stl::expected<size_t, error_t> RemoteSPIBus::transfer(bus::Accessor* owner, 
     uint8_t script_buf[kMaxBodySize];
     data::MemorySink script_sink{data::DataSpan{script_buf, sizeof(script_buf)}};
     bytecode::BytecodeEncoder enc{script_sink};
-    const uint8_t store_id = (rx != nullptr) ? uint8_t{0} : bytecode::kDiscardStoreId;
+    const uint8_t store_id = (rx != nullptr) ? kDefaultStoreId : bytecode::kDiscardStoreId;
     auto e                 = enc.configure(_remote_bus_id, cfg);
     if (e.has_value()) {
         e = enc.transfer(_remote_bus_id, desc, data::ConstDataSpan{tx_buf, tx_len}, rx_len, store_id);
@@ -1108,7 +1168,7 @@ m5::stl::expected<size_t, error_t> RemoteUARTBus::read(bus::Accessor* owner, con
     bytecode::BytecodeEncoder enc{script_sink};
     auto e = enc.configure(_remote_bus_id, cfg);
     if (e.has_value()) {
-        e = enc.uartTransfer(_remote_bus_id, data::ConstDataSpan{}, rx_len, 0);
+        e = enc.uartTransfer(_remote_bus_id, data::ConstDataSpan{}, rx_len, kDefaultStoreId);
     }
     if (e.has_value()) {
         e = enc.end();
@@ -1127,7 +1187,7 @@ m5::stl::expected<size_t, error_t> RemoteUARTBus::read(bus::Accessor* owner, con
         return m5::stl::make_unexpected(rq.error());
     }
 
-    const auto stored = _session->runner().storedData(0);
+    const auto stored = _session->runner().storedData(kDefaultStoreId);
     if (stored.size > rx_span.size) {
         return m5::stl::make_unexpected(error_t::PROTOCOL_ERROR);
     }
@@ -1180,7 +1240,20 @@ RemoteI2SBus::RemoteI2SBus(RemoteSession& session, uint8_t remote_bus_id)
     // Register the runner credit handler now (ctx = this). Only reports
     // matching our kind/bus_id update the estimate; one handler slot per
     // runner means one RemoteI2SBus per session (see the class comment).
+    // A second live instance on the same session is a contract violation:
+    // debug builds assert, release builds let the newest instance win.
+    M5HAL_ASSERT(_session->runner().streamCreditHandlerCtx() == nullptr,
+                 "RemoteI2SBus: another instance is already registered on this session");
     _session->runner().setStreamCreditHandler(&streamCreditThunk, this);
+}
+
+RemoteI2SBus::~RemoteI2SBus()
+{
+    // Unregister only while we still own the handler slot; otherwise the
+    // runner would keep calling back into a destroyed object.
+    if (_session != nullptr && _session->runner().streamCreditHandlerCtx() == this) {
+        _session->runner().setStreamCreditHandler(nullptr, nullptr);
+    }
 }
 
 m5::stl::expected<void, error_t> RemoteI2SBus::init(const bus::BusConfig& config)
@@ -1217,7 +1290,7 @@ m5::stl::expected<void, error_t> RemoteI2SBus::syncStatus()
     uint8_t script_buf[16];
     data::MemorySink sink{data::DataSpan{script_buf, sizeof(script_buf)}};
     bytecode::BytecodeEncoder enc{sink};
-    auto e = enc.busStreamStatus(types::bus_kind_t::I2S, _remote_bus_id, 0);
+    auto e = enc.busStreamStatus(types::bus_kind_t::I2S, _remote_bus_id, kDefaultStoreId);
     if (e.has_value()) {
         e = enc.end();
     }
@@ -1228,7 +1301,7 @@ m5::stl::expected<void, error_t> RemoteI2SBus::syncStatus()
     if (!rq.has_value()) {
         return rq;
     }
-    const auto stored = _session->runner().storedData(0);
+    const auto stored = _session->runner().storedData(kDefaultStoreId);
     if (stored.size < 8) {
         return m5::stl::make_unexpected(error_t::PROTOCOL_ERROR);
     }
@@ -1254,7 +1327,7 @@ m5::stl::expected<void, error_t> RemoteI2SBus::syncConfig(const i2s::I2SAccessCo
     bytecode::BytecodeEncoder enc{sink};
     auto e = enc.i2sConfig(_remote_bus_id, wire_cfg);
     if (e.has_value()) {
-        e = enc.busStreamStatus(types::bus_kind_t::I2S, _remote_bus_id, 0);
+        e = enc.busStreamStatus(types::bus_kind_t::I2S, _remote_bus_id, kDefaultStoreId);
     }
     if (e.has_value()) {
         e = enc.end();
@@ -1266,7 +1339,7 @@ m5::stl::expected<void, error_t> RemoteI2SBus::syncConfig(const i2s::I2SAccessCo
     if (!rq.has_value()) {
         return rq;
     }
-    const auto stored = _session->runner().storedData(0);
+    const auto stored = _session->runner().storedData(kDefaultStoreId);
     if (stored.size < 8) {
         return m5::stl::make_unexpected(error_t::PROTOCOL_ERROR);
     }
@@ -1306,7 +1379,9 @@ m5::stl::expected<size_t, error_t> RemoteI2SBus::write(bus::Accessor* owner, con
              static_cast<unsigned>(len), static_cast<unsigned>(_sent - _submitted), static_cast<unsigned>(credit()));
 #endif
 
-    while (done < len && (tx == nullptr || !tx->eof())) {
+    // A null `tx` stages nothing: return 0 like the local espidf
+    // implementation (same I2SBus::write contract).
+    while (done < len && tx != nullptr && !tx->eof()) {
         uint32_t cr = credit();
         {
             // In-flight window cap (see setStreamWindow / the detail note above).
@@ -1339,8 +1414,11 @@ m5::stl::expected<size_t, error_t> RemoteI2SBus::write(bus::Accessor* owner, con
         }
         if (cr == 0) {
             // Host-side write timeout: short writes are normal for I2S.
+            // write_timeout_ms == 0 means non-blocking (the same contract
+            // as the local espidf implementation): return what has been
+            // accepted so far instead of waiting for credit.
             const uint32_t now = static_cast<uint32_t>(m5::utility::millis());
-            if (cfg.write_timeout_ms != 0 && (now - start) >= cfg.write_timeout_ms) {
+            if (cfg.write_timeout_ms == 0 || (now - start) >= cfg.write_timeout_ms) {
                 break;
             }
             // Wait for ONE frame (≈ the next credit event) then re-check.
@@ -1365,7 +1443,7 @@ m5::stl::expected<size_t, error_t> RemoteI2SBus::write(bus::Accessor* owner, con
 
         uint8_t data_buf[detail::kMaxStreamChunk];
         size_t staged = 0;
-        while (staged < chunk && (tx == nullptr || !tx->eof())) {
+        while (staged < chunk && !tx->eof()) {
             auto p = tx->peek(chunk - staged);
             if (!p.has_value()) {
                 return m5::stl::make_unexpected(p.error());
@@ -1457,7 +1535,7 @@ bool RemoteGPIO::wireRead(uint32_t local_pin)
     data::MemorySink sink{data::DataSpan{script_buf, sizeof(script_buf)}};
     bytecode::BytecodeEncoder enc{sink};
     const types::gpio_number_t pin = remoteNumber(local_pin);
-    auto e                         = enc.gpioRead(0, &pin, 1);
+    auto e                         = enc.gpioRead(kDefaultStoreId, &pin, 1);
     if (e.has_value()) {
         e = enc.end();
     }
@@ -1468,7 +1546,7 @@ bool RemoteGPIO::wireRead(uint32_t local_pin)
     if (!rq.has_value()) {
         return false;  // the error stays observable on the session
     }
-    const auto stored = _session->runner().storedData(0);
+    const auto stored = _session->runner().storedData(kDefaultStoreId);
     return stored.size >= 1 && (stored.data[0] & 0x01) != 0;
 }
 

@@ -50,14 +50,17 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const ::m5::hal
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
     const auto& i2c_config = static_cast<const BusConfig&>(config);
-    _config                = i2c_config;
-    _port                  = i2c_config.i2c_port;
-    if (_config.pin_scl < 0 || _config.pin_sda < 0) {
+    if (i2c_config.pin_scl < 0 || i2c_config.pin_sda < 0) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
+    // Release the previous driver while `_port` still names the OLD port;
+    // adopting the new config first would delete the wrong driver and
+    // leak the old one.
     if (_installed) {
         (void)release();
     }
+    _config = i2c_config;
+    _port   = i2c_config.i2c_port;
 
     ::i2c_config_t conf   = {};
     conf.mode             = I2C_MODE_MASTER;
@@ -146,7 +149,9 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
         return size_t{0};
     }
 
-    size_t total    = write_bytes.size();
+    // Data phase only: the staged buffer holds prefix + tx, but the
+    // prefix is not counted in the return value (matches SPI, S16 D4).
+    size_t total    = write_bytes.size() - desc.prefix_len;
     ::esp_err_t err = ESP_OK;
 
     if (!have_rx) {
@@ -159,6 +164,16 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
         }
         auto rx_span = rsv.value();
         if (rx_span.size == 0) {
+            // Write-only degradation: the tx phase must still hit the
+            // wire — returning early here reported "sent" without ever
+            // transmitting (S16 D10).
+            if (have_tx) {
+                mapped = mapEspErr(::i2c_master_write_to_device(_port, static_cast<uint8_t>(cfg.i2c_addr),
+                                                                write_bytes.data(), write_bytes.size(), ticks));
+                if (::m5::hal::v1::error::isError(mapped)) {
+                    return m5::stl::make_unexpected(mapped);
+                }
+            }
             return total;
         }
 

@@ -177,10 +177,8 @@ void runTimerBenchmark()
                empty);
     printBench("M5HAL fastTick()", measure(TIMER_ITERATIONS, [](uint32_t) { g_sink += m5hal::service::fastTick(); }),
                empty);
-    printBench("M5HAL fastTickNsec()",
-               measure(TIMER_ITERATIONS, [](uint32_t) { g_sink += m5hal::service::fastTickNsec(); }), empty);
-    printBench("M5HAL defaultNowNsec()",
-               measure(TIMER_ITERATIONS, [](uint32_t) { g_sink += m5hal::service::defaultNowNsec(); }), empty);
+    printBench("M5HAL defaultNowTick()",
+               measure(TIMER_ITERATIONS, [](uint32_t) { g_sink += m5hal::service::defaultNowTick(); }), empty);
     Serial.printf("sink=%lu\n", static_cast<unsigned long>(g_sink));
 }
 

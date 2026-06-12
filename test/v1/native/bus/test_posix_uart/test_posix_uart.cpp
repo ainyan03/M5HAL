@@ -479,7 +479,7 @@ TEST(PosixUART, RemoteSessionEndToEndOverPty)
             if (error::isError(result)) {
                 return m5::stl::make_unexpected(result);
             }
-            size_t total = desc.prefix_len;
+            size_t total = 0;  // data phase only (S16 D4)
             if (tx != nullptr) {
                 while (!tx->eof()) {
                     auto p = tx->peek(64);
@@ -668,10 +668,10 @@ TEST(PosixUART, ConnectRemoteSerialExplicitPathOverPty)
             return {};
         }
         m5::stl::expected<size_t, error::error_t> transfer(bus::Accessor*, const i2c::I2CMasterAccessConfig&,
-                                                           const i2c::TransferDesc& desc, data::Source*,
+                                                           const i2c::TransferDesc&, data::Source*,
                                                            data::Sink*) override
         {
-            return desc.prefix_len;
+            return size_t{0};  // data phase only (S16 D4)
         }
     };
 

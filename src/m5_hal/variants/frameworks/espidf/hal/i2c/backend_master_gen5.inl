@@ -221,7 +221,9 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
         return m5::stl::make_unexpected(ensured.error());
     }
 
-    size_t total = write_bytes.size();
+    // Data phase only: the staged buffer holds prefix + tx, but the
+    // prefix is not counted in the return value (matches SPI, S16 D4).
+    size_t total = write_bytes.size() - desc.prefix_len;
 
     auto finish = [&](::esp_err_t result) -> m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> {
         auto result_map = mapEspErr(result);
@@ -242,6 +244,12 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
     }
     auto rx_span = rsv.value();
     if (rx_span.size == 0) {
+        // A sink that reserves 0 bytes degrades this to write-only: the
+        // tx phase must still hit the wire — returning early here
+        // reported "sent" without ever transmitting (S16 D10).
+        if (have_tx) {
+            return finish(::i2c_master_transmit(_dev_handle, write_bytes.data(), write_bytes.size(), timeout));
+        }
         return finish(ESP_OK);
     }
 

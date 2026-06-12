@@ -9,9 +9,8 @@
 // variant provides a given HAL. It declares HAS_HAL_*_ for every HAL
 // kind for which it ships a no-op concrete (see header.hpp).
 
-#define M5HAL_VARIANT_CURRENT_ALIAS_     stub
-#define M5HAL_VARIANT_CURRENT_BASE_PATH_ ../variants/frameworks/stub
-#define M5HAL_VARIANT_CURRENT_BASE_NS_   variants::frameworks::stub
+#define M5HAL_VARIANT_CURRENT_ALIAS_   stub
+#define M5HAL_VARIANT_CURRENT_BASE_NS_ variants::frameworks::stub
 
 #define M5HAL_VARIANT_CURRENT_HAS_HAL_GPIO_ 1
 // I2C / SPI / UART are not yet declared because their abstract bases

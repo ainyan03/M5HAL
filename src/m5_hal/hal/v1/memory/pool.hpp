@@ -52,6 +52,14 @@ private:
     alignas(16) uint8_t storage_[kPoolSize]{};
     uint32_t bitmap_ = 0;
     uint8_t block_counts_[BlockCount]{};
+    /*!
+      Task-context only. Calling from an ISR on a single-core system will
+      deadlock immediately because the ISR preempts the task that holds the
+      flag and then spins forever waiting for itself. Equally, this is a
+      no-yield busy-wait, so any priority-inversion scenario (a low-priority
+      task holds the lock while a high-priority task spins) will stall the
+      high-priority task for the full allocation duration.
+     */
     mutable std::atomic_flag _lock = ATOMIC_FLAG_INIT;
 };
 

@@ -2,6 +2,7 @@
 #define M5_HAL_HAL_V1_MEMORY_ALLOCATOR_INL_
 
 #include "allocator.hpp"
+#include "../assert.hpp"
 #include "../m5_hal.hpp"
 
 #include <algorithm>
@@ -36,11 +37,19 @@ M5HAL_INLINE_V1 namespace v1
             return nullptr;
         }
 
-        if (usage == usage_t::temp && _temp_pool.owns(ptr)) {
-            void* pool_ptr = _temp_pool.reallocate(ptr, preserve_size, new_size);
-            if (pool_ptr != nullptr) {
-                return pool_ptr;
+        // Dispatch on where `ptr` actually lives, not on `usage`: a
+        // pool-owned pointer must never reach the fallback reallocator
+        // (it is not a heap pointer). `usage` only decides where the
+        // data moves to.
+        if (_temp_pool.owns(ptr)) {
+            if (usage == usage_t::temp) {
+                void* pool_ptr = _temp_pool.reallocate(ptr, preserve_size, new_size);
+                if (pool_ptr != nullptr) {
+                    return pool_ptr;
+                }
             }
+            // Move out of the pool: either the usage changed away from
+            // temp, or the pool cannot satisfy `new_size`.
             void* next = allocate(new_size, usage);
             if (next == nullptr) {
                 return nullptr;
@@ -56,6 +65,14 @@ M5HAL_INLINE_V1 namespace v1
     void Allocator::deallocate(void* ptr)
     {
         if (_temp_pool.deallocate(ptr)) {
+            return;
+        }
+        // A pointer inside the pool that the pool refused (double free or
+        // interior pointer) must not reach the fallback `free` — that
+        // would corrupt the heap. Contract violation: crash in debug,
+        // ignore in release.
+        if (_temp_pool.owns(ptr)) {
+            M5HAL_ASSERT(false, "Allocator::deallocate: invalid in-pool pointer (double free or interior pointer)");
             return;
         }
 

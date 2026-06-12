@@ -30,9 +30,16 @@ public:
     virtual bool readSda() const     = 0;
 };
 
+// Timing pair for the detail services. `half_period` / `timeout` are
+// COMPARABLE-TICK quantities in whatever unit the caller feeds
+// ServiceContext::now_tick with — the detail services only add them to
+// and compare them against that field. fromConfig() builds the pair in
+// nanoseconds (for callers that pump nanosecond contexts, e.g. the
+// native tests); the synchronous transfer path converts it once with
+// serviceTimingToTicks() and pumps raw fastTick() counts instead.
 struct MasterTiming {
-    ::m5::hal::v1::service::tick_nsec_t half_period_nsec = 5000;
-    ::m5::hal::v1::service::tick_nsec_t timeout_nsec     = 1000000000u;
+    ::m5::hal::v1::service::fast_tick_t half_period = 5000;
+    ::m5::hal::v1::service::fast_tick_t timeout     = 1000000000u;
 
     static constexpr uint32_t kNsecPerSec  = 1000000000u;
     static constexpr uint32_t kNsecPerMsec = 1000000u;
@@ -40,7 +47,7 @@ struct MasterTiming {
     static m5::stl::expected<MasterTiming, ::m5::hal::v1::error::error_t> fromConfig(
         const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg)
     {
-        if (cfg.freq == 0 || cfg.timeout_ms > (::m5::hal::v1::service::kMaxComparableDelayNsec / kNsecPerMsec)) {
+        if (cfg.freq == 0 || cfg.timeout_ms > (::m5::hal::v1::service::kMaxComparableDelayTicks / kNsecPerMsec)) {
             return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
         }
 
@@ -50,11 +57,11 @@ struct MasterTiming {
         if (half == 0) {
             half = 1;
         }
-        if (half > ::m5::hal::v1::service::kMaxComparableDelayNsec) {
+        if (half > ::m5::hal::v1::service::kMaxComparableDelayTicks) {
             return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
         }
-        timing.half_period_nsec = static_cast<::m5::hal::v1::service::tick_nsec_t>(half);
-        timing.timeout_nsec     = static_cast<::m5::hal::v1::service::tick_nsec_t>(cfg.timeout_ms * kNsecPerMsec);
+        timing.half_period = static_cast<::m5::hal::v1::service::fast_tick_t>(half);
+        timing.timeout     = static_cast<::m5::hal::v1::service::fast_tick_t>(cfg.timeout_ms * kNsecPerMsec);
         return timing;
     }
 };
@@ -63,73 +70,73 @@ class MasterServiceTiming {
 public:
     enum class ClockWaitResult : uint8_t { Released, Waiting, Timeout };
 
-    void reset(::m5::hal::v1::service::tick_nsec_t now_nsec)
+    void reset(::m5::hal::v1::service::fast_tick_t now_tick)
     {
-        _due           = now_nsec;
-        _stretch_start = now_nsec;
+        _due           = now_tick;
+        _stretch_start = now_tick;
     }
-    ::m5::hal::v1::service::tick_nsec_t dueNsec() const
+    ::m5::hal::v1::service::fast_tick_t dueTick() const
     {
         return _due;
     }
     template <typename State>
-    void scheduleAfterHalfFromNow(const MasterTiming& timing, ::m5::hal::v1::service::tick_nsec_t now_nsec,
+    void scheduleAfterHalfFromNow(const MasterTiming& timing, ::m5::hal::v1::service::fast_tick_t now_tick,
                                   State& state, State next)
     {
-        _due  = now_nsec + timing.half_period_nsec;
+        _due  = now_tick + timing.half_period;
         state = next;
     }
     template <typename State>
-    void scheduleNextHalf(const MasterTiming& timing, ::m5::hal::v1::service::tick_nsec_t now_nsec, State& state,
+    void scheduleNextHalf(const MasterTiming& timing, ::m5::hal::v1::service::fast_tick_t now_tick, State& state,
                           State next)
     {
         // Preserve the ideal clock phase for small service/GPIO overhead, but
         // resync after a large delay so the bus never emits catch-up bursts.
-        const auto next_due = _due + timing.half_period_nsec;
-        _due  = ::m5::hal::v1::service::hasReached(now_nsec, next_due) ? now_nsec + timing.half_period_nsec : next_due;
+        const auto next_due = _due + timing.half_period;
+        _due  = ::m5::hal::v1::service::hasReached(now_tick, next_due) ? now_tick + timing.half_period : next_due;
         state = next;
     }
     template <typename State>
-    void scheduleNow(::m5::hal::v1::service::tick_nsec_t now_nsec, State& state, State next)
+    void scheduleNow(::m5::hal::v1::service::fast_tick_t now_tick, State& state, State next)
     {
-        _due  = now_nsec;
+        _due  = now_tick;
         state = next;
     }
     template <typename State>
-    void beginClockStretch(::m5::hal::v1::service::tick_nsec_t now_nsec, State& state, State wait_state)
+    void beginClockStretch(::m5::hal::v1::service::fast_tick_t now_tick, State& state, State wait_state)
     {
-        _stretch_start = now_nsec;
-        _due           = now_nsec;
+        _stretch_start = now_tick;
+        _due           = now_tick;
         state          = wait_state;
     }
     ClockWaitResult waitClockHigh(const MasterLineDriver& lines, const MasterTiming& timing,
-                                  ::m5::hal::v1::service::tick_nsec_t now_nsec) const
+                                  ::m5::hal::v1::service::fast_tick_t now_tick) const
     {
         if (lines.readScl()) {
             return ClockWaitResult::Released;
         }
-        if (::m5::hal::v1::service::elapsedNsec(now_nsec, _stretch_start) >= timing.timeout_nsec) {
+        if (::m5::hal::v1::service::elapsedTicks(now_tick, _stretch_start) >= timing.timeout) {
             return ClockWaitResult::Timeout;
         }
         return ClockWaitResult::Waiting;
     }
 
 private:
-    ::m5::hal::v1::service::tick_nsec_t _due           = 0;
-    ::m5::hal::v1::service::tick_nsec_t _stretch_start = 0;
+    ::m5::hal::v1::service::fast_tick_t _due           = 0;
+    ::m5::hal::v1::service::fast_tick_t _stretch_start = 0;
 };
 
 class StartConditionService : public ::m5::hal::v1::service::IService {
 public:
     enum class State : uint8_t { Idle, ReleaseScl, WaitClockHigh, PullSdaLow, PullSclLow, Done, Timeout };
 
-    void begin(MasterLineDriver& lines, const MasterTiming& timing, ::m5::hal::v1::service::tick_nsec_t now_nsec)
+    void begin(MasterLineDriver& lines, const MasterTiming& timing, ::m5::hal::v1::service::fast_tick_t now_tick)
     {
         _lines  = &lines;
         _timing = timing;
         _error  = ::m5::hal::v1::error::error_t::OK;
         _state  = State::ReleaseScl;
-        _clock.reset(now_nsec);
+        _clock.reset(now_tick);
     }
 
     ::m5::hal::v1::service::ServiceResult service(const ::m5::hal::v1::service::ServiceContext& ctx) override
@@ -144,7 +151,7 @@ public:
         if (_state == State::Timeout) {
             return ::m5::hal::v1::service::ServiceResult::Error;
         }
-        if (!hasReached(ctx.now_nsec, _clock.dueNsec())) {
+        if (!hasReached(ctx.now_tick, _clock.dueTick())) {
             return ::m5::hal::v1::service::ServiceResult::Idle;
         }
 
@@ -152,15 +159,15 @@ public:
             case State::ReleaseScl:
                 _lines->writeSclHigh();
                 if (_lines->readScl()) {
-                    _clock.scheduleAfterHalfFromNow(_timing, ctx.now_nsec, _state, State::PullSdaLow);
+                    _clock.scheduleAfterHalfFromNow(_timing, ctx.now_tick, _state, State::PullSdaLow);
                 } else {
-                    _clock.beginClockStretch(ctx.now_nsec, _state, State::WaitClockHigh);
+                    _clock.beginClockStretch(ctx.now_tick, _state, State::WaitClockHigh);
                 }
                 break;
             case State::WaitClockHigh:
-                switch (_clock.waitClockHigh(*_lines, _timing, ctx.now_nsec)) {
+                switch (_clock.waitClockHigh(*_lines, _timing, ctx.now_tick)) {
                     case MasterServiceTiming::ClockWaitResult::Released:
-                        _clock.scheduleAfterHalfFromNow(_timing, ctx.now_nsec, _state, State::PullSdaLow);
+                        _clock.scheduleAfterHalfFromNow(_timing, ctx.now_tick, _state, State::PullSdaLow);
                         break;
                     case MasterServiceTiming::ClockWaitResult::Timeout:
                         _error = ::m5::hal::v1::error::error_t::TIMEOUT_ERROR;
@@ -172,7 +179,7 @@ public:
                 break;
             case State::PullSdaLow:
                 _lines->writeSda(false);
-                _clock.scheduleAfterHalfFromNow(_timing, ctx.now_nsec, _state, State::PullSclLow);
+                _clock.scheduleAfterHalfFromNow(_timing, ctx.now_tick, _state, State::PullSclLow);
                 break;
             case State::PullSclLow:
                 _lines->writeSclLow();
@@ -200,9 +207,9 @@ public:
     {
         return _state == State::Done;
     }
-    ::m5::hal::v1::service::tick_nsec_t dueNsec() const
+    ::m5::hal::v1::service::fast_tick_t dueTick() const
     {
-        return _clock.dueNsec();
+        return _clock.dueTick();
     }
     ::m5::hal::v1::error::error_t error() const
     {
@@ -232,14 +239,14 @@ public:
     };
 
     void begin(MasterLineDriver& lines, const MasterTiming& timing, uint8_t byte,
-               ::m5::hal::v1::service::tick_nsec_t now_nsec)
+               ::m5::hal::v1::service::fast_tick_t now_tick)
     {
         _lines  = &lines;
         _timing = timing;
-        restart(byte, now_nsec);
+        restart(byte, now_tick);
     }
 
-    void restart(uint8_t byte, ::m5::hal::v1::service::tick_nsec_t now_nsec)
+    void restart(uint8_t byte, ::m5::hal::v1::service::fast_tick_t now_tick)
     {
         _byte      = byte;
         _bit_index = 0;
@@ -247,9 +254,9 @@ public:
         _acked     = false;
         _error     = ::m5::hal::v1::error::error_t::OK;
         _state     = State::RaiseClock;
-        _clock.reset(now_nsec);
+        _clock.reset(now_tick);
         _lines->writeSda(bitValue());
-        _clock.scheduleAfterHalfFromNow(_timing, now_nsec, _state, State::RaiseClock);
+        _clock.scheduleAfterHalfFromNow(_timing, now_tick, _state, State::RaiseClock);
     }
 
     ::m5::hal::v1::service::ServiceResult service(const ::m5::hal::v1::service::ServiceContext& ctx) override
@@ -263,13 +270,13 @@ public:
         if (state_value & kTerminalStateMask) {
             return terminalStateResult(state_value);
         }
-        if (!hasReached(ctx.now_nsec, _clock.dueNsec())) {
+        if (!hasReached(ctx.now_tick, _clock.dueTick())) {
             return ::m5::hal::v1::service::ServiceResult::Idle;
         }
 
         if (_state == State::RaiseClock) {
             _lines->writeSclHigh();
-            waitClockHighOrSchedule(ctx.now_nsec, State::LowerClock);
+            waitClockHighOrSchedule(ctx.now_tick, State::LowerClock);
             return ::m5::hal::v1::service::ServiceResult::Progress;
         }
         if (_state == State::LowerClock) {
@@ -278,10 +285,10 @@ public:
             if (_bit_mask != 0) {
                 ++_bit_index;
                 _lines->writeSda(bitValue());
-                scheduleAfterHalf(ctx.now_nsec, State::RaiseClock);
+                scheduleAfterHalf(ctx.now_tick, State::RaiseClock);
             } else {
                 _lines->writeSda(true);
-                scheduleAfterHalf(ctx.now_nsec, State::RaiseAckClock);
+                scheduleAfterHalf(ctx.now_tick, State::RaiseAckClock);
             }
             return ::m5::hal::v1::service::ServiceResult::Progress;
         }
@@ -292,12 +299,12 @@ public:
                 break;
             case State::RaiseAckClock:
                 _lines->writeSclHigh();
-                waitClockHighOrSchedule(ctx.now_nsec, State::SampleAck);
+                waitClockHighOrSchedule(ctx.now_tick, State::SampleAck);
                 return ::m5::hal::v1::service::ServiceResult::Progress;
             case State::WaitClockHigh:
-                switch (_clock.waitClockHigh(*_lines, _timing, ctx.now_nsec)) {
+                switch (_clock.waitClockHigh(*_lines, _timing, ctx.now_tick)) {
                     case MasterServiceTiming::ClockWaitResult::Released:
-                        scheduleAfterHalfFromNow(ctx.now_nsec, _after_stretch);
+                        scheduleAfterHalfFromNow(ctx.now_tick, _after_stretch);
                         return ::m5::hal::v1::service::ServiceResult::Progress;
                     case MasterServiceTiming::ClockWaitResult::Timeout:
                         _error = ::m5::hal::v1::error::error_t::TIMEOUT_ERROR;
@@ -347,9 +354,9 @@ public:
     {
         return _bit_index;
     }
-    ::m5::hal::v1::service::tick_nsec_t dueNsec() const
+    ::m5::hal::v1::service::fast_tick_t dueTick() const
     {
-        return _clock.dueNsec();
+        return _clock.dueTick();
     }
 
 private:
@@ -368,21 +375,21 @@ private:
     {
         return (_byte & _bit_mask) != 0;
     }
-    void scheduleAfterHalf(::m5::hal::v1::service::tick_nsec_t now_nsec, State next)
+    void scheduleAfterHalf(::m5::hal::v1::service::fast_tick_t now_tick, State next)
     {
-        _clock.scheduleNextHalf(_timing, now_nsec, _state, next);
+        _clock.scheduleNextHalf(_timing, now_tick, _state, next);
     }
-    void scheduleAfterHalfFromNow(::m5::hal::v1::service::tick_nsec_t now_nsec, State next)
+    void scheduleAfterHalfFromNow(::m5::hal::v1::service::fast_tick_t now_tick, State next)
     {
-        _clock.scheduleAfterHalfFromNow(_timing, now_nsec, _state, next);
+        _clock.scheduleAfterHalfFromNow(_timing, now_tick, _state, next);
     }
-    void waitClockHighOrSchedule(::m5::hal::v1::service::tick_nsec_t now_nsec, State next)
+    void waitClockHighOrSchedule(::m5::hal::v1::service::fast_tick_t now_tick, State next)
     {
         if (_lines->readScl()) {
-            scheduleAfterHalf(now_nsec, next);
+            scheduleAfterHalf(now_tick, next);
         } else {
             _after_stretch = next;
-            _clock.beginClockStretch(now_nsec, _state, State::WaitClockHigh);
+            _clock.beginClockStretch(now_tick, _state, State::WaitClockHigh);
         }
     }
 
@@ -412,13 +419,13 @@ public:
         Timeout,
     };
 
-    void begin(MasterLineDriver& lines, const MasterTiming& timing, ::m5::hal::v1::service::tick_nsec_t now_nsec)
+    void begin(MasterLineDriver& lines, const MasterTiming& timing, ::m5::hal::v1::service::fast_tick_t now_tick)
     {
         _lines  = &lines;
         _timing = timing;
         _error  = ::m5::hal::v1::error::error_t::OK;
         _state  = State::PullSdaLow;
-        _clock.reset(now_nsec);
+        _clock.reset(now_tick);
     }
 
     ::m5::hal::v1::service::ServiceResult service(const ::m5::hal::v1::service::ServiceContext& ctx) override
@@ -433,23 +440,23 @@ public:
         if (_state == State::BusError || _state == State::Timeout) {
             return ::m5::hal::v1::service::ServiceResult::Error;
         }
-        if (!hasReached(ctx.now_nsec, _clock.dueNsec())) {
+        if (!hasReached(ctx.now_tick, _clock.dueTick())) {
             return ::m5::hal::v1::service::ServiceResult::Idle;
         }
 
         switch (_state) {
             case State::PullSdaLow:
                 _lines->writeSda(false);
-                scheduleAfterHalf(ctx.now_nsec, State::RaiseClock);
+                scheduleAfterHalf(ctx.now_tick, State::RaiseClock);
                 break;
             case State::RaiseClock:
                 _lines->writeSclHigh();
-                waitClockHighOrSchedule(ctx.now_nsec, State::ReleaseSda);
+                waitClockHighOrSchedule(ctx.now_tick, State::ReleaseSda);
                 break;
             case State::WaitClockHigh:
-                switch (_clock.waitClockHigh(*_lines, _timing, ctx.now_nsec)) {
+                switch (_clock.waitClockHigh(*_lines, _timing, ctx.now_tick)) {
                     case MasterServiceTiming::ClockWaitResult::Released:
-                        scheduleAfterHalf(ctx.now_nsec, _after_stretch);
+                        scheduleAfterHalf(ctx.now_tick, _after_stretch);
                         break;
                     case MasterServiceTiming::ClockWaitResult::Timeout:
                         _error = ::m5::hal::v1::error::error_t::TIMEOUT_ERROR;
@@ -461,7 +468,7 @@ public:
                 break;
             case State::ReleaseSda:
                 _lines->writeSda(true);
-                scheduleAfterHalf(ctx.now_nsec, State::VerifySdaHigh);
+                scheduleAfterHalf(ctx.now_tick, State::VerifySdaHigh);
                 break;
             case State::VerifySdaHigh:
                 if (_lines->readSda()) {
@@ -499,23 +506,23 @@ public:
     {
         return _error;
     }
-    ::m5::hal::v1::service::tick_nsec_t dueNsec() const
+    ::m5::hal::v1::service::fast_tick_t dueTick() const
     {
-        return _clock.dueNsec();
+        return _clock.dueTick();
     }
 
 private:
-    void scheduleAfterHalf(::m5::hal::v1::service::tick_nsec_t now_nsec, State next)
+    void scheduleAfterHalf(::m5::hal::v1::service::fast_tick_t now_tick, State next)
     {
-        _clock.scheduleAfterHalfFromNow(_timing, now_nsec, _state, next);
+        _clock.scheduleAfterHalfFromNow(_timing, now_tick, _state, next);
     }
-    void waitClockHighOrSchedule(::m5::hal::v1::service::tick_nsec_t now_nsec, State next)
+    void waitClockHighOrSchedule(::m5::hal::v1::service::fast_tick_t now_tick, State next)
     {
         if (_lines->readScl()) {
-            scheduleAfterHalf(now_nsec, next);
+            scheduleAfterHalf(now_tick, next);
         } else {
             _after_stretch = next;
-            _clock.beginClockStretch(now_nsec, _state, State::WaitClockHigh);
+            _clock.beginClockStretch(now_tick, _state, State::WaitClockHigh);
         }
     }
 
@@ -542,14 +549,14 @@ public:
     };
 
     void begin(MasterLineDriver& lines, const MasterTiming& timing, bool ack_after_read,
-               ::m5::hal::v1::service::tick_nsec_t now_nsec)
+               ::m5::hal::v1::service::fast_tick_t now_tick)
     {
         _lines  = &lines;
         _timing = timing;
-        restart(ack_after_read, now_nsec);
+        restart(ack_after_read, now_tick);
     }
 
-    void restart(bool ack_after_read, ::m5::hal::v1::service::tick_nsec_t now_nsec)
+    void restart(bool ack_after_read, ::m5::hal::v1::service::fast_tick_t now_tick)
     {
         _ack_after_read = ack_after_read;
         _byte           = 0;
@@ -557,7 +564,7 @@ public:
         _bit_mask       = 0x80;
         _error          = ::m5::hal::v1::error::error_t::OK;
         _state          = State::ReleaseSda;
-        _clock.reset(now_nsec);
+        _clock.reset(now_tick);
     }
 
     ::m5::hal::v1::service::ServiceResult service(const ::m5::hal::v1::service::ServiceContext& ctx) override
@@ -570,13 +577,13 @@ public:
         if (state_value & kTerminalStateMask) {
             return terminalStateResult(state_value);
         }
-        if (!hasReached(ctx.now_nsec, _clock.dueNsec())) {
+        if (!hasReached(ctx.now_tick, _clock.dueTick())) {
             return ::m5::hal::v1::service::ServiceResult::Idle;
         }
 
         if (_state == State::RaiseClock) {
             _lines->writeSclHigh();
-            waitClockHighOrSchedule(ctx.now_nsec, State::SampleBit);
+            waitClockHighOrSchedule(ctx.now_tick, State::SampleBit);
             return ::m5::hal::v1::service::ServiceResult::Progress;
         }
         if (_state == State::SampleBit) {
@@ -587,10 +594,10 @@ public:
             _bit_mask >>= 1;
             if (_bit_mask == 0) {
                 _lines->writeSda(!_ack_after_read);
-                scheduleAfterHalf(ctx.now_nsec, State::RaiseAckClock);
+                scheduleAfterHalf(ctx.now_tick, State::RaiseAckClock);
             } else {
                 ++_bit_index;
-                scheduleAfterHalf(ctx.now_nsec, State::RaiseClock);
+                scheduleAfterHalf(ctx.now_tick, State::RaiseClock);
             }
             return ::m5::hal::v1::service::ServiceResult::Progress;
         }
@@ -598,14 +605,14 @@ public:
         switch (_state) {
             case State::ReleaseSda:
                 _lines->writeSda(true);
-                scheduleAfterHalfFromNow(ctx.now_nsec, State::RaiseClock);
+                scheduleAfterHalfFromNow(ctx.now_tick, State::RaiseClock);
                 break;
             case State::RaiseClock:
                 break;
             case State::WaitClockHigh:
-                switch (_clock.waitClockHigh(*_lines, _timing, ctx.now_nsec)) {
+                switch (_clock.waitClockHigh(*_lines, _timing, ctx.now_tick)) {
                     case MasterServiceTiming::ClockWaitResult::Released:
-                        scheduleAfterHalfFromNow(ctx.now_nsec, _after_stretch);
+                        scheduleAfterHalfFromNow(ctx.now_tick, _after_stretch);
                         break;
                     case MasterServiceTiming::ClockWaitResult::Timeout:
                         _error = ::m5::hal::v1::error::error_t::TIMEOUT_ERROR;
@@ -619,7 +626,7 @@ public:
                 break;
             case State::RaiseAckClock:
                 _lines->writeSclHigh();
-                waitClockHighOrSchedule(ctx.now_nsec, State::LowerAckClock);
+                waitClockHighOrSchedule(ctx.now_tick, State::LowerAckClock);
                 break;
             case State::LowerAckClock:
                 _lines->writeSclLow();
@@ -660,9 +667,9 @@ public:
     {
         return _bit_index;
     }
-    ::m5::hal::v1::service::tick_nsec_t dueNsec() const
+    ::m5::hal::v1::service::fast_tick_t dueTick() const
     {
-        return _clock.dueNsec();
+        return _clock.dueTick();
     }
 
 private:
@@ -677,21 +684,21 @@ private:
                                                                          : ::m5::hal::v1::service::ServiceResult::Idle);
     }
 
-    void scheduleAfterHalf(::m5::hal::v1::service::tick_nsec_t now_nsec, State next)
+    void scheduleAfterHalf(::m5::hal::v1::service::fast_tick_t now_tick, State next)
     {
-        _clock.scheduleNextHalf(_timing, now_nsec, _state, next);
+        _clock.scheduleNextHalf(_timing, now_tick, _state, next);
     }
-    void scheduleAfterHalfFromNow(::m5::hal::v1::service::tick_nsec_t now_nsec, State next)
+    void scheduleAfterHalfFromNow(::m5::hal::v1::service::fast_tick_t now_tick, State next)
     {
-        _clock.scheduleAfterHalfFromNow(_timing, now_nsec, _state, next);
+        _clock.scheduleAfterHalfFromNow(_timing, now_tick, _state, next);
     }
-    void waitClockHighOrSchedule(::m5::hal::v1::service::tick_nsec_t now_nsec, State next)
+    void waitClockHighOrSchedule(::m5::hal::v1::service::fast_tick_t now_tick, State next)
     {
         if (_lines->readScl()) {
-            scheduleAfterHalf(now_nsec, next);
+            scheduleAfterHalf(now_tick, next);
         } else {
             _after_stretch = next;
-            _clock.beginClockStretch(now_nsec, _state, State::WaitClockHigh);
+            _clock.beginClockStretch(now_tick, _state, State::WaitClockHigh);
         }
     }
 
@@ -712,34 +719,34 @@ public:
     enum class Operation : uint8_t { Idle, Start, WriteByte, ReadByte, Stop, Address, WriteBuffer, ReadBuffer };
     enum class Phase : uint8_t { Idle, Start, Write, Read };
 
-    void beginStart(MasterLineDriver& lines, const MasterTiming& timing, ::m5::hal::v1::service::tick_nsec_t now_nsec)
+    void beginStart(MasterLineDriver& lines, const MasterTiming& timing, ::m5::hal::v1::service::fast_tick_t now_tick)
     {
         _operation = Operation::Start;
         _error     = ::m5::hal::v1::error::error_t::OK;
-        _start.begin(lines, timing, now_nsec);
+        _start.begin(lines, timing, now_tick);
     }
     void beginWriteByte(MasterLineDriver& lines, const MasterTiming& timing, uint8_t byte,
-                        ::m5::hal::v1::service::tick_nsec_t now_nsec)
+                        ::m5::hal::v1::service::fast_tick_t now_tick)
     {
         _operation = Operation::WriteByte;
         _error     = ::m5::hal::v1::error::error_t::OK;
-        _write.begin(lines, timing, byte, now_nsec);
+        _write.begin(lines, timing, byte, now_tick);
     }
     void beginReadByte(MasterLineDriver& lines, const MasterTiming& timing, bool ack_after_read,
-                       ::m5::hal::v1::service::tick_nsec_t now_nsec)
+                       ::m5::hal::v1::service::fast_tick_t now_tick)
     {
         _operation = Operation::ReadByte;
         _error     = ::m5::hal::v1::error::error_t::OK;
-        _read.begin(lines, timing, ack_after_read, now_nsec);
+        _read.begin(lines, timing, ack_after_read, now_tick);
     }
-    void beginStop(MasterLineDriver& lines, const MasterTiming& timing, ::m5::hal::v1::service::tick_nsec_t now_nsec)
+    void beginStop(MasterLineDriver& lines, const MasterTiming& timing, ::m5::hal::v1::service::fast_tick_t now_tick)
     {
         _operation = Operation::Stop;
         _error     = ::m5::hal::v1::error::error_t::OK;
-        _stop.begin(lines, timing, now_nsec);
+        _stop.begin(lines, timing, now_tick);
     }
     void beginAddress(MasterLineDriver& lines, const MasterTiming& timing, uint8_t addr_byte,
-                      ::m5::hal::v1::service::tick_nsec_t now_nsec)
+                      ::m5::hal::v1::service::fast_tick_t now_tick)
     {
         _lines     = &lines;
         _timing    = &timing;
@@ -747,10 +754,10 @@ public:
         _phase     = Phase::Start;
         _byte      = addr_byte;
         _error     = ::m5::hal::v1::error::error_t::OK;
-        _start.begin(lines, timing, now_nsec);
+        _start.begin(lines, timing, now_tick);
     }
     void beginWriteBuffer(MasterLineDriver& lines, const MasterTiming& timing, const uint8_t* data, size_t len,
-                          ::m5::hal::v1::service::tick_nsec_t now_nsec)
+                          ::m5::hal::v1::service::fast_tick_t now_tick)
     {
         _lines     = &lines;
         _timing    = &timing;
@@ -760,10 +767,10 @@ public:
         _length    = len;
         _index     = 0;
         _error     = ::m5::hal::v1::error::error_t::OK;
-        _write.begin(lines, timing, data[0], now_nsec);
+        _write.begin(lines, timing, data[0], now_tick);
     }
     void beginReadBuffer(MasterLineDriver& lines, const MasterTiming& timing, uint8_t* data, size_t len, bool last_nack,
-                         ::m5::hal::v1::service::tick_nsec_t now_nsec)
+                         ::m5::hal::v1::service::fast_tick_t now_tick)
     {
         _lines     = &lines;
         _timing    = &timing;
@@ -774,7 +781,7 @@ public:
         _index     = 0;
         _last_nack = last_nack;
         _error     = ::m5::hal::v1::error::error_t::OK;
-        _read.begin(lines, timing, ackAfterRead(0), now_nsec);
+        _read.begin(lines, timing, ackAfterRead(0), now_tick);
     }
 
     ::m5::hal::v1::service::ServiceResult service(const ::m5::hal::v1::service::ServiceContext& ctx) override
@@ -827,23 +834,23 @@ public:
     {
         return _index;
     }
-    ::m5::hal::v1::service::tick_nsec_t dueNsec() const
+    ::m5::hal::v1::service::fast_tick_t dueTick() const
     {
         switch (_operation) {
             case Operation::Start:
-                return _start.dueNsec();
+                return _start.dueTick();
             case Operation::WriteByte:
-                return _write.dueNsec();
+                return _write.dueTick();
             case Operation::ReadByte:
-                return _read.dueNsec();
+                return _read.dueTick();
             case Operation::Stop:
-                return _stop.dueNsec();
+                return _stop.dueTick();
             case Operation::Address:
-                return (_phase == Phase::Start) ? _start.dueNsec() : _write.dueNsec();
+                return (_phase == Phase::Start) ? _start.dueTick() : _write.dueTick();
             case Operation::WriteBuffer:
-                return _write.dueNsec();
+                return _write.dueTick();
             case Operation::ReadBuffer:
-                return _read.dueNsec();
+                return _read.dueTick();
             case Operation::Idle:
                 break;
         }
@@ -863,7 +870,7 @@ private:
                 return result;
             }
             _phase = Phase::Write;
-            _write.begin(*_lines, *_timing, _byte, ctx.now_nsec);
+            _write.begin(*_lines, *_timing, _byte, ctx.now_tick);
             return ::m5::hal::v1::service::ServiceResult::Progress;
         }
 
@@ -893,7 +900,7 @@ private:
             _phase     = Phase::Idle;
             return ::m5::hal::v1::service::ServiceResult::Done;
         }
-        _write.restart(_tx_data[_index], ctx.now_nsec);
+        _write.restart(_tx_data[_index], ctx.now_tick);
         return ::m5::hal::v1::service::ServiceResult::Progress;
     }
     ::m5::hal::v1::service::ServiceResult serviceReadBuffer(const ::m5::hal::v1::service::ServiceContext& ctx)
@@ -916,7 +923,7 @@ private:
             _phase     = Phase::Idle;
             return ::m5::hal::v1::service::ServiceResult::Done;
         }
-        _read.restart(ackAfterRead(_index), ctx.now_nsec);
+        _read.restart(ackAfterRead(_index), ctx.now_tick);
         return ::m5::hal::v1::service::ServiceResult::Progress;
     }
     template <typename Service>

@@ -33,7 +33,7 @@ public:
     ServiceResult service(const ServiceContext& ctx) override
     {
         _log->push_back(_id);
-        last_now = ctx.now_nsec;
+        last_now = ctx.now_tick;
         if (remove_self_from != nullptr) {
             (void)remove_self_from->remove(*this);
         }

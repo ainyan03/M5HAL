@@ -35,29 +35,51 @@ M5HAL_INLINE_V1 namespace v1
         Error,
     };
 
+    // `tick_nsec_t` holds NANOSECOND QUANTITIES (durations, configs);
+    // `fast_tick_t` holds COMPARABLE TICKS — the raw mod-2^32 counter
+    // values that ServiceContext carries and due-time math runs on.
+    // The two are layout-identical; the names mark the unit.
     using tick_nsec_t = uint32_t;
     using fast_tick_t = uint32_t;
 
     struct ServiceContext {
-        // 32-bit comparable tick. Wrap-around is intentional; a runner may
-        // pass nanoseconds or raw fast ticks, but every service must keep its
-        // due values in the same unit as this field and compare only with
-        // elapsedNsec()/hasReached().
-        tick_nsec_t now_nsec = 0;
+        // 32-bit comparable tick; wrap-around is intentional. The runner
+        // chooses the unit (the default runner passes raw fastTick()
+        // counts; tests may pass plain numbers) — every service must keep
+        // its due values in the SAME unit as this field and compare only
+        // with elapsedTicks()/hasReached(). Converting an ABSOLUTE tick
+        // to nanoseconds is forbidden here: the conversion is not
+        // continuous across the 2^32 wrap unless the factor divides
+        // exactly (S16 D2), which is why the context carries the raw
+        // tick and durations are converted the other way
+        // (nsecToFastTickCeil) instead.
+        fast_tick_t now_tick = 0;
     };
 
-    constexpr tick_nsec_t kMaxComparableDelayNsec = 0x7FFFFFFFu;
+    /*! @brief Half range of the mod-2^32 comparable space: the longest
+        forward delay elapsedTicks()/hasReached() can represent. */
+    constexpr fast_tick_t kMaxComparableDelayTicks = 0x7FFFFFFFu;
 
-    constexpr tick_nsec_t elapsedNsec(tick_nsec_t now_nsec, tick_nsec_t since_nsec)
+    constexpr fast_tick_t elapsedTicks(fast_tick_t now_tick, fast_tick_t since_tick)
     {
-        return now_nsec - since_nsec;
+        return now_tick - since_tick;
     }
 
-    constexpr bool hasReached(tick_nsec_t now_nsec, tick_nsec_t due_nsec)
+    constexpr bool hasReached(fast_tick_t now_tick, fast_tick_t due_tick)
     {
-        return elapsedNsec(now_nsec, due_nsec) <= kMaxComparableDelayNsec;
+        return elapsedTicks(now_tick, due_tick) <= kMaxComparableDelayTicks;
     }
 
+    /*!
+      @brief Convert a tick DURATION to nanoseconds.
+
+      Duration use only. Feeding it an absolute tick and comparing the
+      results across a wrap is broken by construction: the fixed-point
+      factor K = (1e9<<16)/f makes the mapping discontinuous at the
+      2^32 boundary unless K is a multiple of 2^16 (at 240 MHz the
+      timeline jumps ~0.717 s every ~17.9 s). Absolute time stays in
+      ticks (S16 D2).
+     */
     constexpr tick_nsec_t fastTickToNsec(fast_tick_t tick, uint32_t frequency_hz)
     {
         return frequency_hz ? static_cast<tick_nsec_t>(
@@ -91,30 +113,43 @@ M5HAL_INLINE_V1 namespace v1
 
     inline uint32_t fastTickFrequencyHz()
     {
-#if defined(ESP_PLATFORM) && defined(M5HAL_SERVICE_HAS_ESP_CLK_CPU_FREQ_)
+        // Branch on the SAME condition as fastTick(): the frequency must
+        // describe whatever counter fastTick() actually reads.
+#if defined(ESP_PLATFORM) && defined(M5HAL_SERVICE_HAS_ESP_CPU_H_)
+        // fastTick() reads the CPU cycle counter, so the frequency is the
+        // CPU clock.
+#if defined(M5HAL_SERVICE_HAS_ESP_CLK_CPU_FREQ_)
         const auto freq_hz = esp_clk_cpu_freq();
         if (freq_hz > 0) {
             return static_cast<uint32_t>(freq_hz);
         }
 #endif
+        // F_CPU and CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ are ESP-specific; keeping
+        // them inside the ESP_PLATFORM guard prevents non-ESP targets (e.g. AVR)
+        // that also define F_CPU from returning a CPU frequency here while
+        // fastTick() actually returns micros() (1 MHz) — a guaranteed mismatch.
 #if defined(F_CPU) && F_CPU > 0
         return static_cast<uint32_t>(F_CPU);
 #elif defined(CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ) && CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ > 0
         return static_cast<uint32_t>(CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ) * uint32_t{1000000};
 #else
+        return uint32_t{240000000};  // last-resort default for ESP without clock query
+#endif
+#else
+        // Everywhere else (non-ESP, or ESP without esp_cpu.h) fastTick()
+        // returns micros(), which is always 1 MHz regardless of the CPU
+        // clock. F_CPU is intentionally not consulted here.
         return uint32_t{1000000};
 #endif
     }
 
-    inline tick_nsec_t fastTickNsec()
+    /*! @brief Default ServiceContext clock: the raw fastTick() count.
+        (The former defaultNowNsec()/fastTickNsec() converted the absolute
+        tick through fastTickToNsec, inheriting its wrap discontinuity —
+        removed, S16 D2.) */
+    inline fast_tick_t defaultNowTick()
     {
-        const static uint32_t frequency_hz = fastTickFrequencyHz();
-        return fastTickToNsec(fastTick(), frequency_hz);
-    }
-
-    inline tick_nsec_t defaultNowNsec()
-    {
-        return fastTickNsec();
+        return fastTick();
     }
 
     class IService {
@@ -173,14 +208,14 @@ M5HAL_INLINE_V1 namespace v1
             return progressed;
         }
 
-        bool runOnce(tick_nsec_t now_nsec)
+        bool runOnce(fast_tick_t now_tick)
         {
-            return runOnce(ServiceContext{now_nsec});
+            return runOnce(ServiceContext{now_tick});
         }
 
         bool runOnce()
         {
-            return runOnce(defaultNowNsec());
+            return runOnce(defaultNowTick());
         }
 
         size_t size() const

@@ -931,6 +931,26 @@ m5::stl::expected<size_t, error_t> BytecodeRunner::run(data::Source& script)
     _status_reported = false;
     _reported_status = error_t::OK;
     _reported_offset = 0;
+    _event_mode      = false;
+    return runLoop(script);
+}
+
+m5::stl::expected<size_t, error_t> BytecodeRunner::runEvent(data::ConstDataSpan script)
+{
+    // Event scripts execute WITHOUT touching the request state: no slot
+    // clear, no report reset, and store/report instructions inside the
+    // script are ignored by their handlers while _event_mode is set
+    // (S16 D8). No early-return path exists between here and runLoop's
+    // exit, so the flag reset below is reliable.
+    data::MemorySource source{script};
+    _event_mode = true;
+    auto r      = runLoop(source);
+    _event_mode = false;
+    return r;
+}
+
+m5::stl::expected<size_t, error_t> BytecodeRunner::runLoop(data::Source& script)
+{
     _last_offset     = 0;
     _unknown_skipped = 0;
 
@@ -1003,6 +1023,28 @@ m5::stl::expected<size_t, error_t> BytecodeRunner::run(data::Source& script)
 
 m5::stl::expected<void, error_t> BytecodeRunner::dispatch(uint8_t opcode, data::ConstDataSpan payload)
 {
+    // Receive-only runners (the host session's) accept only the
+    // receive-side opcodes: a peer's script fills data and reports
+    // status, it never drives local buses, pins, or the clock (S16 D8).
+    // Unknown opcodes still reach the forward-compatibility default.
+    if (_receive_only) {
+        switch (static_cast<OpCode>(opcode)) {
+            case OpCode::delay_ms:
+            case OpCode::bus_configure:
+            case OpCode::bus_transfer:
+            case OpCode::gpio_set_mode:
+            case OpCode::gpio_write_high:
+            case OpCode::gpio_write_low:
+            case OpCode::gpio_read:
+            case OpCode::gpio_subscribe:
+            case OpCode::gpio_unsubscribe:
+            case OpCode::bus_write_stream:
+            case OpCode::bus_stream_status:
+                return m5::stl::make_unexpected(error_t::PROTOCOL_ERROR);
+            default:
+                break;
+        }
+    }
     switch (static_cast<OpCode>(opcode)) {
         case OpCode::delay_ms:
             return opDelay(payload);
@@ -1275,6 +1317,9 @@ m5::stl::expected<void, error_t> BytecodeRunner::opGpio(uint8_t opcode, data::Co
 
 m5::stl::expected<void, error_t> BytecodeRunner::opStoreData(data::ConstDataSpan payload)
 {
+    if (_event_mode) {
+        return {};  // events must not clobber request slots (S16 D8)
+    }
     FieldReader r{payload};
     uint8_t store_id = 0;
     if (!r.u8(store_id) || store_id == kDiscardStoreId) {
@@ -1293,6 +1338,9 @@ m5::stl::expected<void, error_t> BytecodeRunner::opStoreData(data::ConstDataSpan
 
 m5::stl::expected<void, error_t> BytecodeRunner::opReport(uint8_t opcode, data::ConstDataSpan payload)
 {
+    if (_event_mode) {
+        return {};  // events must not clobber the report state (S16 D8)
+    }
     FieldReader r{payload};
     uint8_t raw_status = 0;
     if (!r.u8(raw_status)) {

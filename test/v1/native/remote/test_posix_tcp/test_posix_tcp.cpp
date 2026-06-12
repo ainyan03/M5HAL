@@ -186,7 +186,7 @@ struct StubI2CBus : public i2c::I2CBus {
         if (error::isError(result)) {
             return m5::stl::make_unexpected(result);
         }
-        size_t total = desc.prefix_len;
+        size_t total = 0;  // data phase only (S16 D4)
         if (tx != nullptr) {
             while (!tx->eof()) {
                 auto p = tx->peek(64);

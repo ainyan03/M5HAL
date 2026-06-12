@@ -44,9 +44,10 @@ namespace {
     if (_wire) {
         (void)release();
     }
-    _wire      = &wire;
-    _owns_wire = false;
-    _last_freq = 0;
+    _wire            = &wire;
+    _owns_wire       = false;
+    _last_freq       = 0;
+    _last_timeout_ms = 0xFFFFFFFFu;
     return ::m5::hal::v1::error::error_t::OK;
 }
 
@@ -85,9 +86,10 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::release(void)
     if (_wire && _owns_wire) {
         _wire->end();
     }
-    _wire      = nullptr;
-    _owns_wire = false;
-    _last_freq = 0;
+    _wire            = nullptr;
+    _owns_wire       = false;
+    _last_freq       = 0;
+    _last_timeout_ms = 0xFFFFFFFFu;
     return {};
 }
 
@@ -101,12 +103,25 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
     if (_wire == nullptr) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
+    // `Wire` drives 7-bit addressing only: reject a 10-bit request
+    // instead of silently truncating the address (which would address
+    // the wrong device). Same degradation as the espidf gen4 backend.
+    if (cfg.address_is_10bit || cfg.i2c_addr > 0x007Fu) {
+        return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
+    }
 
-    // Apply per-accessor parameters lazily: only call setClock when the
-    // requested frequency differs from the last one we issued.
+    // Apply per-accessor parameters lazily: only call setClock / setTimeOut
+    // when the requested value differs from what was last issued. This mirrors
+    // the _last_freq pattern to avoid redundant Wire API calls.
     if (cfg.freq != _last_freq) {
         _wire->setClock(cfg.freq);
         _last_freq = cfg.freq;
+    }
+    // arduino-esp32 TwoWire::setTimeOut() takes milliseconds, same unit as
+    // cfg.timeout_ms.
+    if (cfg.timeout_ms != _last_timeout_ms) {
+        _wire->setTimeOut(static_cast<uint32_t>(cfg.timeout_ms));
+        _last_timeout_ms = cfg.timeout_ms;
     }
 
     // Pass `desc.prefix` into the legacy code path (header.data /
@@ -144,7 +159,8 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
                 (void)_wire->endTransmission(true);
                 return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::BUFFER_OVERFLOW);
             }
-            total += w;
+            // Prefix bytes are NOT counted: the return value is the data
+            // phase only (tx + rx), matching SPI (S16 D4).
         }
         if (tx) {
             // Drain Source via peek/advance loop. SIZE_MAX requests "all
@@ -191,6 +207,20 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
         }
         auto rx_span = rsv.value();
         if (rx_span.size > 0) {
+// TwoWire::requestFrom silently truncates requests that exceed its internal
+// RX buffer. Detect and reject oversized requests before touching the wire
+// so callers get INVALID_ARGUMENT rather than a short / wrong read.
+#if defined(I2C_BUFFER_LENGTH)
+            constexpr size_t kWireRxBufLen = I2C_BUFFER_LENGTH;
+#else
+            // Fall back to the Arduino default (Wire.h hard-codes 32 on most
+            // cores; 128 is the safe conservative ceiling used when no macro
+            // is available).
+            constexpr size_t kWireRxBufLen = 128u;
+#endif
+            if (rx_span.size > kWireRxBufLen) {
+                return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
+            }
             size_t got = _wire->requestFrom(static_cast<uint8_t>(cfg.i2c_addr), static_cast<size_t>(rx_span.size),
                                             static_cast<size_t>(true));
             if (got != rx_span.size) {

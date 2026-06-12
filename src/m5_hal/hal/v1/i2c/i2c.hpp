@@ -220,6 +220,15 @@ struct I2CMasterAccessor : public bus::Accessor {
       to `bus->transfer(TransferDesc, Source*, Sink*)`. Callers write
       register addresses (or any leading bytes) directly into
       `desc.prefix`.
+
+      Return-value contract: the success value is the DATA-phase byte
+      count `tx + rx`. The register-address prefix is not counted, so a
+      successful `readRegister(reg, buf, 4)` returns 4. This matches
+      `SPIBus::transfer` (which likewise excludes its command/address
+      phases). Success already means the full transfer completed —
+      `r.value() == len` holds for the simple read/write sugars, but
+      prefer checking success only. (Changed in S16 D4: v1 builds
+      before it returned `prefix + tx + rx`.)
      */
     m5::stl::expected<size_t, m5::hal::v1::error::error_t> transfer(const TransferDesc& desc,
                                                                     data::ConstDataSpan tx_bytes,
@@ -447,11 +456,13 @@ struct I2CBus : public bus::Bus {
       @brief Probe a single device without building an accessor.
 
       Internally constructs a stack-allocated `I2CMasterAccessor` as a
-      sentinel and uses it as the lock owner. The sentinel's lifetime
-      is the function scope, so this is thread-safe. One probe
-      includes (sentinel ctor + `beginAccess` + transfer probe path +
-      `endAccess` + sentinel dtor); the ctor is inline and trivially
-      cheap.
+      sentinel and uses it as the lock owner. NOTE: `Bus::lock` is a
+      plain check-then-set (no atomicity), so this is NOT safe to call
+      concurrently from multiple tasks — like every bus API in v1
+      (single-task assumption; blocking/atomic locking is tracked as
+      S16 D1 / S7). One probe includes (sentinel ctor + `beginAccess` +
+      transfer probe path + `endAccess` + sentinel dtor); the ctor is
+      inline and trivially cheap.
 
       Callers that want to customize `freq` / `timeout_ms` should
       build an `I2CMasterAccessor` and use `setConfig` instead. The
@@ -485,9 +496,11 @@ struct I2CBus : public bus::Bus {
       automatically; low-level callers MUST keep an accessor alive
       and pass `&accessor`.
 
-      The return value is the total transferred byte count
-      (`prefix + tx + rx`) or an `error_t`. The probe path returns 0
-      on a successful zero-byte transfer. The default implementation
+      The return value is the DATA-phase byte count (`tx + rx`) or an
+      `error_t` — `desc.prefix` bytes are driven on the wire but not
+      counted, the same split as `SPIBus::transfer` (changed in
+      S16 D4; before, the prefix was included). The probe path returns
+      0 on a successful zero-byte transfer. The default implementation
       returns `NOT_IMPLEMENTED`; every variant overrides it.
      */
     virtual m5::stl::expected<size_t, m5::hal::v1::error::error_t> transfer(bus::Accessor* owner,

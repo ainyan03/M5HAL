@@ -12,9 +12,8 @@
 
 #include "detail/espidf_version.hpp"
 
-#define M5HAL_VARIANT_CURRENT_ALIAS_     espidf
-#define M5HAL_VARIANT_CURRENT_BASE_PATH_ ../variants/frameworks/espidf
-#define M5HAL_VARIANT_CURRENT_BASE_NS_   variants::frameworks::espidf
+#define M5HAL_VARIANT_CURRENT_ALIAS_   espidf
+#define M5HAL_VARIANT_CURRENT_BASE_NS_ variants::frameworks::espidf
 
 #define M5HAL_VARIANT_CURRENT_HAS_HAL_GPIO_ 1
 #if M5HAL_ESPIDF_I2C_HAS_MASTER

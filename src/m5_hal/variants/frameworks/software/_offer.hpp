@@ -8,9 +8,8 @@
 // No include guard / #pragma once: M5HAL_v1.hpp re-includes this during
 // variant scanning. Consumption rules: _macro/offer_all.inl.
 
-#define M5HAL_VARIANT_CURRENT_ALIAS_     software
-#define M5HAL_VARIANT_CURRENT_BASE_PATH_ ../variants/frameworks/software
-#define M5HAL_VARIANT_CURRENT_BASE_NS_   variants::frameworks::software
+#define M5HAL_VARIANT_CURRENT_ALIAS_   software
+#define M5HAL_VARIANT_CURRENT_BASE_NS_ variants::frameworks::software
 #define M5HAL_VARIANT_CURRENT_HAS_HAL_I2C_ 1
 #define M5HAL_VARIANT_CURRENT_HAS_HAL_SPI_ 1
 // clang-format on

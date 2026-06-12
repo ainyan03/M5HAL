@@ -1,6 +1,7 @@
 #ifndef M5_HAL_REMOTE_REMOTE_HPP_
 #define M5_HAL_REMOTE_REMOTE_HPP_
 
+#include "../assert.hpp"
 #include "../bytecode/bytecode.hpp"
 #include "../data.hpp"
 #include "../data/memory.hpp"
@@ -50,8 +51,31 @@ constexpr uint8_t kDefaultStreamId = 0x00;  ///< Remote message channel (spec §
 constexpr size_t kHeaderSize     = 2;                                     ///< TYPE + SEQ.
 constexpr size_t kMaxMessageSize = frame::kMaxDataPayload;                ///< 240.
 constexpr size_t kMaxBodySize    = frame::kMaxDataPayload - kHeaderSize;  ///< 238.
-/*! @brief Guaranteed per-transfer receive-data limit (response script overhead subtracted). */
+/*! @brief Guaranteed per-transfer receive-data limit (response script overhead subtracted).
+ *
+ *  Derivation (checked by the static_assert below):
+ *    A response script carrying one store_data + report_complete + terminator uses:
+ *      store_data     = LenVar(1+1+N) + opcode(1) + store_id(1) + data(N)
+ *                     = 1 + 2 + N      (LenVar is 1 byte when 2+N <= 0xFC, i.e. N <= 250)
+ *      report_complete= LenVar(2) + opcode(1) + status(1) = 3
+ *      terminator     = 1
+ *    Total overhead   = 3 + 3 + 1 = 7  (8 with the 1-byte safety margin chosen here)
+ *    => kMaxTransferRx = kMaxBodySize - 8 = 238 - 8 = 230
+ */
 constexpr size_t kMaxTransferRx = 230;
+static_assert(kMaxTransferRx + 8 <= kMaxBodySize,
+              "kMaxTransferRx leaves insufficient room for response script overhead "
+              "(store_data header + report_complete + terminator = 7 bytes; 8 chosen for margin)");
+/*!
+  @brief Default store slot for response data.
+
+  Used as the `store_id` argument wherever a proxy bus encodes a single
+  receive buffer into the response script. Distinguished from
+  `bytecode::kDiscardStoreId` (0xFF), which signals "do not store".
+  Every `request()` call resets the runner's store slots before decoding
+  the response, so slot 0 is always fresh after each round trip.
+ */
+constexpr uint8_t kDefaultStoreId = 0;
 /*! @brief Round-trip margin added on top of remote-side UART timeouts (spec §UART proxy). */
 constexpr uint32_t kRemoteUartTimeoutMarginMs = 250;
 
@@ -129,16 +153,28 @@ public:
         uint32_t max_bus_timeout_ms = 1000;  ///< Upper bound for timeouts carried by bus_configure.
         /*! @brief Bytes a stream binding must drain before an `evt_stream_credit` is emitted. */
         uint32_t stream_credit_threshold = 2048;
+        /*!
+          @brief Upper bound for a single `bus_transfer`'s wire-requested rx_len.
+
+          The runner allocates rx_len bytes up front, and the LenVar field
+          can spell a full u32 — without a cap one hostile/buggy message
+          could exhaust the device's RAM (S16 D8). A response frame carries
+          at most `kMaxTransferRx` bytes back; the default leaves headroom
+          for larger discard reads while staying allocation-safe.
+         */
+        uint32_t max_transfer_rx = 4096;
     };
 
     explicit Server(data::DataSpan response_scratch) : _runner{memory::defaultAllocator()}, _scratch{response_scratch}
     {
         _runner.setGpioSubscribeHandler(&gpioSubscribeThunk, this);
+        checkScratch();
     }
     Server(data::DataSpan response_scratch, const Config& config, memory::Allocator& alloc = memory::defaultAllocator())
         : _runner{alloc}, _scratch{response_scratch}, _config{config}
     {
         _runner.setGpioSubscribeHandler(&gpioSubscribeThunk, this);
+        checkScratch();
     }
 
     m5::stl::expected<void, m5::hal::v1::error::error_t> registerI2C(uint8_t bus_id, i2c::I2CMasterAccessor& acc);
@@ -266,6 +302,12 @@ private:
                                                                            uint8_t seq);
     m5::stl::expected<void, m5::hal::v1::error::error_t> recordCapability(types::bus_kind_t kind, uint8_t bus_id);
 
+    // Enforce the `response_scratch` contract (>= kMaxMessageSize bytes).
+    // Crash in debug; in release degrade to an empty span, which every
+    // message-building path refuses — the server goes inert instead of
+    // writing out of bounds.
+    void checkScratch();
+
     bytecode::BytecodeRunner _runner;
     data::DataSpan _scratch;
     Config _config;
@@ -351,7 +393,11 @@ private:
 
   `error` messages (a NORESP failure delivered before a synchronous
   reply, or a protocol-level rejection) are recorded and readable via
-  `lastRemoteError()` until `clearRemoteError()`.
+  `lastRemoteError()` until `clearRemoteError()`. The record is
+  seq-agnostic — `lastRemoteError()` means "the most recently observed
+  remote error", whether it arrived inside `request()` or in an idle
+  `poll()` — because the server clears its pending slot on send, so an
+  error frame crossing a host-side timeout is the only copy there is.
 
   `event` messages are reserved: they are passed to the handler installed
   with `setEventHandler` (dropped when none), so a future push-capable
@@ -368,11 +414,16 @@ public:
 
     RemoteSession(data::Source& rx, data::Sink& tx) : _reader{rx}, _writer{tx}, _runner{memory::defaultAllocator()}
     {
+        // Scripts arriving here come FROM the peer: restrict the runner
+        // to receive-side opcodes so a buggy/hostile server cannot drive
+        // this side's buses, pins, or clock (S16 D8).
+        _runner.setReceiveOnly(true);
     }
     RemoteSession(data::Source& rx, data::Sink& tx, const Config& config,
                   memory::Allocator& alloc = memory::defaultAllocator())
         : _reader{rx}, _writer{tx}, _runner{alloc}, _config{config}
     {
+        _runner.setReceiveOnly(true);  // see the delegating ctor's note (S16 D8)
     }
 
     /*! @brief Exchange hello / hello_resp and cache the capabilities. */
@@ -419,7 +470,15 @@ public:
         return _runner;
     }
 
-    /*! @brief Last `error` message payload (OK when none arrived). */
+    /*!
+      @brief Most recently observed `error` message payload (OK when none
+             arrived since the last `clearRemoteError()`).
+
+      Seq-agnostic by design: an error frame whose delivery crosses a
+      host-side timeout still lands here (from `request()` or `poll()`).
+      A NORESP user pattern is: clearRemoteError() -> fire-and-forget ->
+      one synchronous exchange (e.g. ping()) -> check lastRemoteError().
+     */
     m5::hal::v1::error::error_t lastRemoteError() const
     {
         return _last_remote_error;
@@ -439,6 +498,21 @@ public:
     {
         _event_handler = handler;
         _event_ctx     = ctx;
+    }
+
+    /*!
+      @brief True once the transport layer has signalled a clean disconnect.
+
+      Set when `poll()` or the internal `awaitReply()` receives
+      `END_OF_STREAM` / `CLOSED` from the frame reader; cleared by
+      `reset()`. Lets the caller detect a dropped link without waiting
+      for the next `request()` to fail — useful to drain pending events
+      and then gate reconnect logic on this flag instead of absorbing a
+      `DISCONNECTED` error on every subsequent call.
+     */
+    bool disconnected() const
+    {
+        return _disconnected;
     }
 
     /*!
@@ -704,6 +778,15 @@ private:
  */
 struct RemoteI2SBus : public i2s::I2SBus {
     RemoteI2SBus(RemoteSession& session, uint8_t remote_bus_id);
+    /*! @brief Unregisters the credit handler when this instance still owns the slot. */
+    ~RemoteI2SBus() override;
+
+    // The session's runner holds `this` as its stream-credit handler
+    // context; copying or moving would leave that pointer dangling.
+    RemoteI2SBus(const RemoteI2SBus&)            = delete;
+    RemoteI2SBus& operator=(const RemoteI2SBus&) = delete;
+    RemoteI2SBus(RemoteI2SBus&&)                 = delete;
+    RemoteI2SBus& operator=(RemoteI2SBus&&)      = delete;
 
     /*! @brief Local bookkeeping only — the physical bus is configured server-side. */
     m5::stl::expected<void, m5::hal::v1::error::error_t> init(const bus::BusConfig& config) override;

@@ -50,7 +50,7 @@ public:
     {
         (void)owner;
         (void)cfg;
-        size_t done = desc.prefix_len;
+        size_t done = 0;  // data phase only (S16 D4)
         while (tx != nullptr && !tx->eof()) {
             auto span = tx->peek(16);
             if (!span.has_value()) {

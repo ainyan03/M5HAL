@@ -87,7 +87,7 @@ command/address/dummy/data phase の意味を低速 capture で確認する。
 
 検証用 sketch は `experiments/` に置く。 `examples/` は Arduino IDE で開いた利用者がそのまま読める単独完結コードに限定し、 PlatformIO の `build_flags` で backend や runner 条件を差し替えるものは `experiments/` に分離する。
 
-`I2CHotPathBenchmark` は外部 I2C slave を必要とせず、 software I2C の hot path を分解して測るための sketch。 `fastTickNsec loop` / `fastTick loop` は timer 取得コスト、 `virtual line ops` は line driver の仮想呼び出しと read/write の上限、 `write buffer forced due` / `write buffer timed` は byte 列送信 state machine、 `read buffer forced due` / `read buffer timed` は byte 列受信 state machine の内部上限を見る。
+`I2CHotPathBenchmark` は外部 I2C slave を必要とせず、 software I2C の hot path を分解して測るための sketch。 `fastTick loop` は timer 取得コスト、 `virtual line ops` は line driver の仮想呼び出しと read/write の上限、 `write buffer forced due` / `write buffer timed` は byte 列送信 state machine、 `read buffer forced due` / `read buffer timed` は byte 列受信 state machine の内部上限を見る。
 
 software I2C の protocol-level native test は `test/v1/native/bus/test_software_i2c/` にある。 当初の `MockI2CSlave` 案は、現在は `I2CSlaveService` と `VirtualOpenDrainBus` の組み合わせとして実装済み。 probe ACK、write、read-only、write-then-read、address NACK、data NACK、clock stretch timeout、STOP 時 SDA stuck-low、read 最終 byte の master NACK 観測を固定している。
 

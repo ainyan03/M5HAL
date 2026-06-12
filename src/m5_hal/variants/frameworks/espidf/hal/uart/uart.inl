@@ -89,11 +89,18 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const ::m5::hal
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
     const auto& uart_config = static_cast<const BusConfig&>(config);
-    _config                 = uart_config;
-    _port                   = resolvePort(uart_config.port_num);
-    if (_port < UART_NUM_0 || _port >= UART_NUM_MAX) {
+    const auto new_port     = resolvePort(uart_config.port_num);
+    if (new_port < UART_NUM_0 || new_port >= UART_NUM_MAX) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
+    // Re-init: release the previous driver while `_port` still names the
+    // OLD port (otherwise `uart_driver_install` fails on the already-
+    // installed port and the old driver leaks).
+    if (_installed) {
+        (void)release();
+    }
+    _config = uart_config;
+    _port   = new_port;
 
     const int rx_size = static_cast<int>(_config.rx_buffer_size == 0 ? 256 : _config.rx_buffer_size);
     const int tx_size = static_cast<int>(_config.tx_buffer_size);

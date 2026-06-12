@@ -12,17 +12,18 @@
 
 namespace m5::hal::v1::i2s {
 
-/// I2S は DMA 駆動の連続ストリームであり、I2C / SPI のようなトランザクション境界を
-/// 持たない。API は uart と同型 (write / writableBytes)。当面は master TX (再生) のみで、
-/// スロット形式は Philips standard 固定。RX (録音) は pin_din を予約済みの将来拡張。
+/// I2S is a DMA-driven continuous stream with no transaction boundaries like I2C/SPI.
+/// The API mirrors uart (write / writableBytes). Only master TX (playback) is supported
+/// for now with the Philips standard slot format fixed. RX (recording) is reserved for
+/// future extension via pin_din.
 
 struct I2SBusConfig : public bus::BusConfig {
     types::gpio_number_t pin_bclk = -1;
     types::gpio_number_t pin_ws   = -1;
     types::gpio_number_t pin_dout = -1;
-    types::gpio_number_t pin_din  = -1;    ///< RX (録音) 用。当面未使用
-    types::gpio_number_t pin_mclk = -1;    ///< 外部 MCLK を要するコーデック用。-1 = 出力しない
-    size_t tx_buffer_size         = 8192;  ///< DMA バッファ総量の目安 (backend が記述子構成へ丸める)
+    types::gpio_number_t pin_din  = -1;  ///< RX (recording) — reserved, unused for now.
+    types::gpio_number_t pin_mclk = -1;  ///< External MCLK output for codecs that require it; -1 = disabled.
+    size_t tx_buffer_size = 8192;        ///< Approximate DMA buffer size; the backend rounds to descriptor granularity.
 
     constexpr I2SBusConfig(void) : bus::BusConfig{types::bus_kind_t::I2S}
     {
@@ -33,8 +34,8 @@ struct I2SAccessConfig : public bus::AccessConfig {
     uint32_t sample_rate_hz   = 44100;
     uint32_t timeout_ms       = 1000;  ///< Bus lock timeout.
     uint32_t write_timeout_ms = 1000;  ///< write が DMA の空きを待つ上限。0 = non-blocking
-    uint8_t bits_per_sample   = 16;    ///< 当面 16 のみ
-    uint8_t channels          = 2;     ///< 1 = mono / 2 = stereo
+    uint8_t bits_per_sample   = 16;    ///< Currently only 16 is supported.
+    uint8_t channels          = 2;     ///< 1 = mono / 2 = stereo.
 
     constexpr I2SAccessConfig(void) : bus::AccessConfig{types::bus_kind_t::I2S}
     {
@@ -58,7 +59,7 @@ struct I2STxAccessor : public bus::Accessor, public data::StreamWriter {
     m5::stl::expected<size_t, error::error_t> write(data::Source& tx, size_t len);
     m5::stl::expected<size_t, error::error_t> write(const uint8_t* tx, size_t len);
 
-    /// いま write してもブロックせず受理される量 (DMA バッファの空きバイト数)。
+    /// Bytes that can be accepted by write() right now without blocking (DMA buffer free space).
     m5::stl::expected<size_t, error::error_t> writableBytes(void);
 
 protected:
@@ -71,8 +72,8 @@ struct I2SBus : public bus::Bus {
         return _config;
     }
 
-    /// 受理できた分のバイト数を返す (write_timeout_ms 内に DMA へ受理できた量。短い戻りは
-    /// 正常)。underrun はエラーにしない (DMA が枯れたら無音を出力し、次の write で再開する)。
+    /// Returns the byte count accepted within write_timeout_ms; a short return is normal.
+    /// Underrun is not an error: the DMA outputs silence and resumes on the next write.
     virtual m5::stl::expected<size_t, error::error_t> write(bus::Accessor* owner, const I2SAccessConfig& cfg,
                                                             data::Source* tx, size_t len);
     virtual m5::stl::expected<size_t, error::error_t> writableBytes(bus::Accessor* owner, const I2SAccessConfig& cfg);
