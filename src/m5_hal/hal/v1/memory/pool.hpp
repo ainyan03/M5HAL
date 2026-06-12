@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_HAL_V1_MEMORY_POOL_HPP_
 #define M5_HAL_HAL_V1_MEMORY_POOL_HPP_
 
@@ -19,6 +20,10 @@ public:
     void* reallocate(void* ptr, size_t preserve_size, size_t new_size);
     bool deallocate(void* ptr);
     bool owns(const void* ptr) const;
+    /// Byte capacity of the block run starting at `ptr` (0 when `ptr` is
+    /// not a live run start). Lets the owner clamp copies when moving a
+    /// pool allocation out to the fallback heap.
+    size_t allocationSize(const void* ptr) const;
     size_t usedBlocks() const;
     size_t largestFreeRun() const;
 

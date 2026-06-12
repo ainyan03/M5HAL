@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_I2C_I2C_HPP
 #define M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_I2C_I2C_HPP
 
@@ -46,13 +47,13 @@ public:
     // Typed init: takes this variant's BusConfig (S17 E1). Passing the
     // abstract I2CBusConfig (or a sibling variant's config) is a
     // compile error instead of a silent bad downcast.
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> init(const BusConfig& config);
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> release(void) override;
+    ::m5::hal::v1::result_t<void> init(const BusConfig& config);
+    ::m5::hal::v1::result_t<void> release(void) override;
 
-    m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> transfer(
-        ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg,
-        const ::m5::hal::v1::i2c::TransferDesc& desc, ::m5::hal::v1::data::Source* tx,
-        ::m5::hal::v1::data::Sink* rx) override;
+    ::m5::hal::v1::result_t<size_t> transfer(::m5::hal::v1::bus::Accessor* owner,
+                                             const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg,
+                                             const ::m5::hal::v1::i2c::TransferDesc& desc,
+                                             ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx) override;
 
 #if M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5
     ::m5::hal::v1::error::error_t attach(::i2c_master_bus_handle_t bus_handle);
@@ -70,9 +71,8 @@ public:
 
 private:
 #if M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> ensureDevice(
-        const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg);
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> removeDevice(void);
+    ::m5::hal::v1::result_t<void> ensureDevice(const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg);
+    ::m5::hal::v1::result_t<void> removeDevice(void);
 
     ::i2c_master_bus_handle_t _bus_handle = nullptr;
     ::i2c_master_dev_handle_t _dev_handle = nullptr;
@@ -84,6 +84,9 @@ private:
 #elif M5HAL_ESPIDF_I2C_HAS_MASTER_GEN4
     ::i2c_port_t _port = I2C_NUM_0;
     bool _installed    = false;
+    // Last frequency pushed through i2c_param_config; skips the
+    // re-config on every transfer when unchanged (0 = none applied).
+    uint32_t _applied_freq = 0;
 #endif
 };
 

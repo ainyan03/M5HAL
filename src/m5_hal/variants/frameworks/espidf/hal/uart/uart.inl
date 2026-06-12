@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_UART_UART_INL
 #define M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_UART_UART_INL
 
@@ -83,7 +84,7 @@ bool sameConfig(const ::m5::hal::v1::uart::UARTAccessConfig& lhs, const ::m5::ha
 
 }  // namespace
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig& config)
+::m5::hal::v1::result_t<void> Bus::init(const BusConfig& config)
 {
     const auto new_port = resolvePort(config.port_num);
     if (new_port < UART_NUM_0 || new_port >= UART_NUM_MAX) {
@@ -117,7 +118,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig
     return {};
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::release(void)
+::m5::hal::v1::result_t<void> Bus::release(void)
 {
     if (_installed) {
         auto mapped = mapEspErr(::uart_driver_delete(_port));
@@ -130,8 +131,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::release(void)
     return {};
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::applyConfig(
-    const ::m5::hal::v1::uart::UARTAccessConfig& cfg)
+::m5::hal::v1::result_t<void> Bus::applyConfig(const ::m5::hal::v1::uart::UARTAccessConfig& cfg)
 {
     if (!_installed || cfg.baud_rate == 0 || cfg.data_bits < 5 || cfg.data_bits > 8 ||
         (cfg.stop_bits != 1 && cfg.stop_bits != 2)) {
@@ -170,9 +170,9 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::applyConfig(
     return {};
 }
 
-m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::write(::m5::hal::v1::bus::Accessor* owner,
-                                                                    const ::m5::hal::v1::uart::UARTAccessConfig& cfg,
-                                                                    ::m5::hal::v1::data::Source* tx, size_t len)
+::m5::hal::v1::result_t<size_t> Bus::write(::m5::hal::v1::bus::Accessor* owner,
+                                           const ::m5::hal::v1::uart::UARTAccessConfig& cfg,
+                                           ::m5::hal::v1::data::Source* tx, size_t len)
 {
     (void)owner;
     auto applied = applyConfig(cfg);
@@ -207,9 +207,9 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::write(::m5::hal::v
     return done;
 }
 
-m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::read(::m5::hal::v1::bus::Accessor* owner,
-                                                                   const ::m5::hal::v1::uart::UARTAccessConfig& cfg,
-                                                                   ::m5::hal::v1::data::Sink* rx, size_t len)
+::m5::hal::v1::result_t<size_t> Bus::read(::m5::hal::v1::bus::Accessor* owner,
+                                          const ::m5::hal::v1::uart::UARTAccessConfig& cfg,
+                                          ::m5::hal::v1::data::Sink* rx, size_t len)
 {
     (void)owner;
     auto applied = applyConfig(cfg);
@@ -243,8 +243,8 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::read(::m5::hal::v1
     return done;
 }
 
-m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::readableBytes(
-    ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::uart::UARTAccessConfig& cfg)
+::m5::hal::v1::result_t<size_t> Bus::readableBytes(::m5::hal::v1::bus::Accessor* owner,
+                                                   const ::m5::hal::v1::uart::UARTAccessConfig& cfg)
 {
     (void)owner;
     auto applied = applyConfig(cfg);

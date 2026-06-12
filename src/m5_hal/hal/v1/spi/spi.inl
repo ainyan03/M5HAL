@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 
 #include "spi.hpp"
 #include "../data/limited.hpp"
@@ -22,8 +23,7 @@ uint32_t composeBigEndian(data::ConstDataSpan bytes)
     return value;
 }
 
-m5::stl::expected<TransferDesc, m5::hal::v1::error::error_t> commandDesc(const SPIMasterAccessConfig& cfg,
-                                                                         uint32_t command)
+m5::hal::v1::result_t<TransferDesc> commandDesc(const SPIMasterAccessConfig& cfg, uint32_t command)
 {
     const uint8_t command_bytes = transferBytesForBits(cfg.spi_command_length);
     if (command_bytes == 0 || command_bytes > 4) {
@@ -39,9 +39,8 @@ m5::stl::expected<TransferDesc, m5::hal::v1::error::error_t> commandDesc(const S
     return desc;
 }
 
-m5::stl::expected<TransferDesc, m5::hal::v1::error::error_t> commandAddressDesc(const SPIMasterAccessConfig& cfg,
-                                                                                uint32_t command, uint32_t address,
-                                                                                uint8_t dummy_cycles)
+m5::hal::v1::result_t<TransferDesc> commandAddressDesc(const SPIMasterAccessConfig& cfg, uint32_t command,
+                                                       uint32_t address, uint8_t dummy_cycles)
 {
     auto desc = commandDesc(cfg, command);
     if (!desc.has_value()) {
@@ -71,7 +70,7 @@ SPIBus& SPIMasterAccessor::getSPIBus(void) const
     return static_cast<SPIBus&>(_bus);
 }
 
-m5::stl::expected<void, m5::hal::v1::error::error_t> SPIMasterAccessor::setConfig(const SPIMasterAccessConfig& cfg)
+m5::hal::v1::result_t<void> SPIMasterAccessor::setConfig(const SPIMasterAccessConfig& cfg)
 {
     if (inAccess()) {
         return m5::stl::make_unexpected(m5::hal::v1::error::error_t::INVALID_ARGUMENT);
@@ -80,9 +79,8 @@ m5::stl::expected<void, m5::hal::v1::error::error_t> SPIMasterAccessor::setConfi
     return {};
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::transfer(const TransferDesc& desc,
-                                                                                   data::ConstDataSpan tx_bytes,
-                                                                                   data::DataSpan rx_bytes)
+m5::hal::v1::result_t<size_t> SPIMasterAccessor::transfer(const TransferDesc& desc, data::ConstDataSpan tx_bytes,
+                                                          data::DataSpan rx_bytes)
 {
     data::MemorySource tx_src{tx_bytes};
     data::MemorySink rx_dst{rx_bytes};
@@ -90,30 +88,22 @@ m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::transf
     return transfer(desc, (tx_bytes.size > 0) ? &tx_src : nullptr, (rx_bytes.size > 0) ? &rx_dst : nullptr, len);
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::transfer(const TransferDesc& desc,
-                                                                                   data::Source* tx, data::Sink* rx,
-                                                                                   size_t len)
+m5::hal::v1::result_t<size_t> SPIMasterAccessor::transfer(const TransferDesc& desc, data::Source* tx, data::Sink* rx,
+                                                          size_t len)
 {
-    auto bt = beginTransaction();
-    if (!bt.has_value()) {
-        return m5::stl::make_unexpected(bt.error());
-    }
-
-    data::LimitedSource limited_tx{tx, len};
-    data::LimitedSink limited_rx{rx, len};
-    auto result = getSPIBus().transfer(this, _access_config, desc, (tx != nullptr && len > 0) ? &limited_tx : nullptr,
-                                       (rx != nullptr && len > 0) ? &limited_rx : nullptr);
-    auto et     = endTransaction();
-    if (!result.has_value()) {
-        return result;
-    }
-    if (!et.has_value()) {
-        return m5::stl::make_unexpected(et.error());
-    }
-    return result;
+    // Release-error policy: bus::guarded.
+    return bus::guarded([&] { return beginTransaction(); },
+                        [&] {
+                            data::LimitedSource limited_tx{tx, len};
+                            data::LimitedSink limited_rx{rx, len};
+                            return getSPIBus().transfer(this, _access_config, desc,
+                                                        (tx != nullptr && len > 0) ? &limited_tx : nullptr,
+                                                        (rx != nullptr && len > 0) ? &limited_rx : nullptr);
+                        },
+                        [&] { return endTransaction(); });
 }
 
-m5::stl::expected<void, m5::hal::v1::error::error_t> SPIMasterAccessor::beginTransaction(void)
+m5::hal::v1::result_t<void> SPIMasterAccessor::beginTransaction(void)
 {
     if (_transaction_depth != 0) {
         ++_transaction_depth;
@@ -135,7 +125,7 @@ m5::stl::expected<void, m5::hal::v1::error::error_t> SPIMasterAccessor::beginTra
     return {};
 }
 
-m5::stl::expected<void, m5::hal::v1::error::error_t> SPIMasterAccessor::endTransaction(void)
+m5::hal::v1::result_t<void> SPIMasterAccessor::endTransaction(void)
 {
     if (_transaction_depth == 0) {
         return m5::stl::make_unexpected(m5::hal::v1::error::error_t::INVALID_ARGUMENT);
@@ -157,37 +147,37 @@ m5::stl::expected<void, m5::hal::v1::error::error_t> SPIMasterAccessor::endTrans
     return {};
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::write(data::ConstDataSpan tx_bytes)
+m5::hal::v1::result_t<size_t> SPIMasterAccessor::write(data::ConstDataSpan tx_bytes)
 {
     return transfer(TransferDesc{}, tx_bytes, data::DataSpan{});
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::write(data::Source& tx, size_t len)
+m5::hal::v1::result_t<size_t> SPIMasterAccessor::write(data::Source& tx, size_t len)
 {
     return transfer(TransferDesc{}, &tx, nullptr, len);
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::read(data::DataSpan rx_bytes)
+m5::hal::v1::result_t<size_t> SPIMasterAccessor::read(data::DataSpan rx_bytes)
 {
     return transfer(TransferDesc{}, data::ConstDataSpan{}, rx_bytes);
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::read(data::Sink& rx, size_t len)
+m5::hal::v1::result_t<size_t> SPIMasterAccessor::read(data::Sink& rx, size_t len)
 {
     return transfer(TransferDesc{}, nullptr, &rx, len);
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::write(const uint8_t* tx, size_t len)
+m5::hal::v1::result_t<size_t> SPIMasterAccessor::write(const uint8_t* tx, size_t len)
 {
     return write(data::ConstDataSpan{tx, len});
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::read(uint8_t* dst, size_t len)
+m5::hal::v1::result_t<size_t> SPIMasterAccessor::read(uint8_t* dst, size_t len)
 {
     return read(data::DataSpan{dst, len});
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::writeCommand(data::ConstDataSpan tx_bytes)
+m5::hal::v1::result_t<size_t> SPIMasterAccessor::writeCommand(data::ConstDataSpan tx_bytes)
 {
     TransferDesc desc;
     desc.dc_level_valid = true;
@@ -196,7 +186,7 @@ m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::writeC
     return transfer(desc, tx_bytes, data::DataSpan{});
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::writeCommand(uint32_t command)
+m5::hal::v1::result_t<size_t> SPIMasterAccessor::writeCommand(uint32_t command)
 {
     auto desc = commandDesc(_access_config, command);
     if (!desc.has_value()) {
@@ -209,8 +199,7 @@ m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::writeC
     return result.value() + desc->command_bytes;
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::writeCommandAddress(uint32_t command,
-                                                                                              uint32_t address)
+m5::hal::v1::result_t<size_t> SPIMasterAccessor::writeCommandAddress(uint32_t command, uint32_t address)
 {
     auto desc = commandAddressDesc(_access_config, command, address, 0);
     if (!desc.has_value()) {
@@ -223,7 +212,7 @@ m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::writeC
     return result.value() + desc->command_bytes + desc->address_bytes;
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::writeCommandData(data::ConstDataSpan tx_bytes)
+m5::hal::v1::result_t<size_t> SPIMasterAccessor::writeCommandData(data::ConstDataSpan tx_bytes)
 {
     const size_t command_bytes = transferBytesForBits(_access_config.spi_command_length);
     // spi_command_length == 0 is an error: writeCommandData always requires a
@@ -257,8 +246,7 @@ m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::writeC
     return result.value() + command_bytes;
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::writeCommandData(uint32_t command,
-                                                                                           data::ConstDataSpan tx_bytes)
+m5::hal::v1::result_t<size_t> SPIMasterAccessor::writeCommandData(uint32_t command, data::ConstDataSpan tx_bytes)
 {
     auto desc = commandDesc(_access_config, command);
     if (!desc.has_value()) {
@@ -273,8 +261,7 @@ m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::writeC
     return result.value() + desc->command_bytes;
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::writeCommandData(uint32_t command,
-                                                                                           data::Source& tx, size_t len)
+m5::hal::v1::result_t<size_t> SPIMasterAccessor::writeCommandData(uint32_t command, data::Source& tx, size_t len)
 {
     auto desc = commandDesc(_access_config, command);
     if (!desc.has_value()) {
@@ -289,8 +276,8 @@ m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::writeC
     return result.value() + desc->command_bytes;
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::writeCommandAddressData(
-    uint32_t command, uint32_t address, data::ConstDataSpan tx_bytes)
+m5::hal::v1::result_t<size_t> SPIMasterAccessor::writeCommandAddressData(uint32_t command, uint32_t address,
+                                                                         data::ConstDataSpan tx_bytes)
 {
     auto desc = commandAddressDesc(_access_config, command, address, _access_config.spi_write_dummy_cycle);
     if (!desc.has_value()) {
@@ -304,10 +291,8 @@ m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::writeC
     return result.value() + desc->command_bytes + desc->address_bytes;
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::writeCommandAddressData(uint32_t command,
-                                                                                                  uint32_t address,
-                                                                                                  data::Source& tx,
-                                                                                                  size_t len)
+m5::hal::v1::result_t<size_t> SPIMasterAccessor::writeCommandAddressData(uint32_t command, uint32_t address,
+                                                                         data::Source& tx, size_t len)
 {
     auto desc = commandAddressDesc(_access_config, command, address, _access_config.spi_write_dummy_cycle);
     if (!desc.has_value()) {
@@ -321,8 +306,7 @@ m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::writeC
     return result.value() + desc->command_bytes + desc->address_bytes;
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::readCommandData(uint32_t command,
-                                                                                          data::DataSpan rx_bytes)
+m5::hal::v1::result_t<size_t> SPIMasterAccessor::readCommandData(uint32_t command, data::DataSpan rx_bytes)
 {
     auto desc = commandDesc(_access_config, command);
     if (!desc.has_value()) {
@@ -337,8 +321,7 @@ m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::readCo
     return result.value() + desc->command_bytes;
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::readCommandData(uint32_t command,
-                                                                                          data::Sink& rx, size_t len)
+m5::hal::v1::result_t<size_t> SPIMasterAccessor::readCommandData(uint32_t command, data::Sink& rx, size_t len)
 {
     auto desc = commandDesc(_access_config, command);
     if (!desc.has_value()) {
@@ -353,8 +336,8 @@ m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::readCo
     return result.value() + desc->command_bytes;
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::readCommandAddressData(
-    uint32_t command, uint32_t address, data::DataSpan rx_bytes)
+m5::hal::v1::result_t<size_t> SPIMasterAccessor::readCommandAddressData(uint32_t command, uint32_t address,
+                                                                        data::DataSpan rx_bytes)
 {
     auto desc = commandAddressDesc(_access_config, command, address, _access_config.spi_read_dummy_cycle);
     if (!desc.has_value()) {
@@ -368,10 +351,8 @@ m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::readCo
     return result.value() + desc->command_bytes + desc->address_bytes;
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::readCommandAddressData(uint32_t command,
-                                                                                                 uint32_t address,
-                                                                                                 data::Sink& rx,
-                                                                                                 size_t len)
+m5::hal::v1::result_t<size_t> SPIMasterAccessor::readCommandAddressData(uint32_t command, uint32_t address,
+                                                                        data::Sink& rx, size_t len)
 {
     auto desc = commandAddressDesc(_access_config, command, address, _access_config.spi_read_dummy_cycle);
     if (!desc.has_value()) {
@@ -385,7 +366,7 @@ m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIMasterAccessor::readCo
     return result.value() + desc->command_bytes + desc->address_bytes;
 }
 
-m5::stl::expected<void, m5::hal::v1::error::error_t> SPIMasterAccessor::sendDummyClock(size_t count)
+m5::hal::v1::result_t<void> SPIMasterAccessor::sendDummyClock(size_t count)
 {
     if (count > 255) {
         return m5::stl::make_unexpected(m5::hal::v1::error::error_t::INVALID_ARGUMENT);
@@ -399,10 +380,8 @@ m5::stl::expected<void, m5::hal::v1::error::error_t> SPIMasterAccessor::sendDumm
     return {};
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIBus::transfer(bus::Accessor* owner,
-                                                                        const SPIMasterAccessConfig& cfg,
-                                                                        const TransferDesc& desc, data::Source* tx,
-                                                                        data::Sink* rx)
+m5::hal::v1::result_t<size_t> SPIBus::transfer(bus::Accessor* owner, const SPIMasterAccessConfig& cfg,
+                                               const TransferDesc& desc, data::Source* tx, data::Sink* rx)
 {
     (void)owner;
     (void)cfg;
@@ -412,16 +391,14 @@ m5::stl::expected<size_t, m5::hal::v1::error::error_t> SPIBus::transfer(bus::Acc
     return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
 }
 
-m5::stl::expected<void, m5::hal::v1::error::error_t> SPIBus::beginTransaction(bus::Accessor* owner,
-                                                                              const SPIMasterAccessConfig& cfg)
+m5::hal::v1::result_t<void> SPIBus::beginTransaction(bus::Accessor* owner, const SPIMasterAccessConfig& cfg)
 {
     (void)owner;
     (void)cfg;
     return {};
 }
 
-m5::stl::expected<void, m5::hal::v1::error::error_t> SPIBus::endTransaction(bus::Accessor* owner,
-                                                                            const SPIMasterAccessConfig& cfg)
+m5::hal::v1::result_t<void> SPIBus::endTransaction(bus::Accessor* owner, const SPIMasterAccessConfig& cfg)
 {
     (void)owner;
     (void)cfg;

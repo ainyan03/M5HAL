@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // clang-format off
 // Capability self-declaration for the Espressif ESP32 (1st gen) platform variant.
 //

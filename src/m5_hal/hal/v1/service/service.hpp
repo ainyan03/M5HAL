@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_HAL_V1_SERVICE_SERVICE_HPP_
 #define M5_HAL_HAL_V1_SERVICE_SERVICE_HPP_
 
@@ -182,6 +183,13 @@ M5HAL_INLINE_V1 namespace v1
             }
             --_count;
             _services[_count] = nullptr;
+            // Removal from inside runOnce (typically a service removing
+            // itself): the compaction shifted the not-yet-visited tail
+            // down by one, so hold the cursor back to not skip the next
+            // service this pass.
+            if (_iter_index != kMaxServices && index <= _iter_index) {
+                --_iter_index;
+            }
             return true;
         }
 
@@ -193,18 +201,22 @@ M5HAL_INLINE_V1 namespace v1
             _count = 0;
         }
 
+        // Not reentrant: do not call runOnce from inside a service() poll.
+        // Services may add/remove (including themselves) during the pass;
+        // remove() compensates the cursor, and a service added mid-pass is
+        // polled in the same pass (it lands on the not-yet-visited tail).
         bool runOnce(const ServiceContext& ctx)
         {
-            bool progressed    = false;
-            const size_t count = _count;
-            for (size_t i = 0; i < count; ++i) {
-                auto* s = _services[i];
+            bool progressed = false;
+            for (_iter_index = 0; _iter_index < _count; ++_iter_index) {
+                auto* s = _services[_iter_index];
                 if (s == nullptr) {
                     continue;
                 }
                 const auto r = s->service(ctx);
                 progressed   = progressed || r == ServiceResult::Progress || r == ServiceResult::Done;
             }
+            _iter_index = kMaxServices;
             return progressed;
         }
 
@@ -240,6 +252,10 @@ M5HAL_INLINE_V1 namespace v1
 
         IService* _services[kMaxServices] = {};
         size_t _count                     = 0;
+        // Cursor of the in-progress runOnce pass; kMaxServices = not
+        // iterating. remove() adjusts it so mid-pass removal (typically
+        // self-removal) does not skip the next service.
+        size_t _iter_index = kMaxServices;
     };
 
     }  // namespace service

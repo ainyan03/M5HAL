@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include <gtest/gtest.h>
 #include <M5HAL_v1.hpp>
 
@@ -276,6 +277,34 @@ TEST(MemoryAllocator, PoolPointerReallocAcrossUsageMovesOutOfPool)
 
     alloc.deallocate(promoted);
     EXPECT_EQ(FallbackCounters::free_count, 1u);
+}
+
+TEST(MemoryAllocator, PoolMoveOutClampsCopyToBlockRun)
+{
+    Allocator alloc;
+    FallbackCounters::reset();
+    alloc.setFallback(&FallbackCounters::mallocFn, &FallbackCounters::reallocFn, &FallbackCounters::freeFn);
+
+    auto* p = static_cast<unsigned char*>(alloc.allocate(16, usage_t::temp));
+    ASSERT_NE(p, nullptr);
+    EXPECT_EQ(alloc.usedBlocks(), 1u);
+    std::memset(p, 0x5A, 16);
+
+    // Grow past the pool with an oversized `preserve_size`: both exceed
+    // the one-block run, so an unclamped copy would read far past the
+    // allocation (and even past the pool storage). The clamp bounds the
+    // copy to the actual block run.
+    const size_t huge_preserve = Allocator::tempPoolSize() * 2;
+    const size_t big_new_size  = Allocator::tempPoolSize() + 64;
+    auto* moved = static_cast<unsigned char*>(alloc.reallocate(p, huge_preserve, big_new_size, usage_t::temp));
+    ASSERT_NE(moved, nullptr);
+    EXPECT_EQ(alloc.usedBlocks(), 0u);
+    EXPECT_EQ(FallbackCounters::malloc_count, 1u);
+    for (size_t i = 0; i < 16; ++i) {
+        EXPECT_EQ(moved[i], 0x5A);
+    }
+
+    alloc.deallocate(moved);
 }
 
 TEST(MemoryAllocator, DeallocateNullIsSafe)

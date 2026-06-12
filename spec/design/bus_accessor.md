@@ -154,7 +154,7 @@ namespace m5::hal::v1::i2c {
 
     class I2CBus : public bus::Bus {
         virtual error_t attach(/* TwoWire&, i2c_master_bus_handle_t, etc */) = 0;
-        virtual m5::stl::expected<size_t, error_t> transfer(
+        virtual result_t<size_t> transfer(
             bus::Accessor* owner,
             const I2CMasterAccessConfig& cfg,
             const TransferDesc& desc,

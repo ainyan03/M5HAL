@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Smoke test for the native build environment: verifies that
 // PlatformIO + googletest are wired up before the rest of the v1 suite.
 #include <gtest/gtest.h>

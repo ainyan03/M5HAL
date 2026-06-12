@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_GPIO_PORT_HPP_
 #define M5_HAL_GPIO_PORT_HPP_
 

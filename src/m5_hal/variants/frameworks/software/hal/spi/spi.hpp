@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_SOFTWARE_HAL_SPI_SPI_HPP
 #define M5_HAL_VARIANTS_FRAMEWORKS_SOFTWARE_HAL_SPI_SPI_HPP
 
@@ -23,20 +24,20 @@ public:
     // Typed init (S17 E1). BusConfig is an alias of the abstract
     // SPIBusConfig here; the signature still names the alias so every
     // variant reads the same.
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> init(const BusConfig& config);
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> release(void) override
+    ::m5::hal::v1::result_t<void> init(const BusConfig& config);
+    ::m5::hal::v1::result_t<void> release(void) override
     {
         return {};
     }
 
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> beginTransaction(
-        ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg) override;
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> endTransaction(
-        ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg) override;
-    m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> transfer(
-        ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg,
-        const ::m5::hal::v1::spi::TransferDesc& desc, ::m5::hal::v1::data::Source* tx,
-        ::m5::hal::v1::data::Sink* rx) override;
+    ::m5::hal::v1::result_t<void> beginTransaction(::m5::hal::v1::bus::Accessor* owner,
+                                                   const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg) override;
+    ::m5::hal::v1::result_t<void> endTransaction(::m5::hal::v1::bus::Accessor* owner,
+                                                 const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg) override;
+    ::m5::hal::v1::result_t<size_t> transfer(::m5::hal::v1::bus::Accessor* owner,
+                                             const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg,
+                                             const ::m5::hal::v1::spi::TransferDesc& desc,
+                                             ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx) override;
 
 private:
     ::m5::hal::v1::gpio::Pin _pin_clk{};

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5HAL_HPP
 #define M5HAL_HPP
 

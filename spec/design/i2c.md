@@ -43,7 +43,7 @@ namespace m5::hal::v1::i2c {
 
 class I2CBus : public bus::Bus {
 public:
-    virtual m5::stl::expected<size_t, error_t> transfer(
+    virtual result_t<size_t> transfer(
         bus::Accessor* owner,
         const I2CMasterAccessConfig& cfg,
         const TransferDesc& desc,
@@ -55,7 +55,7 @@ public:
     // 内部で stack-allocated な I2CMasterAccessor を sentinel として組み立て、
     // 同じ probe path を呼ぶ。 default `timeout_ms = 50` は I2C scan 用途を
     // 想定 (`I2CMasterAccessConfig` 全体 default の 1000ms とは別)。
-    m5::stl::expected<void, error_t> probe(
+    result_t<void> probe(
         uint16_t addr,
         uint32_t freq         = 100000,
         uint32_t timeout_ms   = 50);
@@ -113,48 +113,48 @@ public:
     // 通信パラメータ差し替え (spec_polish A2)。
     // 「同じ Accessor を使い回して address だけ変えていく」 scan パターン用 sugar。
     // 排他制御中 (`inAccess() == true`) は INVALID_ARGUMENT で reject する。
-    m5::stl::expected<void, error_t> setConfig(const I2CMasterAccessConfig& cfg);
+    result_t<void> setConfig(const I2CMasterAccessConfig& cfg);
 
-    m5::stl::expected<size_t, error_t> transfer(
+    result_t<size_t> transfer(
         const TransferDesc& desc,
         data::ConstDataSpan tx,
         data::DataSpan rx);
-    m5::stl::expected<size_t, error_t> write(data::ConstDataSpan tx);
-    m5::stl::expected<size_t, error_t> read(data::DataSpan rx);
+    result_t<size_t> write(data::ConstDataSpan tx);
+    result_t<size_t> read(data::DataSpan rx);
 
     // raw pointer overload (spec_polish A3): C 配列を直接渡す用途。
-    m5::stl::expected<size_t, error_t> write(const uint8_t* tx, size_t len);
-    m5::stl::expected<size_t, error_t> read(uint8_t* dst, size_t len);
+    result_t<size_t> write(const uint8_t* tx, size_t len);
+    result_t<size_t> read(uint8_t* dst, size_t len);
 
     template <typename TReg /* unsigned integral, sizeof ≤ 2 */>
-    m5::stl::expected<size_t, error_t> writeRegister(TReg reg, data::ConstDataSpan value);
+    result_t<size_t> writeRegister(TReg reg, data::ConstDataSpan value);
 
     template <typename TReg /* 同上 */>
-    m5::stl::expected<size_t, error_t> writeRegister(TReg reg, uint8_t value);
+    result_t<size_t> writeRegister(TReg reg, uint8_t value);
 
     // raw pointer overload (spec_polish A3): register address + N byte 直書き。
     template <typename TReg /* 同上 */>
-    m5::stl::expected<size_t, error_t> writeRegister(TReg reg, const uint8_t* tx, size_t len);
+    result_t<size_t> writeRegister(TReg reg, const uint8_t* tx, size_t len);
 
     template <typename TReg /* 同上 */>
-    m5::stl::expected<size_t, error_t> readRegister(TReg reg, data::DataSpan dst);
+    result_t<size_t> readRegister(TReg reg, data::DataSpan dst);
 
     // raw pointer overload (spec_polish A3): register address + N byte 直読み。
     template <typename TReg /* 同上 */>
-    m5::stl::expected<size_t, error_t> readRegister(TReg reg, uint8_t* dst, size_t len);
+    result_t<size_t> readRegister(TReg reg, uint8_t* dst, size_t len);
 
     template <typename TReg /* 同上 */>
-    m5::stl::expected<uint8_t, error_t> readRegister(TReg reg);
+    result_t<uint8_t> readRegister(TReg reg);
 
     // signed literal overload: register_address_bytes で 1 / 2 byte を決める。
-    m5::stl::expected<size_t, error_t> writeRegister(int reg, data::ConstDataSpan value);
-    m5::stl::expected<size_t, error_t> writeRegister(int reg, uint8_t value);
-    m5::stl::expected<size_t, error_t> writeRegister(int reg, const uint8_t* tx, size_t len);
-    m5::stl::expected<size_t, error_t> readRegister(int reg, data::DataSpan dst);
-    m5::stl::expected<size_t, error_t> readRegister(int reg, uint8_t* dst, size_t len);
-    m5::stl::expected<uint8_t, error_t> readRegister(int reg);
+    result_t<size_t> writeRegister(int reg, data::ConstDataSpan value);
+    result_t<size_t> writeRegister(int reg, uint8_t value);
+    result_t<size_t> writeRegister(int reg, const uint8_t* tx, size_t len);
+    result_t<size_t> readRegister(int reg, data::DataSpan dst);
+    result_t<size_t> readRegister(int reg, uint8_t* dst, size_t len);
+    result_t<uint8_t> readRegister(int reg);
 
-    m5::stl::expected<void, error_t> probe();
+    result_t<void> probe();
 
 private:
     I2CMasterAccessConfig _access_config;

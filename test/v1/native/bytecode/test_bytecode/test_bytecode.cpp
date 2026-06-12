@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Native gtest for the bytecode encoder + runner (hal/v1/bytecode/).
 //
 // Mechanically verifies the wire contract of spec/design/bytecode.md:
@@ -16,6 +17,8 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+
+using ::m5::hal::v1::result_t;
 
 namespace {
 
@@ -36,8 +39,7 @@ using error_t      = error::error_t;
 // Drain helper shared by the capture buses: pull everything from `tx`,
 // then feed `rx_script` into `rx` until it stops accepting.
 template <typename Vec>
-m5::stl::expected<size_t, error_t> drainAndFeed(data::Source* tx, data::Sink* rx, Vec& tx_log,
-                                                const std::vector<uint8_t>& rx_script)
+result_t<size_t> drainAndFeed(data::Source* tx, data::Sink* rx, Vec& tx_log, const std::vector<uint8_t>& rx_script)
 {
     size_t done = 0;
     while (tx != nullptr && !tx->eof()) {
@@ -77,17 +79,16 @@ m5::stl::expected<size_t, error_t> drainAndFeed(data::Source* tx, data::Sink* rx
 
 class CaptureI2CBus : public i2c::I2CBus {
 public:
-    m5::stl::expected<void, error_t> init(const i2c::I2CBusConfig&)
+    result_t<void> init(const i2c::I2CBusConfig&)
     {
         return {};
     }
-    m5::stl::expected<void, error_t> release(void) override
+    result_t<void> release(void) override
     {
         return {};
     }
-    m5::stl::expected<size_t, error_t> transfer(bus::Accessor*, const i2c::I2CMasterAccessConfig& cfg,
-                                                const i2c::TransferDesc& desc, data::Source* tx,
-                                                data::Sink* rx) override
+    result_t<size_t> transfer(bus::Accessor*, const i2c::I2CMasterAccessConfig& cfg, const i2c::TransferDesc& desc,
+                              data::Source* tx, data::Sink* rx) override
     {
         ++transfer_count;
         last_addr = cfg.i2c_addr;
@@ -106,17 +107,16 @@ public:
 
 class CaptureSPIBus : public spi::SPIBus {
 public:
-    m5::stl::expected<void, error_t> init(const spi::SPIBusConfig&)
+    result_t<void> init(const spi::SPIBusConfig&)
     {
         return {};
     }
-    m5::stl::expected<void, error_t> release(void) override
+    result_t<void> release(void) override
     {
         return {};
     }
-    m5::stl::expected<size_t, error_t> transfer(bus::Accessor*, const spi::SPIMasterAccessConfig&,
-                                                const spi::TransferDesc& desc, data::Source* tx,
-                                                data::Sink* rx) override
+    result_t<size_t> transfer(bus::Accessor*, const spi::SPIMasterAccessConfig&, const spi::TransferDesc& desc,
+                              data::Source* tx, data::Sink* rx) override
     {
         ++transfer_count;
         last_desc = desc;
@@ -131,22 +131,20 @@ public:
 
 class CaptureUARTBus : public uart::UARTBus {
 public:
-    m5::stl::expected<size_t, error_t> write(bus::Accessor*, const uart::UARTAccessConfig&, data::Source* tx,
-                                             size_t len) override
+    result_t<size_t> write(bus::Accessor*, const uart::UARTAccessConfig&, data::Source* tx, size_t len) override
     {
         (void)len;
         std::vector<uint8_t> ignored;
         return drainAndFeed(tx, nullptr, tx_bytes, ignored);
     }
-    m5::stl::expected<size_t, error_t> read(bus::Accessor*, const uart::UARTAccessConfig&, data::Sink* rx,
-                                            size_t len) override
+    result_t<size_t> read(bus::Accessor*, const uart::UARTAccessConfig&, data::Sink* rx, size_t len) override
     {
         std::vector<uint8_t> ignored;
         std::vector<uint8_t> chunk{rx_script.begin(),
                                    rx_script.begin() + static_cast<ptrdiff_t>(std::min(len, rx_script.size()))};
         return drainAndFeed(nullptr, rx, ignored, chunk);
     }
-    m5::stl::expected<size_t, error_t> readableBytes(bus::Accessor*, const uart::UARTAccessConfig&) override
+    result_t<size_t> readableBytes(bus::Accessor*, const uart::UARTAccessConfig&) override
     {
         return rx_script.size();
     }
@@ -160,13 +158,12 @@ public:
 // reports a programmable writableBytes.
 class StubI2SBus : public i2s::I2SBus {
 public:
-    m5::stl::expected<void, error_t> init(const i2s::I2SBusConfig& config)
+    result_t<void> init(const i2s::I2SBusConfig& config)
     {
         _config = config;
         return {};
     }
-    m5::stl::expected<size_t, error_t> write(bus::Accessor*, const i2s::I2SAccessConfig& cfg, data::Source* tx,
-                                             size_t len) override
+    result_t<size_t> write(bus::Accessor*, const i2s::I2SAccessConfig& cfg, data::Source* tx, size_t len) override
     {
         last_cfg = cfg;
         // Drain everything from tx, but only "accept" up to accept_limit.
@@ -183,7 +180,7 @@ public:
         written.insert(written.end(), buf.begin(), buf.begin() + static_cast<ptrdiff_t>(accepted));
         return accepted;
     }
-    m5::stl::expected<size_t, error_t> writableBytes(bus::Accessor*, const i2s::I2SAccessConfig&) override
+    result_t<size_t> writableBytes(bus::Accessor*, const i2s::I2SAccessConfig&) override
     {
         return writable;
     }
@@ -252,7 +249,7 @@ public:
     {
         _pending.insert(_pending.end(), bytes, bytes + len);
     }
-    m5::stl::expected<size_t, error_t> read(data::DataSpan dst) override
+    result_t<size_t> read(data::DataSpan dst) override
     {
         ++read_calls;
         const size_t n = std::min({dst.size, _pending.size(), max_chunk});
@@ -260,7 +257,7 @@ public:
         _pending.erase(_pending.begin(), _pending.begin() + static_cast<ptrdiff_t>(n));
         return n;
     }
-    m5::stl::expected<size_t, error_t> readableBytes(void) override
+    result_t<size_t> readableBytes(void) override
     {
         return std::min(_pending.size(), max_chunk);
     }

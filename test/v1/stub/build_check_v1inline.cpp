@@ -16,6 +16,8 @@
 #if M5HAL_V1_INLINE
 static_assert(std::is_same<m5::hal::error::error_t, m5::hal::v1::error::error_t>::value,
               "M5HAL_V1_INLINE=1 but m5::hal::error::error_t did not resolve to v1");
+static_assert(std::is_same<m5::hal::result_t<void>, m5::hal::v1::result_t<void>>::value,
+              "M5HAL_V1_INLINE=1 but m5::hal::result_t did not resolve to v1");
 #endif
 
 // Invariant: explicit v1 access always works, independent of which

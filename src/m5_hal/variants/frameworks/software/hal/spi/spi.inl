@@ -19,7 +19,7 @@ namespace {
 
 constexpr uint32_t kNsecPerSec = 1000000000u;
 
-m5::stl::expected<::m5::hal::v1::service::fast_tick_t, ::m5::hal::v1::error::error_t> halfPeriodTick(
+::m5::hal::v1::result_t<::m5::hal::v1::service::fast_tick_t> halfPeriodTick(
     const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg)
 {
     if (cfg.freq == 0) {
@@ -79,8 +79,8 @@ TransferPlan makePlan(const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg, bool
     return plan;
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> resolveOptionalPin(::m5::hal::v1::types::gpio_number_t gpio_num,
-                                                                          ::m5::hal::v1::gpio::Pin& out)
+::m5::hal::v1::result_t<void> resolveOptionalPin(::m5::hal::v1::types::gpio_number_t gpio_num,
+                                                 ::m5::hal::v1::gpio::Pin& out)
 {
     out = {};
     if (gpio_num < 0) {
@@ -307,7 +307,7 @@ public:
         auto polled = poll(edge_budget);
         if (!polled.has_value()) {
             _error = polled.error();
-            _phase = Phase::done;
+            enterDone();  // park the clock at idle even on the error path
             return ::m5::hal::v1::service::ServiceResult::Error;
         }
         if (!active()) {
@@ -317,8 +317,7 @@ public:
     }
 
 private:
-    m5::stl::expected<::m5::hal::v1::service::ServiceResult, ::m5::hal::v1::error::error_t> poll(
-        uint_fast8_t edge_budget)
+    ::m5::hal::v1::result_t<::m5::hal::v1::service::ServiceResult> poll(uint_fast8_t edge_budget)
     {
         switch (_phase) {
             case Phase::command:
@@ -435,25 +434,54 @@ private:
         }
     }
 
+    // DC changes ride the half-period grid: phase entry happens in the
+    // same poll as the previous phase's final sample edge, so an
+    // immediate write would change DC a few µs after that edge (razor-
+    // thin hold for the device, and unresolvable for the capture-based
+    // wire test). Spending one half period first puts the DC transition
+    // cleanly between the phases.
     void setDC(int8_t level)
     {
         if (_dc.isValid() && level >= 0) {
+            _due_tick += _half_tick;
+            waitUntil(_due_tick);
             _dc.write(level != 0);
         }
     }
 
+    // Terminal transition: give the final half period its full width,
+    // park the clock at the idle level (CPOL) - previously it stayed at
+    // second_level until the NEXT transfer's begin(), so CS deassert
+    // happened on an active clock - and let idle settle for one more
+    // half period so the deassert edge has a clean setup time. The park
+    // write is a no-op for modes that already end at idle (CPHA=1).
+    void enterDone()
+    {
+        stepClock(_clk, _plan.cpol, _half_tick, _due_tick);
+        _due_tick += _half_tick;
+        waitUntil(_due_tick);
+        _phase = Phase::done;
+    }
+
     uint_fast8_t availableEdgeBudget(::m5::hal::v1::service::fast_tick_t now_tick)
     {
-        uint_fast8_t edge_budget = 0;
-        while (edge_budget < 16) {
-            const auto next_due = static_cast<::m5::hal::v1::service::fast_tick_t>(_due_tick + _half_tick);
-            if (!::m5::hal::v1::service::hasReached(now_tick, next_due)) {
-                break;
-            }
-            _due_tick = next_due;
-            ++edge_budget;
+        // At most ONE edge per poll, and a delayed poll re-anchors the
+        // schedule instead of catching up: granting the backlog as a
+        // multi-edge budget would emit those edges back-to-back at CPU
+        // speed, momentarily clocking far above the configured rate.
+        // Same policy as software i2c — when the poll is late the clock
+        // slips (runs late), it never runs faster than configured.
+        const auto next_due = static_cast<::m5::hal::v1::service::fast_tick_t>(_due_tick + _half_tick);
+        if (!::m5::hal::v1::service::hasReached(now_tick, next_due)) {
+            return 0;
         }
-        return edge_budget;
+        const auto second_due = static_cast<::m5::hal::v1::service::fast_tick_t>(next_due + _half_tick);
+        if (::m5::hal::v1::service::hasReached(now_tick, second_due)) {
+            _due_tick = now_tick;  // backlog dropped; next edge is a full half period away
+        } else {
+            _due_tick = next_due;
+        }
+        return 1;
     }
 
     ::m5::hal::v1::service::ServiceResult pollMetaByte(uint_fast8_t edge_budget)
@@ -474,13 +502,20 @@ private:
 
     void pollDummyClock()
     {
-        const bool active = !_plan.cpol;
-        stepClock(_clk, active, _half_tick, _due_tick);
-        stepClock(_clk, _plan.cpol, _half_tick, _due_tick);
+        // Clock dummy cycles exactly like data bits (first -> second
+        // level). The line rests at second_level after a byte, so the
+        // old "!cpol then cpol" order made the first dummy cycle's
+        // leading write a no-transition for CPHA=0 - the wire carried
+        // one less dummy edge than configured (off-by-one against
+        // devices that count dummy clocks on the sample edge). With
+        // first/second ordering every cycle toggles onto its sample
+        // edge regardless of the resting level.
+        stepClock(_clk, _plan.first_level, _half_tick, _due_tick);
+        stepClock(_clk, _plan.second_level, _half_tick, _due_tick);
         --_dummy_remaining;
     }
 
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> acquireChunk()
+    ::m5::hal::v1::result_t<void> acquireChunk()
     {
         _tx_span     = {};
         _rx_span     = {};
@@ -504,7 +539,7 @@ private:
 
         _chunk_len = (_tx_span.size > _rx_span.size) ? _tx_span.size : _rx_span.size;
         if (_chunk_len == 0) {
-            _phase = Phase::done;
+            enterDone();  // natural end of the transfer
         }
         return {};
     }
@@ -527,7 +562,7 @@ private:
         return ::m5::hal::v1::service::ServiceResult::Progress;
     }
 
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> finishChunk()
+    ::m5::hal::v1::result_t<void> finishChunk()
     {
         if (_rx_span.size > 0) {
             auto committed = _rx->commit(_rx_span.size);
@@ -580,7 +615,7 @@ private:
 
 }  // anonymous namespace
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig& config)
+::m5::hal::v1::result_t<void> Bus::init(const BusConfig& config)
 {
     _config = config;
 
@@ -623,9 +658,10 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig
     return {};
 }
 
-m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
-    ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg,
-    const ::m5::hal::v1::spi::TransferDesc& desc, ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
+::m5::hal::v1::result_t<size_t> Bus::transfer(::m5::hal::v1::bus::Accessor* owner,
+                                              const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg,
+                                              const ::m5::hal::v1::spi::TransferDesc& desc,
+                                              ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
 {
     (void)owner;
     // This variant bit-bangs a single-lane MOSI/MISO pair. Multi-lane
@@ -680,8 +716,8 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
     return transfer_service.transferred();
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::beginTransaction(
-    ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg)
+::m5::hal::v1::result_t<void> Bus::beginTransaction(::m5::hal::v1::bus::Accessor* owner,
+                                                    const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg)
 {
     (void)owner;
     if (!_pin_clk.isValid()) {
@@ -701,8 +737,8 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::beginTransaction(
     return {};
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::endTransaction(
-    ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg)
+::m5::hal::v1::result_t<void> Bus::endTransaction(::m5::hal::v1::bus::Accessor* owner,
+                                                  const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg)
 {
     (void)owner;
     _pin_clk.write((cfg.spi_mode & 0x02) != 0);

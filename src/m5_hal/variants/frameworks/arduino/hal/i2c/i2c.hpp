@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_ARDUINO_HAL_I2C_I2C_HPP
 #define M5_HAL_VARIANTS_FRAMEWORKS_ARDUINO_HAL_I2C_I2C_HPP
 
@@ -40,13 +41,13 @@ public:
     // Typed init: takes this variant's BusConfig (S17 E1). Passing the
     // abstract I2CBusConfig (or a sibling variant's config) is a
     // compile error instead of a silent bad downcast.
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> init(const BusConfig& config);
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> release(void) override;
+    ::m5::hal::v1::result_t<void> init(const BusConfig& config);
+    ::m5::hal::v1::result_t<void> release(void) override;
 
-    m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> transfer(
-        ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg,
-        const ::m5::hal::v1::i2c::TransferDesc& desc, ::m5::hal::v1::data::Source* tx,
-        ::m5::hal::v1::data::Sink* rx) override;
+    ::m5::hal::v1::result_t<size_t> transfer(::m5::hal::v1::bus::Accessor* owner,
+                                             const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg,
+                                             const ::m5::hal::v1::i2c::TransferDesc& desc,
+                                             ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx) override;
 
     ::m5::hal::v1::error::error_t attach(::TwoWire& wire);
     ::TwoWire* nativeHandle() const

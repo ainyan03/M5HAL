@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_HAL_V1_MEMORY_ALLOCATOR_HPP_
 #define M5_HAL_HAL_V1_MEMORY_ALLOCATOR_HPP_
 
@@ -44,9 +45,12 @@ M5HAL_INLINE_V1 namespace v1
         /// This is a low-level API. `preserve_size` is supplied by the caller
         /// and may be smaller than the old allocation, including zero, to
         /// intentionally reduce copy cost. M5HAL preserves up to
-        /// `min(preserve_size, new_size)` bytes. Passing a `preserve_size`
-        /// larger than the readable old allocation may read undefined memory
-        /// during fallback copy.
+        /// `min(preserve_size, new_size)` bytes. For pool-owned buffers the
+        /// copy is additionally clamped to the actual pool allocation, so an
+        /// oversized `preserve_size` cannot read past it; for fallback-owned
+        /// buffers the old allocation size is unknown here, and a
+        /// `preserve_size` larger than the readable old allocation may read
+        /// undefined memory during fallback copy.
         ///
         /// The returned pointer may differ from `ptr`, including moves between
         /// the temp pool and fallback allocator. On failure, returns `nullptr`

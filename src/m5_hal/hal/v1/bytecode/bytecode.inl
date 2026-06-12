@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_BYTECODE_BYTECODE_INL_
 #define M5_HAL_BYTECODE_BYTECODE_INL_
 
@@ -86,17 +87,15 @@ struct FieldReader {
     }
 };
 
-// ---- config payloads (sizes are the encoder's; decode is tolerant) ---------
-
-constexpr size_t kI2CConfigSize  = 12;
-constexpr size_t kSPIConfigSize  = 16;
-constexpr size_t kUARTConfigSize = 24;
-constexpr size_t kI2SConfigSize  = 14;
+// ---- config payloads --------------------------------------------------------
+// Sizes and the timeout-field offsets live in bytecode.hpp (shared with
+// the server prescan); the remaining offsets are local to the
+// encode/decode pairs below.
 
 void encodeConfig(uint8_t* dst, const i2c::I2CMasterAccessConfig& cfg)
 {
     putU32(dst + 0, cfg.freq);
-    putU32(dst + 4, cfg.timeout_ms);
+    putU32(dst + kI2CConfigTimeoutOffset, cfg.timeout_ms);
     putU16(dst + 8, cfg.i2c_addr);
     dst[10] = static_cast<uint8_t>((cfg.address_is_10bit ? 0x01 : 0x00) | (cfg.use_restart ? 0x02 : 0x00));
     dst[11] = cfg.register_address_bytes;
@@ -118,7 +117,7 @@ void encodeConfig(uint8_t* dst, const spi::SPIMasterAccessConfig& cfg)
 {
     putU16(dst + 0, static_cast<uint16_t>(cfg.pin_cs));
     putU32(dst + 2, cfg.freq);
-    putU32(dst + 6, cfg.timeout_ms);
+    putU32(dst + kSPIConfigTimeoutOffset, cfg.timeout_ms);
     dst[10] = static_cast<uint8_t>(cfg.spi_data_mode);
     dst[11] = static_cast<uint8_t>((cfg.spi_mode & 0x03) | (cfg.spi_order ? 0x04 : 0x00));
     dst[12] = cfg.spi_command_length;
@@ -150,10 +149,10 @@ void decodeConfig(data::ConstDataSpan src, spi::SPIMasterAccessConfig& cfg)
 void encodeConfig(uint8_t* dst, const uart::UARTAccessConfig& cfg)
 {
     putU32(dst + 0, cfg.baud_rate);
-    putU32(dst + 4, cfg.timeout_ms);
-    putU32(dst + 8, cfg.first_byte_timeout_ms);
-    putU32(dst + 12, cfg.inter_byte_timeout_ms);
-    putU32(dst + 16, cfg.write_timeout_ms);
+    putU32(dst + kUARTConfigTimeoutOffset, cfg.timeout_ms);
+    putU32(dst + kUARTConfigFirstByteTimeoutOffset, cfg.first_byte_timeout_ms);
+    putU32(dst + kUARTConfigInterByteTimeoutOffset, cfg.inter_byte_timeout_ms);
+    putU32(dst + kUARTConfigWriteTimeoutOffset, cfg.write_timeout_ms);
     dst[20] = cfg.data_bits;
     dst[21] = cfg.stop_bits;
     dst[22] = static_cast<uint8_t>(cfg.parity);
@@ -178,8 +177,8 @@ void decodeConfig(data::ConstDataSpan src, uart::UARTAccessConfig& cfg)
 void encodeConfig(uint8_t* dst, const i2s::I2SAccessConfig& cfg)
 {
     putU32(dst + 0, cfg.sample_rate_hz);
-    putU32(dst + 4, cfg.timeout_ms);
-    putU32(dst + 8, cfg.write_timeout_ms);
+    putU32(dst + kI2SConfigTimeoutOffset, cfg.timeout_ms);
+    putU32(dst + kI2SConfigWriteTimeoutOffset, cfg.write_timeout_ms);
     dst[12] = cfg.bits_per_sample;
     dst[13] = cfg.channels;
 }
@@ -263,7 +262,7 @@ bool decodeMeta(data::ConstDataSpan src, spi::TransferDesc& desc)
 // scratch smaller than the instruction, or a stream that stayed silent
 // for a whole timeout period (StreamSource::peek blocks for the missing
 // bytes up to the reader's timeouts, so byte gaps don't trip this).
-m5::stl::expected<data::ConstDataSpan, error_t> peekAtLeast(data::Source& src, size_t need)
+result_t<data::ConstDataSpan> peekAtLeast(data::Source& src, size_t need)
 {
     size_t prev = static_cast<size_t>(-1);
     for (;;) {
@@ -281,7 +280,7 @@ m5::stl::expected<data::ConstDataSpan, error_t> peekAtLeast(data::Source& src, s
     }
 }
 
-m5::stl::expected<size_t, error_t> checkedAdd(size_t lhs, size_t rhs)
+result_t<size_t> checkedAdd(size_t lhs, size_t rhs)
 {
     if (lhs > static_cast<size_t>(-1) - rhs) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -289,12 +288,12 @@ m5::stl::expected<size_t, error_t> checkedAdd(size_t lhs, size_t rhs)
     return lhs + rhs;
 }
 
-m5::stl::expected<size_t, error_t> checkedPayload(size_t base, size_t extra)
+result_t<size_t> checkedPayload(size_t base, size_t extra)
 {
     return checkedAdd(base, extra);
 }
 
-m5::stl::expected<size_t, error_t> checkedPayload(size_t base, size_t extra0, size_t extra1)
+result_t<size_t> checkedPayload(size_t base, size_t extra0, size_t extra1)
 {
     auto sum = checkedAdd(base, extra0);
     if (!sum.has_value()) {
@@ -357,7 +356,7 @@ size_t encodeLenVar(uint8_t* dst, size_t value)
 
 // ---- BytecodeEncoder --------------------------------------------------------
 
-m5::stl::expected<data::DataSpan, error_t> BytecodeEncoder::beginInstruction(OpCode opcode, size_t payload_size)
+result_t<data::DataSpan> BytecodeEncoder::beginInstruction(OpCode opcode, size_t payload_size)
 {
     // A payload near SIZE_MAX (broken caller span) would wrap the size
     // arithmetic below; reject it before any reservation happens.
@@ -381,12 +380,12 @@ m5::stl::expected<data::DataSpan, error_t> BytecodeEncoder::beginInstruction(OpC
     return data::DataSpan{p + prefix + 1, payload_size};
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::emit(void)
+result_t<void> BytecodeEncoder::emit(void)
 {
     return _sink->commit(_instr_size);
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::delayMs(uint32_t ms)
+result_t<void> BytecodeEncoder::delayMs(uint32_t ms)
 {
     auto payload = beginInstruction(OpCode::delay_ms, 4);
     if (!payload.has_value()) {
@@ -396,7 +395,7 @@ m5::stl::expected<void, error_t> BytecodeEncoder::delayMs(uint32_t ms)
     return emit();
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::configure(uint8_t bus_id, const i2c::I2CMasterAccessConfig& cfg)
+result_t<void> BytecodeEncoder::configure(uint8_t bus_id, const i2c::I2CMasterAccessConfig& cfg)
 {
     auto payload = beginInstruction(OpCode::bus_configure, 2 + kI2CConfigSize);
     if (!payload.has_value()) {
@@ -409,7 +408,7 @@ m5::stl::expected<void, error_t> BytecodeEncoder::configure(uint8_t bus_id, cons
     return emit();
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::configure(uint8_t bus_id, const spi::SPIMasterAccessConfig& cfg)
+result_t<void> BytecodeEncoder::configure(uint8_t bus_id, const spi::SPIMasterAccessConfig& cfg)
 {
     auto payload = beginInstruction(OpCode::bus_configure, 2 + kSPIConfigSize);
     if (!payload.has_value()) {
@@ -422,7 +421,7 @@ m5::stl::expected<void, error_t> BytecodeEncoder::configure(uint8_t bus_id, cons
     return emit();
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::configure(uint8_t bus_id, const uart::UARTAccessConfig& cfg)
+result_t<void> BytecodeEncoder::configure(uint8_t bus_id, const uart::UARTAccessConfig& cfg)
 {
     auto payload = beginInstruction(OpCode::bus_configure, 2 + kUARTConfigSize);
     if (!payload.has_value()) {
@@ -435,7 +434,7 @@ m5::stl::expected<void, error_t> BytecodeEncoder::configure(uint8_t bus_id, cons
     return emit();
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::i2sConfig(uint8_t bus_id, const i2s::I2SAccessConfig& cfg)
+result_t<void> BytecodeEncoder::i2sConfig(uint8_t bus_id, const i2s::I2SAccessConfig& cfg)
 {
     auto payload = beginInstruction(OpCode::bus_configure, 2 + kI2SConfigSize);
     if (!payload.has_value()) {
@@ -448,8 +447,8 @@ m5::stl::expected<void, error_t> BytecodeEncoder::i2sConfig(uint8_t bus_id, cons
     return emit();
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::transfer(uint8_t bus_id, const i2c::TransferDesc& desc,
-                                                           data::ConstDataSpan tx, size_t rx_len, uint8_t store_id)
+result_t<void> BytecodeEncoder::transfer(uint8_t bus_id, const i2c::TransferDesc& desc, data::ConstDataSpan tx,
+                                         size_t rx_len, uint8_t store_id)
 {
     if (desc.prefix_len > i2c::TransferDesc::PREFIX_CAPACITY || (tx.data == nullptr && tx.size != 0)) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -477,8 +476,8 @@ m5::stl::expected<void, error_t> BytecodeEncoder::transfer(uint8_t bus_id, const
     return emit();
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::transfer(uint8_t bus_id, const spi::TransferDesc& desc,
-                                                           data::ConstDataSpan tx, size_t rx_len, uint8_t store_id)
+result_t<void> BytecodeEncoder::transfer(uint8_t bus_id, const spi::TransferDesc& desc, data::ConstDataSpan tx,
+                                         size_t rx_len, uint8_t store_id)
 {
     if (tx.data == nullptr && tx.size != 0) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -505,8 +504,7 @@ m5::stl::expected<void, error_t> BytecodeEncoder::transfer(uint8_t bus_id, const
     return emit();
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::uartTransfer(uint8_t bus_id, data::ConstDataSpan tx, size_t rx_len,
-                                                               uint8_t store_id)
+result_t<void> BytecodeEncoder::uartTransfer(uint8_t bus_id, data::ConstDataSpan tx, size_t rx_len, uint8_t store_id)
 {
     if (tx.data == nullptr && tx.size != 0) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -531,8 +529,7 @@ m5::stl::expected<void, error_t> BytecodeEncoder::uartTransfer(uint8_t bus_id, d
     return emit();
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::gpioSetMode(types::gpio_mode_t mode, const types::gpio_number_t* pins,
-                                                              size_t count)
+result_t<void> BytecodeEncoder::gpioSetMode(types::gpio_mode_t mode, const types::gpio_number_t* pins, size_t count)
 {
     if (pins == nullptr && count != 0) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -557,7 +554,7 @@ m5::stl::expected<void, error_t> BytecodeEncoder::gpioSetMode(types::gpio_mode_t
     return emit();
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::gpioWriteHigh(const types::gpio_number_t* pins, size_t count)
+result_t<void> BytecodeEncoder::gpioWriteHigh(const types::gpio_number_t* pins, size_t count)
 {
     if (pins == nullptr && count != 0) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -576,7 +573,7 @@ m5::stl::expected<void, error_t> BytecodeEncoder::gpioWriteHigh(const types::gpi
     return emit();
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::gpioWriteLow(const types::gpio_number_t* pins, size_t count)
+result_t<void> BytecodeEncoder::gpioWriteLow(const types::gpio_number_t* pins, size_t count)
 {
     if (pins == nullptr && count != 0) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -595,8 +592,7 @@ m5::stl::expected<void, error_t> BytecodeEncoder::gpioWriteLow(const types::gpio
     return emit();
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::gpioRead(uint8_t store_id, const types::gpio_number_t* pins,
-                                                           size_t count)
+result_t<void> BytecodeEncoder::gpioRead(uint8_t store_id, const types::gpio_number_t* pins, size_t count)
 {
     if (pins == nullptr && count != 0) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -621,7 +617,7 @@ m5::stl::expected<void, error_t> BytecodeEncoder::gpioRead(uint8_t store_id, con
     return emit();
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::gpioSubscribe(const types::gpio_number_t* pins, size_t count)
+result_t<void> BytecodeEncoder::gpioSubscribe(const types::gpio_number_t* pins, size_t count)
 {
     if (pins == nullptr && count != 0) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -640,7 +636,7 @@ m5::stl::expected<void, error_t> BytecodeEncoder::gpioSubscribe(const types::gpi
     return emit();
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::gpioUnsubscribe(const types::gpio_number_t* pins, size_t count)
+result_t<void> BytecodeEncoder::gpioUnsubscribe(const types::gpio_number_t* pins, size_t count)
 {
     if (pins == nullptr && count != 0) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -659,8 +655,7 @@ m5::stl::expected<void, error_t> BytecodeEncoder::gpioUnsubscribe(const types::g
     return emit();
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::evtGpioState(const types::gpio_number_t* pins, const bool* levels,
-                                                               size_t count)
+result_t<void> BytecodeEncoder::evtGpioState(const types::gpio_number_t* pins, const bool* levels, size_t count)
 {
     if ((pins == nullptr || levels == nullptr) && count != 0) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -687,8 +682,7 @@ m5::stl::expected<void, error_t> BytecodeEncoder::evtGpioState(const types::gpio
     return emit();
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::busWriteStream(types::bus_kind_t kind, uint8_t bus_id,
-                                                                 const uint8_t* data, size_t len)
+result_t<void> BytecodeEncoder::busWriteStream(types::bus_kind_t kind, uint8_t bus_id, const uint8_t* data, size_t len)
 {
     if (data == nullptr && len != 0) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -710,8 +704,7 @@ m5::stl::expected<void, error_t> BytecodeEncoder::busWriteStream(types::bus_kind
     return emit();
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::busStreamStatus(types::bus_kind_t kind, uint8_t bus_id,
-                                                                  uint8_t store_id)
+result_t<void> BytecodeEncoder::busStreamStatus(types::bus_kind_t kind, uint8_t bus_id, uint8_t store_id)
 {
     auto payload = beginInstruction(OpCode::bus_stream_status, 3);
     if (!payload.has_value()) {
@@ -724,8 +717,8 @@ m5::stl::expected<void, error_t> BytecodeEncoder::busStreamStatus(types::bus_kin
     return emit();
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::evtStreamCredit(types::bus_kind_t kind, uint8_t bus_id, uint32_t free,
-                                                                  uint32_t submitted)
+result_t<void> BytecodeEncoder::evtStreamCredit(types::bus_kind_t kind, uint8_t bus_id, uint32_t free,
+                                                uint32_t submitted)
 {
     auto payload = beginInstruction(OpCode::evt_stream_credit, 2 + 4 + 4);
     if (!payload.has_value()) {
@@ -739,7 +732,7 @@ m5::stl::expected<void, error_t> BytecodeEncoder::evtStreamCredit(types::bus_kin
     return emit();
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::storeData(uint8_t store_id, data::ConstDataSpan bytes)
+result_t<void> BytecodeEncoder::storeData(uint8_t store_id, data::ConstDataSpan bytes)
 {
     if (bytes.data == nullptr && bytes.size != 0) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -756,7 +749,7 @@ m5::stl::expected<void, error_t> BytecodeEncoder::storeData(uint8_t store_id, da
     return emit();
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::reportError(error_t err, size_t offset)
+result_t<void> BytecodeEncoder::reportError(error_t err, size_t offset)
 {
     auto payload = beginInstruction(OpCode::report_error, 1 + lenVarSize(offset));
     if (!payload.has_value()) {
@@ -768,7 +761,7 @@ m5::stl::expected<void, error_t> BytecodeEncoder::reportError(error_t err, size_
     return emit();
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::reportComplete(error_t status)
+result_t<void> BytecodeEncoder::reportComplete(error_t status)
 {
     auto payload = beginInstruction(OpCode::report_complete, 1);
     if (!payload.has_value()) {
@@ -778,7 +771,7 @@ m5::stl::expected<void, error_t> BytecodeEncoder::reportComplete(error_t status)
     return emit();
 }
 
-m5::stl::expected<void, error_t> BytecodeEncoder::end(void)
+result_t<void> BytecodeEncoder::end(void)
 {
     auto reserved = _sink->reserve(1);
     if (!reserved.has_value()) {
@@ -793,7 +786,7 @@ m5::stl::expected<void, error_t> BytecodeEncoder::end(void)
 
 // ---- BytecodeRunner ---------------------------------------------------------
 
-m5::stl::expected<void, error_t> BytecodeRunner::registerI2C(uint8_t bus_id, i2c::I2CMasterAccessor& acc)
+result_t<void> BytecodeRunner::registerI2C(uint8_t bus_id, i2c::I2CMasterAccessor& acc)
 {
     if (bus_id >= kMaxBusBindings) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -802,7 +795,7 @@ m5::stl::expected<void, error_t> BytecodeRunner::registerI2C(uint8_t bus_id, i2c
     return {};
 }
 
-m5::stl::expected<void, error_t> BytecodeRunner::registerSPI(uint8_t bus_id, spi::SPIMasterAccessor& acc)
+result_t<void> BytecodeRunner::registerSPI(uint8_t bus_id, spi::SPIMasterAccessor& acc)
 {
     if (bus_id >= kMaxBusBindings) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -811,7 +804,7 @@ m5::stl::expected<void, error_t> BytecodeRunner::registerSPI(uint8_t bus_id, spi
     return {};
 }
 
-m5::stl::expected<void, error_t> BytecodeRunner::registerUART(uint8_t bus_id, uart::UARTAccessor& acc)
+result_t<void> BytecodeRunner::registerUART(uint8_t bus_id, uart::UARTAccessor& acc)
 {
     if (bus_id >= kMaxBusBindings) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -820,7 +813,7 @@ m5::stl::expected<void, error_t> BytecodeRunner::registerUART(uint8_t bus_id, ua
     return {};
 }
 
-m5::stl::expected<void, error_t> BytecodeRunner::registerI2S(uint8_t bus_id, i2s::I2STxAccessor& acc)
+result_t<void> BytecodeRunner::registerI2S(uint8_t bus_id, i2s::I2STxAccessor& acc)
 {
     if (bus_id >= kMaxBusBindings) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -830,7 +823,7 @@ m5::stl::expected<void, error_t> BytecodeRunner::registerI2S(uint8_t bus_id, i2s
     return {};
 }
 
-m5::stl::expected<BytecodeRunner::StreamStatus, error_t> BytecodeRunner::i2sStreamStatus(uint8_t bus_id)
+result_t<BytecodeRunner::StreamStatus> BytecodeRunner::i2sStreamStatus(uint8_t bus_id)
 {
     if (bus_id >= kMaxBusBindings || _i2s[bus_id] == nullptr) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -887,7 +880,7 @@ void BytecodeRunner::clearStored(void)
     }
 }
 
-m5::stl::expected<BytecodeRunner::Slot*, error_t> BytecodeRunner::allocStore(uint8_t store_id, size_t size)
+result_t<BytecodeRunner::Slot*> BytecodeRunner::allocStore(uint8_t store_id, size_t size)
 {
     Slot* free_slot = nullptr;
     Slot* target    = nullptr;
@@ -919,13 +912,13 @@ m5::stl::expected<BytecodeRunner::Slot*, error_t> BytecodeRunner::allocStore(uin
     return target;
 }
 
-m5::stl::expected<size_t, error_t> BytecodeRunner::run(data::ConstDataSpan script)
+result_t<size_t> BytecodeRunner::run(data::ConstDataSpan script)
 {
     data::MemorySource source{script};
     return run(source);
 }
 
-m5::stl::expected<size_t, error_t> BytecodeRunner::run(data::Source& script)
+result_t<size_t> BytecodeRunner::run(data::Source& script)
 {
     clearStored();
     _status_reported = false;
@@ -935,7 +928,7 @@ m5::stl::expected<size_t, error_t> BytecodeRunner::run(data::Source& script)
     return runLoop(script);
 }
 
-m5::stl::expected<size_t, error_t> BytecodeRunner::runEvent(data::ConstDataSpan script)
+result_t<size_t> BytecodeRunner::runEvent(data::ConstDataSpan script)
 {
     // Event scripts execute WITHOUT touching the request state: no slot
     // clear, no report reset, and store/report instructions inside the
@@ -949,7 +942,7 @@ m5::stl::expected<size_t, error_t> BytecodeRunner::runEvent(data::ConstDataSpan 
     return r;
 }
 
-m5::stl::expected<size_t, error_t> BytecodeRunner::runLoop(data::Source& script)
+result_t<size_t> BytecodeRunner::runLoop(data::Source& script)
 {
     _last_offset     = 0;
     _unknown_skipped = 0;
@@ -1021,7 +1014,7 @@ m5::stl::expected<size_t, error_t> BytecodeRunner::runLoop(data::Source& script)
     return offset;
 }
 
-m5::stl::expected<void, error_t> BytecodeRunner::dispatch(uint8_t opcode, data::ConstDataSpan payload)
+result_t<void> BytecodeRunner::dispatch(uint8_t opcode, data::ConstDataSpan payload)
 {
     // Receive-only runners (the host session's) accept only the
     // receive-side opcodes: a peer's script fills data and reports
@@ -1082,7 +1075,7 @@ m5::stl::expected<void, error_t> BytecodeRunner::dispatch(uint8_t opcode, data::
     }
 }
 
-m5::stl::expected<void, error_t> BytecodeRunner::opDelay(data::ConstDataSpan payload)
+result_t<void> BytecodeRunner::opDelay(data::ConstDataSpan payload)
 {
     FieldReader r{payload};
     uint32_t ms = 0;
@@ -1097,7 +1090,7 @@ m5::stl::expected<void, error_t> BytecodeRunner::opDelay(data::ConstDataSpan pay
     return {};
 }
 
-m5::stl::expected<void, error_t> BytecodeRunner::opBusConfigure(data::ConstDataSpan payload)
+result_t<void> BytecodeRunner::opBusConfigure(data::ConstDataSpan payload)
 {
     FieldReader r{payload};
     uint8_t kind = 0, bus_id = 0;
@@ -1147,7 +1140,7 @@ m5::stl::expected<void, error_t> BytecodeRunner::opBusConfigure(data::ConstDataS
     }
 }
 
-m5::stl::expected<void, error_t> BytecodeRunner::opBusTransfer(data::ConstDataSpan payload)
+result_t<void> BytecodeRunner::opBusTransfer(data::ConstDataSpan payload)
 {
     FieldReader r{payload};
     uint8_t kind = 0, bus_id = 0, store_id = 0;
@@ -1255,7 +1248,7 @@ m5::stl::expected<void, error_t> BytecodeRunner::opBusTransfer(data::ConstDataSp
     }
 }
 
-m5::stl::expected<void, error_t> BytecodeRunner::opGpio(uint8_t opcode, data::ConstDataSpan payload)
+result_t<void> BytecodeRunner::opGpio(uint8_t opcode, data::ConstDataSpan payload)
 {
     if (_gpio_group == nullptr) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -1315,7 +1308,7 @@ m5::stl::expected<void, error_t> BytecodeRunner::opGpio(uint8_t opcode, data::Co
     return {};
 }
 
-m5::stl::expected<void, error_t> BytecodeRunner::opStoreData(data::ConstDataSpan payload)
+result_t<void> BytecodeRunner::opStoreData(data::ConstDataSpan payload)
 {
     if (_event_mode) {
         return {};  // events must not clobber request slots (S16 D8)
@@ -1336,7 +1329,7 @@ m5::stl::expected<void, error_t> BytecodeRunner::opStoreData(data::ConstDataSpan
     return {};
 }
 
-m5::stl::expected<void, error_t> BytecodeRunner::opReport(uint8_t opcode, data::ConstDataSpan payload)
+result_t<void> BytecodeRunner::opReport(uint8_t opcode, data::ConstDataSpan payload)
 {
     if (_event_mode) {
         return {};  // events must not clobber the report state (S16 D8)
@@ -1359,7 +1352,7 @@ m5::stl::expected<void, error_t> BytecodeRunner::opReport(uint8_t opcode, data::
     return {};
 }
 
-m5::stl::expected<void, error_t> BytecodeRunner::opGpioSubscribe(uint8_t opcode, data::ConstDataSpan payload)
+result_t<void> BytecodeRunner::opGpioSubscribe(uint8_t opcode, data::ConstDataSpan payload)
 {
     if ((payload.size % 2) != 0) {
         return m5::stl::make_unexpected(error_t::PROTOCOL_ERROR);
@@ -1372,21 +1365,26 @@ m5::stl::expected<void, error_t> BytecodeRunner::opGpioSubscribe(uint8_t opcode,
         // Empty payload: unsubscribe all (pins=nullptr, count=0)
         return _gpio_subscribe_fn(_gpio_subscribe_ctx, subscribe, nullptr, 0);
     }
-    // Call handler once per pin
-    const size_t count = payload.size / 2;
-    for (size_t i = 0; i < count; ++i) {
-        const uint16_t raw             = static_cast<uint16_t>(static_cast<uint16_t>(payload.data[i * 2]) |
-                                                               (static_cast<uint16_t>(payload.data[i * 2 + 1]) << 8));
-        const types::gpio_number_t pin = static_cast<types::gpio_number_t>(raw);
-        auto r                         = _gpio_subscribe_fn(_gpio_subscribe_ctx, subscribe, &pin, 1);
-        if (!r.has_value()) {
-            return r;
-        }
+    // Decode the whole pin list and hand it to the handler in ONE call,
+    // so the handler can apply all-or-nothing semantics (a per-pin loop
+    // here would leave a prefix subscribed when a later pin fails). One
+    // remote message bounds the payload (BODY <= 238 bytes), so the
+    // stack list stays small; larger hand-built scripts are rejected.
+    const size_t count         = payload.size / 2;
+    constexpr size_t kMaxBatch = 120;
+    if (count > kMaxBatch) {
+        return m5::stl::make_unexpected(error_t::OUT_OF_RESOURCE);
     }
-    return {};
+    types::gpio_number_t pins[kMaxBatch];
+    for (size_t i = 0; i < count; ++i) {
+        const uint16_t raw = static_cast<uint16_t>(static_cast<uint16_t>(payload.data[i * 2]) |
+                                                   (static_cast<uint16_t>(payload.data[i * 2 + 1]) << 8));
+        pins[i]            = static_cast<types::gpio_number_t>(raw);
+    }
+    return _gpio_subscribe_fn(_gpio_subscribe_ctx, subscribe, pins, count);
 }
 
-m5::stl::expected<void, error_t> BytecodeRunner::opEvtGpioState(data::ConstDataSpan payload)
+result_t<void> BytecodeRunner::opEvtGpioState(data::ConstDataSpan payload)
 {
     if ((payload.size % 3) != 0) {
         return m5::stl::make_unexpected(error_t::PROTOCOL_ERROR);
@@ -1406,7 +1404,7 @@ m5::stl::expected<void, error_t> BytecodeRunner::opEvtGpioState(data::ConstDataS
     return {};
 }
 
-m5::stl::expected<void, error_t> BytecodeRunner::opBusWriteStream(data::ConstDataSpan payload)
+result_t<void> BytecodeRunner::opBusWriteStream(data::ConstDataSpan payload)
 {
     FieldReader r{payload};
     uint8_t kind = 0, bus_id = 0;
@@ -1441,7 +1439,7 @@ m5::stl::expected<void, error_t> BytecodeRunner::opBusWriteStream(data::ConstDat
     return {};
 }
 
-m5::stl::expected<void, error_t> BytecodeRunner::opBusStreamStatus(data::ConstDataSpan payload)
+result_t<void> BytecodeRunner::opBusStreamStatus(data::ConstDataSpan payload)
 {
     FieldReader r{payload};
     uint8_t kind = 0, bus_id = 0, store_id = 0;
@@ -1470,7 +1468,7 @@ m5::stl::expected<void, error_t> BytecodeRunner::opBusStreamStatus(data::ConstDa
     return {};
 }
 
-m5::stl::expected<void, error_t> BytecodeRunner::opEvtStreamCredit(data::ConstDataSpan payload)
+result_t<void> BytecodeRunner::opEvtStreamCredit(data::ConstDataSpan payload)
 {
     FieldReader r{payload};
     uint8_t kind = 0, bus_id = 0;
@@ -1486,7 +1484,7 @@ m5::stl::expected<void, error_t> BytecodeRunner::opEvtStreamCredit(data::ConstDa
     return {};
 }
 
-m5::stl::expected<void, error_t> BytecodeRunner::writeResponse(data::Sink& out, error_t status)
+result_t<void> BytecodeRunner::writeResponse(data::Sink& out, error_t status)
 {
     BytecodeEncoder encoder{out};
     for (const auto& slot : _slots) {

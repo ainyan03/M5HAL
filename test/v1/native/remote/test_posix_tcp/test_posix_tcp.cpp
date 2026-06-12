@@ -22,6 +22,8 @@
 #include <cstring>
 #include <thread>
 
+using ::m5::hal::v1::result_t;
+
 namespace {
 
 namespace bus     = ::m5::hal::v1::bus;
@@ -174,13 +176,12 @@ struct StubI2CBus : public i2c::I2CBus {
     uint16_t last_addr    = 0;
     error::error_t result = error::error_t::OK;
 
-    m5::stl::expected<void, error::error_t> init(const i2c::I2CBusConfig&)
+    result_t<void> init(const i2c::I2CBusConfig&)
     {
         return {};
     }
-    m5::stl::expected<size_t, error::error_t> transfer(bus::Accessor*, const i2c::I2CMasterAccessConfig& cfg,
-                                                       const i2c::TransferDesc& desc, data::Source* tx,
-                                                       data::Sink* rx) override
+    result_t<size_t> transfer(bus::Accessor*, const i2c::I2CMasterAccessConfig& cfg, const i2c::TransferDesc& desc,
+                              data::Source* tx, data::Sink* rx) override
     {
         last_addr = cfg.i2c_addr;
         if (error::isError(result)) {
@@ -326,15 +327,15 @@ TEST(PosixTCP, ConnectRemoteTcpRejectsMalformedEndpoints)
 {
     tcp::TcpRemoteEndpoint ep;
     const char* malformed[] = {
-        nullptr,         // no endpoint at all
-        "localhost",     // no port
-        "localhost:",    // empty port
-        ":5555",         // empty host
-        "host:0",        // port 0 is not connectable
-        "host:65536",    // port out of range
-        "host:12ab",     // trailing junk after the port
-        "[::1]",         // bracket form without a port
-        "[::1]5555",     // bracket form missing the separator
+        nullptr,       // no endpoint at all
+        "localhost",   // no port
+        "localhost:",  // empty port
+        ":5555",       // empty host
+        "host:0",      // port 0 is not connectable
+        "host:65536",  // port out of range
+        "host:12ab",   // trailing junk after the port
+        "[::1]",       // bracket form without a port
+        "[::1]5555",   // bracket form missing the separator
     };
     for (const char* endpoint : malformed) {
         auto r = tcp::connectRemoteTcp(ep, endpoint);

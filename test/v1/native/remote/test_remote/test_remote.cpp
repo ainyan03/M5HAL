@@ -11,6 +11,8 @@
 #include <cstring>
 #include <vector>
 
+using ::m5::hal::v1::result_t;
+
 namespace {
 
 namespace bus      = ::m5::hal::v1::bus;
@@ -33,11 +35,11 @@ public:
     explicit VecSink(std::vector<uint8_t>& out) : _out{&out}
     {
     }
-    m5::stl::expected<data::DataSpan, error_t> reserve(size_t max_len) override
+    result_t<data::DataSpan> reserve(size_t max_len) override
     {
         return data::DataSpan{_stage, max_len < sizeof(_stage) ? max_len : sizeof(_stage)};
     }
-    m5::stl::expected<void, error_t> commit(size_t N) override
+    result_t<void> commit(size_t N) override
     {
         _out->insert(_out->end(), _stage, _stage + N);
         return {};
@@ -69,7 +71,7 @@ public:
         _pump_ctx = ctx;
     }
 
-    m5::stl::expected<data::ConstDataSpan, error_t> peek(size_t max_len) override
+    result_t<data::ConstDataSpan> peek(size_t max_len) override
     {
         if (_pump != nullptr) {
             _pump(_pump_ctx);
@@ -80,7 +82,7 @@ public:
         }
         return data::ConstDataSpan{_in->data() + _pos, avail < max_len ? avail : max_len};
     }
-    m5::stl::expected<void, error_t> advance(size_t N) override
+    result_t<void> advance(size_t N) override
     {
         const size_t avail = _in->size() - _pos;
         _pos += N < avail ? N : avail;
@@ -111,15 +113,14 @@ struct StubI2CBus : public i2c::I2CBus {
     uint8_t rx_pattern    = 0xA0;         // rx byte i = rx_pattern + i
     error_t result        = error_t::OK;  // forced outcome
 
-    m5::stl::expected<void, error_t> init(const i2c::I2CBusConfig& config)
+    result_t<void> init(const i2c::I2CBusConfig& config)
     {
         _config = config;
         return {};
     }
 
-    m5::stl::expected<size_t, error_t> transfer(bus::Accessor*, const i2c::I2CMasterAccessConfig& cfg,
-                                                const i2c::TransferDesc& desc, data::Source* tx,
-                                                data::Sink* rx) override
+    result_t<size_t> transfer(bus::Accessor*, const i2c::I2CMasterAccessConfig& cfg, const i2c::TransferDesc& desc,
+                              data::Source* tx, data::Sink* rx) override
     {
         ++transfer_count;
         last_cfg        = cfg;
@@ -466,14 +467,13 @@ struct StubSPIBus : public spi::SPIBus {
     std::vector<uint8_t> last_tx;
     uint8_t rx_pattern = 0xB0;
 
-    m5::stl::expected<void, error_t> init(const spi::SPIBusConfig& config)
+    result_t<void> init(const spi::SPIBusConfig& config)
     {
         _config = config;
         return {};
     }
-    m5::stl::expected<size_t, error_t> transfer(bus::Accessor*, const spi::SPIMasterAccessConfig& cfg,
-                                                const spi::TransferDesc& desc, data::Source* tx,
-                                                data::Sink* rx) override
+    result_t<size_t> transfer(bus::Accessor*, const spi::SPIMasterAccessConfig& cfg, const spi::TransferDesc& desc,
+                              data::Source* tx, data::Sink* rx) override
     {
         last_cfg  = cfg;
         last_desc = desc;
@@ -510,13 +510,12 @@ struct StubUARTBus : public uart_::UARTBus {
     std::vector<uint8_t> rx_data;  // bytes "already received" remotely
     uart_::UARTAccessConfig last_cfg{};
 
-    m5::stl::expected<void, error_t> init(const uart_::UARTBusConfig& config)
+    result_t<void> init(const uart_::UARTBusConfig& config)
     {
         _config = config;
         return {};
     }
-    m5::stl::expected<size_t, error_t> write(bus::Accessor*, const uart_::UARTAccessConfig& cfg, data::Source* tx,
-                                             size_t len) override
+    result_t<size_t> write(bus::Accessor*, const uart_::UARTAccessConfig& cfg, data::Source* tx, size_t len) override
     {
         last_cfg     = cfg;
         size_t total = 0;
@@ -531,8 +530,7 @@ struct StubUARTBus : public uart_::UARTBus {
         }
         return total;
     }
-    m5::stl::expected<size_t, error_t> read(bus::Accessor*, const uart_::UARTAccessConfig& cfg, data::Sink* rx,
-                                            size_t len) override
+    result_t<size_t> read(bus::Accessor*, const uart_::UARTAccessConfig& cfg, data::Sink* rx, size_t len) override
     {
         last_cfg = cfg;
         if (rx == nullptr) {
@@ -548,7 +546,7 @@ struct StubUARTBus : public uart_::UARTBus {
         (void)rx->commit(n);
         return n;  // short read when fewer bytes were "available"
     }
-    m5::stl::expected<size_t, error_t> readableBytes(bus::Accessor*, const uart_::UARTAccessConfig&) override
+    result_t<size_t> readableBytes(bus::Accessor*, const uart_::UARTAccessConfig&) override
     {
         return rx_data.size();
     }
@@ -799,7 +797,7 @@ public:
     explicit VecStreamWriter(std::vector<uint8_t>& out) : _out{&out}
     {
     }
-    m5::stl::expected<size_t, error_t> write(data::ConstDataSpan src) override
+    result_t<size_t> write(data::ConstDataSpan src) override
     {
         _out->insert(_out->end(), src.data, src.data + src.size);
         return src.size;
@@ -821,7 +819,7 @@ public:
         _pump     = fn;
         _pump_ctx = ctx;
     }
-    m5::stl::expected<size_t, error_t> read(data::DataSpan dst) override
+    result_t<size_t> read(data::DataSpan dst) override
     {
         if (_pump != nullptr) {
             _pump(_pump_ctx);
@@ -832,7 +830,7 @@ public:
         _pos += take;
         return take;  // 0 = nothing arrived in time (StreamReader contract)
     }
-    m5::stl::expected<size_t, error_t> readableBytes(void) override
+    result_t<size_t> readableBytes(void) override
     {
         return _in->size() - _pos;
     }
@@ -1098,6 +1096,85 @@ TEST_F(StageBLoopback, SubscriptionTableFull)
     EXPECT_EQ(r.error(), error_t::OUT_OF_RESOURCE);
 }
 
+TEST_F(StageBLoopback, BatchSubscribeIsAllOrNothing)
+{
+    types::gpio_number_t captured_pin = -1;
+    session.runner().setGpioEventHandler(
+        [](void* c, types::gpio_number_t pin, bool) { *static_cast<types::gpio_number_t*>(c) = pin; }, &captured_pin);
+
+    remote::RemoteGPIO remote_gpio{session, RecordingGPIO::kPins, 0};
+    gpio::GPIOGroup host_group;
+    ASSERT_TRUE(host_group.addGPIO(&remote_gpio, 3).has_value());
+
+    // Pre-existing subscription that a failed batch must not disturb.
+    rec_gpio.read_value[13] = false;
+    ASSERT_TRUE(remote_gpio.subscribe(13).has_value());
+
+    // Batch [valid 5, invalid 200]: the whole instruction must fail...
+    uint8_t script_buf[32];
+    data::MemorySink sink{data::DataSpan{script_buf, sizeof(script_buf)}};
+    bytecode::BytecodeEncoder enc{sink};
+    const types::gpio_number_t pins[2] = {types::makeGpioNumber(0, 5), types::makeGpioNumber(0, 200)};
+    ASSERT_TRUE(enc.gpioSubscribe(pins, 2).has_value());
+    ASSERT_TRUE(enc.end().has_value());
+    auto rq = session.request(data::ConstDataSpan{script_buf, sink.written()});
+    ASSERT_FALSE(rq.has_value());
+    EXPECT_EQ(rq.error(), error_t::INVALID_ARGUMENT);
+
+    // ...without subscribing the leading valid pin (no event on change).
+    rec_gpio.read_value[5] = true;
+    auto p                 = session.poll();
+    ASSERT_TRUE(p.has_value());
+    EXPECT_EQ(p.value(), 0u);
+    EXPECT_EQ(captured_pin, static_cast<types::gpio_number_t>(-1));
+
+    // The pre-existing subscription still works.
+    rec_gpio.read_value[13] = true;
+    p                       = session.poll();
+    ASSERT_TRUE(p.has_value());
+    EXPECT_GE(p.value(), 1u);
+    EXPECT_EQ(captured_pin, types::makeGpioNumber(0, 13));
+}
+
+TEST_F(StageBLoopback, BatchSubscribeCapacityCheckedUpfrontWithDedup)
+{
+    remote::RemoteGPIO remote_gpio{session, RecordingGPIO::kPins, 0};
+    gpio::GPIOGroup host_group;
+    ASSERT_TRUE(host_group.addGPIO(&remote_gpio, 3).has_value());
+
+    // Fill all but one slot (pins 0..6).
+    for (uint8_t p = 0; p + 1 < remote::Server::kMaxSubscriptions; ++p) {
+        ASSERT_TRUE(remote_gpio.subscribe(p).has_value()) << "pin " << (int)p;
+    }
+
+    // Batch of 2 NEW pins with 1 free slot: must fail atomically (the
+    // first pin would fit, but no prefix may be applied).
+    uint8_t script_buf[32];
+    {
+        data::MemorySink sink{data::DataSpan{script_buf, sizeof(script_buf)}};
+        bytecode::BytecodeEncoder enc{sink};
+        const types::gpio_number_t pins[2] = {types::makeGpioNumber(0, 9), types::makeGpioNumber(0, 10)};
+        ASSERT_TRUE(enc.gpioSubscribe(pins, 2).has_value());
+        ASSERT_TRUE(enc.end().has_value());
+        auto rq = session.request(data::ConstDataSpan{script_buf, sink.written()});
+        ASSERT_FALSE(rq.has_value());
+        EXPECT_EQ(rq.error(), error_t::OUT_OF_RESOURCE);
+    }
+
+    // Batch [9, 9, already-subscribed 0] nets ONE new pin: the capacity
+    // pre-check must count duplicates only once, so this fits the free
+    // slot (which also proves the failed batch above consumed nothing).
+    {
+        data::MemorySink sink{data::DataSpan{script_buf, sizeof(script_buf)}};
+        bytecode::BytecodeEncoder enc{sink};
+        const types::gpio_number_t pins[3] = {types::makeGpioNumber(0, 9), types::makeGpioNumber(0, 9),
+                                              types::makeGpioNumber(0, 0)};
+        ASSERT_TRUE(enc.gpioSubscribe(pins, 3).has_value());
+        ASSERT_TRUE(enc.end().has_value());
+        ASSERT_TRUE(session.request(data::ConstDataSpan{script_buf, sink.written()}).has_value());
+    }
+}
+
 TEST_F(StageBLoopback, HelloClearsSubscriptions)
 {
     types::gpio_number_t captured_pin = -1;
@@ -1178,13 +1255,12 @@ struct StubI2SBus : public i2s::I2SBus {
         return capacity - in_buffer;
     }
 
-    m5::stl::expected<void, error_t> init(const i2s::I2SBusConfig& config)
+    result_t<void> init(const i2s::I2SBusConfig& config)
     {
         _config = config;
         return {};
     }
-    m5::stl::expected<size_t, error_t> write(bus::Accessor*, const i2s::I2SAccessConfig& cfg, data::Source* tx,
-                                             size_t len) override
+    result_t<size_t> write(bus::Accessor*, const i2s::I2SAccessConfig& cfg, data::Source* tx, size_t len) override
     {
         ++write_calls;
         last_cfg = cfg;
@@ -1205,7 +1281,7 @@ struct StubI2SBus : public i2s::I2SBus {
         submitted += accepted;
         return static_cast<size_t>(accepted);
     }
-    m5::stl::expected<size_t, error_t> writableBytes(bus::Accessor*, const i2s::I2SAccessConfig&) override
+    result_t<size_t> writableBytes(bus::Accessor*, const i2s::I2SAccessConfig&) override
     {
         return static_cast<size_t>(freeBytes());
     }

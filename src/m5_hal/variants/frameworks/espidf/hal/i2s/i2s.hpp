@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_I2S_I2S_HPP
 #define M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_I2S_I2S_HPP
 
@@ -35,21 +36,19 @@ public:
     // Typed init (S17 E1). BusConfig is an alias of the abstract
     // I2SBusConfig here; the signature still names the alias so every
     // variant reads the same.
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> init(const BusConfig& config);
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> release(void) override;
+    ::m5::hal::v1::result_t<void> init(const BusConfig& config);
+    ::m5::hal::v1::result_t<void> release(void) override;
 
-    m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> write(::m5::hal::v1::bus::Accessor* owner,
-                                                                   const ::m5::hal::v1::i2s::I2SAccessConfig& cfg,
-                                                                   ::m5::hal::v1::data::Source* tx,
-                                                                   size_t len) override;
+    ::m5::hal::v1::result_t<size_t> write(::m5::hal::v1::bus::Accessor* owner,
+                                          const ::m5::hal::v1::i2s::I2SAccessConfig& cfg,
+                                          ::m5::hal::v1::data::Source* tx, size_t len) override;
 
-    m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> writableBytes(
-        ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::i2s::I2SAccessConfig& cfg) override;
+    ::m5::hal::v1::result_t<size_t> writableBytes(::m5::hal::v1::bus::Accessor* owner,
+                                                  const ::m5::hal::v1::i2s::I2SAccessConfig& cfg) override;
 
 private:
     // Lazily open (or reconfigure) the I2S channel to match cfg.
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> ensureChannel(
-        const ::m5::hal::v1::i2s::I2SAccessConfig& cfg);
+    ::m5::hal::v1::result_t<void> ensureChannel(const ::m5::hal::v1::i2s::I2SAccessConfig& cfg);
 
     // Close and delete the channel if it exists.
     void destroyChannel(void);

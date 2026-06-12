@@ -3,8 +3,8 @@
 //
 // Re-includable. M5HAL_v1.hpp re-includes this after every _offer.hpp
 // during variant scanning: consumes the M5HAL_VARIANT_CURRENT_*_ macros,
-// emits namespace aliases for offered HALs, then undefs every consumed
-// macro so the next pass starts clean.
+// emits namespace aliases for offered HALs (via offer_kind.inl), then
+// undefs every consumed macro so the next pass starts clean.
 //
 // Inputs (from the just-included _offer.hpp):
 //   M5HAL_VARIANT_CURRENT_ALIAS_   — variant short name used as alias namespace (e.g. arduino)
@@ -14,22 +14,23 @@
 // Optional input (set by the M5HAL_v1.hpp scan loop, not the _offer.hpp):
 //   M5HAL_VARIANT_PLATFORM_          — 1 only while scanning a platform variant
 //
-// Aliases generated when M5HAL_VARIANT_CURRENT_HAS_HAL_GPIO_ is set:
-//   m5::hal::v1::gpio::variant::<ALIAS>   — always created
-//   m5::hal::v1::gpio::variant::platform  — only while scanning a platform variant, first hit only
-//   m5::hal::v1::gpio                     — flat injection of the first hit across all variants
-//                                            (relies on
-//                                            m5::hal::v1::gpio not containing a class
-//                                            named identically to one in the variant)
+// Aliases generated per offered kind (emitted by offer_kind.inl):
+//   m5::hal::v1::<kind>::variant::<ALIAS>   — always created
+//   m5::hal::v1::<kind>::variant::platform  — only while scanning a platform variant, first hit only
+//   m5::hal::v1::<kind>                     — flat injection of the first hit across all variants
 //
 // The first hit also burns the winner's identity into
 // M5HAL_V1_SELECTED_VARIANT_<KIND> — a plain integer macro usable in
 // both #if and static_assert (values: M5HAL_V1_VARIANT_ID_*,
-// variants/ids.hpp; M5HAL_v1.hpp defaults unoffered kinds to NONE).
-// #define does not expand its replacement list, so the value cannot be
-// forwarded from the (later-undeffed) M5HAL_VARIANT_CURRENT_ID_; the
-// explicit #elif chain per variant id is the only way to fix the value
-// at first-hit time.
+// variants/ids.hpp; M5HAL_v1.hpp defaults unoffered kinds to NONE) —
+// and that marker doubles as the kind's first-hit guard. #define does
+// not expand its replacement list, so the value cannot be forwarded
+// from the (later-undeffed) M5HAL_VARIANT_CURRENT_ID_; the explicit
+// #elif chain per variant id is the only way to fix the value at
+// first-hit time, and it cannot be shared across kinds because the
+// marker NAME is kind-specific ([026]). When adding a VARIANT, extend
+// every chain (the #else makes a miss a compile error); when adding a
+// KIND, copy one dispatch block and adjust the kind tokens.
 //
 // Note: v0/v1 coexistence — target / source namespaces both pass through
 // the explicit ::v1:: sub namespace. The shared bus base classes live in
@@ -42,23 +43,13 @@
 // ---------------------------------------------------------------------
 #if defined(M5HAL_VARIANT_CURRENT_HAS_HAL_GPIO_) && M5HAL_VARIANT_CURRENT_HAS_HAL_GPIO_
 
-namespace m5 { namespace hal { namespace v1 { namespace gpio { namespace variant {
-namespace M5HAL_VARIANT_CURRENT_ALIAS_ {
-    using namespace ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v1::gpio;
-}
-} } } } }  // namespace m5::hal::v1::gpio::variant
-
+#  define M5HAL_OFFER_KIND_NS_ gpio
 #  if defined(M5HAL_VARIANT_PLATFORM_) && !defined(M5HAL_VARIANT_PLATFORM_GPIO_BOUND_)
 #    define M5HAL_VARIANT_PLATFORM_GPIO_BOUND_ 1
-namespace m5 { namespace hal { namespace v1 { namespace gpio { namespace variant {
-namespace platform {
-    using namespace ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v1::gpio;
-}
-} } } } }
+#    define M5HAL_OFFER_KIND_EMIT_PLATFORM_ 1
 #  endif
-
-#  ifndef M5HAL_VARIANT_OFFER_GPIO_BOUND_
-#    define M5HAL_VARIANT_OFFER_GPIO_BOUND_ 1
+#  ifndef M5HAL_V1_SELECTED_VARIANT_GPIO
+#    define M5HAL_OFFER_KIND_EMIT_FLAT_ 1
 #    if M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V1_VARIANT_ID_PLATFORM_ESP32
 #      define M5HAL_V1_SELECTED_VARIANT_GPIO M5HAL_V1_VARIANT_ID_PLATFORM_ESP32
 #    elif M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V1_VARIANT_ID_FRAMEWORK_ARDUINO
@@ -71,11 +62,11 @@ namespace platform {
 #      define M5HAL_V1_SELECTED_VARIANT_GPIO M5HAL_V1_VARIANT_ID_FRAMEWORK_SOFTWARE
 #    elif M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V1_VARIANT_ID_FRAMEWORK_STUB
 #      define M5HAL_V1_SELECTED_VARIANT_GPIO M5HAL_V1_VARIANT_ID_FRAMEWORK_STUB
+#    else
+#      error "offer_all.inl: M5HAL_VARIANT_CURRENT_ID_ missing from the gpio selected-marker chain"
 #    endif
-namespace m5 { namespace hal { namespace v1 { namespace gpio {
-    using namespace ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v1::gpio;
-} } } }
 #  endif
+#  include "./offer_kind.inl"
 
 #endif  // M5HAL_VARIANT_CURRENT_HAS_HAL_GPIO_
 
@@ -91,23 +82,13 @@ namespace m5 { namespace hal { namespace v1 { namespace gpio {
 // ---------------------------------------------------------------------
 #if defined(M5HAL_VARIANT_CURRENT_HAS_HAL_I2C_) && M5HAL_VARIANT_CURRENT_HAS_HAL_I2C_
 
-namespace m5 { namespace hal { namespace v1 { namespace i2c { namespace variant {
-namespace M5HAL_VARIANT_CURRENT_ALIAS_ {
-    using namespace ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v1::i2c;
-}
-} } } } }  // namespace m5::hal::v1::i2c::variant
-
+#  define M5HAL_OFFER_KIND_NS_ i2c
 #  if defined(M5HAL_VARIANT_PLATFORM_) && !defined(M5HAL_VARIANT_PLATFORM_I2C_BOUND_)
 #    define M5HAL_VARIANT_PLATFORM_I2C_BOUND_ 1
-namespace m5 { namespace hal { namespace v1 { namespace i2c { namespace variant {
-namespace platform {
-    using namespace ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v1::i2c;
-}
-} } } } }
+#    define M5HAL_OFFER_KIND_EMIT_PLATFORM_ 1
 #  endif
-
-#  ifndef M5HAL_VARIANT_OFFER_I2C_BOUND_
-#    define M5HAL_VARIANT_OFFER_I2C_BOUND_ 1
+#  ifndef M5HAL_V1_SELECTED_VARIANT_I2C
+#    define M5HAL_OFFER_KIND_EMIT_FLAT_ 1
 #    if M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V1_VARIANT_ID_PLATFORM_ESP32
 #      define M5HAL_V1_SELECTED_VARIANT_I2C M5HAL_V1_VARIANT_ID_PLATFORM_ESP32
 #    elif M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V1_VARIANT_ID_FRAMEWORK_ARDUINO
@@ -120,11 +101,11 @@ namespace platform {
 #      define M5HAL_V1_SELECTED_VARIANT_I2C M5HAL_V1_VARIANT_ID_FRAMEWORK_SOFTWARE
 #    elif M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V1_VARIANT_ID_FRAMEWORK_STUB
 #      define M5HAL_V1_SELECTED_VARIANT_I2C M5HAL_V1_VARIANT_ID_FRAMEWORK_STUB
+#    else
+#      error "offer_all.inl: M5HAL_VARIANT_CURRENT_ID_ missing from the i2c selected-marker chain"
 #    endif
-namespace m5 { namespace hal { namespace v1 { namespace i2c {
-    using namespace ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v1::i2c;
-} } } }
 #  endif
+#  include "./offer_kind.inl"
 
 #endif  // M5HAL_VARIANT_CURRENT_HAS_HAL_I2C_
 
@@ -133,23 +114,13 @@ namespace m5 { namespace hal { namespace v1 { namespace i2c {
 // ---------------------------------------------------------------------
 #if defined(M5HAL_VARIANT_CURRENT_HAS_HAL_SPI_) && M5HAL_VARIANT_CURRENT_HAS_HAL_SPI_
 
-namespace m5 { namespace hal { namespace v1 { namespace spi { namespace variant {
-namespace M5HAL_VARIANT_CURRENT_ALIAS_ {
-    using namespace ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v1::spi;
-}
-} } } } }  // namespace m5::hal::v1::spi::variant
-
+#  define M5HAL_OFFER_KIND_NS_ spi
 #  if defined(M5HAL_VARIANT_PLATFORM_) && !defined(M5HAL_VARIANT_PLATFORM_SPI_BOUND_)
 #    define M5HAL_VARIANT_PLATFORM_SPI_BOUND_ 1
-namespace m5 { namespace hal { namespace v1 { namespace spi { namespace variant {
-namespace platform {
-    using namespace ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v1::spi;
-}
-} } } } }
+#    define M5HAL_OFFER_KIND_EMIT_PLATFORM_ 1
 #  endif
-
-#  ifndef M5HAL_VARIANT_OFFER_SPI_BOUND_
-#    define M5HAL_VARIANT_OFFER_SPI_BOUND_ 1
+#  ifndef M5HAL_V1_SELECTED_VARIANT_SPI
+#    define M5HAL_OFFER_KIND_EMIT_FLAT_ 1
 #    if M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V1_VARIANT_ID_PLATFORM_ESP32
 #      define M5HAL_V1_SELECTED_VARIANT_SPI M5HAL_V1_VARIANT_ID_PLATFORM_ESP32
 #    elif M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V1_VARIANT_ID_FRAMEWORK_ARDUINO
@@ -162,11 +133,11 @@ namespace platform {
 #      define M5HAL_V1_SELECTED_VARIANT_SPI M5HAL_V1_VARIANT_ID_FRAMEWORK_SOFTWARE
 #    elif M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V1_VARIANT_ID_FRAMEWORK_STUB
 #      define M5HAL_V1_SELECTED_VARIANT_SPI M5HAL_V1_VARIANT_ID_FRAMEWORK_STUB
+#    else
+#      error "offer_all.inl: M5HAL_VARIANT_CURRENT_ID_ missing from the spi selected-marker chain"
 #    endif
-namespace m5 { namespace hal { namespace v1 { namespace spi {
-    using namespace ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v1::spi;
-} } } }
 #  endif
+#  include "./offer_kind.inl"
 
 #endif  // M5HAL_VARIANT_CURRENT_HAS_HAL_SPI_
 
@@ -175,23 +146,13 @@ namespace m5 { namespace hal { namespace v1 { namespace spi {
 // ---------------------------------------------------------------------
 #if defined(M5HAL_VARIANT_CURRENT_HAS_HAL_I2S_) && M5HAL_VARIANT_CURRENT_HAS_HAL_I2S_
 
-namespace m5 { namespace hal { namespace v1 { namespace i2s { namespace variant {
-namespace M5HAL_VARIANT_CURRENT_ALIAS_ {
-    using namespace ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v1::i2s;
-}
-} } } } }  // namespace m5::hal::v1::i2s::variant
-
+#  define M5HAL_OFFER_KIND_NS_ i2s
 #  if defined(M5HAL_VARIANT_PLATFORM_) && !defined(M5HAL_VARIANT_PLATFORM_I2S_BOUND_)
 #    define M5HAL_VARIANT_PLATFORM_I2S_BOUND_ 1
-namespace m5 { namespace hal { namespace v1 { namespace i2s { namespace variant {
-namespace platform {
-    using namespace ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v1::i2s;
-}
-} } } } }
+#    define M5HAL_OFFER_KIND_EMIT_PLATFORM_ 1
 #  endif
-
-#  ifndef M5HAL_VARIANT_OFFER_I2S_BOUND_
-#    define M5HAL_VARIANT_OFFER_I2S_BOUND_ 1
+#  ifndef M5HAL_V1_SELECTED_VARIANT_I2S
+#    define M5HAL_OFFER_KIND_EMIT_FLAT_ 1
 #    if M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V1_VARIANT_ID_PLATFORM_ESP32
 #      define M5HAL_V1_SELECTED_VARIANT_I2S M5HAL_V1_VARIANT_ID_PLATFORM_ESP32
 #    elif M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V1_VARIANT_ID_FRAMEWORK_ARDUINO
@@ -204,11 +165,11 @@ namespace platform {
 #      define M5HAL_V1_SELECTED_VARIANT_I2S M5HAL_V1_VARIANT_ID_FRAMEWORK_SOFTWARE
 #    elif M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V1_VARIANT_ID_FRAMEWORK_STUB
 #      define M5HAL_V1_SELECTED_VARIANT_I2S M5HAL_V1_VARIANT_ID_FRAMEWORK_STUB
+#    else
+#      error "offer_all.inl: M5HAL_VARIANT_CURRENT_ID_ missing from the i2s selected-marker chain"
 #    endif
-namespace m5 { namespace hal { namespace v1 { namespace i2s {
-    using namespace ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v1::i2s;
-} } } }
 #  endif
+#  include "./offer_kind.inl"
 
 #endif  // M5HAL_VARIANT_CURRENT_HAS_HAL_I2S_
 
@@ -217,23 +178,13 @@ namespace m5 { namespace hal { namespace v1 { namespace i2s {
 // ---------------------------------------------------------------------
 #if defined(M5HAL_VARIANT_CURRENT_HAS_HAL_UART_) && M5HAL_VARIANT_CURRENT_HAS_HAL_UART_
 
-namespace m5 { namespace hal { namespace v1 { namespace uart { namespace variant {
-namespace M5HAL_VARIANT_CURRENT_ALIAS_ {
-    using namespace ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v1::uart;
-}
-} } } } }  // namespace m5::hal::v1::uart::variant
-
+#  define M5HAL_OFFER_KIND_NS_ uart
 #  if defined(M5HAL_VARIANT_PLATFORM_) && !defined(M5HAL_VARIANT_PLATFORM_UART_BOUND_)
 #    define M5HAL_VARIANT_PLATFORM_UART_BOUND_ 1
-namespace m5 { namespace hal { namespace v1 { namespace uart { namespace variant {
-namespace platform {
-    using namespace ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v1::uart;
-}
-} } } } }
+#    define M5HAL_OFFER_KIND_EMIT_PLATFORM_ 1
 #  endif
-
-#  ifndef M5HAL_VARIANT_OFFER_UART_BOUND_
-#    define M5HAL_VARIANT_OFFER_UART_BOUND_ 1
+#  ifndef M5HAL_V1_SELECTED_VARIANT_UART
+#    define M5HAL_OFFER_KIND_EMIT_FLAT_ 1
 #    if M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V1_VARIANT_ID_PLATFORM_ESP32
 #      define M5HAL_V1_SELECTED_VARIANT_UART M5HAL_V1_VARIANT_ID_PLATFORM_ESP32
 #    elif M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V1_VARIANT_ID_FRAMEWORK_ARDUINO
@@ -246,11 +197,11 @@ namespace platform {
 #      define M5HAL_V1_SELECTED_VARIANT_UART M5HAL_V1_VARIANT_ID_FRAMEWORK_SOFTWARE
 #    elif M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V1_VARIANT_ID_FRAMEWORK_STUB
 #      define M5HAL_V1_SELECTED_VARIANT_UART M5HAL_V1_VARIANT_ID_FRAMEWORK_STUB
+#    else
+#      error "offer_all.inl: M5HAL_VARIANT_CURRENT_ID_ missing from the uart selected-marker chain"
 #    endif
-namespace m5 { namespace hal { namespace v1 { namespace uart {
-    using namespace ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v1::uart;
-} } } }
 #  endif
+#  include "./offer_kind.inl"
 
 #endif  // M5HAL_VARIANT_CURRENT_HAS_HAL_UART_
 

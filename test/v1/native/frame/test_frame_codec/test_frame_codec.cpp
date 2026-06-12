@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Native gtest for the frame codec (hal/v1/frame/frame.hpp).
 //
 // Mechanically verifies the wire codec against spec/design/frame.md:
@@ -14,6 +15,8 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+
+using ::m5::hal::v1::result_t;
 
 namespace {
 
@@ -37,7 +40,7 @@ public:
         _pending.insert(_pending.end(), bytes, bytes + len);
     }
 
-    m5::stl::expected<size_t, error_t> read(DataSpan dst) override
+    result_t<size_t> read(DataSpan dst) override
     {
         ++read_calls;
         const size_t n = std::min(dst.size, _pending.size());
@@ -45,7 +48,7 @@ public:
         _pending.erase(_pending.begin(), _pending.begin() + static_cast<ptrdiff_t>(n));
         return n;
     }
-    m5::stl::expected<size_t, error_t> readableBytes(void) override
+    result_t<size_t> readableBytes(void) override
     {
         return _pending.size();
     }
@@ -58,7 +61,7 @@ private:
 
 class FakeStreamWriter : public StreamWriter {
 public:
-    m5::stl::expected<size_t, error_t> write(ConstDataSpan src) override
+    result_t<size_t> write(ConstDataSpan src) override
     {
         const size_t n = std::min(src.size, accept_limit);
         written.insert(written.end(), src.data, src.data + n);
@@ -330,6 +333,35 @@ TEST(FrameReader, ExtractsSequentialFramesFromMemorySource)
     result = reader.next(view);
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), error_t::END_OF_STREAM);
+}
+
+TEST(FrameReader, TruncatedTailOnClosedSourceEndsInsteadOfLivelocking)
+{
+    std::array<uint8_t, 32> buf{};
+    const uint8_t payload[] = {0x10, 0x20, 0x30};
+    auto written            = frame::encodeData({buf.data(), buf.size()}, 7, {payload, sizeof(payload)});
+    ASSERT_TRUE(written.has_value());
+
+    // Cut the last byte off: the prefix announces more than the source
+    // can ever deliver. A MemorySource is closed (content fixed at
+    // construction), so the reader reports END_OF_STREAM instead of a
+    // need_more the caller would retry forever.
+    MemorySource source{ConstDataSpan{buf.data(), written.value() - 1}};
+    frame::FrameReader reader{source};
+    frame::View view;
+    auto result = reader.next(view);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), error_t::END_OF_STREAM);
+    // The partial tail stays unconsumed; eof() == false marks the
+    // mid-frame ending for callers that care.
+    EXPECT_FALSE(source.eof());
+
+    // A lone byte (shorter than the 2-byte prefix) ends the same way.
+    MemorySource lone{ConstDataSpan{buf.data(), 1}};
+    frame::FrameReader lone_reader{lone};
+    auto lone_result = lone_reader.next(view);
+    ASSERT_FALSE(lone_result.has_value());
+    EXPECT_EQ(lone_result.error(), error_t::END_OF_STREAM);
 }
 
 TEST(FrameReader, HandlesSplitArrivalAcrossPeeks)

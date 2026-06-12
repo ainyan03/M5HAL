@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_POSIX_HAL_TCP_REMOTE_CONNECT_HPP
 #define M5_HAL_VARIANTS_FRAMEWORKS_POSIX_HAL_TCP_REMOTE_CONNECT_HPP
 
@@ -68,7 +69,7 @@ struct TcpConnectOptions {
   timeout); `TIMEOUT_ERROR` when connected but nothing answered hello
   (the socket is closed again before returning).
  */
-m5::stl::expected<::m5::hal::v1::remote::Capabilities, ::m5::hal::v1::error::error_t> connectRemoteTcp(
+::m5::hal::v1::result_t<::m5::hal::v1::remote::Capabilities> connectRemoteTcp(
     TcpRemoteEndpoint& ep, const char* endpoint, const TcpConnectOptions& opt = TcpConnectOptions{});
 
 }  // namespace m5::variants::frameworks::posix::hal::v1::tcp

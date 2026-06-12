@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_VARIANTS_IDS_HPP
 #define M5_HAL_VARIANTS_IDS_HPP
 
@@ -60,5 +61,98 @@
 #define M5HAL_V1_VARIANT_ID_PLATFORM_SAMD51    105
 #define M5HAL_V1_VARIANT_ID_PLATFORM_SPRESENSE 106
 #define M5HAL_V1_VARIANT_ID_PLATFORM_STM32     107
+
+// --- X-macro mirror of the registry above (same names, registry order) ---
+//
+// PP constraint ([026]): #define / #if directives cannot be generated
+// from a macro expansion, so the #define list above stays hand-written
+// (it must work in #if) and this list mirrors it. The C++ derivations
+// below keep the two in lockstep: an entry added here but not above
+// fails to compile (unknown M5HAL_V1_VARIANT_ID_<NAME>), and the
+// ascending-order static_assert catches duplicate or out-of-order
+// values — the registry ranges are ordered and append-only, so the
+// value sequence is strictly increasing by construction.
+#define M5HAL_V1_VARIANT_ID_LIST_(X) \
+    X(NONE)                          \
+    X(FRAMEWORK_ARDUINO)             \
+    X(FRAMEWORK_ESPIDF)              \
+    X(FRAMEWORK_POSIX)               \
+    X(FRAMEWORK_SOFTWARE)            \
+    X(FRAMEWORK_STUB)                \
+    X(PLATFORM_WINDOWS)              \
+    X(PLATFORM_MACOS)                \
+    X(PLATFORM_LINUX)                \
+    X(PLATFORM_AVR)                  \
+    X(PLATFORM_ESP8266)              \
+    X(PLATFORM_ESP32)                \
+    X(PLATFORM_RP2040)               \
+    X(PLATFORM_SAMD21)               \
+    X(PLATFORM_SAMD51)               \
+    X(PLATFORM_SPRESENSE)            \
+    X(PLATFORM_STM32)
+
+#include <stddef.h>
+#include <stdint.h>
+
+namespace m5::hal::v1 {
+
+/*!
+  @brief The variant identity registry as a typed enum (u16 = the wire
+         width; values are the M5HAL_V1_VARIANT_ID_* macros).
+
+  For runtime / typed use; the PP macros remain the #if-capable face of
+  the same registry.
+ */
+enum class variant_id_t : uint16_t {
+#define M5HAL_V1_VARIANT_ID_ENUM_ENTRY_(NAME) NAME = M5HAL_V1_VARIANT_ID_##NAME,
+    M5HAL_V1_VARIANT_ID_LIST_(M5HAL_V1_VARIANT_ID_ENUM_ENTRY_)
+#undef M5HAL_V1_VARIANT_ID_ENUM_ENTRY_
+};
+
+/*! @brief Registry name of `id` ("PLATFORM_ESP32", ...), or "UNKNOWN". */
+constexpr const char* variantIdName(variant_id_t id)
+{
+    switch (id) {
+#define M5HAL_V1_VARIANT_ID_NAME_CASE_(NAME) \
+    case variant_id_t::NAME:                 \
+        return #NAME;
+        M5HAL_V1_VARIANT_ID_LIST_(M5HAL_V1_VARIANT_ID_NAME_CASE_)
+#undef M5HAL_V1_VARIANT_ID_NAME_CASE_
+    }
+    return "UNKNOWN";
+}
+
+/*! @brief Overload for raw registry values (e.g. the
+    M5HAL_V1_SELECTED_VARIANT_<KIND> / M5HAL_V1_TARGET_PLATFORM_VARIANT_ID
+    integer markers). */
+constexpr const char* variantIdName(uint16_t id)
+{
+    return variantIdName(static_cast<variant_id_t>(id));
+}
+
+namespace detail {
+
+constexpr uint16_t kVariantIdValues[] = {
+#define M5HAL_V1_VARIANT_ID_VALUE_(NAME) M5HAL_V1_VARIANT_ID_##NAME,
+    M5HAL_V1_VARIANT_ID_LIST_(M5HAL_V1_VARIANT_ID_VALUE_)
+#undef M5HAL_V1_VARIANT_ID_VALUE_
+};
+
+constexpr bool variantIdsStrictlyIncrease()
+{
+    for (size_t i = 1; i < sizeof(kVariantIdValues) / sizeof(kVariantIdValues[0]); ++i) {
+        if (kVariantIdValues[i - 1] >= kVariantIdValues[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static_assert(variantIdsStrictlyIncrease(),
+              "variants/ids.hpp: registry values must be unique and listed in ascending registry order");
+
+}  // namespace detail
+
+}  // namespace m5::hal::v1
 
 #endif  // M5_HAL_VARIANTS_IDS_HPP

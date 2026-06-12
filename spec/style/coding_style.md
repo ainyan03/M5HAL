@@ -35,7 +35,7 @@ using namespace ::m5::hal::v1;  // resolve unqualified types::/bus:: refs
 
 - 旧来の `namespace m5 { namespace ... { ... } }` の入れ子は使わない
 - closing brace のコメントは fully qualified namespace パスを書く
-- 例外として `_macro/offer_all.inl` は 1 行ネスト形式を許容する
+- 例外として `_macro/offer_all.inl` / `_macro/offer_kind.inl` は 1 行ネスト形式を許容する
 
 ## 命名規則
 
@@ -116,6 +116,7 @@ RAII 型:
 |---|---|
 | バッファサイズ・配列インデックス | `size_t` |
 | エラーコード | `error::error_t` (M5HAL 自前定義) |
+| **API 戻り値 (値 or エラー)** | **`result_t<T>`** (`m5::hal::v1` 直下、 定義 = `hal/v1/error.hpp`)。 `m5::stl::expected<T, error::error_t>` の **pure alias** (同一型) — 派生クラスにしない (monadic 連鎖の decay、 基底↔派生変換、 将来の `std::expected` 乗り換え、 M5UU との語彙分裂を避ける)。 v1 のシグネチャは `expected` を直接綴らずこの alias を使う |
 | 構造体メンバ (固定幅・メモリ効率重視) | `int8_t` / `int16_t` / `int32_t` / `uint8_t` 等 |
 | 関数引数・ローカル変数 (演算速度重視) | `int_fast16_t` / `int_fast32_t` |
 | 真偽値 | `bool` |
@@ -163,7 +164,7 @@ variant 機構の実装に関する規則。 全体像は [../design/variants.md
 
 ### `*.inl` ファイル (re-include 前提)
 
-- `_macro/offer_all.inl` のように **繰り返し include される前提** のファイルは include guard を持たない
+- `_macro/offer_all.inl` / `offer_kind.inl` のように **繰り返し include される前提** のファイルは include guard を持たない
 - ファイル冒頭にコメントで「re-include 前提」 を明示する
 - 各 `*.inl` の責務 (どのマクロを消費し、 どの alias を生成するか) もコメントで明示する
 
@@ -187,7 +188,7 @@ variant 機構の実装に関する規則。 全体像は [../design/variants.md
 - ディレクトリ階層と一致 (例: `src/m5_hal/variants/frameworks/arduino/hal/i2c/i2c.hpp` 内の宣言は `m5::variants::frameworks::arduino::hal::v1::i2c::*`)
 - variant 内では必要に応じて `using namespace ::m5::hal::v1;` を置ける
 - `m5::hal::v1::types::*` は `::m5::hal::v1::types::*` の fully qualified 形式で書く
-- `using namespace` による flat 注入は `_macro/offer_all.inl` のみで行う
+- `using namespace` による flat 注入は `_macro/offer_kind.inl` (offer_all.inl の per-kind 展開) のみで行う
 
 ## アサーション・ロギング
 
@@ -249,9 +250,7 @@ struct I2CMasterAccessor : public bus::Accessor {
       @param rx_bytes  Buffer for received bytes. Empty span = write-only transfer
       @return Number of bytes actually transferred, or error code
      */
-    m5::stl::expected<size_t, error::error_t> transfer(const TransferDesc& desc,
-                                                       data::ConstDataSpan tx_bytes,
-                                                       data::DataSpan rx_bytes);
+    result_t<size_t> transfer(const TransferDesc& desc, data::ConstDataSpan tx_bytes, data::DataSpan rx_bytes);
 };
 ```
 

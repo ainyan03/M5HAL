@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_I2C_BACKEND_MASTER_WRITE_BUFFER_INL
 #define M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_I2C_BACKEND_MASTER_WRITE_BUFFER_INL
 
@@ -14,8 +15,7 @@ class TempWriteBuffer {
 public:
     TempWriteBuffer() = default;
 
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> build(::m5::hal::v1::data::ConstDataSpan prefix,
-                                                                 ::m5::hal::v1::data::Source* tx)
+    ::m5::hal::v1::result_t<void> build(::m5::hal::v1::data::ConstDataSpan prefix, ::m5::hal::v1::data::Source* tx)
     {
         ::m5::hal::v1::data::ConstDataSpan first{};
         if (tx != nullptr && !tx->eof()) {
@@ -89,7 +89,7 @@ public:
     }
 
 private:
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> append(::m5::hal::v1::data::ConstDataSpan span)
+    ::m5::hal::v1::result_t<void> append(::m5::hal::v1::data::ConstDataSpan span)
     {
         if (span.size == 0) {
             return {};
@@ -109,7 +109,7 @@ private:
         return {};
     }
 
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> reserve(size_t required)
+    ::m5::hal::v1::result_t<void> reserve(size_t required)
     {
         if (required <= _capacity) {
             return {};

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_HAL_V1_I2C_SLAVE_HPP_
 #define M5_HAL_HAL_V1_I2C_SLAVE_HPP_
 
@@ -35,9 +36,9 @@ class I2CSlaveDriver {
 public:
     virtual ~I2CSlaveDriver() = default;
 
-    virtual m5::stl::expected<void, error::error_t> init(const I2CSlaveConfig& cfg) = 0;
-    virtual m5::stl::expected<void, error::error_t> release()                       = 0;
-    virtual service::IService* service()                                            = 0;
+    virtual result_t<void> init(const I2CSlaveConfig& cfg) = 0;
+    virtual result_t<void> release()                       = 0;
+    virtual service::IService* service()                   = 0;
 };
 
 class ScopedI2CSlaveServiceRegistration {
@@ -73,7 +74,7 @@ public:
         return *this;
     }
 
-    m5::stl::expected<void, error::error_t> registerTo(service::ServiceRunner& runner, I2CSlaveDriver& driver)
+    result_t<void> registerTo(service::ServiceRunner& runner, I2CSlaveDriver& driver)
     {
         release();
         auto* svc = driver.service();
@@ -118,7 +119,7 @@ public:
     // (S16 D6).
     I2CSlaveService() = default;
 
-    m5::stl::expected<void, error::error_t> init(I2CSlaveLineDriver& lines, const I2CSlaveConfig& config)
+    result_t<void> init(I2CSlaveLineDriver& lines, const I2CSlaveConfig& config)
     {
         if (config.address_is_10bit || config.address > 0x7F) {
             return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);

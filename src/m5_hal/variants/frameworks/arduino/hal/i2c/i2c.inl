@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_ARDUINO_HAL_I2C_I2C_INL
 #define M5_HAL_VARIANTS_FRAMEWORKS_ARDUINO_HAL_I2C_I2C_INL
 
@@ -51,7 +52,7 @@ namespace {
     return ::m5::hal::v1::error::error_t::OK;
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig& config)
+::m5::hal::v1::result_t<void> Bus::init(const BusConfig& config)
 {
     _config = config;
     if (_wire) {
@@ -77,7 +78,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig
     return {};
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::release(void)
+::m5::hal::v1::result_t<void> Bus::release(void)
 {
     if (_wire && _owns_wire) {
         _wire->end();
@@ -89,9 +90,10 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::release(void)
     return {};
 }
 
-m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
-    ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg,
-    const ::m5::hal::v1::i2c::TransferDesc& desc, ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
+::m5::hal::v1::result_t<size_t> Bus::transfer(::m5::hal::v1::bus::Accessor* owner,
+                                              const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg,
+                                              const ::m5::hal::v1::i2c::TransferDesc& desc,
+                                              ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
 {
     // `owner` is reserved for future lock / unlock semantics
     // (the M5UU lock migration is currently on hold); ignored here.

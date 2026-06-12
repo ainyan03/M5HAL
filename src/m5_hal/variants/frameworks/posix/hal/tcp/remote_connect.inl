@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_POSIX_HAL_TCP_REMOTE_CONNECT_INL
 #define M5_HAL_VARIANTS_FRAMEWORKS_POSIX_HAL_TCP_REMOTE_CONNECT_INL
 
@@ -59,9 +60,8 @@ bool parseEndpoint(const char* endpoint, char* host, size_t host_cap, uint16_t& 
 
 }  // namespace
 
-m5::stl::expected<::m5::hal::v1::remote::Capabilities, error_t> connectRemoteTcp(TcpRemoteEndpoint& ep,
-                                                                                 const char* endpoint,
-                                                                                 const TcpConnectOptions& opt)
+result_t<::m5::hal::v1::remote::Capabilities> connectRemoteTcp(TcpRemoteEndpoint& ep, const char* endpoint,
+                                                               const TcpConnectOptions& opt)
 {
     char host[kTcpEndpointCapacity];
     uint16_t port = 0;

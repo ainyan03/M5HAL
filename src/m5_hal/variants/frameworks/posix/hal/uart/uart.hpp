@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_POSIX_HAL_UART_UART_HPP
 #define M5_HAL_VARIANTS_FRAMEWORKS_POSIX_HAL_UART_UART_HPP
 
@@ -46,18 +47,17 @@ public:
     // Typed init: takes this variant's BusConfig (S17 E1). Passing the
     // abstract UARTBusConfig (or a sibling variant's config) is a
     // compile error instead of a silent bad downcast.
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> init(const BusConfig& config);
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> release(void) override;
+    ::m5::hal::v1::result_t<void> init(const BusConfig& config);
+    ::m5::hal::v1::result_t<void> release(void) override;
 
-    m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> write(::m5::hal::v1::bus::Accessor* owner,
-                                                                   const ::m5::hal::v1::uart::UARTAccessConfig& cfg,
-                                                                   ::m5::hal::v1::data::Source* tx,
-                                                                   size_t len) override;
-    m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> read(::m5::hal::v1::bus::Accessor* owner,
-                                                                  const ::m5::hal::v1::uart::UARTAccessConfig& cfg,
-                                                                  ::m5::hal::v1::data::Sink* rx, size_t len) override;
-    m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> readableBytes(
-        ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::uart::UARTAccessConfig& cfg) override;
+    ::m5::hal::v1::result_t<size_t> write(::m5::hal::v1::bus::Accessor* owner,
+                                          const ::m5::hal::v1::uart::UARTAccessConfig& cfg,
+                                          ::m5::hal::v1::data::Source* tx, size_t len) override;
+    ::m5::hal::v1::result_t<size_t> read(::m5::hal::v1::bus::Accessor* owner,
+                                         const ::m5::hal::v1::uart::UARTAccessConfig& cfg,
+                                         ::m5::hal::v1::data::Sink* rx, size_t len) override;
+    ::m5::hal::v1::result_t<size_t> readableBytes(::m5::hal::v1::bus::Accessor* owner,
+                                                  const ::m5::hal::v1::uart::UARTAccessConfig& cfg) override;
 
     // Open the named device (owning the fd), or adopt a caller-owned fd
     // (e.g. one end of an openpty() pair). Both leave termios setup to the
@@ -76,13 +76,11 @@ public:
     static bool baudToSpeed(uint32_t baud, uint32_t& out_speed);
 
 private:
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> applyConfig(
-        const ::m5::hal::v1::uart::UARTAccessConfig& cfg);
+    ::m5::hal::v1::result_t<void> applyConfig(const ::m5::hal::v1::uart::UARTAccessConfig& cfg);
     // Push one span to the fd, honouring EAGAIN + the write timeout.
-    m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> rawWrite(const uint8_t* data, size_t len,
-                                                                      uint32_t timeout_ms);
+    ::m5::hal::v1::result_t<size_t> rawWrite(const uint8_t* data, size_t len, uint32_t timeout_ms);
     // Drain the coalescing buffer (no-op when empty / coalescing disabled).
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> flushCoalesced(uint32_t timeout_ms);
+    ::m5::hal::v1::result_t<void> flushCoalesced(uint32_t timeout_ms);
 
     static constexpr size_t kCoalesceCapacity = 4096;
 

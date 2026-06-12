@@ -156,9 +156,15 @@ typed init では誤用 (抽象 config や別 variant の config を拡張フィ
    - `m5::hal::<kind>` への flat 注入 (using-directive、 最初の 1 回)
 3. 全 `M5HAL_VARIANT_CURRENT_*_` マクロを undef
 
-注意: `BASE_NS_` の値自体には層名 `::hal` を含めない。 `offer_all.inl` が HAL 層用 alias を組み立てる際に `::hal` を挟む。 将来 runtime 層を追加する場合は同じ BASE_NS 値を起点に `::runtime` を挟む形で並列展開される。
+namespace の組み立て (手順 2) は kind 非依存なので `_macro/offer_kind.inl` に一本化されており、
+`offer_all.inl` の各 kind ブロックはパラメータマクロ (`M5HAL_OFFER_KIND_NS_` /
+`M5HAL_OFFER_KIND_EMIT_PLATFORM_` / `M5HAL_OFFER_KIND_EMIT_FLAT_`) を立てて再 include するだけ。
+kind ブロック側に残るのはマクロ名が kind 固有でディレクティブを生成できない部分
+(HAS ゲート / platform 束縛ガード / selected-variant marker の `#elif` チェーン) のみ。
 
-`_macro/offer_all.inl` のみマクロ展開の都合で **1 行ネスト形式の namespace 宣言を維持** (`namespace m5 { namespace hal { namespace ... { ... } } }`)。 これは [../style/coding_style.md](../style/coding_style.md) §namespace 宣言形式 の唯一の例外。
+注意: `BASE_NS_` の値自体には層名 `::hal` を含めない。 `offer_kind.inl` が HAL 層用 alias を組み立てる際に `::hal` を挟む。 将来 runtime 層を追加する場合は同じ BASE_NS 値を起点に `::runtime` を挟む形で並列展開される。
+
+`_macro/offer_all.inl` / `_macro/offer_kind.inl` のみマクロ展開の都合で **1 行ネスト形式の namespace 宣言を維持** (`namespace m5 { namespace hal { namespace ... { ... } } }`)。 これは [../style/coding_style.md](../style/coding_style.md) §namespace 宣言形式 の唯一の例外。
 
 ### 選択 variant の診断 (selected-variant marker)
 
@@ -208,7 +214,23 @@ static_assert(std::is_same<m5hal::i2c::Bus, m5hal::i2c::variant::arduino::Bus>::
 
 実装注: `#define` は置換リストを展開しないため、 first-hit 時の `M5HAL_VARIANT_CURRENT_ID_` の
 **値**を別マクロへ転送することはプリプロセッサでは不可能 — `offer_all.inl` の各 kind ブロックに
-variant ID ごとの `#elif` チェーンを書き下しているのはこの制約による。
+variant ID ごとの `#elif` チェーンを書き下しているのはこの制約による。 チェーン末尾の `#else`
+は `#error`: レジストリに居ない ID で offer した variant は静かに次点へ flat 注入を譲らず、
+コンパイルエラーで止まる。
+
+### 型付きミラー (`variant_id_t` / `variantIdName`)
+
+`variants/ids.hpp` は `#define` レジストリ (上記、 `#if` で使える正本) に加えて、 同じ並びの
+X-macro リスト `M5HAL_V1_VARIANT_ID_LIST_` と、 そこから導出する型付きミラーを提供する:
+
+- `m5::hal::v1::variant_id_t` — `enum class : uint16_t` (u16 = ワイヤ幅)。 値は `#define` と同一
+- `m5::hal::v1::variantIdName(id)` — レジストリ名を返す `constexpr` 関数 (`variant_id_t` /
+  生 u16 の両オーバーロード。 未登録値は `"UNKNOWN"`)。 marker 値の診断表示向け
+
+プリプロセッサは `#define` をマクロ展開から生成できないため `#define` リストは手書きのまま残るが、
+両リストの整合はコンパイル時に検証される: X リストへの追加は対応する `#define` が無いと
+コンパイルエラーになり、 値列の昇順 static_assert (レジストリは並び順 = 値順、 append-only) が
+重複・順序ずれを検出する。
 
 検出値も同じレジストリなので、 「この platform variant が GPIO を勝ったか」のような
 検出×選択の跨ぎ比較が直接書ける:
@@ -268,9 +290,10 @@ posix は素の POSIX host (Arduino / ESP-IDF SDK を含まないビルド) で 
 2. `variants/frameworks/_checker.hpp` に `M5HAL_FRAMEWORK_HAS_<NAME>` を追加する。ユーザーが切り替える挙動なら
    `M5HAL_CONFIG_*` として [configuration.md](configuration.md) に登録する
 3. `variants/ids.hpp` に `M5HAL_V1_VARIANT_ID_FRAMEWORK_<NAME>` を追加し (framework レンジ 1〜49 の
-   末尾に +1、 append-only)、 `_offer.hpp` で `M5HAL_VARIANT_CURRENT_ID_` として申告する。
+   末尾に +1、 append-only。 X-macro リスト `M5HAL_V1_VARIANT_ID_LIST_` にも同位置に追加)、
+   `_offer.hpp` で `M5HAL_VARIANT_CURRENT_ID_` として申告する。
    `_macro/offer_all.inl` の各 kind の `#elif` チェーンにも 1 行ずつ追加する
-   (§選択 variant の診断 の実装注を参照)
+   (§選択 variant の診断 の実装注を参照。 漏れはチェーン末尾の `#error` で止まる)
 4. `M5HAL_v1.hpp` の scan order に header include + `_offer.hpp` + `offer_all.inl` を追加する。実装が `.inl`
    を持つ場合は `M5HAL_v1.cpp` にも include を追加する
 5. 既存 kind を提供する場合は `_offer.hpp` で `M5HAL_VARIANT_CURRENT_HAS_HAL_<KIND>_` を申告し、 kind の
@@ -284,7 +307,10 @@ posix は素の POSIX host (Arduino / ESP-IDF SDK を含まないビルド) で 
 1. `src/m5_hal/hal/v1/<kind>/<kind>.hpp`（必要なら `.inl`）で共通抽象と config / accessor / desc を定義する
 2. `types::BusKind` に kind tag を追加し、 `BusConfig` / `AccessConfig` 派生の ctor でその tag を設定する
 3. `M5HAL_v1.hpp` / `M5HAL_v1.cpp` に共通 header / impl を include する
-4. `_macro/offer_all.inl` に `M5HAL_VARIANT_CURRENT_HAS_HAL_<KIND>_` の alias 展開を追加する
+4. `_macro/offer_all.inl` に新 kind のディスパッチブロックを追加する (既存 kind のブロックを複製して
+   kind トークンを差し替える: HAS ゲート / `M5HAL_OFFER_KIND_NS_` / platform 束縛ガード /
+   `M5HAL_V1_SELECTED_VARIANT_<KIND>` チェーン + `offer_kind.inl` の include)。 `M5HAL_v1.hpp` の
+   scan 後 NONE 補完にも 1 ブロック追加する
 5. 各 variant の `_offer.hpp` は、具象が揃った variant だけ新 kind を申告する。stub が fallback を担う場合は
    stub の具象も同時に用意する
 6. native build_check と、最低1つの API-level unit test を追加する

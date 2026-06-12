@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_SPI_SPI_HPP_
 #define M5_HAL_SPI_SPI_HPP_
 
@@ -138,66 +139,60 @@ struct SPIMasterAccessor : public bus::Accessor {
     SPIBus& getSPIBus(void) const;
 
     /*! @brief Replace the per-target configuration; same contract as I2C. */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> setConfig(const SPIMasterAccessConfig& cfg);
+    m5::hal::v1::result_t<void> setConfig(const SPIMasterAccessConfig& cfg);
 
     /*!
       @brief Sole span-based transfer sugar.
      */
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> transfer(const TransferDesc& desc,
-                                                                    data::ConstDataSpan tx_bytes,
-                                                                    data::DataSpan rx_bytes);
+    m5::hal::v1::result_t<size_t> transfer(const TransferDesc& desc, data::ConstDataSpan tx_bytes,
+                                           data::DataSpan rx_bytes);
     /*!
       @brief Source/Sink overload for streaming callers.
       @param len  Cap on the bytes transferred this call, even if the
                   underlying `Source` / `Sink` could continue further.
      */
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> transfer(const TransferDesc& desc, data::Source* tx,
-                                                                    data::Sink* rx, size_t len);
+    m5::hal::v1::result_t<size_t> transfer(const TransferDesc& desc, data::Source* tx, data::Sink* rx, size_t len);
     /*!
       @name CS scope (begin / end transaction).
       @{
      */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> beginTransaction(void);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> endTransaction(void);
+    m5::hal::v1::result_t<void> beginTransaction(void);
+    m5::hal::v1::result_t<void> endTransaction(void);
     /*! @} */
 
     /*!
       @name Plain write / read sugars (span, Source/Sink, raw pointer).
       @{
      */
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> write(data::ConstDataSpan tx_bytes);
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> write(data::Source& tx, size_t len);
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> read(data::DataSpan rx_bytes);
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> read(data::Sink& rx, size_t len);
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> write(const uint8_t* tx, size_t len);
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> read(uint8_t* dst, size_t len);
+    m5::hal::v1::result_t<size_t> write(data::ConstDataSpan tx_bytes);
+    m5::hal::v1::result_t<size_t> write(data::Source& tx, size_t len);
+    m5::hal::v1::result_t<size_t> read(data::DataSpan rx_bytes);
+    m5::hal::v1::result_t<size_t> read(data::Sink& rx, size_t len);
+    m5::hal::v1::result_t<size_t> write(const uint8_t* tx, size_t len);
+    m5::hal::v1::result_t<size_t> read(uint8_t* dst, size_t len);
     /*! @} */
 
     /*!
       @name Command / address sugars for display-like SPI peripherals.
       @{
      */
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> writeCommand(data::ConstDataSpan tx_bytes);
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> writeCommand(uint32_t command);
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> writeCommandAddress(uint32_t command, uint32_t address);
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> writeCommandData(data::ConstDataSpan tx_bytes);
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> writeCommandData(uint32_t command,
-                                                                            data::ConstDataSpan tx_bytes);
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> writeCommandData(uint32_t command, data::Source& tx,
-                                                                            size_t len);
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> writeCommandAddressData(uint32_t command, uint32_t address,
-                                                                                   data::ConstDataSpan tx_bytes);
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> writeCommandAddressData(uint32_t command, uint32_t address,
-                                                                                   data::Source& tx, size_t len);
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> readCommandData(uint32_t command, data::DataSpan rx_bytes);
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> readCommandData(uint32_t command, data::Sink& rx,
-                                                                           size_t len);
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> readCommandAddressData(uint32_t command, uint32_t address,
-                                                                                  data::DataSpan rx_bytes);
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> readCommandAddressData(uint32_t command, uint32_t address,
-                                                                                  data::Sink& rx, size_t len);
+    m5::hal::v1::result_t<size_t> writeCommand(data::ConstDataSpan tx_bytes);
+    m5::hal::v1::result_t<size_t> writeCommand(uint32_t command);
+    m5::hal::v1::result_t<size_t> writeCommandAddress(uint32_t command, uint32_t address);
+    m5::hal::v1::result_t<size_t> writeCommandData(data::ConstDataSpan tx_bytes);
+    m5::hal::v1::result_t<size_t> writeCommandData(uint32_t command, data::ConstDataSpan tx_bytes);
+    m5::hal::v1::result_t<size_t> writeCommandData(uint32_t command, data::Source& tx, size_t len);
+    m5::hal::v1::result_t<size_t> writeCommandAddressData(uint32_t command, uint32_t address,
+                                                          data::ConstDataSpan tx_bytes);
+    m5::hal::v1::result_t<size_t> writeCommandAddressData(uint32_t command, uint32_t address, data::Source& tx,
+                                                          size_t len);
+    m5::hal::v1::result_t<size_t> readCommandData(uint32_t command, data::DataSpan rx_bytes);
+    m5::hal::v1::result_t<size_t> readCommandData(uint32_t command, data::Sink& rx, size_t len);
+    m5::hal::v1::result_t<size_t> readCommandAddressData(uint32_t command, uint32_t address, data::DataSpan rx_bytes);
+    m5::hal::v1::result_t<size_t> readCommandAddressData(uint32_t command, uint32_t address, data::Sink& rx,
+                                                         size_t len);
     /*! @brief Drive `count` dummy clock cycles. */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> sendDummyClock(size_t count);
+    m5::hal::v1::result_t<void> sendDummyClock(size_t count);
     /*! @} */
 
 protected:
@@ -220,10 +215,8 @@ struct SPIBus : public bus::Bus {
         return _config;
     }
 
-    virtual m5::stl::expected<void, m5::hal::v1::error::error_t> beginTransaction(bus::Accessor* owner,
-                                                                                  const SPIMasterAccessConfig& cfg);
-    virtual m5::stl::expected<void, m5::hal::v1::error::error_t> endTransaction(bus::Accessor* owner,
-                                                                                const SPIMasterAccessConfig& cfg);
+    virtual m5::hal::v1::result_t<void> beginTransaction(bus::Accessor* owner, const SPIMasterAccessConfig& cfg);
+    virtual m5::hal::v1::result_t<void> endTransaction(bus::Accessor* owner, const SPIMasterAccessConfig& cfg);
     /*!
       @brief Core SPI transfer entry point.
 
@@ -241,10 +234,8 @@ struct SPIBus : public bus::Bus {
       `tx` / `rx` are nullable (`nullptr` = no data for that direction).
       The default implementation returns `NOT_IMPLEMENTED`.
      */
-    virtual m5::stl::expected<size_t, m5::hal::v1::error::error_t> transfer(bus::Accessor* owner,
-                                                                            const SPIMasterAccessConfig& cfg,
-                                                                            const TransferDesc& desc, data::Source* tx,
-                                                                            data::Sink* rx);
+    virtual m5::hal::v1::result_t<size_t> transfer(bus::Accessor* owner, const SPIMasterAccessConfig& cfg,
+                                                   const TransferDesc& desc, data::Source* tx, data::Sink* rx);
 
 protected:
     SPIBusConfig _config;

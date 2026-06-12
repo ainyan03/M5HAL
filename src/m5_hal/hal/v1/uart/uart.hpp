@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_UART_UART_HPP_
 #define M5_HAL_UART_UART_HPP_
 
@@ -82,17 +83,17 @@ struct UARTTxAccessor : public bus::Accessor, public data::StreamWriter {
     }
     UARTBus& getUARTBus(void) const;
 
-    m5::stl::expected<void, error::error_t> setConfig(const UARTAccessConfig& cfg);
-    m5::stl::expected<void, error::error_t> beginTxAccess(uint32_t timeout_ms = 0);
-    m5::stl::expected<void, error::error_t> endTxAccess(void);
+    result_t<void> setConfig(const UARTAccessConfig& cfg);
+    result_t<void> beginTxAccess(uint32_t timeout_ms = 0);
+    result_t<void> endTxAccess(void);
     bool inTxAccess(void) const
     {
         return _tx_access_depth > 0;
     }
 
-    m5::stl::expected<size_t, error::error_t> write(data::ConstDataSpan tx_bytes) override;
-    m5::stl::expected<size_t, error::error_t> write(data::Source& tx, size_t len);
-    m5::stl::expected<size_t, error::error_t> write(const uint8_t* tx, size_t len);
+    result_t<size_t> write(data::ConstDataSpan tx_bytes) override;
+    result_t<size_t> write(data::Source& tx, size_t len);
+    result_t<size_t> write(const uint8_t* tx, size_t len);
 
 protected:
     UARTAccessConfig _access_config;
@@ -113,19 +114,19 @@ struct UARTRxAccessor : public bus::Accessor, public data::StreamReader {
     }
     UARTBus& getUARTBus(void) const;
 
-    m5::stl::expected<void, error::error_t> setConfig(const UARTAccessConfig& cfg);
-    m5::stl::expected<void, error::error_t> beginRxAccess(uint32_t timeout_ms = 0);
-    m5::stl::expected<void, error::error_t> endRxAccess(void);
+    result_t<void> setConfig(const UARTAccessConfig& cfg);
+    result_t<void> beginRxAccess(uint32_t timeout_ms = 0);
+    result_t<void> endRxAccess(void);
     bool inRxAccess(void) const
     {
         return _rx_access_depth > 0;
     }
 
-    m5::stl::expected<size_t, error::error_t> read(data::DataSpan rx_bytes) override;
-    m5::stl::expected<size_t, error::error_t> read(data::Sink& rx, size_t len);
-    m5::stl::expected<size_t, error::error_t> read(uint8_t* dst, size_t len);
+    result_t<size_t> read(data::DataSpan rx_bytes) override;
+    result_t<size_t> read(data::Sink& rx, size_t len);
+    result_t<size_t> read(uint8_t* dst, size_t len);
 
-    m5::stl::expected<size_t, error::error_t> readableBytes(void) override;
+    result_t<size_t> readableBytes(void) override;
 
 protected:
     UARTAccessConfig _access_config;
@@ -163,23 +164,23 @@ struct UARTAccessor {
         return _rx;
     }
 
-    m5::stl::expected<void, error::error_t> setConfig(const UARTAccessConfig& cfg);
-    m5::stl::expected<void, error::error_t> beginAccess(uint32_t timeout_ms = 0);
-    m5::stl::expected<void, error::error_t> endAccess(void);
+    result_t<void> setConfig(const UARTAccessConfig& cfg);
+    result_t<void> beginAccess(uint32_t timeout_ms = 0);
+    result_t<void> endAccess(void);
     bool inAccess(void) const
     {
         return _tx.inTxAccess() || _rx.inRxAccess();
     }
 
-    m5::stl::expected<size_t, error::error_t> write(data::ConstDataSpan tx_bytes);
-    m5::stl::expected<size_t, error::error_t> write(data::Source& tx, size_t len);
-    m5::stl::expected<size_t, error::error_t> write(const uint8_t* tx, size_t len);
+    result_t<size_t> write(data::ConstDataSpan tx_bytes);
+    result_t<size_t> write(data::Source& tx, size_t len);
+    result_t<size_t> write(const uint8_t* tx, size_t len);
 
-    m5::stl::expected<size_t, error::error_t> read(data::DataSpan rx_bytes);
-    m5::stl::expected<size_t, error::error_t> read(data::Sink& rx, size_t len);
-    m5::stl::expected<size_t, error::error_t> read(uint8_t* dst, size_t len);
+    result_t<size_t> read(data::DataSpan rx_bytes);
+    result_t<size_t> read(data::Sink& rx, size_t len);
+    result_t<size_t> read(uint8_t* dst, size_t len);
 
-    m5::stl::expected<size_t, error::error_t> readableBytes(void);
+    result_t<size_t> readableBytes(void);
 
 protected:
     UARTTxAccessor _tx;
@@ -192,17 +193,14 @@ struct UARTBus : public bus::Bus {
         return _config;
     }
 
-    virtual m5::stl::expected<size_t, error::error_t> write(bus::Accessor* owner, const UARTAccessConfig& cfg,
-                                                            data::Source* tx, size_t len);
-    virtual m5::stl::expected<size_t, error::error_t> read(bus::Accessor* owner, const UARTAccessConfig& cfg,
-                                                           data::Sink* rx, size_t len);
-    virtual m5::stl::expected<size_t, error::error_t> readableBytes(bus::Accessor* owner, const UARTAccessConfig& cfg);
+    virtual result_t<size_t> write(bus::Accessor* owner, const UARTAccessConfig& cfg, data::Source* tx, size_t len);
+    virtual result_t<size_t> read(bus::Accessor* owner, const UARTAccessConfig& cfg, data::Sink* rx, size_t len);
+    virtual result_t<size_t> readableBytes(bus::Accessor* owner, const UARTAccessConfig& cfg);
 
-    m5::stl::expected<void, error::error_t> lock(bus::Accessor* owner, uint32_t timeout_ms = 0) override;
-    m5::stl::expected<void, error::error_t> unlock(bus::Accessor* owner) override;
-    virtual m5::stl::expected<void, error::error_t> lockChannel(bus::Accessor* owner, Channel ch,
-                                                                uint32_t timeout_ms = 0);
-    virtual m5::stl::expected<void, error::error_t> unlockChannel(bus::Accessor* owner, Channel ch);
+    result_t<void> lock(bus::Accessor* owner, uint32_t timeout_ms = 0) override;
+    result_t<void> unlock(bus::Accessor* owner) override;
+    virtual result_t<void> lockChannel(bus::Accessor* owner, Channel ch, uint32_t timeout_ms = 0);
+    virtual result_t<void> unlockChannel(bus::Accessor* owner, Channel ch);
 
 protected:
     UARTBusConfig _config;

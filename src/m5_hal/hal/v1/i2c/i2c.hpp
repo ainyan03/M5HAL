@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_I2C_I2C_HPP_
 #define M5_HAL_I2C_I2C_HPP_
 
@@ -210,7 +211,7 @@ struct I2CMasterAccessor : public bus::Accessor {
       `cfg.freq != _last_freq`, so this entry point needs no extra
       invalidation logic — transparent to the caller.
      */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> setConfig(const I2CMasterAccessConfig& cfg);
+    m5::hal::v1::result_t<void> setConfig(const I2CMasterAccessConfig& cfg);
 
     /*!
       @brief Sole transfer sugar: wrap one transfer with
@@ -230,9 +231,8 @@ struct I2CMasterAccessor : public bus::Accessor {
       prefer checking success only. (Changed in S16 D4: v1 builds
       before it returned `prefix + tx + rx`.)
      */
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> transfer(const TransferDesc& desc,
-                                                                    data::ConstDataSpan tx_bytes,
-                                                                    data::DataSpan rx_bytes);
+    m5::hal::v1::result_t<size_t> transfer(const TransferDesc& desc, data::ConstDataSpan tx_bytes,
+                                           data::DataSpan rx_bytes);
 
     /*!
       @brief Source/Sink overload for streaming callers.
@@ -241,8 +241,7 @@ struct I2CMasterAccessor : public bus::Accessor {
       overload). `tx` / `rx` are nullable; the span sugar above
       delegates here.
      */
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> transfer(const TransferDesc& desc, data::Source* tx,
-                                                                    data::Sink* rx);
+    m5::hal::v1::result_t<size_t> transfer(const TransferDesc& desc, data::Source* tx, data::Sink* rx);
 
     /*!
       @name Span-based write / read sugars.
@@ -251,8 +250,8 @@ struct I2CMasterAccessor : public bus::Accessor {
       `beginAccess` / `endAccess` wrap is shared.
       @{
      */
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> write(data::ConstDataSpan tx_bytes);
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> read(data::DataSpan rx_bytes);
+    m5::hal::v1::result_t<size_t> write(data::ConstDataSpan tx_bytes);
+    m5::hal::v1::result_t<size_t> read(data::DataSpan rx_bytes);
     /*! @} */
 
     /*!
@@ -264,8 +263,8 @@ struct I2CMasterAccessor : public bus::Accessor {
       `data::ConstDataSpan` value types are distinct.
       @{
      */
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> write(const uint8_t* tx, size_t len);
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> read(uint8_t* dst, size_t len);
+    m5::hal::v1::result_t<size_t> write(const uint8_t* tx, size_t len);
+    m5::hal::v1::result_t<size_t> read(uint8_t* dst, size_t len);
     /*! @} */
 
     /*!
@@ -289,6 +288,14 @@ struct I2CMasterAccessor : public bus::Accessor {
       `I2CMasterAccessConfig::register_address_bytes` (`0` / `1` =
       1 byte, `2` = 2 bytes).
 
+      CAUTION - the two paths derive the wire width differently: the
+      typed overloads use `sizeof(TReg)` and IGNORE
+      `register_address_bytes`, the literal (`int`) overloads use
+      `register_address_bytes` only. On a device configured with
+      `register_address_bytes = 2`, a `uint8_t` constant still sends
+      ONE address byte - use `uint16_t` constants (or literals) there.
+      Mixing the two styles on the same device is the trap to avoid.
+
       Value-side size and byte order are the caller's responsibility
       (compose N bytes with `data::ConstDataSpan` / `data::DataSpan`).
       Big- / little-endian helpers belong in M5UU's
@@ -298,14 +305,14 @@ struct I2CMasterAccessor : public bus::Accessor {
     template <typename TReg,
               typename std::enable_if<
                   std::is_integral<TReg>::value && std::is_unsigned<TReg>::value && sizeof(TReg) <= 2, int>::type = 0>
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> writeRegister(TReg reg, data::ConstDataSpan value)
+    m5::hal::v1::result_t<size_t> writeRegister(TReg reg, data::ConstDataSpan value)
     {
         return transfer(TransferDesc{reg}, value, data::DataSpan{});
     }
     template <typename TReg,
               typename std::enable_if<
                   std::is_integral<TReg>::value && std::is_unsigned<TReg>::value && sizeof(TReg) <= 2, int>::type = 0>
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> writeRegister(TReg reg, uint8_t value)
+    m5::hal::v1::result_t<size_t> writeRegister(TReg reg, uint8_t value)
     {
         return writeRegister(reg, data::ConstDataSpan{&value, 1});
     }
@@ -318,14 +325,14 @@ struct I2CMasterAccessor : public bus::Accessor {
     template <typename TReg,
               typename std::enable_if<
                   std::is_integral<TReg>::value && std::is_unsigned<TReg>::value && sizeof(TReg) <= 2, int>::type = 0>
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> writeRegister(TReg reg, const uint8_t* tx, size_t len)
+    m5::hal::v1::result_t<size_t> writeRegister(TReg reg, const uint8_t* tx, size_t len)
     {
         return writeRegister(reg, data::ConstDataSpan{tx, len});
     }
     template <typename TReg,
               typename std::enable_if<
                   std::is_integral<TReg>::value && std::is_unsigned<TReg>::value && sizeof(TReg) <= 2, int>::type = 0>
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> readRegister(TReg reg, data::DataSpan dst)
+    m5::hal::v1::result_t<size_t> readRegister(TReg reg, data::DataSpan dst)
     {
         return transfer(TransferDesc{reg}, data::ConstDataSpan{}, dst);
     }
@@ -333,7 +340,7 @@ struct I2CMasterAccessor : public bus::Accessor {
     template <typename TReg,
               typename std::enable_if<
                   std::is_integral<TReg>::value && std::is_unsigned<TReg>::value && sizeof(TReg) <= 2, int>::type = 0>
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> readRegister(TReg reg, uint8_t* dst, size_t len)
+    m5::hal::v1::result_t<size_t> readRegister(TReg reg, uint8_t* dst, size_t len)
     {
         return readRegister(reg, data::DataSpan{dst, len});
     }
@@ -341,7 +348,7 @@ struct I2CMasterAccessor : public bus::Accessor {
     template <typename TReg,
               typename std::enable_if<
                   std::is_integral<TReg>::value && std::is_unsigned<TReg>::value && sizeof(TReg) <= 2, int>::type = 0>
-    m5::stl::expected<uint8_t, m5::hal::v1::error::error_t> readRegister(TReg reg)
+    m5::hal::v1::result_t<uint8_t> readRegister(TReg reg)
     {
         uint8_t v;
         auto r = readRegister(reg, data::DataSpan{&v, 1});
@@ -363,7 +370,7 @@ struct I2CMasterAccessor : public bus::Accessor {
       `INVALID_ARGUMENT` in release builds.
       @{
      */
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> writeRegister(int reg, data::ConstDataSpan value)
+    m5::hal::v1::result_t<size_t> writeRegister(int reg, data::ConstDataSpan value)
     {
         auto desc = makeLiteralRegisterDesc(reg);
         if (!desc.has_value()) {
@@ -371,15 +378,15 @@ struct I2CMasterAccessor : public bus::Accessor {
         }
         return transfer(desc.value(), value, data::DataSpan{});
     }
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> writeRegister(int reg, uint8_t value)
+    m5::hal::v1::result_t<size_t> writeRegister(int reg, uint8_t value)
     {
         return writeRegister(reg, data::ConstDataSpan{&value, 1});
     }
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> writeRegister(int reg, const uint8_t* tx, size_t len)
+    m5::hal::v1::result_t<size_t> writeRegister(int reg, const uint8_t* tx, size_t len)
     {
         return writeRegister(reg, data::ConstDataSpan{tx, len});
     }
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> readRegister(int reg, data::DataSpan dst)
+    m5::hal::v1::result_t<size_t> readRegister(int reg, data::DataSpan dst)
     {
         auto desc = makeLiteralRegisterDesc(reg);
         if (!desc.has_value()) {
@@ -387,11 +394,11 @@ struct I2CMasterAccessor : public bus::Accessor {
         }
         return transfer(desc.value(), data::ConstDataSpan{}, dst);
     }
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> readRegister(int reg, uint8_t* dst, size_t len)
+    m5::hal::v1::result_t<size_t> readRegister(int reg, uint8_t* dst, size_t len)
     {
         return readRegister(reg, data::DataSpan{dst, len});
     }
-    m5::stl::expected<uint8_t, m5::hal::v1::error::error_t> readRegister(int reg)
+    m5::hal::v1::result_t<uint8_t> readRegister(int reg)
     {
         uint8_t v;
         auto r = readRegister(reg, data::DataSpan{&v, 1});
@@ -409,10 +416,10 @@ struct I2CMasterAccessor : public bus::Accessor {
       (or another bus error) otherwise. Promotes the legacy
       "empty-write" idiom to a named API.
      */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> probe(void);
+    m5::hal::v1::result_t<void> probe(void);
 
 protected:
-    m5::stl::expected<TransferDesc, m5::hal::v1::error::error_t> makeLiteralRegisterDesc(int reg) const
+    m5::hal::v1::result_t<TransferDesc> makeLiteralRegisterDesc(int reg) const
     {
         if (reg < 0) {
             return m5::stl::make_unexpected(m5::hal::v1::error::error_t::INVALID_ARGUMENT);
@@ -470,8 +477,7 @@ struct I2CBus : public bus::Bus {
       second per NACK is impractical) and is intentionally smaller
       than `I2CMasterAccessConfig`'s default of 1000 ms.
      */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> probe(uint16_t i2c_addr, uint32_t freq = 100000,
-                                                               uint32_t timeout_ms = 50);
+    m5::hal::v1::result_t<void> probe(uint16_t i2c_addr, uint32_t freq = 100000, uint32_t timeout_ms = 50);
 
     /*!
       @brief Core I2C transfer entry point.
@@ -503,10 +509,8 @@ struct I2CBus : public bus::Bus {
       0 on a successful zero-byte transfer. The default implementation
       returns `NOT_IMPLEMENTED`; every variant overrides it.
      */
-    virtual m5::stl::expected<size_t, m5::hal::v1::error::error_t> transfer(bus::Accessor* owner,
-                                                                            const I2CMasterAccessConfig& cfg,
-                                                                            const TransferDesc& desc, data::Source* tx,
-                                                                            data::Sink* rx);
+    virtual m5::hal::v1::result_t<size_t> transfer(bus::Accessor* owner, const I2CMasterAccessConfig& cfg,
+                                                   const TransferDesc& desc, data::Source* tx, data::Sink* rx);
 
 protected:
     I2CBusConfig _config;

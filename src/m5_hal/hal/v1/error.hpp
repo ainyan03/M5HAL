@@ -1,11 +1,14 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_ERROR_HPP
 #define M5_HAL_ERROR_HPP
+
+#include <m5_utility/stl/expected.hpp>
 
 #include <stdint.h>
 
 /*!
   @namespace m5::hal::v1::error
-  @brief Error codes returned by v1 HAL APIs via `m5::stl::expected<T, error_t>`.
+  @brief Error codes returned by v1 HAL APIs via `result_t<T>`.
  */
 namespace m5::hal::v1::error {
 
@@ -45,9 +48,9 @@ enum class ErrorType : int8_t {
 };
 using error_t = ErrorType;
 
-// Internal helpers. Public APIs return `m5::stl::expected<..., error_t>` so
-// callers use `if (auto r = ...; !r) ...` uniformly; these are kept for
-// variant implementations and test fixtures that handle a raw error_t.
+// Internal helpers. Public APIs return `result_t<T>` so callers use
+// `if (auto r = ...; !r) ...` uniformly; these are kept for variant
+// implementations and test fixtures that handle a raw error_t.
 constexpr bool isError(const error_t e)
 {
     return e < error_t::OK;
@@ -58,5 +61,23 @@ constexpr bool isOk(const error_t e)
 }
 
 }  // namespace m5::hal::v1::error
+
+namespace m5::hal::v1 {
+
+/*!
+  @brief Standard return type of v1 HAL APIs: a value of `T` or an
+         `error::error_t`.
+
+  Pure alias of `m5::stl::expected<T, error::error_t>` — the SAME type,
+  not a derived one, so it interconverts freely with code (including
+  M5UnitUnified) that spells the underlying type out, and a future move
+  to `std::expected` stays a one-line change. The `_t` suffix follows
+  the house typedef convention (`error_t`, `gpio_number_t`, ...) and
+  avoids shadowing by the ubiquitous `auto result = ...` locals.
+ */
+template <typename T>
+using result_t = m5::stl::expected<T, error::error_t>;
+
+}  // namespace m5::hal::v1
 
 #endif

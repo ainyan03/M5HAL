@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 
 #ifndef M5_HAL_V0_BUS_HPP_
 #define M5_HAL_V0_BUS_HPP_

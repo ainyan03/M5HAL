@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_HAL_V1_MEMORY_ALLOCATOR_INL_
 #define M5_HAL_HAL_V1_MEMORY_ALLOCATOR_INL_
 
@@ -54,7 +55,10 @@ M5HAL_INLINE_V1 namespace v1
             if (next == nullptr) {
                 return nullptr;
             }
-            std::memcpy(next, ptr, std::min(preserve_size, new_size));
+            // `preserve_size` is caller input; clamp the copy to the actual
+            // block run so it cannot read past the old pool allocation.
+            const size_t pool_capacity = _temp_pool.allocationSize(ptr);
+            std::memcpy(next, ptr, std::min(std::min(preserve_size, new_size), pool_capacity));
             deallocate(ptr);
             return next;
         }

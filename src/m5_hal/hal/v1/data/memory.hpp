@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_DATA_MEMORY_HPP_
 #define M5_HAL_DATA_MEMORY_HPP_
 
@@ -38,14 +39,14 @@ public:
     {
     }
 
-    m5::stl::expected<ConstDataSpan, m5::hal::v1::error::error_t> peek(size_t max_len) override
+    m5::hal::v1::result_t<ConstDataSpan> peek(size_t max_len) override
     {
         size_t remain = (_cursor < _data.size) ? (_data.size - _cursor) : 0;
         size_t take   = std::min(max_len, remain);
         return ConstDataSpan{_data.data + _cursor, take};
     }
 
-    m5::stl::expected<void, m5::hal::v1::error::error_t> advance(size_t N) override
+    m5::hal::v1::result_t<void> advance(size_t N) override
     {
         size_t remain = (_cursor < _data.size) ? (_data.size - _cursor) : 0;
         _cursor += std::min(N, remain);
@@ -55,6 +56,13 @@ public:
     bool eof() const override
     {
         return _cursor >= _data.size;
+    }
+
+    /*! @brief Always true: the content is fixed at construction, so the
+        peekable bytes are final even while some remain unconsumed. */
+    bool closed() const override
+    {
+        return true;
     }
 
 private:
@@ -83,14 +91,14 @@ public:
     {
     }
 
-    m5::stl::expected<DataSpan, m5::hal::v1::error::error_t> reserve(size_t max_len) override
+    m5::hal::v1::result_t<DataSpan> reserve(size_t max_len) override
     {
         size_t remain = (_cursor < _buf.size) ? (_buf.size - _cursor) : 0;
         size_t take   = std::min(max_len, remain);
         return DataSpan{_buf.data + _cursor, take};
     }
 
-    m5::stl::expected<void, m5::hal::v1::error::error_t> commit(size_t N) override
+    m5::hal::v1::result_t<void> commit(size_t N) override
     {
         size_t remain = (_cursor < _buf.size) ? (_buf.size - _cursor) : 0;
         _cursor += std::min(N, remain);

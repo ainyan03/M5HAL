@@ -33,20 +33,19 @@ class DummyI2CBus : public i2c::I2CBus {
 public:
     // Typed init (S17 E1): the fake adds no fields, so it takes the
     // abstract kind config.
-    ::m5::stl::expected<void, error::error_t> init(const i2c::I2CBusConfig& config)
+    ::m5::hal::v1::result_t<void> init(const i2c::I2CBusConfig& config)
     {
         _config = config;
         return {};
     }
 
-    ::m5::stl::expected<void, error::error_t> release(void) override
+    ::m5::hal::v1::result_t<void> release(void) override
     {
         return {};
     }
 
-    ::m5::stl::expected<size_t, error::error_t> transfer(bus::Accessor* owner, const i2c::I2CMasterAccessConfig& cfg,
-                                                         const i2c::TransferDesc& desc, data::Source* tx,
-                                                         data::Sink* rx) override
+    ::m5::hal::v1::result_t<size_t> transfer(bus::Accessor* owner, const i2c::I2CMasterAccessConfig& cfg,
+                                             const i2c::TransferDesc& desc, data::Source* tx, data::Sink* rx) override
     {
         (void)owner;
         (void)cfg;
@@ -85,36 +84,33 @@ public:
 
 class DummySPIBus : public spi::SPIBus {
 public:
-    ::m5::stl::expected<void, error::error_t> init(const spi::SPIBusConfig& config)
+    ::m5::hal::v1::result_t<void> init(const spi::SPIBusConfig& config)
     {
         _config = config;
         return {};
     }
 
-    ::m5::stl::expected<void, error::error_t> release(void) override
+    ::m5::hal::v1::result_t<void> release(void) override
     {
         return {};
     }
 
-    ::m5::stl::expected<void, error::error_t> beginTransaction(bus::Accessor* owner,
-                                                               const spi::SPIMasterAccessConfig& cfg) override
-    {
-        (void)owner;
-        (void)cfg;
-        return {};
-    }
-
-    ::m5::stl::expected<void, error::error_t> endTransaction(bus::Accessor* owner,
-                                                             const spi::SPIMasterAccessConfig& cfg) override
+    ::m5::hal::v1::result_t<void> beginTransaction(bus::Accessor* owner, const spi::SPIMasterAccessConfig& cfg) override
     {
         (void)owner;
         (void)cfg;
         return {};
     }
 
-    ::m5::stl::expected<size_t, error::error_t> transfer(bus::Accessor* owner, const spi::SPIMasterAccessConfig& cfg,
-                                                         const spi::TransferDesc& desc, data::Source* tx,
-                                                         data::Sink* rx) override
+    ::m5::hal::v1::result_t<void> endTransaction(bus::Accessor* owner, const spi::SPIMasterAccessConfig& cfg) override
+    {
+        (void)owner;
+        (void)cfg;
+        return {};
+    }
+
+    ::m5::hal::v1::result_t<size_t> transfer(bus::Accessor* owner, const spi::SPIMasterAccessConfig& cfg,
+                                             const spi::TransferDesc& desc, data::Source* tx, data::Sink* rx) override
     {
         (void)owner;
         (void)cfg;
@@ -154,19 +150,19 @@ public:
 
 class DummyUARTBus : public uart::UARTBus {
 public:
-    ::m5::stl::expected<void, error::error_t> init(const uart::UARTBusConfig& config)
+    ::m5::hal::v1::result_t<void> init(const uart::UARTBusConfig& config)
     {
         _config = config;
         return {};
     }
 
-    ::m5::stl::expected<void, error::error_t> release(void) override
+    ::m5::hal::v1::result_t<void> release(void) override
     {
         return {};
     }
 
-    ::m5::stl::expected<size_t, error::error_t> write(bus::Accessor* owner, const uart::UARTAccessConfig& cfg,
-                                                      data::Source* tx, size_t len) override
+    ::m5::hal::v1::result_t<size_t> write(bus::Accessor* owner, const uart::UARTAccessConfig& cfg, data::Source* tx,
+                                          size_t len) override
     {
         (void)owner;
         (void)cfg;
@@ -188,8 +184,8 @@ public:
         return done;
     }
 
-    ::m5::stl::expected<size_t, error::error_t> read(bus::Accessor* owner, const uart::UARTAccessConfig& cfg,
-                                                     data::Sink* rx, size_t len) override
+    ::m5::hal::v1::result_t<size_t> read(bus::Accessor* owner, const uart::UARTAccessConfig& cfg, data::Sink* rx,
+                                         size_t len) override
     {
         (void)owner;
         (void)cfg;
@@ -211,8 +207,7 @@ public:
         return done;
     }
 
-    ::m5::stl::expected<size_t, error::error_t> readableBytes(bus::Accessor* owner,
-                                                              const uart::UARTAccessConfig& cfg) override
+    ::m5::hal::v1::result_t<size_t> readableBytes(bus::Accessor* owner, const uart::UARTAccessConfig& cfg) override
     {
         (void)owner;
         (void)cfg;
@@ -258,6 +253,16 @@ static_assert(M5HAL_V1_SELECTED_VARIANT_GPIO == M5HAL_V1_VARIANT_ID_PLATFORM_ESP
 static_assert(M5HAL_V1_SELECTED_VARIANT_GPIO == M5HAL_V1_TARGET_PLATFORM_VARIANT_ID,
               "the detected platform's variant should win GPIO on ESP32");
 #endif
+
+// ---- Typed registry mirror (S18 F4/F5) ------------------------------------
+// The enum and name table derive from the ids.hpp X-macro list; pin the
+// PP face and the typed face to the same values / spellings.
+static_assert(static_cast<uint16_t>(::m5::hal::v1::variant_id_t::PLATFORM_ESP32) == M5HAL_V1_VARIANT_ID_PLATFORM_ESP32,
+              "variant_id_t must mirror the PP registry values");
+static_assert(::m5::hal::v1::variantIdName(::m5::hal::v1::variant_id_t::FRAMEWORK_ARDUINO)[0] == 'F',
+              "variantIdName must resolve registry names");
+static_assert(::m5::hal::v1::variantIdName(static_cast<uint16_t>(0xFFFFu))[0] == 'U',
+              "variantIdName must answer UNKNOWN for unregistered values");
 
 inline void compileCommonApiSurface(void)
 {
@@ -396,8 +401,8 @@ inline void compileCommonApiSurface(void)
     namespace frame = ::m5::hal::v1::frame;
     uint8_t frame_buf[frame::checkedFrameWireSize(1)];
     detail::useResult(frame::encodeDelimiter(detail::data::DataSpan{frame_buf, sizeof(frame_buf)}));
-    detail::useResult(frame::encodeChecked(detail::data::DataSpan{frame_buf, sizeof(frame_buf)},
-                                           frame::Kind::control, detail::data::ConstDataSpan{}));
+    detail::useResult(frame::encodeChecked(detail::data::DataSpan{frame_buf, sizeof(frame_buf)}, frame::Kind::control,
+                                           detail::data::ConstDataSpan{}));
     detail::useResult(
         frame::encodeData(detail::data::DataSpan{frame_buf, sizeof(frame_buf)}, 0, detail::data::ConstDataSpan{}));
     (void)frame::crc16CcittUpdate(0xFFFF, 0x00);
@@ -411,8 +416,8 @@ inline void compileCommonApiSurface(void)
     detail::data::MemorySink frame_snk{detail::data::DataSpan{}};
     frame::FrameReader frame_reader{frame_src};
     frame::FrameWriter frame_writer{frame_snk};
-    detail::useResult(frame_reader.next(frame_view));      // empty source -> END_OF_STREAM
-    detail::useResult(frame_writer.writeDelimiter());      // closed sink -> CLOSED
+    detail::useResult(frame_reader.next(frame_view));  // empty source -> END_OF_STREAM
+    detail::useResult(frame_writer.writeDelimiter());  // closed sink -> CLOSED
 
     // Bytecode: encoder + runner surface. All calls stay I/O-free
     // (closed sinks, empty scripts, no registered targets touched).

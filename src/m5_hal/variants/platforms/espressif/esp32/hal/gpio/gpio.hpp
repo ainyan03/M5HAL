@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_VARIANTS_PLATFORMS_ESPRESSIF_ESP32_HAL_GPIO_GPIO_HPP
 #define M5_HAL_VARIANTS_PLATFORMS_ESPRESSIF_ESP32_HAL_GPIO_GPIO_HPP
 
@@ -65,6 +66,11 @@ protected:
     uint32_t _fromLocalPin(::m5::hal::v1::types::gpio_local_pin_t pin_index) const override
     {
         M5HAL_ASSERT(pin_index < static_cast<::m5::hal::v1::types::gpio_local_pin_t>(kWidth), "pin_index out of range");
+        // Bank membership: without this, a pin from another bank would
+        // silently alias onto `pin_index & 31` of this bank (e.g.
+        // `getPort(0)->write(40, v)` driving GPIO8).
+        M5HAL_ASSERT((pin_index >> 5) == _port_index, "pin_index %u not in port %u", static_cast<unsigned>(pin_index),
+                     static_cast<unsigned>(_port_index));
         return 1u << (pin_index & 31);  // pin_mask. `1u <<` avoids signed shift UB.
     }
 };

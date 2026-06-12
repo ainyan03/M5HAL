@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_POSIX_HAL_UART_REMOTE_CONNECT_HPP
 #define M5_HAL_VARIANTS_FRAMEWORKS_POSIX_HAL_UART_REMOTE_CONNECT_HPP
 
@@ -111,7 +112,7 @@ struct ConnectOptions {
   Errors: `IO_ERROR` when no port could be opened (or none exists);
   `TIMEOUT_ERROR` when ports opened but nothing answered hello.
  */
-m5::stl::expected<::m5::hal::v1::remote::Capabilities, ::m5::hal::v1::error::error_t> connectRemoteSerial(
+::m5::hal::v1::result_t<::m5::hal::v1::remote::Capabilities> connectRemoteSerial(
     SerialRemoteEndpoint& ep, const ConnectOptions& opt = ConnectOptions{});
 
 }  // namespace m5::variants::frameworks::posix::hal::v1::uart

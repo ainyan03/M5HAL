@@ -93,8 +93,8 @@ detail::MasterTiming serviceTimingToTicks(const detail::MasterTiming& timing)
 }
 
 template <typename Service>
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> runErrorReportingService(
-    Service& service, ::m5::hal::v1::service::fast_tick_t deadline_tick)
+::m5::hal::v1::result_t<void> runErrorReportingService(Service& service,
+                                                       ::m5::hal::v1::service::fast_tick_t deadline_tick)
 {
 #if !M5HAL_DEBUG_SOFTWARE_I2C_NO_WAIT
     uint32_t idle_spins = 0;
@@ -135,9 +135,9 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> runErrorReportingService(
     }
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> sendAddressWithServices(
-    ::m5::hal::v1::gpio::Pin& scl, ::m5::hal::v1::gpio::Pin& sda, const detail::MasterTiming& timing, uint8_t addr_byte,
-    ::m5::hal::v1::service::fast_tick_t deadline_tick)
+::m5::hal::v1::result_t<void> sendAddressWithServices(::m5::hal::v1::gpio::Pin& scl, ::m5::hal::v1::gpio::Pin& sda,
+                                                      const detail::MasterTiming& timing, uint8_t addr_byte,
+                                                      ::m5::hal::v1::service::fast_tick_t deadline_tick)
 {
     PinMasterLineDriver lines{scl, sda};
     detail::MasterTransactionService transaction;
@@ -146,9 +146,9 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> sendAddressWithServices(
     return runErrorReportingService(transaction, deadline_tick);
 }
 
-m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> writeBytesWithService(
-    ::m5::hal::v1::gpio::Pin& scl, ::m5::hal::v1::gpio::Pin& sda, const detail::MasterTiming& timing,
-    const uint8_t* data, size_t len, ::m5::hal::v1::service::fast_tick_t deadline_tick)
+::m5::hal::v1::result_t<size_t> writeBytesWithService(::m5::hal::v1::gpio::Pin& scl, ::m5::hal::v1::gpio::Pin& sda,
+                                                      const detail::MasterTiming& timing, const uint8_t* data,
+                                                      size_t len, ::m5::hal::v1::service::fast_tick_t deadline_tick)
 {
     PinMasterLineDriver lines{scl, sda};
     detail::MasterTransactionService transaction;
@@ -163,9 +163,9 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> writeBytesWithService(
     return transaction.transferred();
 }
 
-m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> readBytesWithService(
-    ::m5::hal::v1::gpio::Pin& scl, ::m5::hal::v1::gpio::Pin& sda, const detail::MasterTiming& timing, uint8_t* data,
-    size_t len, bool last_nack, ::m5::hal::v1::service::fast_tick_t deadline_tick)
+::m5::hal::v1::result_t<size_t> readBytesWithService(::m5::hal::v1::gpio::Pin& scl, ::m5::hal::v1::gpio::Pin& sda,
+                                                     const detail::MasterTiming& timing, uint8_t* data, size_t len,
+                                                     bool last_nack, ::m5::hal::v1::service::fast_tick_t deadline_tick)
 {
     PinMasterLineDriver lines{scl, sda};
     detail::MasterTransactionService transaction;
@@ -180,9 +180,8 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> readBytesWithService(
     return transaction.transferred();
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> sendStopWithService(::m5::hal::v1::gpio::Pin& scl,
-                                                                           ::m5::hal::v1::gpio::Pin& sda,
-                                                                           const detail::MasterTiming& timing)
+::m5::hal::v1::result_t<void> sendStopWithService(::m5::hal::v1::gpio::Pin& scl, ::m5::hal::v1::gpio::Pin& sda,
+                                                  const detail::MasterTiming& timing)
 {
     PinMasterLineDriver lines{scl, sda};
     detail::MasterTransactionService transaction;
@@ -194,7 +193,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> sendStopWithService(::m5:
 
 }  // anonymous namespace
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig& config)
+::m5::hal::v1::result_t<void> Bus::init(const BusConfig& config)
 {
     _config = config;
 
@@ -226,9 +225,10 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig
     return {};
 }
 
-m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
-    ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg,
-    const ::m5::hal::v1::i2c::TransferDesc& desc, ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
+::m5::hal::v1::result_t<size_t> Bus::transfer(::m5::hal::v1::bus::Accessor* owner,
+                                              const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg,
+                                              const ::m5::hal::v1::i2c::TransferDesc& desc,
+                                              ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
 {
     // `owner` is reserved for future lock / unlock semantics
     // (the M5UU lock migration is currently on hold); ignored here.
@@ -264,7 +264,7 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
     size_t total          = 0;
     bool write_phase_open = false;
 
-    auto write_addr = [&](bool read_bit) -> m5::stl::expected<void, ::m5::hal::v1::error::error_t> {
+    auto write_addr = [&](bool read_bit) -> ::m5::hal::v1::result_t<void> {
         uint8_t addr_byte = static_cast<uint8_t>((cfg.i2c_addr << 1) | (read_bit ? 1 : 0));
         return sendAddressWithServices(*scl, *sda, service_timing, addr_byte, deadline_tick);
     };

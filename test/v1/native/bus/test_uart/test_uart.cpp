@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include <M5HAL_v1.hpp>
 #include <gtest/gtest.h>
 
@@ -9,22 +10,22 @@ class RecordingUARTBus : public m5::hal::v1::uart::UARTBus {
 public:
     // Typed init (S17 E1): the fake adds no fields, so it takes the
     // abstract kind config.
-    m5::stl::expected<void, m5::hal::v1::error::error_t> init(const m5::hal::v1::uart::UARTBusConfig& config)
+    m5::hal::v1::result_t<void> init(const m5::hal::v1::uart::UARTBusConfig& config)
     {
         _config = config;
         return {};
     }
 
-    m5::stl::expected<void, m5::hal::v1::error::error_t> release(void) override
+    m5::hal::v1::result_t<void> release(void) override
     {
         tx_recorded.clear();
         rx_queue.clear();
         return {};
     }
 
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> write(m5::hal::v1::bus::Accessor* owner,
-                                                                 const m5::hal::v1::uart::UARTAccessConfig& cfg,
-                                                                 m5::hal::v1::data::Source* tx, size_t len) override
+    m5::hal::v1::result_t<size_t> write(m5::hal::v1::bus::Accessor* owner,
+                                        const m5::hal::v1::uart::UARTAccessConfig& cfg, m5::hal::v1::data::Source* tx,
+                                        size_t len) override
     {
         last_owner  = owner;
         last_cfg    = cfg;
@@ -47,9 +48,9 @@ public:
         return done;
     }
 
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> read(m5::hal::v1::bus::Accessor* owner,
-                                                                const m5::hal::v1::uart::UARTAccessConfig& cfg,
-                                                                m5::hal::v1::data::Sink* rx, size_t len) override
+    m5::hal::v1::result_t<size_t> read(m5::hal::v1::bus::Accessor* owner,
+                                       const m5::hal::v1::uart::UARTAccessConfig& cfg, m5::hal::v1::data::Sink* rx,
+                                       size_t len) override
     {
         last_owner  = owner;
         last_cfg    = cfg;
@@ -80,8 +81,8 @@ public:
         return done;
     }
 
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> readableBytes(
-        m5::hal::v1::bus::Accessor* owner, const m5::hal::v1::uart::UARTAccessConfig& cfg) override
+    m5::hal::v1::result_t<size_t> readableBytes(m5::hal::v1::bus::Accessor* owner,
+                                                const m5::hal::v1::uart::UARTAccessConfig& cfg) override
     {
         last_owner = owner;
         last_cfg   = cfg;

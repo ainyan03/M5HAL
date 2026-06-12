@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Skeleton tests for the Pin / Port abstraction (encoded-value
 // hiding + assert-based contracts). The stub variant's Port
 // (`m5::variants::frameworks::stub::hal::v1::gpio::Port`) drives

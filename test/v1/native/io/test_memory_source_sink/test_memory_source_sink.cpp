@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Native gtest for MemorySource / MemorySink.
 //
 // Mechanically verifies the behavioural contract of the memory-backed

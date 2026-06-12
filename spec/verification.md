@@ -20,8 +20,9 @@ M5HAL v1 開発で使う検証コマンドとその運用詳細を示す。
 | software SPI logic analyzer | software SPI の SCLK/MOSI/CS/DC wire activity smoke test | `pio run -e v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino` |
 | software SPI 5MHz / NDEBUG | software SPI の高周波設定と `M5HAL_ASSERT` 無効化の比較 | `pio run -e v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino_5mhz -e v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino_5mhz_ndebug` |
 | software SPI wire self-test | ESP32 実機で低速 software SPI の command/address/dummy/data、bit order、mode edge semantic を GPIO capture で判定 | `pio test -e v1_test_esp32_arduino_software_spi_wire` |
+| espidf SPI wire self-test | 同じ wire 契約を ESP-IDF hardware spi_master backend で判定 (capture rig は共通 `test/v1/embedded/bus/spi_wire_capture.hpp`) | `pio test -e v1_test_esp32_arduino_espidf_spi_wire` |
 | ESP-IDF I2C smoke | BoardMenu の純 ESP-IDF env で ESP-IDF I2C backend を選び bus init → scan → register read | `pio run -e v1_exp_menu_idf5 -t upload` |
-| ESP-IDF SPI build check | ESP-IDF framework variant の SPI master backend が public v1 header から見えることを確認 | `pio run -e v1_check_esp32_espidf` |
+| ESP-IDF SPI build check | ESP-IDF framework variant の SPI master backend が public v1 header から見えることを確認 (wire semantic は上記 espidf SPI wire self-test で実機判定) | `pio run -e v1_check_esp32_espidf` |
 | software I2C hot path | bit-bang I2C の timer / virtual GPIO / write buffer state machine の切り分け | `pio run -e v1_experiment_I2CHotPathBenchmark_esp32_arduino` |
 | M5UU 破壊検出 | M5UnitUnified との互換性確認 | 下記参照 |
 | clang-format | コードフォーマット検証 | 下記参照 |
@@ -114,7 +115,9 @@ DC out   -> DC capture in
 
 `v1_test_esp32_arduino_software_spi_wire_jumper` は ESP32 用の別 GPIO capture env。 既定では `CLK 18 -> 32`、`MOSI 23 -> 33`、`DC 2 -> 25`、`CS 5 -> 26` を想定する。 `v1_test_esp32s3_arduino_software_spi_wire` は ESP32-S3 用 env で、初期値は USB-only capture を想定する。
 
-最初の対象は低速の protocol semantic。 `writeCommandAddressData(0x02, 0x001234, {0xDE, 0xAD})` では command 8 clock、address 24 clock、write dummy 4 clock、data 16 clock、 `readCommandAddressData(0x0B, 0x001234, rx[4])` では command 8 clock、address 24 clock、read dummy 8 clock、read data 32 clock を検証する。 CS は phase 全体で active、DC は command phase だけ low、address/dummy/data phase は high であることを固定する。 追加で LSB first の bit sequence と、SPI mode 0-3 の active edge polarity / edge alternation を検証する。
+最初の対象は低速の protocol semantic。 `writeCommandAddressData(0x02, 0x001234, {0xDE, 0xAD})` では command 8 clock、address 24 clock、write dummy 4 clock、data 16 clock、 `readCommandAddressData(0x0B, 0x001234, rx[4])` では command 8 clock、address 24 clock、read dummy 8 clock、read data 32 clock を検証する。 CS は phase 全体で active、DC は command phase だけ low、address/dummy/data phase は high であることを固定する。 追加で LSB first の bit sequence と、SPI mode 0-3 の active edge polarity / edge alternation、 および pacing guard (連続 3 edge のスパン >= half period — 「設定より速くクロックしない」方針の恒久ガード) を検証する。
+
+> **capture 分解能の限界**: capture task は GPIO ポーリング (1 サンプル ~数 µs) なので、 数 µs 以内に複数の遷移が起きると 1 サンプルに融合して個別 edge を分解できない。 このため本テストは **低速設定 (既定 2 kHz) 専用**で、 高速設定のワイヤ検証には外部ロジックアナライザが要る。 実装側も phase 境界のイベント (DC 遷移、 idle 復帰) を half-period グリッドに載せて、 capture が分解できる間隔を保証している (design/spi.md)。
 
 明示 transaction の検証では、2 回以上の `transfer()` / `write()` を連続実行しても
 CS assert/deassert が transaction の前後 1 回ずつに留まることを見る。これは

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include <M5HAL_v1.hpp>
 #include <gtest/gtest.h>
 
@@ -5,6 +6,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+
+using ::m5::hal::v1::result_t;
 
 namespace {
 
@@ -27,14 +30,13 @@ public:
 
     // Typed init (S17 E1): the fake adds no fields, so it takes the
     // abstract kind config.
-    m5::stl::expected<void, error::error_t> init(const spi::SPIBusConfig& config)
+    result_t<void> init(const spi::SPIBusConfig& config)
     {
         _config = config;
         return {};
     }
 
-    m5::stl::expected<void, error::error_t> beginTransaction(bus::Accessor* owner,
-                                                             const spi::SPIMasterAccessConfig& cfg) override
+    result_t<void> beginTransaction(bus::Accessor* owner, const spi::SPIMasterAccessConfig& cfg) override
     {
         transaction_owners.push_back(owner);
         transaction_cfgs.push_back(cfg);
@@ -42,8 +44,7 @@ public:
         return {};
     }
 
-    m5::stl::expected<void, error::error_t> endTransaction(bus::Accessor* owner,
-                                                           const spi::SPIMasterAccessConfig& cfg) override
+    result_t<void> endTransaction(bus::Accessor* owner, const spi::SPIMasterAccessConfig& cfg) override
     {
         transaction_owners.push_back(owner);
         transaction_cfgs.push_back(cfg);
@@ -51,9 +52,8 @@ public:
         return {};
     }
 
-    m5::stl::expected<size_t, error::error_t> transfer(bus::Accessor* owner, const spi::SPIMasterAccessConfig& cfg,
-                                                       const spi::TransferDesc& desc, data::Source* tx,
-                                                       data::Sink* rx) override
+    result_t<size_t> transfer(bus::Accessor* owner, const spi::SPIMasterAccessConfig& cfg,
+                              const spi::TransferDesc& desc, data::Source* tx, data::Sink* rx) override
     {
         Call call;
         call.owner = owner;

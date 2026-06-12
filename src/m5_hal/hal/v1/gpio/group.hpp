@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_GPIO_GROUP_HPP_
 #define M5_HAL_GPIO_GROUP_HPP_
 
@@ -61,7 +62,7 @@ public:
       already in use, or storage is full. See spec §addGPIO for the
       full rule set.
      */
-    [[nodiscard]] m5::stl::expected<void, error::error_t> addGPIO(const IGPIO* gpio, types::gpio_slot_t slot)
+    [[nodiscard]] result_t<void> addGPIO(const IGPIO* gpio, types::gpio_slot_t slot)
     {
         if (gpio == nullptr) {
             return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
@@ -94,7 +95,7 @@ public:
       registered. The hole is filled by moving the last entry over it
       (swap-and-pop; the entry order is not preserved).
      */
-    [[nodiscard]] m5::stl::expected<void, error::error_t> removeGPIO(types::gpio_slot_t slot)
+    [[nodiscard]] result_t<void> removeGPIO(types::gpio_slot_t slot)
     {
         if (slot >= kSlotCount) {
             return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
@@ -140,7 +141,7 @@ public:
       @brief Checked resolution. Invalid input recovers through the
              `expected` error path.
      */
-    [[nodiscard]] m5::stl::expected<Pin, error::error_t> tryGetPin(types::gpio_number_t gpio_num) const
+    [[nodiscard]] result_t<Pin> tryGetPin(types::gpio_number_t gpio_num) const
     {
         if (!isValid(gpio_num)) {
             return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);

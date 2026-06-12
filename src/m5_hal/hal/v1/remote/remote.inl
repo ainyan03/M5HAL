@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_REMOTE_REMOTE_INL_
 #define M5_HAL_REMOTE_REMOTE_INL_
 
@@ -38,7 +39,7 @@ void Server::checkScratch()
     }
 }
 
-m5::stl::expected<void, error_t> Server::recordCapability(types::bus_kind_t kind, uint8_t bus_id)
+result_t<void> Server::recordCapability(types::bus_kind_t kind, uint8_t bus_id)
 {
     // Idempotent: re-registering the same (kind, bus_id) pair is a no-op success
     // so that Server::register* can be called multiple times without exhausting
@@ -55,7 +56,7 @@ m5::stl::expected<void, error_t> Server::recordCapability(types::bus_kind_t kind
     return {};
 }
 
-m5::stl::expected<void, error_t> Server::registerI2C(uint8_t bus_id, i2c::I2CMasterAccessor& acc)
+result_t<void> Server::registerI2C(uint8_t bus_id, i2c::I2CMasterAccessor& acc)
 {
     auto r = _runner.registerI2C(bus_id, acc);
     if (!r.has_value()) {
@@ -64,7 +65,7 @@ m5::stl::expected<void, error_t> Server::registerI2C(uint8_t bus_id, i2c::I2CMas
     return recordCapability(types::bus_kind_t::I2C, bus_id);
 }
 
-m5::stl::expected<void, error_t> Server::registerSPI(uint8_t bus_id, spi::SPIMasterAccessor& acc)
+result_t<void> Server::registerSPI(uint8_t bus_id, spi::SPIMasterAccessor& acc)
 {
     auto r = _runner.registerSPI(bus_id, acc);
     if (!r.has_value()) {
@@ -73,7 +74,7 @@ m5::stl::expected<void, error_t> Server::registerSPI(uint8_t bus_id, spi::SPIMas
     return recordCapability(types::bus_kind_t::SPI, bus_id);
 }
 
-m5::stl::expected<void, error_t> Server::registerUART(uint8_t bus_id, uart::UARTAccessor& acc)
+result_t<void> Server::registerUART(uint8_t bus_id, uart::UARTAccessor& acc)
 {
     auto r = _runner.registerUART(bus_id, acc);
     if (!r.has_value()) {
@@ -82,7 +83,7 @@ m5::stl::expected<void, error_t> Server::registerUART(uint8_t bus_id, uart::UART
     return recordCapability(types::bus_kind_t::UART, bus_id);
 }
 
-m5::stl::expected<void, error_t> Server::registerI2S(uint8_t bus_id, i2s::I2STxAccessor& acc)
+result_t<void> Server::registerI2S(uint8_t bus_id, i2s::I2STxAccessor& acc)
 {
     auto r = _runner.registerI2S(bus_id, acc);
     if (!r.has_value()) {
@@ -129,24 +130,32 @@ error_t Server::prescan(data::ConstDataSpan script, size_t& offset) const
             if (payload.size >= 2) {
                 const data::ConstDataSpan cfg{payload.data + 2, payload.size - 2};
                 bool exceeded = false;
+                // Field offsets: bytecode.hpp §bus_configure config payload
+                // layout (shared with encodeConfig).
                 switch (static_cast<types::bus_kind_t>(payload.data[0])) {
                     case types::bus_kind_t::I2C:
-                        exceeded = detail::u32FieldExceeds(cfg, 4, _config.max_bus_timeout_ms);
+                        exceeded =
+                            detail::u32FieldExceeds(cfg, bytecode::kI2CConfigTimeoutOffset, _config.max_bus_timeout_ms);
                         break;
                     case types::bus_kind_t::SPI:
-                        exceeded = detail::u32FieldExceeds(cfg, 6, _config.max_bus_timeout_ms);
+                        exceeded =
+                            detail::u32FieldExceeds(cfg, bytecode::kSPIConfigTimeoutOffset, _config.max_bus_timeout_ms);
                         break;
                     case types::bus_kind_t::UART:
-                        // timeout_ms / first_byte / inter_byte / write timeouts
-                        exceeded = detail::u32FieldExceeds(cfg, 4, _config.max_bus_timeout_ms) ||
-                                   detail::u32FieldExceeds(cfg, 8, _config.max_bus_timeout_ms) ||
-                                   detail::u32FieldExceeds(cfg, 12, _config.max_bus_timeout_ms) ||
-                                   detail::u32FieldExceeds(cfg, 16, _config.max_bus_timeout_ms);
+                        exceeded = detail::u32FieldExceeds(cfg, bytecode::kUARTConfigTimeoutOffset,
+                                                           _config.max_bus_timeout_ms) ||
+                                   detail::u32FieldExceeds(cfg, bytecode::kUARTConfigFirstByteTimeoutOffset,
+                                                           _config.max_bus_timeout_ms) ||
+                                   detail::u32FieldExceeds(cfg, bytecode::kUARTConfigInterByteTimeoutOffset,
+                                                           _config.max_bus_timeout_ms) ||
+                                   detail::u32FieldExceeds(cfg, bytecode::kUARTConfigWriteTimeoutOffset,
+                                                           _config.max_bus_timeout_ms);
                         break;
                     case types::bus_kind_t::I2S:
-                        // sample_rate(0) / timeout_ms(4) / write_timeout(8)
-                        exceeded = detail::u32FieldExceeds(cfg, 4, _config.max_bus_timeout_ms) ||
-                                   detail::u32FieldExceeds(cfg, 8, _config.max_bus_timeout_ms);
+                        exceeded = detail::u32FieldExceeds(cfg, bytecode::kI2SConfigTimeoutOffset,
+                                                           _config.max_bus_timeout_ms) ||
+                                   detail::u32FieldExceeds(cfg, bytecode::kI2SConfigWriteTimeoutOffset,
+                                                           _config.max_bus_timeout_ms);
                         break;
                     default:
                         break;
@@ -185,7 +194,7 @@ Server::ExecOutcome Server::execute(data::ConstDataSpan script)
     return out;
 }
 
-m5::stl::expected<error_t, error_t> Server::processScript(data::ConstDataSpan script, data::Sink& out)
+result_t<error_t> Server::processScript(data::ConstDataSpan script, data::Sink& out)
 {
     const ExecOutcome outcome = execute(script);
     if (outcome.ran) {
@@ -208,8 +217,8 @@ m5::stl::expected<error_t, error_t> Server::processScript(data::ConstDataSpan sc
     return outcome.status;
 }
 
-m5::stl::expected<void, error_t> Server::sendMessage(frame::FrameWriter& out, uint8_t stream_id, uint8_t type,
-                                                     uint8_t seq, data::ConstDataSpan body)
+result_t<void> Server::sendMessage(frame::FrameWriter& out, uint8_t stream_id, uint8_t type, uint8_t seq,
+                                   data::ConstDataSpan body)
 {
     if (body.size > kMaxBodySize || _scratch.size < kHeaderSize + body.size) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -226,7 +235,7 @@ m5::stl::expected<void, error_t> Server::sendMessage(frame::FrameWriter& out, ui
     return {};
 }
 
-m5::stl::expected<void, error_t> Server::flushPendingError(frame::FrameWriter& out, uint8_t stream_id, uint8_t seq)
+result_t<void> Server::flushPendingError(frame::FrameWriter& out, uint8_t stream_id, uint8_t seq)
 {
     if (!_pending_valid) {
         return {};
@@ -240,8 +249,8 @@ m5::stl::expected<void, error_t> Server::flushPendingError(frame::FrameWriter& o
     return r;
 }
 
-m5::stl::expected<void, error_t> Server::processMessage(uint8_t type, uint8_t seq, data::ConstDataSpan body,
-                                                        frame::FrameWriter& out, uint8_t stream_id)
+result_t<void> Server::processMessage(uint8_t type, uint8_t seq, data::ConstDataSpan body, frame::FrameWriter& out,
+                                      uint8_t stream_id)
 {
     const uint8_t kind4 = type & kTypeKindMask;
     const bool noresp   = (type & kTypeNorespBit) != 0;
@@ -346,13 +355,12 @@ void Server::clearSubscriptions()
     _sub_count = 0;
 }
 
-m5::stl::expected<void, error_t> Server::gpioSubscribeThunk(void* ctx, bool subscribe, const types::gpio_number_t* pins,
-                                                            size_t count)
+result_t<void> Server::gpioSubscribeThunk(void* ctx, bool subscribe, const types::gpio_number_t* pins, size_t count)
 {
     return static_cast<Server*>(ctx)->handleSubscribe(subscribe, pins, count);
 }
 
-m5::stl::expected<void, error_t> Server::handleSubscribe(bool subscribe, const types::gpio_number_t* pins, size_t count)
+result_t<void> Server::handleSubscribe(bool subscribe, const types::gpio_number_t* pins, size_t count)
 {
     if (_gpio_group == nullptr) {
         return m5::stl::make_unexpected(error_t::UNSUPPORTED);
@@ -382,14 +390,34 @@ m5::stl::expected<void, error_t> Server::handleSubscribe(bool subscribe, const t
         return {};
     }
 
-    // Subscribe: validate and add each pin
+    // Subscribe: all-or-nothing. Pass 1 validates every pin and counts
+    // the genuinely new ones, so a failing pin cannot leave a prefix of
+    // the batch subscribed (and pre-existing subscriptions are never
+    // disturbed by a failed batch).
+    size_t new_count = 0;
     for (size_t p = 0; p < count; ++p) {
-        // Validate the pin exists
-        auto pin_handle = _gpio_group->tryGetPin(pins[p]);
-        if (!pin_handle.has_value()) {
+        if (!_gpio_group->tryGetPin(pins[p]).has_value()) {
             return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
         }
-        // Check for duplicate (idempotent)
+        bool found = false;
+        for (size_t i = 0; i < _sub_count; ++i) {
+            if (_subs[i].pin == pins[p]) {
+                found = true;
+                break;
+            }
+        }
+        for (size_t q = 0; !found && q < p; ++q) {
+            found = (pins[q] == pins[p]);  // duplicate inside the batch itself
+        }
+        if (!found) {
+            ++new_count;
+        }
+    }
+    if (_sub_count + new_count > kMaxSubscriptions) {
+        return m5::stl::make_unexpected(error_t::OUT_OF_RESOURCE);
+    }
+    // Pass 2: commit (cannot fail — everything was validated above).
+    for (size_t p = 0; p < count; ++p) {
         bool found = false;
         for (size_t i = 0; i < _sub_count; ++i) {
             if (_subs[i].pin == pins[p]) {
@@ -398,21 +426,18 @@ m5::stl::expected<void, error_t> Server::handleSubscribe(bool subscribe, const t
             }
         }
         if (found) {
-            continue;  // idempotent success
-        }
-        if (_sub_count >= kMaxSubscriptions) {
-            return m5::stl::make_unexpected(error_t::OUT_OF_RESOURCE);
+            continue;  // idempotent (also swallows in-batch duplicates)
         }
         // Record current level as baseline (notify from next change on)
         Subscription& sub = _subs[_sub_count++];
         sub.pin           = pins[p];
-        sub.last_level    = pin_handle.value().read();
+        sub.last_level    = _gpio_group->tryGetPin(pins[p]).value().read();
         sub.active        = true;
     }
     return {};
 }
 
-m5::stl::expected<bool, error_t> Server::pollSubscriptions(frame::FrameWriter& out, uint8_t stream_id)
+result_t<bool> Server::pollSubscriptions(frame::FrameWriter& out, uint8_t stream_id)
 {
     if (_sub_count == 0 || _scratch.size < kMaxMessageSize) {
         return false;  // no subscriptions, or inert (scratch contract violated)
@@ -483,7 +508,7 @@ void Server::clearStreamCredit()
     }
 }
 
-m5::stl::expected<bool, error_t> Server::pollStreamCredit(frame::FrameWriter& out, uint8_t stream_id)
+result_t<bool> Server::pollStreamCredit(frame::FrameWriter& out, uint8_t stream_id)
 {
     if (_scratch.size < kMaxMessageSize) {
         return false;  // inert (scratch contract violated)
@@ -602,7 +627,7 @@ service::ServiceResult RemoteServerService::service(const service::ServiceContex
 
 // ---- RemoteSession ------------------------------------------------------------
 
-m5::stl::expected<void, error_t> RemoteSession::sendMessage(uint8_t type, uint8_t seq, data::ConstDataSpan body)
+result_t<void> RemoteSession::sendMessage(uint8_t type, uint8_t seq, data::ConstDataSpan body)
 {
     if (body.size > kMaxBodySize) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -629,7 +654,7 @@ m5::stl::expected<void, error_t> RemoteSession::sendMessage(uint8_t type, uint8_
     return {};
 }
 
-m5::stl::expected<void, error_t> RemoteSession::awaitReply(AwaitKind kind, uint8_t seq)
+result_t<void> RemoteSession::awaitReply(AwaitKind kind, uint8_t seq)
 {
     const uint8_t want   = kind == AwaitKind::response     ? static_cast<uint8_t>(MessageType::response)
                            : kind == AwaitKind::hello_resp ? static_cast<uint8_t>(MessageType::hello_resp)
@@ -704,7 +729,7 @@ m5::stl::expected<void, error_t> RemoteSession::awaitReply(AwaitKind kind, uint8
     }
 }
 
-m5::stl::expected<void, error_t> RemoteSession::request(data::ConstDataSpan script)
+result_t<void> RemoteSession::request(data::ConstDataSpan script)
 {
     if (_disconnected) {
         return m5::stl::make_unexpected(error_t::DISCONNECTED);
@@ -735,7 +760,7 @@ m5::stl::expected<void, error_t> RemoteSession::request(data::ConstDataSpan scri
     return {};
 }
 
-m5::stl::expected<void, error_t> RemoteSession::requestNoResponse(data::ConstDataSpan script)
+result_t<void> RemoteSession::requestNoResponse(data::ConstDataSpan script)
 {
     if (_disconnected) {
         return m5::stl::make_unexpected(error_t::DISCONNECTED);
@@ -746,7 +771,7 @@ m5::stl::expected<void, error_t> RemoteSession::requestNoResponse(data::ConstDat
     return sendMessage(static_cast<uint8_t>(MessageType::request) | kTypeNorespBit, _next_seq++, script);
 }
 
-m5::stl::expected<Capabilities, error_t> RemoteSession::hello()
+result_t<Capabilities> RemoteSession::hello()
 {
     if (_disconnected) {
         return m5::stl::make_unexpected(error_t::DISCONNECTED);
@@ -783,7 +808,7 @@ m5::stl::expected<Capabilities, error_t> RemoteSession::hello()
     return caps;
 }
 
-m5::stl::expected<void, error_t> RemoteSession::ping()
+result_t<void> RemoteSession::ping()
 {
     if (_disconnected) {
         return m5::stl::make_unexpected(error_t::DISCONNECTED);
@@ -796,7 +821,7 @@ m5::stl::expected<void, error_t> RemoteSession::ping()
     return awaitReply(AwaitKind::pong, seq);
 }
 
-m5::stl::expected<size_t, error_t> RemoteSession::poll(size_t max_frames)
+result_t<size_t> RemoteSession::poll(size_t max_frames)
 {
     size_t events = 0;
 
@@ -857,18 +882,22 @@ m5::stl::expected<size_t, error_t> RemoteSession::poll(size_t max_frames)
 
 // ---- RemoteI2CBus -------------------------------------------------------------
 
-m5::stl::expected<void, error_t> RemoteI2CBus::init(const i2c::I2CBusConfig& config)
+result_t<void> RemoteI2CBus::init(const i2c::I2CBusConfig& config)
 {
     _config = config;
     return {};
 }
 
-m5::stl::expected<size_t, error_t> RemoteI2CBus::transfer(bus::Accessor* owner, const i2c::I2CMasterAccessConfig& cfg,
-                                                          const i2c::TransferDesc& desc, data::Source* tx,
-                                                          data::Sink* rx)
+namespace detail {
+
+// Shared marshalling body of the I2C / SPI proxy `transfer` overrides.
+// The wire flow is kind-agnostic; the config / desc types pick the
+// encoder overloads (and thereby the kind byte on the wire).
+template <typename AccessConfig, typename TransferDesc>
+result_t<size_t> proxyTransfer(RemoteSession* session, uint8_t remote_bus_id, const AccessConfig& cfg,
+                               const TransferDesc& desc, data::Source* tx, data::Sink* rx)
 {
-    (void)owner;
-    if (_session == nullptr) {
+    if (session == nullptr) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
     }
 
@@ -919,9 +948,9 @@ m5::stl::expected<size_t, error_t> RemoteI2CBus::transfer(bus::Accessor* owner, 
     data::MemorySink script_sink{data::DataSpan{script_buf, sizeof(script_buf)}};
     bytecode::BytecodeEncoder enc{script_sink};
     const uint8_t store_id = (rx != nullptr) ? kDefaultStoreId : bytecode::kDiscardStoreId;
-    auto e                 = enc.configure(_remote_bus_id, cfg);
+    auto e                 = enc.configure(remote_bus_id, cfg);
     if (e.has_value()) {
-        e = enc.transfer(_remote_bus_id, desc, data::ConstDataSpan{tx_buf, tx_len}, rx_len, store_id);
+        e = enc.transfer(remote_bus_id, desc, data::ConstDataSpan{tx_buf, tx_len}, rx_len, store_id);
     }
     if (e.has_value()) {
         e = enc.end();
@@ -933,14 +962,14 @@ m5::stl::expected<size_t, error_t> RemoteI2CBus::transfer(bus::Accessor* owner, 
                                             : e.error());
     }
 
-    auto rq = _session->request(data::ConstDataSpan{script_buf, script_sink.written()});
+    auto rq = session->request(data::ConstDataSpan{script_buf, script_sink.written()});
     if (!rq.has_value()) {
         return m5::stl::make_unexpected(rq.error());
     }
 
     size_t rx_got = 0;
     if (rx != nullptr) {
-        const auto stored = _session->runner().storedData(store_id);
+        const auto stored = session->runner().storedData(store_id);
         if (stored.size > rx_span.size) {
             return m5::stl::make_unexpected(error_t::PROTOCOL_ERROR);
         }
@@ -953,109 +982,38 @@ m5::stl::expected<size_t, error_t> RemoteI2CBus::transfer(bus::Accessor* owner, 
         }
         rx_got = stored.size;
     }
-    // Data phase only, like every local I2C backend (S16 D4): the prefix
-    // is not counted.
+    // Data phase only, like every local backend (S16 D4): the prefix is
+    // not counted.
     return tx_len + rx_got;
+}
+
+}  // namespace detail
+
+result_t<size_t> RemoteI2CBus::transfer(bus::Accessor* owner, const i2c::I2CMasterAccessConfig& cfg,
+                                        const i2c::TransferDesc& desc, data::Source* tx, data::Sink* rx)
+{
+    (void)owner;
+    return detail::proxyTransfer(_session, _remote_bus_id, cfg, desc, tx, rx);
 }
 
 // ---- RemoteSPIBus -------------------------------------------------------------
 
-m5::stl::expected<void, error_t> RemoteSPIBus::init(const spi::SPIBusConfig& config)
+result_t<void> RemoteSPIBus::init(const spi::SPIBusConfig& config)
 {
     _config = config;
     return {};
 }
 
-m5::stl::expected<size_t, error_t> RemoteSPIBus::transfer(bus::Accessor* owner, const spi::SPIMasterAccessConfig& cfg,
-                                                          const spi::TransferDesc& desc, data::Source* tx,
-                                                          data::Sink* rx)
+result_t<size_t> RemoteSPIBus::transfer(bus::Accessor* owner, const spi::SPIMasterAccessConfig& cfg,
+                                        const spi::TransferDesc& desc, data::Source* tx, data::Sink* rx)
 {
     (void)owner;
-    if (_session == nullptr) {
-        return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
-    }
-
-    uint8_t tx_buf[kMaxBodySize];
-    size_t tx_len = 0;
-    if (tx != nullptr) {
-        while (!tx->eof()) {
-            const size_t space = sizeof(tx_buf) - tx_len;
-            auto p             = tx->peek(space != 0 ? space : 1);
-            if (!p.has_value()) {
-                return m5::stl::make_unexpected(p.error());
-            }
-            if (p.value().size == 0) {
-                break;
-            }
-            if (space == 0) {
-                return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
-            }
-            ::memcpy(tx_buf + tx_len, p.value().data, p.value().size);
-            tx_len += p.value().size;
-            auto adv = tx->advance(p.value().size);
-            if (!adv.has_value()) {
-                return m5::stl::make_unexpected(adv.error());
-            }
-        }
-    }
-
-    data::DataSpan rx_span{};
-    size_t rx_len = 0;
-    if (rx != nullptr) {
-        auto rsv = rx->reserve(SIZE_MAX);
-        if (!rsv.has_value()) {
-            return m5::stl::make_unexpected(rsv.error());
-        }
-        rx_span = rsv.value();
-        rx_len  = rx_span.size;
-        if (rx_len > kMaxTransferRx) {
-            return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
-        }
-    }
-
-    uint8_t script_buf[kMaxBodySize];
-    data::MemorySink script_sink{data::DataSpan{script_buf, sizeof(script_buf)}};
-    bytecode::BytecodeEncoder enc{script_sink};
-    const uint8_t store_id = (rx != nullptr) ? kDefaultStoreId : bytecode::kDiscardStoreId;
-    auto e                 = enc.configure(_remote_bus_id, cfg);
-    if (e.has_value()) {
-        e = enc.transfer(_remote_bus_id, desc, data::ConstDataSpan{tx_buf, tx_len}, rx_len, store_id);
-    }
-    if (e.has_value()) {
-        e = enc.end();
-    }
-    if (!e.has_value()) {
-        return m5::stl::make_unexpected(e.error() == error_t::BUFFER_OVERFLOW || e.error() == error_t::CLOSED
-                                            ? error_t::INVALID_ARGUMENT
-                                            : e.error());
-    }
-
-    auto rq = _session->request(data::ConstDataSpan{script_buf, script_sink.written()});
-    if (!rq.has_value()) {
-        return m5::stl::make_unexpected(rq.error());
-    }
-
-    size_t rx_got = 0;
-    if (rx != nullptr) {
-        const auto stored = _session->runner().storedData(store_id);
-        if (stored.size > rx_span.size) {
-            return m5::stl::make_unexpected(error_t::PROTOCOL_ERROR);
-        }
-        if (stored.size != 0) {
-            ::memcpy(rx_span.data, stored.data, stored.size);
-        }
-        auto c = rx->commit(stored.size);
-        if (!c.has_value()) {
-            return m5::stl::make_unexpected(c.error());
-        }
-        rx_got = stored.size;
-    }
-    return tx_len + rx_got;
+    return detail::proxyTransfer(_session, _remote_bus_id, cfg, desc, tx, rx);
 }
 
 // ---- RemoteUARTBus ------------------------------------------------------------
 
-m5::stl::expected<void, error_t> RemoteUARTBus::init(const uart::UARTBusConfig& config)
+result_t<void> RemoteUARTBus::init(const uart::UARTBusConfig& config)
 {
     _config = config;
     return {};
@@ -1063,7 +1021,7 @@ m5::stl::expected<void, error_t> RemoteUARTBus::init(const uart::UARTBusConfig& 
 
 // Send one script with the session timeout temporarily raised to cover
 // the remote-side blocking time (spec §UART proxy, timeout composition).
-m5::stl::expected<size_t, error_t> RemoteUARTBus::runScript(data::ConstDataSpan script, uint32_t required_timeout_ms)
+result_t<size_t> RemoteUARTBus::runScript(data::ConstDataSpan script, uint32_t required_timeout_ms)
 {
     auto& session        = *_session;
     const uint32_t saved = session.responseTimeoutMs();
@@ -1078,8 +1036,8 @@ m5::stl::expected<size_t, error_t> RemoteUARTBus::runScript(data::ConstDataSpan 
     return size_t{0};
 }
 
-m5::stl::expected<size_t, error_t> RemoteUARTBus::write(bus::Accessor* owner, const uart::UARTAccessConfig& cfg,
-                                                        data::Source* tx, size_t len)
+result_t<size_t> RemoteUARTBus::write(bus::Accessor* owner, const uart::UARTAccessConfig& cfg, data::Source* tx,
+                                      size_t len)
 {
     (void)owner;
     if (_session == nullptr) {
@@ -1135,8 +1093,8 @@ m5::stl::expected<size_t, error_t> RemoteUARTBus::write(bus::Accessor* owner, co
     return tx_len;
 }
 
-m5::stl::expected<size_t, error_t> RemoteUARTBus::read(bus::Accessor* owner, const uart::UARTAccessConfig& cfg,
-                                                       data::Sink* rx, size_t len)
+result_t<size_t> RemoteUARTBus::read(bus::Accessor* owner, const uart::UARTAccessConfig& cfg, data::Sink* rx,
+                                     size_t len)
 {
     (void)owner;
     if (_session == nullptr || rx == nullptr) {
@@ -1192,7 +1150,7 @@ m5::stl::expected<size_t, error_t> RemoteUARTBus::read(bus::Accessor* owner, con
     return stored.size;  // remote short reads come through as-is
 }
 
-m5::stl::expected<size_t, error_t> RemoteUARTBus::readableBytes(bus::Accessor* owner, const uart::UARTAccessConfig& cfg)
+result_t<size_t> RemoteUARTBus::readableBytes(bus::Accessor* owner, const uart::UARTAccessConfig& cfg)
 {
     (void)owner;
     (void)cfg;
@@ -1247,7 +1205,7 @@ RemoteI2SBus::~RemoteI2SBus()
     }
 }
 
-m5::stl::expected<void, error_t> RemoteI2SBus::init(const i2s::I2SBusConfig& config)
+result_t<void> RemoteI2SBus::init(const i2s::I2SBusConfig& config)
 {
     _config = config;
     return {};
@@ -1273,7 +1231,7 @@ void RemoteI2SBus::onCredit(uint32_t free, uint32_t submitted)
 #endif
 }
 
-m5::stl::expected<void, error_t> RemoteI2SBus::syncStatus()
+result_t<void> RemoteI2SBus::syncStatus()
 {
     uint8_t script_buf[16];
     data::MemorySink sink{data::DataSpan{script_buf, sizeof(script_buf)}};
@@ -1303,7 +1261,7 @@ m5::stl::expected<void, error_t> RemoteI2SBus::syncStatus()
     return {};
 }
 
-m5::stl::expected<void, error_t> RemoteI2SBus::syncConfig(const i2s::I2SAccessConfig& cfg)
+result_t<void> RemoteI2SBus::syncConfig(const i2s::I2SAccessConfig& cfg)
 {
     // Send the device a non-blocking write timeout: credit, not the server
     // poll, does the waiting (spec §I2S proxy).
@@ -1339,8 +1297,8 @@ m5::stl::expected<void, error_t> RemoteI2SBus::syncConfig(const i2s::I2SAccessCo
     return {};
 }
 
-m5::stl::expected<size_t, error_t> RemoteI2SBus::write(bus::Accessor* owner, const i2s::I2SAccessConfig& cfg,
-                                                       data::Source* tx, size_t len)
+result_t<size_t> RemoteI2SBus::write(bus::Accessor* owner, const i2s::I2SAccessConfig& cfg, data::Source* tx,
+                                     size_t len)
 {
     (void)owner;
     if (_session == nullptr) {
@@ -1475,7 +1433,7 @@ m5::stl::expected<size_t, error_t> RemoteI2SBus::write(bus::Accessor* owner, con
     return done;
 }
 
-m5::stl::expected<size_t, error_t> RemoteI2SBus::writableBytes(bus::Accessor* owner, const i2s::I2SAccessConfig& cfg)
+result_t<size_t> RemoteI2SBus::writableBytes(bus::Accessor* owner, const i2s::I2SAccessConfig& cfg)
 {
     (void)owner;
     (void)cfg;
@@ -1500,37 +1458,36 @@ void RemotePort::_setPinModeEncoded(uint32_t encoded_num, ::m5::hal::v1::types::
     _owner->wireSetMode(encoded_num, mode);
 }
 
-void RemoteGPIO::wireWrite(uint32_t local_pin, bool v)
-{
-    // NORESP: the IPort hook cannot return an error; a server-side
-    // failure parks as the pending error (observable on the session).
-    uint8_t script_buf[16];
-    data::MemorySink sink{data::DataSpan{script_buf, sizeof(script_buf)}};
-    bytecode::BytecodeEncoder enc{sink};
-    const types::gpio_number_t pin = remoteNumber(local_pin);
-    auto e                         = v ? enc.gpioWriteHigh(&pin, 1) : enc.gpioWriteLow(&pin, 1);
-    if (e.has_value()) {
-        e = enc.end();
-    }
-    if (e.has_value()) {
-        (void)_session->requestNoResponse(data::ConstDataSpan{script_buf, sink.written()});
-    }
-}
-
-bool RemoteGPIO::wireRead(uint32_t local_pin)
+template <typename Op>
+result_t<void> RemoteGPIO::pinScript(uint32_t local_pin, bool await, Op&& op)
 {
     uint8_t script_buf[16];
     data::MemorySink sink{data::DataSpan{script_buf, sizeof(script_buf)}};
     bytecode::BytecodeEncoder enc{sink};
     const types::gpio_number_t pin = remoteNumber(local_pin);
-    auto e                         = enc.gpioRead(kDefaultStoreId, &pin, 1);
+    auto e                         = op(enc, &pin);
     if (e.has_value()) {
         e = enc.end();
     }
     if (!e.has_value()) {
-        return false;
+        return e;
     }
-    auto rq = _session->request(data::ConstDataSpan{script_buf, sink.written()});
+    const data::ConstDataSpan script{script_buf, sink.written()};
+    return await ? _session->request(script) : _session->requestNoResponse(script);
+}
+
+void RemoteGPIO::wireWrite(uint32_t local_pin, bool v)
+{
+    (void)pinScript(local_pin, false, [&](bytecode::BytecodeEncoder& enc, const types::gpio_number_t* pin) {
+        return v ? enc.gpioWriteHigh(pin, 1) : enc.gpioWriteLow(pin, 1);
+    });
+}
+
+bool RemoteGPIO::wireRead(uint32_t local_pin)
+{
+    auto rq = pinScript(local_pin, true, [](bytecode::BytecodeEncoder& enc, const types::gpio_number_t* pin) {
+        return enc.gpioRead(kDefaultStoreId, pin, 1);
+    });
     if (!rq.has_value()) {
         return false;  // the error stays observable on the session
     }
@@ -1540,49 +1497,23 @@ bool RemoteGPIO::wireRead(uint32_t local_pin)
 
 void RemoteGPIO::wireSetMode(uint32_t local_pin, ::m5::hal::v1::types::gpio_mode_t mode)
 {
-    uint8_t script_buf[16];
-    data::MemorySink sink{data::DataSpan{script_buf, sizeof(script_buf)}};
-    bytecode::BytecodeEncoder enc{sink};
-    const types::gpio_number_t pin = remoteNumber(local_pin);
-    auto e                         = enc.gpioSetMode(mode, &pin, 1);
-    if (e.has_value()) {
-        e = enc.end();
-    }
-    if (e.has_value()) {
-        (void)_session->requestNoResponse(data::ConstDataSpan{script_buf, sink.written()});
-    }
+    (void)pinScript(local_pin, false, [&](bytecode::BytecodeEncoder& enc, const types::gpio_number_t* pin) {
+        return enc.gpioSetMode(mode, pin, 1);
+    });
 }
 
-m5::stl::expected<void, error_t> RemoteGPIO::subscribe(::m5::hal::v1::types::gpio_local_pin_t local_pin)
+result_t<void> RemoteGPIO::subscribe(::m5::hal::v1::types::gpio_local_pin_t local_pin)
 {
-    uint8_t script_buf[16];
-    data::MemorySink sink{data::DataSpan{script_buf, sizeof(script_buf)}};
-    bytecode::BytecodeEncoder enc{sink};
-    const types::gpio_number_t pin = remoteNumber(local_pin);
-    auto e                         = enc.gpioSubscribe(&pin, 1);
-    if (e.has_value()) {
-        e = enc.end();
-    }
-    if (!e.has_value()) {
-        return e;
-    }
-    return _session->request(data::ConstDataSpan{script_buf, sink.written()});
+    return pinScript(local_pin, true, [](bytecode::BytecodeEncoder& enc, const types::gpio_number_t* pin) {
+        return enc.gpioSubscribe(pin, 1);
+    });
 }
 
-m5::stl::expected<void, error_t> RemoteGPIO::unsubscribe(::m5::hal::v1::types::gpio_local_pin_t local_pin)
+result_t<void> RemoteGPIO::unsubscribe(::m5::hal::v1::types::gpio_local_pin_t local_pin)
 {
-    uint8_t script_buf[16];
-    data::MemorySink sink{data::DataSpan{script_buf, sizeof(script_buf)}};
-    bytecode::BytecodeEncoder enc{sink};
-    const types::gpio_number_t pin = remoteNumber(local_pin);
-    auto e                         = enc.gpioUnsubscribe(&pin, 1);
-    if (e.has_value()) {
-        e = enc.end();
-    }
-    if (!e.has_value()) {
-        return e;
-    }
-    return _session->request(data::ConstDataSpan{script_buf, sink.written()});
+    return pinScript(local_pin, true, [](bytecode::BytecodeEncoder& enc, const types::gpio_number_t* pin) {
+        return enc.gpioUnsubscribe(pin, 1);
+    });
 }
 
 }  // namespace m5::hal::v1::remote

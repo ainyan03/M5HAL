@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_DATA_HPP_
 #define M5_HAL_DATA_HPP_
 
@@ -75,6 +76,14 @@ struct DataSpan {
     (`eof()` also becomes true). Because of that, `peek(0)` is a
     contract violation (`max_len` must be >= 1); the behavior is
     derivation-defined.
+  - `closed()` asks whether the PRODUCER side is finished: true means
+    the bytes currently peekable are final and nothing will ever be
+    appended (TCP half-close semantics — readable leftovers may
+    remain). `eof()` == `closed()` AND drained. The default returns
+    `eof()` (safe for streaming derivations: false while attached);
+    finite derivations override it (`MemorySource` is always closed —
+    its content is fixed at construction). Consumers use this to tell
+    a retryable short read from one that can never make progress.
   - `advance(N)` is an independent cursor operation, unrelated to the
     presence or size of any prior `peek`. Discarding bytes by repeated
     `advance` is a supported usage.
@@ -98,9 +107,16 @@ class Source {
 public:
     virtual ~Source() = default;
 
-    virtual m5::stl::expected<ConstDataSpan, m5::hal::v1::error::error_t> peek(size_t max_len) = 0;
-    virtual m5::stl::expected<void, m5::hal::v1::error::error_t> advance(size_t N)             = 0;
-    virtual bool eof() const                                                                   = 0;
+    virtual m5::hal::v1::result_t<ConstDataSpan> peek(size_t max_len) = 0;
+    virtual m5::hal::v1::result_t<void> advance(size_t N)             = 0;
+    virtual bool eof() const                                          = 0;
+
+    /// Producer-side closure (see the contract block above): true when
+    /// the currently peekable bytes are final. Default: `eof()`.
+    virtual bool closed() const
+    {
+        return eof();
+    }
 };
 
 /*!
@@ -137,9 +153,9 @@ class Sink {
 public:
     virtual ~Sink() = default;
 
-    virtual m5::stl::expected<DataSpan, m5::hal::v1::error::error_t> reserve(size_t max_len) = 0;
-    virtual m5::stl::expected<void, m5::hal::v1::error::error_t> commit(size_t N)            = 0;
-    virtual bool closed() const                                                              = 0;
+    virtual m5::hal::v1::result_t<DataSpan> reserve(size_t max_len) = 0;
+    virtual m5::hal::v1::result_t<void> commit(size_t N)            = 0;
+    virtual bool closed() const                                     = 0;
 };
 
 }  // namespace m5::hal::v1::data

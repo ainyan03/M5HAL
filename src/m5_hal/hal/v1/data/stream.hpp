@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_DATA_STREAM_HPP_
 #define M5_HAL_DATA_STREAM_HPP_
 
@@ -47,8 +48,8 @@ namespace m5::hal::v1::data {
 struct StreamReader {
     virtual ~StreamReader() = default;
 
-    virtual m5::stl::expected<size_t, m5::hal::v1::error::error_t> read(DataSpan dst)  = 0;
-    virtual m5::stl::expected<size_t, m5::hal::v1::error::error_t> readableBytes(void) = 0;
+    virtual m5::hal::v1::result_t<size_t> read(DataSpan dst)  = 0;
+    virtual m5::hal::v1::result_t<size_t> readableBytes(void) = 0;
 };
 
 /*!
@@ -62,7 +63,7 @@ struct StreamReader {
 struct StreamWriter {
     virtual ~StreamWriter() = default;
 
-    virtual m5::stl::expected<size_t, m5::hal::v1::error::error_t> write(ConstDataSpan src) = 0;
+    virtual m5::hal::v1::result_t<size_t> write(ConstDataSpan src) = 0;
 };
 
 /*!
@@ -92,9 +93,10 @@ struct StreamWriter {
   discarded immediately, the rest is consumed automatically by later
   `peek` / `advance` calls.
 
-  `eof()` is true only for a detached adapter (null reader). Stream
-  errors, including timeouts, are reported through the error path and
-  never latch EOF.
+  `eof()` is true only for a detached adapter (null reader), and
+  `closed()` keeps its default (= eof()): an attached stream may always
+  produce more bytes. Stream errors, including timeouts, are reported
+  through the error path and never latch EOF.
  */
 class StreamSource : public Source {
 public:
@@ -105,7 +107,7 @@ public:
     {
     }
 
-    m5::stl::expected<ConstDataSpan, m5::hal::v1::error::error_t> peek(size_t max_len) override
+    m5::hal::v1::result_t<ConstDataSpan> peek(size_t max_len) override
     {
         if (_reader == nullptr) {
             return ConstDataSpan{};
@@ -152,7 +154,7 @@ public:
         return ConstDataSpan{_scratch.data, std::min(buffered(), max_len)};
     }
 
-    m5::stl::expected<void, m5::hal::v1::error::error_t> advance(size_t N) override
+    m5::hal::v1::result_t<void> advance(size_t N) override
     {
         if (_reader == nullptr) {
             return {};
@@ -213,7 +215,7 @@ private:
     // is already readable (advance path). The scratch buffer doubles as
     // the discard area: a reservation only exists while the buffer is
     // empty (`advance` always consumes buffered bytes first).
-    m5::stl::expected<void, m5::hal::v1::error::error_t> drainSkip(bool blocking)
+    m5::hal::v1::result_t<void> drainSkip(bool blocking)
     {
         while (_pending_skip > 0) {
             size_t want = std::min(_pending_skip, _scratch.size);
@@ -268,7 +270,7 @@ public:
     {
     }
 
-    m5::stl::expected<DataSpan, m5::hal::v1::error::error_t> reserve(size_t max_len) override
+    m5::hal::v1::result_t<DataSpan> reserve(size_t max_len) override
     {
         if (_writer == nullptr) {
             return DataSpan{};
@@ -279,7 +281,7 @@ public:
         return DataSpan{_scratch.data, std::min(max_len, _scratch.size)};
     }
 
-    m5::stl::expected<void, m5::hal::v1::error::error_t> commit(size_t N) override
+    m5::hal::v1::result_t<void> commit(size_t N) override
     {
         if (_writer == nullptr) {
             return m5::stl::make_unexpected(m5::hal::v1::error::error_t::CLOSED);

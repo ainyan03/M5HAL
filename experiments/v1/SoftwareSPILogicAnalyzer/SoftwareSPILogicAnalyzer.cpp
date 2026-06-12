@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include <Arduino.h>
 #include <M5HAL_v1.hpp>
 

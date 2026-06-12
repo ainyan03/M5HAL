@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 
 #include "M5HAL_v1.hpp"
 #include "m5_hal/hal/v1/bus/bus.inl"
@@ -106,6 +107,11 @@ M5HAL_INLINE_V1 namespace v1
 #if defined(ESP_PLATFORM)
         Memory.setFallback(&m5halEspidfMalloc, &m5halEspidfRealloc, &m5halEspidfFree);
 #endif
+        // Cannot fail by construction: the group is empty (slot 0 free,
+        // storage available) and every variant's getGPIO() returns a
+        // non-null instance. The assert documents that invariant; in
+        // release builds (assert compiled out) a violation would leave
+        // slot 0 empty and surface as gpio_number_t lookups failing.
         auto r = Gpio.addGPIO(gpio::getGPIO(), 0);
         assert(r.has_value() && "M5HALCore::ctor: slot 0 (MCU GPIO) registration failed");
         (void)r;  // Silences a [[nodiscard]] warning when asserts are disabled in release builds.

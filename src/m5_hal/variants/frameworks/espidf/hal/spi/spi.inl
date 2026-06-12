@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_SPI_SPI_INL
 #define M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_SPI_SPI_INL
 
@@ -56,7 +57,11 @@ void setPinLevel(::m5::hal::v1::types::gpio_number_t pin, bool level)
 void setPinOutput(::m5::hal::v1::types::gpio_number_t pin, bool level)
 {
     if (pin >= 0) {
-        (void)::gpio_set_direction(static_cast<::gpio_num_t>(pin), GPIO_MODE_OUTPUT);
+        // INPUT_OUTPUT (not plain OUTPUT) keeps the input buffer enabled,
+        // matching the espidf GPIO variant's convention: the driven level
+        // stays readable through the GPIO in register (self-tests and
+        // diagnostics read CS/DC back), at no electrical cost.
+        (void)::gpio_set_direction(static_cast<::gpio_num_t>(pin), GPIO_MODE_INPUT_OUTPUT);
         setPinLevel(pin, level);
     }
 }
@@ -74,8 +79,8 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
     return static_cast<uint8_t>(value >> shift);
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> transmit(::spi_device_handle_t device, const void* tx_buffer,
-                                                                void* rx_buffer, size_t tx_len, size_t rx_len)
+::m5::hal::v1::result_t<void> transmit(::spi_device_handle_t device, const void* tx_buffer, void* rx_buffer,
+                                       size_t tx_len, size_t rx_len)
 {
     ::spi_transaction_t trans = {};
     trans.tx_buffer           = tx_buffer;
@@ -93,8 +98,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> transmit(::spi_device_han
     return {};
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> sendMeta(::spi_device_handle_t device, uint32_t value,
-                                                                uint8_t bytes)
+::m5::hal::v1::result_t<void> sendMeta(::spi_device_handle_t device, uint32_t value, uint8_t bytes)
 {
     if (bytes > 4) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
@@ -110,7 +114,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> sendMeta(::spi_device_han
     return {};
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> sendDummy(::spi_device_handle_t device, uint8_t cycles)
+::m5::hal::v1::result_t<void> sendDummy(::spi_device_handle_t device, uint8_t cycles)
 {
     if (cycles == 0) {
         return {};
@@ -126,9 +130,8 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> sendDummy(::spi_device_ha
     return {};
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> transferChunk(::spi_device_handle_t device,
-                                                                     ::m5::hal::v1::data::ConstDataSpan tx_span,
-                                                                     ::m5::hal::v1::data::DataSpan rx_span)
+::m5::hal::v1::result_t<void> transferChunk(::spi_device_handle_t device, ::m5::hal::v1::data::ConstDataSpan tx_span,
+                                            ::m5::hal::v1::data::DataSpan rx_span)
 {
     const size_t common = (tx_span.size < rx_span.size) ? tx_span.size : rx_span.size;
     if (common > 0) {
@@ -164,7 +167,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> transferChunk(::spi_devic
     return ::m5::hal::v1::error::error_t::OK;
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig& config)
+::m5::hal::v1::result_t<void> Bus::init(const BusConfig& config)
 {
     // Release the previous bus while `_host` still names the OLD host;
     // adopting the new config first would free the wrong bus and leak
@@ -198,7 +201,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig
     return {};
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::release(void)
+::m5::hal::v1::result_t<void> Bus::release(void)
 {
     auto removed = removeDevice();
     if (!removed.has_value()) {
@@ -216,7 +219,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::release(void)
     return {};
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::removeDevice(void)
+::m5::hal::v1::result_t<void> Bus::removeDevice(void)
 {
     if (_device == nullptr) {
         return {};
@@ -233,12 +236,11 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::removeDevice(void)
     return {};
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::ensureDevice(
-    const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg, bool half_duplex)
+::m5::hal::v1::result_t<bool> Bus::ensureDevice(const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg, bool half_duplex)
 {
     if (_device != nullptr && _device_freq == cfg.freq && _device_mode == cfg.spi_mode &&
         _device_order == cfg.spi_order && _device_half_duplex == half_duplex) {
-        return {};
+        return false;  // already configured; no re-add
     }
 
     auto removed = removeDevice();
@@ -268,33 +270,60 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::ensureDevice(
     _device_mode        = cfg.spi_mode;
     _device_order       = cfg.spi_order;
     _device_half_duplex = half_duplex;
-    return {};
+    return true;  // device (re)created — SCK idle level may not be settled yet
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::beginTransaction(
-    ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg)
+::m5::hal::v1::result_t<void> Bus::beginTransaction(::m5::hal::v1::bus::Accessor* owner,
+                                                    const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg)
 {
     (void)owner;
     if (cfg.freq == 0) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
+    }
+    // Configure the device BEFORE asserting CS, and settle SCK onto the
+    // mode's idle level (CPOL) with one protocol-invisible dummy clock
+    // while CS is still inactive. Configuring lazily inside transfer()
+    // made CPOL=1 modes assert CS while SCK still sat at the previous
+    // idle level, popping an extra SCK edge inside the CS window
+    // (caught by the on-target wire self-test). Half-duplex is the
+    // right default guess: every command/address/dummy sugar and any
+    // one-directional transfer is half-duplex; the rare full-duplex
+    // transfer re-adds the device once in transfer() (same mode, so the
+    // idle level is unaffected).
+    auto dev = ensureDevice(cfg, true);
+    if (!dev.has_value()) {
+        return m5::stl::make_unexpected(dev.error());
+    }
+    if (dev.value()) {
+        auto settle = sendDummy(_device, 1);
+        if (!settle.has_value()) {
+            return m5::stl::make_unexpected(settle.error());
+        }
     }
     _transaction_active = true;
     setPinOutput(cfg.pin_cs, false);
     return {};
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::endTransaction(
-    ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg)
+::m5::hal::v1::result_t<void> Bus::endTransaction(::m5::hal::v1::bus::Accessor* owner,
+                                                  const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg)
 {
     (void)owner;
     setPinLevel(cfg.pin_cs, true);
     _transaction_active = false;
-    return removeDevice();
+    // The device handle stays cached across transactions: ensureDevice
+    // re-creates it only when the next transaction's config differs, so
+    // the steady same-config case skips the per-transaction
+    // add/remove_device round trip AND the settle dummy clock (SCK is
+    // already parked at this mode's idle level). release() still
+    // removes the handle.
+    return {};
 }
 
-m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
-    ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg,
-    const ::m5::hal::v1::spi::TransferDesc& desc, ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
+::m5::hal::v1::result_t<size_t> Bus::transfer(::m5::hal::v1::bus::Accessor* owner,
+                                              const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg,
+                                              const ::m5::hal::v1::spi::TransferDesc& desc,
+                                              ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
 {
     (void)owner;
     if (!_transaction_active || cfg.freq == 0) {

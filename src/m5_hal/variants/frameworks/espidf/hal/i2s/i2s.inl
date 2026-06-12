@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_I2S_I2S_INL
 #define M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_I2S_I2S_INL
 
@@ -93,7 +94,7 @@ bool Bus::onSentCallback(::i2s_chan_handle_t /*handle*/, ::i2s_event_data_t* eve
 // ---------------------------------------------------------------------------
 // init
 // ---------------------------------------------------------------------------
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig& config)
+::m5::hal::v1::result_t<void> Bus::init(const BusConfig& config)
 {
     // Re-init: tear down any existing channel first — clearing the handle
     // without `i2s_del_channel` would leak the old channel with its DMA
@@ -110,7 +111,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig
 // ---------------------------------------------------------------------------
 // release
 // ---------------------------------------------------------------------------
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::release(void)
+::m5::hal::v1::result_t<void> Bus::release(void)
 {
     destroyChannel();
     return {};
@@ -134,8 +135,7 @@ void Bus::destroyChannel(void)
 // ---------------------------------------------------------------------------
 // ensureChannel
 // ---------------------------------------------------------------------------
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::ensureChannel(
-    const ::m5::hal::v1::i2s::I2SAccessConfig& cfg)
+::m5::hal::v1::result_t<void> Bus::ensureChannel(const ::m5::hal::v1::i2s::I2SAccessConfig& cfg)
 {
     // Only 16-bit samples are supported.
     if (cfg.bits_per_sample != 16) {
@@ -290,9 +290,9 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::ensureChannel(
 // ---------------------------------------------------------------------------
 // write
 // ---------------------------------------------------------------------------
-m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::write(::m5::hal::v1::bus::Accessor* owner,
-                                                                    const ::m5::hal::v1::i2s::I2SAccessConfig& cfg,
-                                                                    ::m5::hal::v1::data::Source* tx, size_t len)
+::m5::hal::v1::result_t<size_t> Bus::write(::m5::hal::v1::bus::Accessor* owner,
+                                           const ::m5::hal::v1::i2s::I2SAccessConfig& cfg,
+                                           ::m5::hal::v1::data::Source* tx, size_t len)
 {
     (void)owner;
 
@@ -414,8 +414,8 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::write(::m5::hal::v
 // ---------------------------------------------------------------------------
 // writableBytes
 // ---------------------------------------------------------------------------
-m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::writableBytes(
-    ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::i2s::I2SAccessConfig& cfg)
+::m5::hal::v1::result_t<size_t> Bus::writableBytes(::m5::hal::v1::bus::Accessor* owner,
+                                                   const ::m5::hal::v1::i2s::I2SAccessConfig& cfg)
 {
     (void)owner;
 

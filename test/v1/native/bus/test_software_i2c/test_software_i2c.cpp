@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Scaffolding for the software (bit-bang) I2C bus native gtest.
 // `RecordingPort` (a minimal `gpio::IPort` that records caller events
 // in order) plus tests that confirm `software::Bus::init` and the
@@ -1011,11 +1012,11 @@ TEST(I2CSlaveDriverRegistration, RegistersAndRemovesDriverService)
         explicit StubSlaveDriver(m5::hal::v1::service::IService* svc) : svc{svc}
         {
         }
-        m5::stl::expected<void, m5::hal::v1::error::error_t> init(const m5::hal::v1::i2c::I2CSlaveConfig&) override
+        m5::hal::v1::result_t<void> init(const m5::hal::v1::i2c::I2CSlaveConfig&) override
         {
             return {};
         }
-        m5::stl::expected<void, m5::hal::v1::error::error_t> release() override
+        m5::hal::v1::result_t<void> release() override
         {
             return {};
         }
@@ -1059,11 +1060,11 @@ TEST(I2CSlaveDriverRegistration, RejectsNullOrDuplicateService)
         explicit StubSlaveDriver(m5::hal::v1::service::IService* svc) : svc{svc}
         {
         }
-        m5::stl::expected<void, m5::hal::v1::error::error_t> init(const m5::hal::v1::i2c::I2CSlaveConfig&) override
+        m5::hal::v1::result_t<void> init(const m5::hal::v1::i2c::I2CSlaveConfig&) override
         {
             return {};
         }
-        m5::stl::expected<void, m5::hal::v1::error::error_t> release() override
+        m5::hal::v1::result_t<void> release() override
         {
             return {};
         }
@@ -1449,11 +1450,10 @@ public:
     {
         return _config;
     }
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> transfer(m5::hal::v1::bus::Accessor*,
-                                                                    const m5::hal::v1::i2c::I2CMasterAccessConfig& cfg,
-                                                                    const m5::hal::v1::i2c::TransferDesc& desc,
-                                                                    m5::hal::v1::data::Source* tx,
-                                                                    m5::hal::v1::data::Sink* rx) override
+    m5::hal::v1::result_t<size_t> transfer(m5::hal::v1::bus::Accessor*,
+                                           const m5::hal::v1::i2c::I2CMasterAccessConfig& cfg,
+                                           const m5::hal::v1::i2c::TransferDesc& desc, m5::hal::v1::data::Source* tx,
+                                           m5::hal::v1::data::Sink* rx) override
     {
         ++transfer_count;
         last_cfg        = cfg;

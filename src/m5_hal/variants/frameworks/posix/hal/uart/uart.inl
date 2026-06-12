@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_POSIX_HAL_UART_UART_INL
 #define M5_HAL_VARIANTS_FRAMEWORKS_POSIX_HAL_UART_UART_INL
 
@@ -167,7 +168,7 @@ bool Bus::baudToSpeed(uint32_t baud, uint32_t& out_speed)
     return true;
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig& config)
+::m5::hal::v1::result_t<void> Bus::init(const BusConfig& config)
 {
     (void)release();
     _config      = config;
@@ -176,7 +177,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig
     return {};
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::release(void)
+::m5::hal::v1::result_t<void> Bus::release(void)
 {
     if (_owns_fd && _fd >= 0) {
         ::close(_fd);
@@ -230,8 +231,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::release(void)
     return ::m5::hal::v1::error::error_t::OK;
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::applyConfig(
-    const ::m5::hal::v1::uart::UARTAccessConfig& cfg)
+::m5::hal::v1::result_t<void> Bus::applyConfig(const ::m5::hal::v1::uart::UARTAccessConfig& cfg)
 {
     if (cfg.baud_rate == 0 || cfg.data_bits != 8 || (cfg.stop_bits != 1 && cfg.stop_bits != 2)) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
@@ -330,8 +330,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::applyConfig(
     return {};
 }
 
-m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::rawWrite(const uint8_t* data, size_t len,
-                                                                       uint32_t timeout_ms)
+::m5::hal::v1::result_t<size_t> Bus::rawWrite(const uint8_t* data, size_t len, uint32_t timeout_ms)
 {
     size_t done = 0;
     while (done < len) {
@@ -356,7 +355,7 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::rawWrite(const uin
     return done;
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::flushCoalesced(uint32_t timeout_ms)
+::m5::hal::v1::result_t<void> Bus::flushCoalesced(uint32_t timeout_ms)
 {
     if (_co_used == 0) {
         return {};
@@ -373,9 +372,9 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::flushCoalesced(uint3
     return {};
 }
 
-m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::write(::m5::hal::v1::bus::Accessor* owner,
-                                                                    const ::m5::hal::v1::uart::UARTAccessConfig& cfg,
-                                                                    ::m5::hal::v1::data::Source* tx, size_t len)
+::m5::hal::v1::result_t<size_t> Bus::write(::m5::hal::v1::bus::Accessor* owner,
+                                           const ::m5::hal::v1::uart::UARTAccessConfig& cfg,
+                                           ::m5::hal::v1::data::Source* tx, size_t len)
 {
     (void)owner;
     auto applied = applyConfig(cfg);
@@ -434,9 +433,9 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::write(::m5::hal::v
     return done;
 }
 
-m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::read(::m5::hal::v1::bus::Accessor* owner,
-                                                                   const ::m5::hal::v1::uart::UARTAccessConfig& cfg,
-                                                                   ::m5::hal::v1::data::Sink* rx, size_t len)
+::m5::hal::v1::result_t<size_t> Bus::read(::m5::hal::v1::bus::Accessor* owner,
+                                          const ::m5::hal::v1::uart::UARTAccessConfig& cfg,
+                                          ::m5::hal::v1::data::Sink* rx, size_t len)
 {
     (void)owner;
     auto applied = applyConfig(cfg);
@@ -486,8 +485,8 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::read(::m5::hal::v1
     return done;
 }
 
-m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::readableBytes(
-    ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::uart::UARTAccessConfig& cfg)
+::m5::hal::v1::result_t<size_t> Bus::readableBytes(::m5::hal::v1::bus::Accessor* owner,
+                                                   const ::m5::hal::v1::uart::UARTAccessConfig& cfg)
 {
     (void)owner;
     auto applied = applyConfig(cfg);

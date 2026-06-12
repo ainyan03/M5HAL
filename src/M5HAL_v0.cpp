@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // M5HAL v0 translation unit.
 //
 // Aggregates the v0 (published v0.0.x API) `.inl` files. The v1

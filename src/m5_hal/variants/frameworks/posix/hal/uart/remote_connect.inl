@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_POSIX_HAL_UART_REMOTE_CONNECT_INL
 #define M5_HAL_VARIANTS_FRAMEWORKS_POSIX_HAL_UART_REMOTE_CONNECT_INL
 
@@ -67,8 +68,7 @@ bool probeCandidate(SerialRemoteEndpoint& ep, const char* path, uint32_t baud, c
 
 }  // namespace
 
-m5::stl::expected<::m5::hal::v1::remote::Capabilities, error_t> connectRemoteSerial(SerialRemoteEndpoint& ep,
-                                                                                    const ConnectOptions& opt)
+result_t<::m5::hal::v1::remote::Capabilities> connectRemoteSerial(SerialRemoteEndpoint& ep, const ConnectOptions& opt)
 {
     const uint32_t baud = ep.rx.getConfig().baud_rate;
     auto& session       = ep.link.session();

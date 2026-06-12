@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Native gtest for StreamSource / StreamSink (hal/v1/data/stream.hpp).
 //
 // Mechanically verifies the adapter contract on top of scripted fake
@@ -17,6 +18,8 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+
+using ::m5::hal::v1::result_t;
 
 namespace {
 
@@ -49,7 +52,7 @@ public:
         _has_error   = true;
     }
 
-    m5::stl::expected<size_t, error_t> read(DataSpan dst) override
+    result_t<size_t> read(DataSpan dst) override
     {
         ++read_calls;
         if (_has_error) {
@@ -61,7 +64,7 @@ public:
         _pending.erase(_pending.begin(), _pending.begin() + static_cast<ptrdiff_t>(n));
         return n;
     }
-    m5::stl::expected<size_t, error_t> readableBytes(void) override
+    result_t<size_t> readableBytes(void) override
     {
         return _pending.size();
     }
@@ -78,7 +81,7 @@ private:
 // caps a single write to simulate a short write (write timeout).
 class FakeStreamWriter : public StreamWriter {
 public:
-    m5::stl::expected<size_t, error_t> write(ConstDataSpan src) override
+    result_t<size_t> write(ConstDataSpan src) override
     {
         if (_has_error) {
             _has_error = false;

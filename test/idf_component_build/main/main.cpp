@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Official ESP-IDF component build check for M5HAL across the chip family
 // (esp32 / s3 / c3 / c6 / h2 / p4). Reuses the shared v1 API-surface compile
 // fence (which references PinBackup / ScopedPinBackup), so building this app

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_SOFTWARE_HAL_I2C_I2C_HPP
 #define M5_HAL_VARIANTS_FRAMEWORKS_SOFTWARE_HAL_I2C_I2C_HPP
 
@@ -44,8 +45,7 @@ struct MasterTiming {
     static constexpr uint32_t kNsecPerSec  = 1000000000u;
     static constexpr uint32_t kNsecPerMsec = 1000000u;
 
-    static m5::stl::expected<MasterTiming, ::m5::hal::v1::error::error_t> fromConfig(
-        const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg)
+    static ::m5::hal::v1::result_t<MasterTiming> fromConfig(const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg)
     {
         if (cfg.freq == 0 || cfg.timeout_ms > (::m5::hal::v1::service::kMaxComparableDelayTicks / kNsecPerMsec)) {
             return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
@@ -981,19 +981,19 @@ public:
     // Typed init (S17 E1). BusConfig is an alias of the abstract
     // I2CBusConfig here; the signature still names the alias so every
     // variant reads the same.
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> init(const BusConfig& config);
+    ::m5::hal::v1::result_t<void> init(const BusConfig& config);
     // The bit-bang variant owns no resource beyond the high-Z state
     // of the pins it grabbed in `init`, so `release` is a no-op that
     // returns OK.
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> release(void) override
+    ::m5::hal::v1::result_t<void> release(void) override
     {
         return {};
     }
 
-    m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> transfer(
-        ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg,
-        const ::m5::hal::v1::i2c::TransferDesc& desc, ::m5::hal::v1::data::Source* tx,
-        ::m5::hal::v1::data::Sink* rx) override;
+    ::m5::hal::v1::result_t<size_t> transfer(::m5::hal::v1::bus::Accessor* owner,
+                                             const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg,
+                                             const ::m5::hal::v1::i2c::TransferDesc& desc,
+                                             ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx) override;
 
 private:
     // Resolved during `init()` from `_config.pin_scl` / `pin_sda`

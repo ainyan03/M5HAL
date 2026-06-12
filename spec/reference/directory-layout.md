@@ -33,6 +33,9 @@ src/
   m5_hal/
     _macro/
       offer_all.inl
+      offer_kind.inl
+    _detail/
+      bsd_tcp.{hpp,inl}
     hal/
       v1/
         bus/bus.{hpp,inl}
@@ -79,7 +82,8 @@ src/
 1. `src/m5_hal/hal/` 配下は `m5::hal::*` と厳密に対応させる
 2. `src/m5_hal/variants/` 配下は `m5::variants::*` と厳密に対応させる
 3. ライブラリルート `src/m5_hal/` は `m5` ルートに対応する例外とする
-4. `_macro/`, `_checker.hpp`, `_offer.hpp` などのメタ要素は namespace 非対応の例外とする
+4. `_macro/`, `_detail/`, `_checker.hpp`, `_offer.hpp` などのメタ要素は namespace 非対応の例外とする
+   (`_detail/` = variant 横断の共有実装。 namespace は `m5::hal::v1::detail`)
 5. HAL の範疇外要素は `hal/` の外に置く
 6. cross-cutting な型 (`error_t` 等) は `m5::hal::` 直下に置く
 
@@ -103,7 +107,7 @@ namespace m5::variants::frameworks::arduino::hal::v1::i2c {
 }  // namespace m5::variants::frameworks::arduino::hal::v1::i2c
 ```
 
-例外として `_macro/offer_all.inl` はマクロ展開の都合で 1 行ネスト形式を許容する。
+例外として `_macro/offer_all.inl` / `_macro/offer_kind.inl` はマクロ展開の都合で 1 行ネスト形式を許容する。
 
 ## variant 内の構造規約
 

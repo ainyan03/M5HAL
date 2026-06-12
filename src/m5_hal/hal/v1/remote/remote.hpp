@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_REMOTE_REMOTE_HPP_
 #define M5_HAL_REMOTE_REMOTE_HPP_
 
@@ -177,11 +178,11 @@ public:
         checkScratch();
     }
 
-    m5::stl::expected<void, m5::hal::v1::error::error_t> registerI2C(uint8_t bus_id, i2c::I2CMasterAccessor& acc);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> registerSPI(uint8_t bus_id, spi::SPIMasterAccessor& acc);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> registerUART(uint8_t bus_id, uart::UARTAccessor& acc);
+    m5::hal::v1::result_t<void> registerI2C(uint8_t bus_id, i2c::I2CMasterAccessor& acc);
+    m5::hal::v1::result_t<void> registerSPI(uint8_t bus_id, spi::SPIMasterAccessor& acc);
+    m5::hal::v1::result_t<void> registerUART(uint8_t bus_id, uart::UARTAccessor& acc);
     /*! @brief Publish an I2S TX accessor as a stream bus (spec §stream credit). */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> registerI2S(uint8_t bus_id, i2s::I2STxAccessor& acc);
+    m5::hal::v1::result_t<void> registerI2S(uint8_t bus_id, i2s::I2STxAccessor& acc);
     void setGPIOGroup(gpio::GPIOGroup& group)
     {
         _runner.setGPIOGroup(group);
@@ -202,8 +203,7 @@ public:
       instruction's error). Sink errors while writing the response come
       back through the expected error path.
      */
-    m5::stl::expected<m5::hal::v1::error::error_t, m5::hal::v1::error::error_t> processScript(
-        data::ConstDataSpan script, data::Sink& out);
+    m5::hal::v1::result_t<m5::hal::v1::error::error_t> processScript(data::ConstDataSpan script, data::Sink& out);
 
     /*!
       @brief Level 2: handle one already-de-framed remote message.
@@ -215,9 +215,8 @@ public:
       next synchronous reply. Errors returned by this call are transport
       (Sink) failures only.
      */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> processMessage(uint8_t type, uint8_t seq,
-                                                                        data::ConstDataSpan body,
-                                                                        frame::FrameWriter& out, uint8_t stream_id);
+    m5::hal::v1::result_t<void> processMessage(uint8_t type, uint8_t seq, data::ConstDataSpan body,
+                                               frame::FrameWriter& out, uint8_t stream_id);
 
     /*! @brief Messages dropped for forward compatibility (unknown type / reserved bits). */
     size_t droppedCount() const
@@ -250,7 +249,7 @@ public:
         return _sub_count;
     }
     /*! @brief Poll subscribed pins; returns true when an event was emitted. */
-    m5::stl::expected<bool, m5::hal::v1::error::error_t> pollSubscriptions(frame::FrameWriter& out, uint8_t stream_id);
+    m5::hal::v1::result_t<bool> pollSubscriptions(frame::FrameWriter& out, uint8_t stream_id);
     /*! @} */
 
     /*!
@@ -269,7 +268,7 @@ public:
      */
     void clearStreamCredit();
     /*! @brief Poll stream bindings; returns true when an event was emitted. */
-    m5::stl::expected<bool, m5::hal::v1::error::error_t> pollStreamCredit(frame::FrameWriter& out, uint8_t stream_id);
+    m5::hal::v1::result_t<bool> pollStreamCredit(frame::FrameWriter& out, uint8_t stream_id);
     /*! @} */
 
 private:
@@ -286,21 +285,16 @@ private:
     };
 
     // Runner-side hook: routes gpio_subscribe / gpio_unsubscribe here.
-    static m5::stl::expected<void, m5::hal::v1::error::error_t> gpioSubscribeThunk(void* ctx, bool subscribe,
-                                                                                   const types::gpio_number_t* pins,
-                                                                                   size_t count);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> handleSubscribe(bool subscribe,
-                                                                         const types::gpio_number_t* pins,
-                                                                         size_t count);
+    static m5::hal::v1::result_t<void> gpioSubscribeThunk(void* ctx, bool subscribe, const types::gpio_number_t* pins,
+                                                          size_t count);
+    m5::hal::v1::result_t<void> handleSubscribe(bool subscribe, const types::gpio_number_t* pins, size_t count);
 
     ExecOutcome execute(data::ConstDataSpan script);
     m5::hal::v1::error::error_t prescan(data::ConstDataSpan script, size_t& offset) const;
-    m5::stl::expected<void, m5::hal::v1::error::error_t> sendMessage(frame::FrameWriter& out, uint8_t stream_id,
-                                                                     uint8_t type, uint8_t seq,
-                                                                     data::ConstDataSpan body);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> flushPendingError(frame::FrameWriter& out, uint8_t stream_id,
-                                                                           uint8_t seq);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> recordCapability(types::bus_kind_t kind, uint8_t bus_id);
+    m5::hal::v1::result_t<void> sendMessage(frame::FrameWriter& out, uint8_t stream_id, uint8_t type, uint8_t seq,
+                                            data::ConstDataSpan body);
+    m5::hal::v1::result_t<void> flushPendingError(frame::FrameWriter& out, uint8_t stream_id, uint8_t seq);
+    m5::hal::v1::result_t<void> recordCapability(types::bus_kind_t kind, uint8_t bus_id);
 
     // Enforce the `response_scratch` contract (>= kMaxMessageSize bytes).
     // Crash in debug; in release degrade to an empty span, which every
@@ -427,9 +421,9 @@ public:
     }
 
     /*! @brief Exchange hello / hello_resp and cache the capabilities. */
-    m5::stl::expected<Capabilities, m5::hal::v1::error::error_t> hello();
+    m5::hal::v1::result_t<Capabilities> hello();
     /*! @brief Liveness probe (ping / pong). */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> ping();
+    m5::hal::v1::result_t<void> ping();
 
     /*!
       @brief Send a request script and await its response.
@@ -438,10 +432,10 @@ public:
       error becomes this call's error. `script.size` must be
       <= kMaxBodySize.
      */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> request(data::ConstDataSpan script);
+    m5::hal::v1::result_t<void> request(data::ConstDataSpan script);
 
     /*! @brief Fire-and-forget request (NORESP). Failures surface as a later remote error. */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> requestNoResponse(data::ConstDataSpan script);
+    m5::hal::v1::result_t<void> requestNoResponse(data::ConstDataSpan script);
 
     /*!
       @brief Drain frames that are already available, dispatching events.
@@ -462,7 +456,7 @@ public:
       cadence shorter than the rx timeout, a larger bound turns poll()
       into a frame-paced capture loop that starves the caller.
      */
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> poll(size_t max_frames = 8);
+    m5::hal::v1::result_t<size_t> poll(size_t max_frames = 8);
 
     /*! @brief Runner that executed the most recent response script. */
     bytecode::BytecodeRunner& runner()
@@ -554,9 +548,8 @@ public:
 private:
     enum class AwaitKind : uint8_t { response, hello_resp, pong };
 
-    m5::stl::expected<void, m5::hal::v1::error::error_t> sendMessage(uint8_t type, uint8_t seq,
-                                                                     data::ConstDataSpan body);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> awaitReply(AwaitKind kind, uint8_t seq);
+    m5::hal::v1::result_t<void> sendMessage(uint8_t type, uint8_t seq, data::ConstDataSpan body);
+    m5::hal::v1::result_t<void> awaitReply(AwaitKind kind, uint8_t seq);
 
     frame::FrameReader _reader;
     frame::FrameWriter _writer;
@@ -661,16 +654,14 @@ struct RemoteI2CBus : public i2c::I2CBus {
 
     /*! @brief Local bookkeeping only — the physical bus is configured server-side.
         Takes the abstract kind config: the proxy adds no fields (S17 E1). */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> init(const i2c::I2CBusConfig& config);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> release(void) override
+    m5::hal::v1::result_t<void> init(const i2c::I2CBusConfig& config);
+    m5::hal::v1::result_t<void> release(void) override
     {
         return {};
     }
 
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> transfer(bus::Accessor* owner,
-                                                                    const i2c::I2CMasterAccessConfig& cfg,
-                                                                    const i2c::TransferDesc& desc, data::Source* tx,
-                                                                    data::Sink* rx) override;
+    m5::hal::v1::result_t<size_t> transfer(bus::Accessor* owner, const i2c::I2CMasterAccessConfig& cfg,
+                                           const i2c::TransferDesc& desc, data::Source* tx, data::Sink* rx) override;
 
 private:
     RemoteSession* _session = nullptr;
@@ -695,16 +686,14 @@ struct RemoteSPIBus : public spi::SPIBus {
 
     /*! @brief Local bookkeeping only — the physical bus is configured server-side.
         Takes the abstract kind config: the proxy adds no fields (S17 E1). */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> init(const spi::SPIBusConfig& config);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> release(void) override
+    m5::hal::v1::result_t<void> init(const spi::SPIBusConfig& config);
+    m5::hal::v1::result_t<void> release(void) override
     {
         return {};
     }
 
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> transfer(bus::Accessor* owner,
-                                                                    const spi::SPIMasterAccessConfig& cfg,
-                                                                    const spi::TransferDesc& desc, data::Source* tx,
-                                                                    data::Sink* rx) override;
+    m5::hal::v1::result_t<size_t> transfer(bus::Accessor* owner, const spi::SPIMasterAccessConfig& cfg,
+                                           const spi::TransferDesc& desc, data::Source* tx, data::Sink* rx) override;
 
 private:
     RemoteSession* _session = nullptr;
@@ -735,23 +724,20 @@ struct RemoteUARTBus : public uart::UARTBus {
 
     /*! @brief Local bookkeeping only — the physical bus is configured server-side.
         Takes the abstract kind config: the proxy adds no fields (S17 E1). */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> init(const uart::UARTBusConfig& config);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> release(void) override
+    m5::hal::v1::result_t<void> init(const uart::UARTBusConfig& config);
+    m5::hal::v1::result_t<void> release(void) override
     {
         return {};
     }
 
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> write(bus::Accessor* owner,
-                                                                 const uart::UARTAccessConfig& cfg, data::Source* tx,
-                                                                 size_t len) override;
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> read(bus::Accessor* owner, const uart::UARTAccessConfig& cfg,
-                                                                data::Sink* rx, size_t len) override;
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> readableBytes(bus::Accessor* owner,
-                                                                         const uart::UARTAccessConfig& cfg) override;
+    m5::hal::v1::result_t<size_t> write(bus::Accessor* owner, const uart::UARTAccessConfig& cfg, data::Source* tx,
+                                        size_t len) override;
+    m5::hal::v1::result_t<size_t> read(bus::Accessor* owner, const uart::UARTAccessConfig& cfg, data::Sink* rx,
+                                       size_t len) override;
+    m5::hal::v1::result_t<size_t> readableBytes(bus::Accessor* owner, const uart::UARTAccessConfig& cfg) override;
 
 private:
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> runScript(data::ConstDataSpan script,
-                                                                     uint32_t required_timeout_ms);
+    m5::hal::v1::result_t<size_t> runScript(data::ConstDataSpan script, uint32_t required_timeout_ms);
 
     RemoteSession* _session = nullptr;
     uint8_t _remote_bus_id  = 0;
@@ -793,16 +779,15 @@ struct RemoteI2SBus : public i2s::I2SBus {
 
     /*! @brief Local bookkeeping only — the physical bus is configured server-side.
         Takes the abstract kind config: the proxy adds no fields (S17 E1). */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> init(const i2s::I2SBusConfig& config);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> release(void) override
+    m5::hal::v1::result_t<void> init(const i2s::I2SBusConfig& config);
+    m5::hal::v1::result_t<void> release(void) override
     {
         return {};
     }
 
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> write(bus::Accessor* owner, const i2s::I2SAccessConfig& cfg,
-                                                                 data::Source* tx, size_t len) override;
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> writableBytes(bus::Accessor* owner,
-                                                                         const i2s::I2SAccessConfig& cfg) override;
+    m5::hal::v1::result_t<size_t> write(bus::Accessor* owner, const i2s::I2SAccessConfig& cfg, data::Source* tx,
+                                        size_t len) override;
+    m5::hal::v1::result_t<size_t> writableBytes(bus::Accessor* owner, const i2s::I2SAccessConfig& cfg) override;
 
     /*!
       @brief Cap on un-acknowledged bytes in flight (the backpressure window).
@@ -837,9 +822,9 @@ private:
 
     // (Re)apply the AccessConfig and re-sync the credit baseline with a
     // synchronous bus_configure + bus_stream_status script.
-    m5::stl::expected<void, m5::hal::v1::error::error_t> syncConfig(const i2s::I2SAccessConfig& cfg);
+    m5::hal::v1::result_t<void> syncConfig(const i2s::I2SAccessConfig& cfg);
     // Ask the device for a fresh (free, submitted) snapshot synchronously.
-    m5::stl::expected<void, m5::hal::v1::error::error_t> syncStatus();
+    m5::hal::v1::result_t<void> syncStatus();
 
     // Current host-side credit estimate (bytes the device can accept now).
     uint32_t credit() const
@@ -936,8 +921,8 @@ public:
       REMOTE gpio_number space) and pump `session.poll()` while idle.
       @{
      */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> subscribe(::m5::hal::v1::types::gpio_local_pin_t local_pin);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> unsubscribe(::m5::hal::v1::types::gpio_local_pin_t local_pin);
+    m5::hal::v1::result_t<void> subscribe(::m5::hal::v1::types::gpio_local_pin_t local_pin);
+    m5::hal::v1::result_t<void> unsubscribe(::m5::hal::v1::types::gpio_local_pin_t local_pin);
     /*! @} */
 
     gpio::IPort* portForPin(::m5::hal::v1::types::gpio_local_pin_t pin_index) const override
@@ -961,6 +946,17 @@ private:
     void wireWrite(uint32_t local_pin, bool v);
     bool wireRead(uint32_t local_pin);
     void wireSetMode(uint32_t local_pin, ::m5::hal::v1::types::gpio_mode_t mode);
+    /*!
+      @brief Encode and send one single-pin op as a self-contained script.
+
+      `op(enc, &pin)` emits the one instruction; `end()` and the
+      host-to-remote pin-number conversion are shared here. With `await`
+      the script goes out as a normal request (reply checked); without,
+      as NORESP — a server-side failure then parks as the session's
+      pending error (the IPort hooks cannot return one).
+     */
+    template <typename Op>
+    m5::hal::v1::result_t<void> pinScript(uint32_t local_pin, bool await, Op&& op);
     ::m5::hal::v1::types::gpio_number_t remoteNumber(uint32_t local_pin) const
     {
         return ::m5::hal::v1::types::makeGpioNumber(_remote_slot,

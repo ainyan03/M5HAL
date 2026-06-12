@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_FRAME_FRAME_INL_
 #define M5_HAL_FRAME_FRAME_INL_
 
@@ -42,7 +43,7 @@ uint16_t check16(data::ConstDataSpan wire_frame)
     return crc;
 }
 
-m5::stl::expected<size_t, error_t> encodeDelimiter(data::DataSpan dst)
+result_t<size_t> encodeDelimiter(data::DataSpan dst)
 {
     if (dst.data == nullptr || dst.size < kPrefixSize) {
         return m5::stl::make_unexpected(error_t::BUFFER_OVERFLOW);
@@ -52,7 +53,7 @@ m5::stl::expected<size_t, error_t> encodeDelimiter(data::DataSpan dst)
     return kPrefixSize;
 }
 
-m5::stl::expected<size_t, error_t> encodeChecked(data::DataSpan dst, Kind kind, data::ConstDataSpan kind_body)
+result_t<size_t> encodeChecked(data::DataSpan dst, Kind kind, data::ConstDataSpan kind_body)
 {
     if (!isCheckedKind(kind) || kind_body.size > kMaxBodySize - kCheckSize ||
         (kind_body.data == nullptr && kind_body.size != 0)) {
@@ -74,7 +75,7 @@ m5::stl::expected<size_t, error_t> encodeChecked(data::DataSpan dst, Kind kind, 
     return need;
 }
 
-m5::stl::expected<size_t, error_t> encodeData(data::DataSpan dst, uint8_t stream_id, data::ConstDataSpan stream_data)
+result_t<size_t> encodeData(data::DataSpan dst, uint8_t stream_id, data::ConstDataSpan stream_data)
 {
     if (stream_data.size > kMaxDataPayload || (stream_data.data == nullptr && stream_data.size != 0)) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -160,7 +161,7 @@ DecodeResult decode(data::ConstDataSpan src, View& view)
     return {DecodeStatus::ok, full_size};
 }
 
-m5::stl::expected<DecodeResult, error_t> FrameReader::next(View& view)
+result_t<DecodeResult> FrameReader::next(View& view)
 {
     view = {};
     // Release the frame handed out by the previous call (the View
@@ -187,6 +188,13 @@ m5::stl::expected<DecodeResult, error_t> FrameReader::next(View& view)
             return m5::stl::make_unexpected(error_t::END_OF_STREAM);
         }
         if (head.value().size < kPrefixSize) {
+            if (_source->closed()) {
+                // The producer is done and the leftover byte can never
+                // grow into a frame: surface end-of-stream instead of a
+                // need_more the caller would retry forever (the partial
+                // tail stays unconsumed).
+                return m5::stl::make_unexpected(error_t::END_OF_STREAM);
+            }
             return DecodeResult{DecodeStatus::need_more, 0};
         }
         const size_t full_size = kPrefixSize + head.value().data[0];
@@ -196,9 +204,14 @@ m5::stl::expected<DecodeResult, error_t> FrameReader::next(View& view)
             return m5::stl::make_unexpected(peeked.error());
         }
         if (peeked.value().size < full_size) {
-            // Timed out (stream) or truncated (memory): more bytes may
-            // still arrive, so the caller retries. A frame larger than
-            // what the Source can lend stays here as well.
+            if (_source->closed()) {
+                // Stream ended mid-frame (finite source with a truncated
+                // tail): retrying cannot make progress.
+                return m5::stl::make_unexpected(error_t::END_OF_STREAM);
+            }
+            // Timed out (stream): more bytes may still arrive, so the
+            // caller retries. A frame larger than what the Source can
+            // lend stays here as well.
             return DecodeResult{DecodeStatus::need_more, 0};
         }
 
@@ -228,7 +241,7 @@ m5::stl::expected<DecodeResult, error_t> FrameReader::next(View& view)
     }
 }
 
-m5::stl::expected<size_t, error_t> FrameWriter::reserveExact(size_t need, data::DataSpan& out)
+result_t<size_t> FrameWriter::reserveExact(size_t need, data::DataSpan& out)
 {
     auto reserved = _sink->reserve(need);
     if (!reserved.has_value()) {
@@ -241,7 +254,7 @@ m5::stl::expected<size_t, error_t> FrameWriter::reserveExact(size_t need, data::
     return need;
 }
 
-m5::stl::expected<size_t, error_t> FrameWriter::writeDelimiter(void)
+result_t<size_t> FrameWriter::writeDelimiter(void)
 {
     data::DataSpan span{};
     auto reserved = reserveExact(kPrefixSize, span);
@@ -259,7 +272,7 @@ m5::stl::expected<size_t, error_t> FrameWriter::writeDelimiter(void)
     return encoded;
 }
 
-m5::stl::expected<size_t, error_t> FrameWriter::writeChecked(Kind kind, data::ConstDataSpan kind_body)
+result_t<size_t> FrameWriter::writeChecked(Kind kind, data::ConstDataSpan kind_body)
 {
     if (!isCheckedKind(kind) || kind_body.size > kMaxBodySize - kCheckSize ||
         (kind_body.data == nullptr && kind_body.size != 0)) {
@@ -281,7 +294,7 @@ m5::stl::expected<size_t, error_t> FrameWriter::writeChecked(Kind kind, data::Co
     return encoded;
 }
 
-m5::stl::expected<size_t, error_t> FrameWriter::writeData(uint8_t stream_id, data::ConstDataSpan stream_data)
+result_t<size_t> FrameWriter::writeData(uint8_t stream_id, data::ConstDataSpan stream_data)
 {
     if (stream_data.size > kMaxDataPayload || (stream_data.data == nullptr && stream_data.size != 0)) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);

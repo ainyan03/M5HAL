@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 
 #include "i2c.hpp"
 #include "../error.hpp"
@@ -15,7 +16,7 @@ I2CBus& I2CMasterAccessor::getI2CBus(void) const
     return static_cast<I2CBus&>(_bus);
 }
 
-m5::stl::expected<void, m5::hal::v1::error::error_t> I2CMasterAccessor::setConfig(const I2CMasterAccessConfig& cfg)
+m5::hal::v1::result_t<void> I2CMasterAccessor::setConfig(const I2CMasterAccessConfig& cfg)
 {
     if (inAccess()) {
         return m5::stl::make_unexpected(m5::hal::v1::error::error_t::INVALID_ARGUMENT);
@@ -24,60 +25,46 @@ m5::stl::expected<void, m5::hal::v1::error::error_t> I2CMasterAccessor::setConfi
     return {};
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> I2CMasterAccessor::transfer(const TransferDesc& desc,
-                                                                                   data::ConstDataSpan tx_bytes,
-                                                                                   data::DataSpan rx_bytes)
+m5::hal::v1::result_t<size_t> I2CMasterAccessor::transfer(const TransferDesc& desc, data::ConstDataSpan tx_bytes,
+                                                          data::DataSpan rx_bytes)
 {
     data::MemorySource tx_src{tx_bytes};
     data::MemorySink rx_dst{rx_bytes};
     return transfer(desc, (tx_bytes.size > 0) ? &tx_src : nullptr, (rx_bytes.size > 0) ? &rx_dst : nullptr);
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> I2CMasterAccessor::transfer(const TransferDesc& desc,
-                                                                                   data::Source* tx, data::Sink* rx)
+m5::hal::v1::result_t<size_t> I2CMasterAccessor::transfer(const TransferDesc& desc, data::Source* tx, data::Sink* rx)
 {
     // Wrap the body in beginAccess / endAccess for mutual exclusion.
     // When the outer caller already holds a `ScopedAccess` or an
     // explicit `beginAccess`, the depth counter prevents a double lock.
-    auto ba = beginAccess(_access_config.timeout_ms);
-    if (!ba.has_value()) {
-        return m5::stl::make_unexpected(ba.error());
-    }
-    auto result = getI2CBus().transfer(this, _access_config, desc, tx, rx);
-    // Same release-error policy as the UART/SPI accessors: the transfer
-    // error wins, but a clean transfer must not hide a broken release
-    // (depth-counter corruption would otherwise go unnoticed).
-    auto ea = endAccess();
-    if (!result.has_value()) {
-        return result;
-    }
-    if (!ea.has_value()) {
-        return m5::stl::make_unexpected(ea.error());
-    }
-    return result;
+    // Release-error policy: bus::guarded.
+    return bus::guarded([&] { return beginAccess(_access_config.timeout_ms); },
+                        [&] { return getI2CBus().transfer(this, _access_config, desc, tx, rx); },
+                        [&] { return endAccess(); });
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> I2CMasterAccessor::write(data::ConstDataSpan tx_bytes)
+m5::hal::v1::result_t<size_t> I2CMasterAccessor::write(data::ConstDataSpan tx_bytes)
 {
     return transfer(TransferDesc{}, tx_bytes, data::DataSpan{});
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> I2CMasterAccessor::read(data::DataSpan rx_bytes)
+m5::hal::v1::result_t<size_t> I2CMasterAccessor::read(data::DataSpan rx_bytes)
 {
     return transfer(TransferDesc{}, data::ConstDataSpan{}, rx_bytes);
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> I2CMasterAccessor::write(const uint8_t* tx, size_t len)
+m5::hal::v1::result_t<size_t> I2CMasterAccessor::write(const uint8_t* tx, size_t len)
 {
     return write(data::ConstDataSpan{tx, len});
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> I2CMasterAccessor::read(uint8_t* dst, size_t len)
+m5::hal::v1::result_t<size_t> I2CMasterAccessor::read(uint8_t* dst, size_t len)
 {
     return read(data::DataSpan{dst, len});
 }
 
-m5::stl::expected<void, m5::hal::v1::error::error_t> I2CMasterAccessor::probe(void)
+m5::hal::v1::result_t<void> I2CMasterAccessor::probe(void)
 {
     auto r = transfer(TransferDesc{}, data::ConstDataSpan{}, data::DataSpan{});
     if (!r.has_value()) {
@@ -86,8 +73,7 @@ m5::stl::expected<void, m5::hal::v1::error::error_t> I2CMasterAccessor::probe(vo
     return {};
 }
 
-m5::stl::expected<void, m5::hal::v1::error::error_t> I2CBus::probe(uint16_t i2c_addr, uint32_t freq,
-                                                                   uint32_t timeout_ms)
+m5::hal::v1::result_t<void> I2CBus::probe(uint16_t i2c_addr, uint32_t freq, uint32_t timeout_ms)
 {
     I2CMasterAccessConfig cfg;
     cfg.i2c_addr   = i2c_addr;
@@ -97,10 +83,8 @@ m5::stl::expected<void, m5::hal::v1::error::error_t> I2CBus::probe(uint16_t i2c_
     return sentinel.probe();
 }
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> I2CBus::transfer(bus::Accessor* owner,
-                                                                        const I2CMasterAccessConfig& cfg,
-                                                                        const TransferDesc& desc, data::Source* tx,
-                                                                        data::Sink* rx)
+m5::hal::v1::result_t<size_t> I2CBus::transfer(bus::Accessor* owner, const I2CMasterAccessConfig& cfg,
+                                               const TransferDesc& desc, data::Source* tx, data::Sink* rx)
 {
     (void)owner;
     (void)cfg;

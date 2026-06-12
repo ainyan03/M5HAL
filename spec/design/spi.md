@@ -108,6 +108,32 @@ read/write の自然な違いを表現するため、 `spi_read_dummy_cycle` と
 write dummy を `TransferDesc::dummy_cycles` に詰める。 特定 command だけ dummy 数が
 違う場合は、 caller が `TransferDesc` を直接組んで `transfer()` を呼ぶ。
 
+ワイヤ上の dummy cycle は **データビットと同じ first→second level の順**で刻む。
+これにより各 dummy cycle が必ず sample edge への遷移を 1 回持ち、 設定数ぶんの
+clock がデバイスから数えられる (旧実装の「!CPOL→CPOL」順は CPHA=0 で先頭 cycle が
+無遷移になり、 ワイヤ上の dummy clock が 1 少なくなる off-by-one があった —
+2026-06 の実機 wire test 初実走で検出)。
+
+転送の終端では **CS deassert の前に SCK を idle level (CPOL) へ復帰**させ、 さらに
+half period 分の settle を置く (CPHA=1 系は元々 idle で終わるため復帰は無遷移)。
+CS が active clock のまま解除される波形を防ぐ。
+
+**DC の遷移も half-period グリッドに載せる**: phase 境界 (command→address→data) の
+DC 変更は、 直前 phase の最終 sample edge から half period 置いてから行う。 phase
+遷移は最終 edge と同一 poll 内で起きるため、 即時に書くと DC hold が数 µs の
+razor-thin になる (デバイスは edge で latch するので実害は出にくいが、 波形として
+曖昧で、 capture 方式の wire test では分解できない)。
+
+**CS ウィンドウ内に構成由来の SCK エッジを漏らさない** (ESP-IDF backend): device の
+構成 (mode = CPOL/CPHA の確定) は **CS assert の前**に行い、 構成を変更した場合は
+CS 非アクティブのまま settle 用 dummy 1 clock を出して SCK を mode のアイドル
+レベルへ確定させる。 構成を transfer 内へ遅延させると、 CPOL=1 系で CS assert 後に
+SCK のアイドル遷移エッジが 1 個混入する (実機 wire test で検出)。 CS 非アクティブ中の
+クロックはプロトコル不可視なので settle は無害。 device handle はトランザクションを
+跨いでキャッシュされ、 構成 (freq / mode / order / duplex) が変わったときだけ
+再生成 + settle が走る — 同一構成の連続トランザクションでは SCK は前回の終端で
+既にアイドルに置かれている。
+
 ## software SPI variant の実装方針
 
 `variants::frameworks::software` の SPI master は、 GPIO `Pin` を push-pull
@@ -127,9 +153,12 @@ runner に戻せる構造へ寄せている。
   内の状態として明示する。
 - CS 区間は `SPIMasterAccessor` / `SPIBus` の transaction 層で扱い、byte/phase
   transfer 本体から分離する。
-- byte 内部は bit/edge 単位の state に分解する。ただし高周波設定で dispatch
-  overhead が支配的にならないよう、同期 runner は時間差分から得た edge budget
-  の範囲で複数 edge をまとめて処理する。
+- byte 内部は bit/edge 単位の state に分解し、1 回の poll で出力する edge は
+  **最大 1 つ**に制限する。poll が遅延して理想スケジュールに backlog ができた
+  場合は、複数 edge をまとめて取り戻すのではなく `now` へ再アンカーして
+  スケジュールを滑らせる (i2c と同方針 — backlog をまとめて出力すると runner
+  速度で連続 edge となり、設定より大幅に速いクロック burst になるため。
+  クロックは公称より遅れることはあっても速くならない)。
 - `ByteTransferState` は enum による setup/leading/trailing state を持たず、
   `active` / `done` / `pending_second_edge` / `bit_index` で byte 内の進行だけを
   表す。phase 遷移は `TransferService` に閉じ、byte hot path は edge 消費に集中させる。

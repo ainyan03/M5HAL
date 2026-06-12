@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_HAL_V1_MEMORY_POOL_INL_
 #define M5_HAL_HAL_V1_MEMORY_POOL_INL_
 
@@ -92,6 +93,25 @@ template <size_t BlockSize, size_t BlockCount>
 bool FixedBlockPool<BlockSize, BlockCount>::owns(const void* ptr) const
 {
     return containsPointer(ptr);
+}
+
+template <size_t BlockSize, size_t BlockCount>
+size_t FixedBlockPool<BlockSize, BlockCount>::allocationSize(const void* ptr) const
+{
+    if (!containsPointer(ptr)) {
+        return 0;
+    }
+    const auto* bytes   = static_cast<const uint8_t*>(ptr);
+    const size_t offset = static_cast<size_t>(bytes - storage_);
+    if ((offset % BlockSize) != 0) {
+        return 0;
+    }
+    lockPool();
+    const size_t index  = offset / BlockSize;
+    const uint8_t count = block_counts_[index];
+    const size_t result = (count != 0 && index + count <= BlockCount) ? static_cast<size_t>(count) * BlockSize : 0;
+    unlockPool();
+    return result;
 }
 
 template <size_t BlockSize, size_t BlockCount>

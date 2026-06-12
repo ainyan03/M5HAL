@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Skeleton tests for the `m5::hal::v1::gpio::GPIO` abstract and the
 // `stub::GPIO` concrete. By design, `GPIO` focuses on Port
 // management and exposes no pin operations (`write` / `read` /

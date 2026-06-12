@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_DATA_LIMITED_HPP_
 #define M5_HAL_DATA_LIMITED_HPP_
 
@@ -50,7 +51,7 @@ public:
     {
     }
 
-    m5::stl::expected<ConstDataSpan, m5::hal::v1::error::error_t> peek(size_t max_len) override
+    m5::hal::v1::result_t<ConstDataSpan> peek(size_t max_len) override
     {
         size_t want = std::min(max_len, _remaining);
         if (want == 0 || _base == nullptr) {
@@ -59,7 +60,7 @@ public:
         return _base->peek(want);
     }
 
-    m5::stl::expected<void, m5::hal::v1::error::error_t> advance(size_t N) override
+    m5::hal::v1::result_t<void> advance(size_t N) override
     {
         size_t step = std::min(N, _remaining);
         _remaining -= step;
@@ -77,6 +78,13 @@ public:
     bool eof() const override
     {
         return _remaining == 0 || _base == nullptr || _base->eof();
+    }
+
+    /*! @brief Producer closure: a spent cap is final, and a closed base
+        stays closed through the decorator. */
+    bool closed() const override
+    {
+        return _remaining == 0 || _base == nullptr || _base->closed();
     }
 
     /*! @brief Bytes still allowed through the cap (debug / verification). */
@@ -109,7 +117,7 @@ public:
     {
     }
 
-    m5::stl::expected<DataSpan, m5::hal::v1::error::error_t> reserve(size_t max_len) override
+    m5::hal::v1::result_t<DataSpan> reserve(size_t max_len) override
     {
         size_t want = std::min(max_len, _remaining);
         if (want == 0 || _base == nullptr) {
@@ -118,7 +126,7 @@ public:
         return _base->reserve(want);
     }
 
-    m5::stl::expected<void, m5::hal::v1::error::error_t> commit(size_t N) override
+    m5::hal::v1::result_t<void> commit(size_t N) override
     {
         size_t step = std::min(N, _remaining);
         _remaining -= step;

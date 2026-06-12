@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Native gtest for service::ServiceRunner (hal/v1/service/service.hpp).
 //
 // test_basic covers the happy path (registration order) and the tick
@@ -5,7 +6,8 @@
 // cooperative runner promises its services: duplicate / over-capacity
 // registration is rejected, removal compacts while preserving order,
 // runOnce aggregates Progress|Done into its return value, and a
-// service may remove itself from inside its own service() callback
+// service may remove itself (or a sibling) from inside its own
+// service() callback without skipping the next service in the pass
 // (the bit-bang state machines end themselves exactly this way).
 
 #include <gtest/gtest.h>
@@ -23,7 +25,8 @@ using service::ServiceResult;
 using service::ServiceRunner;
 
 // Appends its id to a shared log on every call and returns a scripted
-// result. Optionally removes itself from the runner when it is called.
+// result. Optionally removes a service (itself by default) from the
+// runner when it is called.
 class ScriptedService : public IService {
 public:
     ScriptedService(std::vector<int>& log, int id, ServiceResult result) : _log{&log}, _id{id}, _result{result}
@@ -34,14 +37,15 @@ public:
     {
         _log->push_back(_id);
         last_now = ctx.now_tick;
-        if (remove_self_from != nullptr) {
-            (void)remove_self_from->remove(*this);
+        if (remove_from != nullptr) {
+            (void)remove_from->remove(remove_what != nullptr ? *remove_what : *this);
         }
         return _result;
     }
 
-    ServiceRunner* remove_self_from = nullptr;
-    service::tick_nsec_t last_now   = 0;
+    ServiceRunner* remove_from    = nullptr;
+    IService* remove_what         = nullptr;  // nullptr = remove self
+    service::tick_nsec_t last_now = 0;
 
 private:
     std::vector<int>* _log = nullptr;
@@ -132,19 +136,38 @@ TEST(ServiceRunner, ServiceMayRemoveItselfWhileRunning)
     ServiceRunner runner;
     ScriptedService a{log, 1, ServiceResult::Done};
     ScriptedService b{log, 2, ServiceResult::Idle};
-    a.remove_self_from = &runner;
+    a.remove_from = &runner;
     ASSERT_TRUE(runner.add(a));
     ASSERT_TRUE(runner.add(b));
 
-    // The self-removing pass must not crash and must report progress
-    // (a returned Done). In-flight table edits may defer a sibling to
-    // the next pass, so b's call count is asserted over two passes.
+    // Self-removal compacts the table mid-pass; the cursor compensates,
+    // so b (shifted into a's slot) still runs in the SAME pass.
     EXPECT_TRUE(runner.runOnce(ServiceContext{0}));
     EXPECT_EQ(runner.size(), 1u);
+    EXPECT_EQ(log, (std::vector<int>{1, 2}));
 
     log.clear();
     (void)runner.runOnce(ServiceContext{1});
     EXPECT_EQ(log, (std::vector<int>{2}));  // a is gone, b still runs
+}
+
+TEST(ServiceRunner, ServiceMayRemoveASiblingWhileRunning)
+{
+    std::vector<int> log;
+    ServiceRunner runner;
+    ScriptedService a{log, 1, ServiceResult::Idle};
+    ScriptedService b{log, 2, ServiceResult::Idle};
+    ScriptedService c{log, 3, ServiceResult::Idle};
+    a.remove_from = &runner;
+    a.remove_what = &b;
+    ASSERT_TRUE(runner.add(a));
+    ASSERT_TRUE(runner.add(b));
+    ASSERT_TRUE(runner.add(c));
+
+    // a removes b before b's turn: b must not run, c must not be skipped.
+    (void)runner.runOnce(ServiceContext{0});
+    EXPECT_EQ(log, (std::vector<int>{1, 3}));
+    EXPECT_EQ(runner.size(), 2u);
 }
 
 }  // namespace

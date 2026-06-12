@@ -98,7 +98,7 @@ protected:
 ### 契約
 
 - **public API は gpio_local_pin_t 受け、 内部で encoded 変換** — `_fromLocalPin(pin_index)` を呼んでから encoded hook へ dispatch
-- **invalid pin_index は assert で debug 即死、 release UB** — `_fromLocalPin` 実装の責務 (`expected` で wrap しない)
+- **invalid pin_index は assert で debug 即死、 release UB** — `_fromLocalPin` 実装の責務 (`expected` で wrap しない)。 IGPIO 内 local pin 空間の一部だけを担う Port (複数 bank 構成や base 付き Port) では、 **自 Port に所属しない pin_index も invalid** として assert する (他 bank の pin が bit 折り返しで自 bank へ alias する事故の防止)
 - **`writeHigh` / `writeLow` 高速 path** — default 実装は `_writePinEncoded(encoded, true/false)` に委譲し、 variant は override できる
 - **Pin factory** — `getPin(pin_index)` 経由でのみ Pin 値型を発行。 `_fromLocalPin` で encoded 化し、 `Pin{this, encoded}` の private ctor (`IPort` が friend) を呼ぶ
 - **protected non-virtual dtor** — `delete (IPort*)` を許可しない
@@ -200,9 +200,9 @@ public:
     GPIOGroup(GPIOGroup&&)      = delete;
 
     // 登録 / 解除 (checked、 startup 時のみ、 [[nodiscard]] で握り潰し防止)
-    [[nodiscard]] m5::stl::expected<void, error::error_t>
+    [[nodiscard]] result_t<void>
     addGPIO(const IGPIO* gpio, types::gpio_slot_t slot);
-    [[nodiscard]] m5::stl::expected<void, error::error_t>
+    [[nodiscard]] result_t<void>
     removeGPIO(types::gpio_slot_t slot);
 
     // 問い合わせ (checked)
@@ -211,7 +211,7 @@ public:
     bool         isValid(types::gpio_number_t gpio_num) const;
 
     // Pin 解決 (checked sugar、 [[nodiscard]] で expected の握り潰し防止)
-    [[nodiscard]] m5::stl::expected<Pin, error::error_t>
+    [[nodiscard]] result_t<Pin>
     tryGetPin(types::gpio_number_t gpio_num) const;
 
     // Pin 解決 (unchecked fast path、 contract violation 時 assert/UB)

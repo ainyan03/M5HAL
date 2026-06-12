@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // GPIOGroup tests.
 //
 // Verifies the slot-based registration model:

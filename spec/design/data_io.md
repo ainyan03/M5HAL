@@ -27,14 +27,16 @@ namespace m5::hal::v1::data {
 class Source {
 public:
     virtual ~Source() = default;
-    virtual m5::stl::expected<ConstDataSpan, error_t> peek(size_t max_len) = 0;
-    virtual m5::stl::expected<void, error_t>          advance(size_t N)    = 0;
-    virtual bool                                      eof() const          = 0;
+    virtual result_t<ConstDataSpan> peek(size_t max_len) = 0;
+    virtual result_t<void>          advance(size_t N)    = 0;
+    virtual bool                    eof() const          = 0;
+    virtual bool                    closed() const { return eof(); }
 };
 
 }
 ```
 
+- `result_t<T>` = `m5::stl::expected<T, error::error_t>` の alias ([`hal/v1/error.hpp`](../../src/m5_hal/hal/v1/error.hpp)、 規約は [coding_style.md](../style/coding_style.md) §型の使い分け)
 - **`peek(max_len)`**: cursor 位置から最大 `max_len` bytes を借用 Span として返す。 連続呼び出し (advance を挟まない) では **monotonic non-decreasing** — 前回返した先頭部分のバイト列は不変、 size は減少せず末尾に追加されることがある。 pointer は同一とは限らないが、 内容の整合性は保証
 - **借用 Span の lifetime**: 次の `peek` または `advance` 呼び出しまで有効
 - **空 Span = end-of-stream**: `peek` で size 0 の Span が返れば end-of-stream 確定 (`eof()` も true)
@@ -44,6 +46,7 @@ public:
   - stream 系 Source: 内部に **skip 予約** として保持し、 データが届くたびに自動消費される (caller の while ループを不要にする)
   - メモリ系 Source: 不足分を破棄し end-of-stream へ遷移
 - **`eof()`**: 「これ以上データは来ない」 final state の問い合わせ。 caller は advance 後に `eof()` を確認することで skip 不足を検知できる
+- **`closed()`**: **生産側が閉じたか**の問い合わせ。 true = いま peek できるバイトが最終で、 以後追加されることはない (TCP half-close の意味論 — 読み残しは残り得る)。 `eof()` = `closed()` かつ飲み干した、 の関係。 default 実装は `eof()` を返す (stream 系は接続中 false で安全側)。 有限派生は override する — `MemorySource` は内容が構築時確定なので常に true。 consumer はこれで「再試行で進み得る短読み」 と 「永遠に進まない短読み」 を弁別する (`FrameReader` の端数末尾 livelock 対策)
 - **`peek(0)` は契約違反**: 空 span = end-of-stream 表明と衝突するため、 `max_len` は 1 以上であること。 違反時の挙動は派生実装定義 (size 検証は不要、 debug assert 任意 — Sink の契約違反と同じ扱い)。 `Sink::reserve(0)` も同様
 
 ## Sink の契約
@@ -54,8 +57,8 @@ namespace m5::hal::v1::data {
 class Sink {
 public:
     virtual ~Sink() = default;
-    virtual m5::stl::expected<DataSpan, error_t> reserve(size_t max_len) = 0;
-    virtual m5::stl::expected<void, error_t>     commit(size_t N)        = 0;
+    virtual result_t<DataSpan> reserve(size_t max_len) = 0;
+    virtual result_t<void>     commit(size_t N)        = 0;
     virtual bool                                 closed() const          = 0;
 };
 
@@ -82,7 +85,7 @@ public:
 
 ## error path の責務
 
-Source / Sink の 4 つの core API (`peek` / `advance` / `reserve` / `commit`) は全て `m5::stl::expected<..., error_t>` を返す。 これは **将来の stream 通信派生 (TCP/UDP/network ringbuffer/DMA/remote bus 等、 真の I/O error を発生させ得る派生) を視野に入れた抽象基底の規約**。 typical な同期メモリ系派生 (`MemorySource` / `MemorySink` / `LimitedSource` / `LimitedSink`) が現状 error を返さないのは **派生実装の現状であり、 抽象基底の規約ではない**。
+Source / Sink の 4 つの core API (`peek` / `advance` / `reserve` / `commit`) は全て `result_t<...>` を返す。 これは **将来の stream 通信派生 (TCP/UDP/network ringbuffer/DMA/remote bus 等、 真の I/O error を発生させ得る派生) を視野に入れた抽象基底の規約**。 typical な同期メモリ系派生 (`MemorySource` / `MemorySink` / `LimitedSource` / `LimitedSink`) が現状 error を返さないのは **派生実装の現状であり、 抽象基底の規約ではない**。
 
 ### caller 側の遵守事項
 
@@ -118,7 +121,7 @@ stream / frame / remote 系で必要になる粒度は v1 `error_t` に追加済
 | 要素 | 不採用理由 |
 |---|---|
 | `Chunk` (lifetime 管理 + frame hint) | I2C / SPI register access 中心のスコープで過剰。 所有権移譲が必要になったら別途 `OwnedSpan` 等で導入 |
-| `TransferResult` (`{transferred, error}`) | 既存 `m5::stl::expected<size_t, error_t>` で十分。 「途中まで成功」 を細かく表現する必要が出てきたら別途検討 |
+| `TransferResult` (`{transferred, error}`) | 既存 `result_t<size_t>` で十分。 「途中まで成功」 を細かく表現する必要が出てきたら別途検討 |
 | `Completion` (非同期 handle) | sync 通信前提。 非同期サポートは将来の拡張余地として残す |
 | NVI (Non-Virtual Interface) パターン | 素直な virtual API を採る ([../style/coding_style.md](../style/coding_style.md) 参照) |
 
@@ -128,7 +131,7 @@ stream / frame / remote 系で必要になる粒度は v1 `error_t` に追加済
 |---|---|---|
 | `MemorySource` | `hal/data/memory.hpp` | 固定 `ConstDataSpan` を起点に Source として yield する基本実装 |
 | `MemorySink` | 同上 | 固定 `DataSpan` に書き込む基本実装 |
-| `LimitedSource` | `hal/data/limited.hpp` | base となる Source を「先頭 N byte だけ」 に制限する装飾。 base が先に eof になればその時点で eof |
+| `LimitedSource` | `hal/data/limited.hpp` | base となる Source を「先頭 N byte だけ」 に制限する装飾。 base が先に eof / closed になればその時点で eof / closed。 cap 消費後も closed |
 | `LimitedSink` | 同上 | base となる Sink を「N byte だけ」 に制限する装飾。 ringbuffer 等の容量不明 / 無限 Sink から「N byte だけ受信」 を実現するのが典型用途 |
 | `StreamReader` / `StreamWriter` | `hal/data/stream.hpp` | pull/push 型バイトストリームの最小能力を表す抽象 (§Stream アダプタ)。 UART split accessor 等の transport が実装する |
 | `StreamSource` | 同上 | `StreamReader` を Source に持ち上げるアダプタ。 caller 提供 scratch で `peek` の借用契約を実現 |
@@ -206,4 +209,4 @@ UART の split accessor (`UARTTxAccessor` / `UARTRxAccessor`、 [uart.md](uart.m
 |---|---|
 | `peek` / `advance` | Source: 借用 Span 取得 / cursor 前進 (連続 peek は monotonic non-decreasing 冪等) |
 | `reserve` / `commit` | Sink: 書き込み領域取得 / 書き込み量報告 (契約違反は UB) |
-| `eof` / `closed` | 終端 final state 問い合わせ (Source 側 / Sink 側) |
+| `eof` / `closed` | 終端 final state 問い合わせ。 `closed` は両側にある: Source 側 = 生産側が閉じた (読み残しは残り得る、 `eof` = closed かつ飲み干した)、 Sink 側 = 受け側が閉じた |

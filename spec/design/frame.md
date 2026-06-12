@@ -74,7 +74,7 @@ codec が意味解釈するのは `data` の stream_id 規則と padding / delim
 | `encodeChecked(dst, kind, kind_body)` | 同上 | kind が checked でない / body 超過・null → `INVALID_ARGUMENT`、dst 不足 → `BUFFER_OVERFLOW` |
 | `encodeData(dst, stream_id, payload)` | 同上 | payload > 240・null → `INVALID_ARGUMENT`、dst 不足 → `BUFFER_OVERFLOW` |
 
-いずれも `m5::stl::expected<size_t, error_t>`。エラー時に部分出力は生じない。dst へ直接構築する (中間バッファなし)。
+いずれも `result_t<size_t>`。エラー時に部分出力は生じない。dst へ直接構築する (中間バッファなし)。
 
 ## FrameReader / FrameWriter (Source/Sink 統合)
 

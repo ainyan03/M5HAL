@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_SPI_SPI_HPP
 #define M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_SPI_SPI_HPP
 
@@ -35,17 +36,17 @@ public:
     // Typed init: takes this variant's BusConfig (S17 E1). Passing the
     // abstract SPIBusConfig (or a sibling variant's config) is a
     // compile error instead of a silent bad downcast.
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> init(const BusConfig& config);
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> release(void) override;
+    ::m5::hal::v1::result_t<void> init(const BusConfig& config);
+    ::m5::hal::v1::result_t<void> release(void) override;
 
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> beginTransaction(
-        ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg) override;
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> endTransaction(
-        ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg) override;
-    m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> transfer(
-        ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg,
-        const ::m5::hal::v1::spi::TransferDesc& desc, ::m5::hal::v1::data::Source* tx,
-        ::m5::hal::v1::data::Sink* rx) override;
+    ::m5::hal::v1::result_t<void> beginTransaction(::m5::hal::v1::bus::Accessor* owner,
+                                                   const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg) override;
+    ::m5::hal::v1::result_t<void> endTransaction(::m5::hal::v1::bus::Accessor* owner,
+                                                 const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg) override;
+    ::m5::hal::v1::result_t<size_t> transfer(::m5::hal::v1::bus::Accessor* owner,
+                                             const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg,
+                                             const ::m5::hal::v1::spi::TransferDesc& desc,
+                                             ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx) override;
 
     ::m5::hal::v1::error::error_t attach(::spi_host_device_t host);
     ::spi_host_device_t nativeHost() const
@@ -58,9 +59,9 @@ public:
     }
 
 private:
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> ensureDevice(
-        const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg, bool half_duplex);
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> removeDevice(void);
+    // true = the device was (re)created (SCK idle level may need settling).
+    ::m5::hal::v1::result_t<bool> ensureDevice(const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg, bool half_duplex);
+    ::m5::hal::v1::result_t<void> removeDevice(void);
 
     ::spi_host_device_t _host     = SPI2_HOST;
     ::spi_device_handle_t _device = nullptr;

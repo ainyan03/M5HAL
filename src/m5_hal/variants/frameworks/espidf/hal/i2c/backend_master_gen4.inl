@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_I2C_BACKEND_MASTER_GEN4_INL
 #define M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_I2C_BACKEND_MASTER_GEN4_INL
 
@@ -44,7 +45,7 @@ bool isValidAddress(const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg)
 
 }  // namespace
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig& config)
+::m5::hal::v1::result_t<void> Bus::init(const BusConfig& config)
 {
     if (config.pin_scl < 0 || config.pin_sda < 0) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
@@ -75,15 +76,17 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig
     if (::m5::hal::v1::error::isError(mapped)) {
         return m5::stl::make_unexpected(mapped);
     }
-    _installed = true;
+    _installed    = true;
+    _applied_freq = conf.master.clk_speed;
     return {};
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::release(void)
+::m5::hal::v1::result_t<void> Bus::release(void)
 {
     if (_installed) {
-        auto mapped = mapEspErr(::i2c_driver_delete(_port));
-        _installed  = false;
+        auto mapped   = mapEspErr(::i2c_driver_delete(_port));
+        _installed    = false;
+        _applied_freq = 0;
         if (::m5::hal::v1::error::isError(mapped)) {
             return m5::stl::make_unexpected(mapped);
         }
@@ -91,9 +94,10 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::release(void)
     return {};
 }
 
-m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
-    ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg,
-    const ::m5::hal::v1::i2c::TransferDesc& desc, ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
+::m5::hal::v1::result_t<size_t> Bus::transfer(::m5::hal::v1::bus::Accessor* owner,
+                                              const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg,
+                                              const ::m5::hal::v1::i2c::TransferDesc& desc,
+                                              ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
 {
     (void)owner;
     if (!_installed || cfg.freq == 0 || !isValidAddress(cfg)) {
@@ -103,19 +107,23 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
     // The gen4 driver has no per-device handle (unlike the gen5 backend, which
     // caches an i2c_master_dev_handle_t and only re-adds it when the
     // address/frequency change). Here the per-target frequency lives only in
-    // i2c_config_t, so we re-apply it each transfer. A future optimization could
-    // cache the last applied frequency and skip i2c_param_config when unchanged.
-    ::i2c_config_t conf   = {};
-    conf.mode             = I2C_MODE_MASTER;
-    conf.sda_io_num       = static_cast<int>(_config.pin_sda);
-    conf.scl_io_num       = static_cast<int>(_config.pin_scl);
-    conf.sda_pullup_en    = true;
-    conf.scl_pullup_en    = true;
-    conf.master.clk_speed = cfg.freq;
-    conf.clk_flags        = 0;
-    auto mapped           = mapEspErr(::i2c_param_config(_port, &conf));
-    if (::m5::hal::v1::error::isError(mapped)) {
-        return m5::stl::make_unexpected(mapped);
+    // i2c_config_t; cache the last applied value and re-run i2c_param_config
+    // only when it changes (pins change only via init, which resets the cache).
+    auto mapped = ::m5::hal::v1::error::error_t::OK;
+    if (cfg.freq != _applied_freq) {
+        ::i2c_config_t conf   = {};
+        conf.mode             = I2C_MODE_MASTER;
+        conf.sda_io_num       = static_cast<int>(_config.pin_sda);
+        conf.scl_io_num       = static_cast<int>(_config.pin_scl);
+        conf.sda_pullup_en    = true;
+        conf.scl_pullup_en    = true;
+        conf.master.clk_speed = cfg.freq;
+        conf.clk_flags        = 0;
+        mapped                = mapEspErr(::i2c_param_config(_port, &conf));
+        if (::m5::hal::v1::error::isError(mapped)) {
+            return m5::stl::make_unexpected(mapped);
+        }
+        _applied_freq = cfg.freq;
     }
 
     detail::TempWriteBuffer write_bytes;

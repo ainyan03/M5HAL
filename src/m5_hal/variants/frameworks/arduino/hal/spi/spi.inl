@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_ARDUINO_HAL_SPI_SPI_INL
 #define M5_HAL_VARIANTS_FRAMEWORKS_ARDUINO_HAL_SPI_SPI_INL
 
@@ -63,7 +64,7 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
     return static_cast<uint8_t>(value >> shift);
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> transferByte(::SPIClass& spi, uint8_t tx_byte, uint8_t* rx_byte)
+::m5::hal::v1::result_t<void> transferByte(::SPIClass& spi, uint8_t tx_byte, uint8_t* rx_byte)
 {
     const uint8_t value = spi.transfer(tx_byte);
     if (rx_byte != nullptr) {
@@ -72,7 +73,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> transferByte(::SPIClass& 
     return {};
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> sendMeta(::SPIClass& spi, uint32_t value, uint8_t bytes)
+::m5::hal::v1::result_t<void> sendMeta(::SPIClass& spi, uint32_t value, uint8_t bytes)
 {
     if (bytes > 4) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
@@ -87,7 +88,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> sendMeta(::SPIClass& spi,
     return {};
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> sendDummy(::SPIClass& spi, uint8_t cycles)
+::m5::hal::v1::result_t<void> sendDummy(::SPIClass& spi, uint8_t cycles)
 {
     if (cycles == 0) {
         return {};
@@ -123,9 +124,8 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> sendDummy(::SPIClass& spi
 #endif
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> transferChunk(::SPIClass& spi,
-                                                                     ::m5::hal::v1::data::ConstDataSpan tx_span,
-                                                                     ::m5::hal::v1::data::DataSpan rx_span)
+::m5::hal::v1::result_t<void> transferChunk(::SPIClass& spi, ::m5::hal::v1::data::ConstDataSpan tx_span,
+                                            ::m5::hal::v1::data::DataSpan rx_span)
 {
     const size_t common = (tx_span.size < rx_span.size) ? tx_span.size : rx_span.size;
     if (common > 0) {
@@ -152,7 +152,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> transferChunk(::SPIClass&
     return ::m5::hal::v1::error::error_t::OK;
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig& config)
+::m5::hal::v1::result_t<void> Bus::init(const BusConfig& config)
 {
     _config = config;
     if (_spi) {
@@ -184,7 +184,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig
     return {};
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::release(void)
+::m5::hal::v1::result_t<void> Bus::release(void)
 {
     if (_spi && _owns_spi) {
         _spi->end();
@@ -194,8 +194,8 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::release(void)
     return {};
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::beginTransaction(
-    ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg)
+::m5::hal::v1::result_t<void> Bus::beginTransaction(::m5::hal::v1::bus::Accessor* owner,
+                                                    const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg)
 {
     (void)owner;
     if (_spi == nullptr || cfg.freq == 0) {
@@ -206,8 +206,8 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::beginTransaction(
     return {};
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::endTransaction(
-    ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg)
+::m5::hal::v1::result_t<void> Bus::endTransaction(::m5::hal::v1::bus::Accessor* owner,
+                                                  const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg)
 {
     (void)owner;
     setPinLevel(cfg.pin_cs, true);
@@ -217,9 +217,10 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::endTransaction(
     return {};
 }
 
-m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
-    ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg,
-    const ::m5::hal::v1::spi::TransferDesc& desc, ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
+::m5::hal::v1::result_t<size_t> Bus::transfer(::m5::hal::v1::bus::Accessor* owner,
+                                              const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg,
+                                              const ::m5::hal::v1::spi::TransferDesc& desc,
+                                              ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
 {
     (void)owner;
     // This variant drives a single-lane MOSI/MISO pair through SPIClass.

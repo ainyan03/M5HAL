@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_FRAME_FRAME_HPP_
 #define M5_HAL_FRAME_FRAME_HPP_
 
@@ -131,11 +132,9 @@ uint16_t check16(data::ConstDataSpan wire_frame);
 // BUFFER_OVERFLOW (`dst` cannot hold the frame). No partial output is
 // produced on error.
 
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> encodeDelimiter(data::DataSpan dst);
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> encodeChecked(data::DataSpan dst, Kind kind,
-                                                                     data::ConstDataSpan kind_body);
-m5::stl::expected<size_t, m5::hal::v1::error::error_t> encodeData(data::DataSpan dst, uint8_t stream_id,
-                                                                  data::ConstDataSpan stream_data);
+m5::hal::v1::result_t<size_t> encodeDelimiter(data::DataSpan dst);
+m5::hal::v1::result_t<size_t> encodeChecked(data::DataSpan dst, Kind kind, data::ConstDataSpan kind_body);
+m5::hal::v1::result_t<size_t> encodeData(data::DataSpan dst, uint8_t stream_id, data::ConstDataSpan stream_data);
 
 /*!
   @brief Try to decode one frame from the head of `src`.
@@ -178,6 +177,12 @@ DecodeResult decode(data::ConstDataSpan src, View& view);
     StreamSource means "no bytes arrived in time - call again";
     `END_OF_STREAM` is returned when the Source reports EOF (empty
     peek), e.g. a fully drained MemorySource.
+  - A short peek on a CLOSED Source (producer done - the bytes can
+    never grow into a frame) also returns `END_OF_STREAM` instead of
+    `need_more`, so pumping a finite Source with a truncated tail
+    terminates instead of livelocking. The partial tail stays
+    unconsumed; `source.eof() == false` afterwards tells the caller
+    the stream ended mid-frame.
  */
 class FrameReader {
 public:
@@ -185,7 +190,7 @@ public:
     {
     }
 
-    m5::stl::expected<DecodeResult, m5::hal::v1::error::error_t> next(View& view);
+    m5::hal::v1::result_t<DecodeResult> next(View& view);
 
 private:
     data::Source* _source = nullptr;
@@ -210,13 +215,12 @@ public:
     {
     }
 
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> writeDelimiter(void);
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> writeChecked(Kind kind, data::ConstDataSpan kind_body);
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> writeData(uint8_t stream_id,
-                                                                     data::ConstDataSpan stream_data);
+    m5::hal::v1::result_t<size_t> writeDelimiter(void);
+    m5::hal::v1::result_t<size_t> writeChecked(Kind kind, data::ConstDataSpan kind_body);
+    m5::hal::v1::result_t<size_t> writeData(uint8_t stream_id, data::ConstDataSpan stream_data);
 
 private:
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> reserveExact(size_t need, data::DataSpan& out);
+    m5::hal::v1::result_t<size_t> reserveExact(size_t need, data::DataSpan& out);
 
     data::Sink* _sink = nullptr;
 };

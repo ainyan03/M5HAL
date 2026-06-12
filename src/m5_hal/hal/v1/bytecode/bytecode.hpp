@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_BYTECODE_BYTECODE_HPP_
 #define M5_HAL_BYTECODE_BYTECODE_HPP_
 
@@ -77,6 +78,32 @@ constexpr uint8_t kDiscardStoreId = 0xFF;
 constexpr size_t kMaxStoreSlots  = 8;  ///< Labeled response slots per runner.
 constexpr size_t kMaxBusBindings = 4;  ///< Registered accessors per bus kind.
 
+// ---- bus_configure config payload layout (wire format) ---------------------
+//
+// Per-kind config blob sizes (the encoder's; decode is tolerant) and
+// the byte offsets of the u32-LE timeout fields inside each blob. The
+// offsets are the single source shared by `encodeConfig` (bytecode.inl)
+// and the server's prescan policy checks (`Server::prescan`,
+// remote.inl) — both reference these names, never raw numbers.
+constexpr size_t kI2CConfigSize  = 12;
+constexpr size_t kSPIConfigSize  = 16;
+constexpr size_t kUARTConfigSize = 24;
+constexpr size_t kI2SConfigSize  = 14;
+
+constexpr size_t kI2CConfigTimeoutOffset           = 4;   ///< timeout_ms
+constexpr size_t kSPIConfigTimeoutOffset           = 6;   ///< timeout_ms
+constexpr size_t kUARTConfigTimeoutOffset          = 4;   ///< timeout_ms
+constexpr size_t kUARTConfigFirstByteTimeoutOffset = 8;   ///< first_byte_timeout_ms
+constexpr size_t kUARTConfigInterByteTimeoutOffset = 12;  ///< inter_byte_timeout_ms
+constexpr size_t kUARTConfigWriteTimeoutOffset     = 16;  ///< write_timeout_ms
+constexpr size_t kI2SConfigTimeoutOffset           = 4;   ///< timeout_ms
+constexpr size_t kI2SConfigWriteTimeoutOffset      = 8;   ///< write_timeout_ms
+
+static_assert(kI2CConfigTimeoutOffset + 4 <= kI2CConfigSize, "i2c timeout field must fit the config blob");
+static_assert(kSPIConfigTimeoutOffset + 4 <= kSPIConfigSize, "spi timeout field must fit the config blob");
+static_assert(kUARTConfigWriteTimeoutOffset + 4 <= kUARTConfigSize, "uart timeout fields must fit the config blob");
+static_assert(kI2SConfigWriteTimeoutOffset + 4 <= kI2SConfigSize, "i2s timeout fields must fit the config blob");
+
 /*!
   @brief Decoded little-endian length prefix.
 
@@ -122,65 +149,54 @@ public:
     {
     }
 
-    m5::stl::expected<void, m5::hal::v1::error::error_t> delayMs(uint32_t ms);
+    m5::hal::v1::result_t<void> delayMs(uint32_t ms);
 
-    m5::stl::expected<void, m5::hal::v1::error::error_t> configure(uint8_t bus_id,
-                                                                   const i2c::I2CMasterAccessConfig& cfg);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> configure(uint8_t bus_id,
-                                                                   const spi::SPIMasterAccessConfig& cfg);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> configure(uint8_t bus_id, const uart::UARTAccessConfig& cfg);
+    m5::hal::v1::result_t<void> configure(uint8_t bus_id, const i2c::I2CMasterAccessConfig& cfg);
+    m5::hal::v1::result_t<void> configure(uint8_t bus_id, const spi::SPIMasterAccessConfig& cfg);
+    m5::hal::v1::result_t<void> configure(uint8_t bus_id, const uart::UARTAccessConfig& cfg);
     /*! @brief Configure a registered I2S accessor (spec §stream credit). */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> i2sConfig(uint8_t bus_id, const i2s::I2SAccessConfig& cfg);
+    m5::hal::v1::result_t<void> i2sConfig(uint8_t bus_id, const i2s::I2SAccessConfig& cfg);
 
-    m5::stl::expected<void, m5::hal::v1::error::error_t> transfer(uint8_t bus_id, const i2c::TransferDesc& desc,
-                                                                  data::ConstDataSpan tx, size_t rx_len,
-                                                                  uint8_t store_id = kDiscardStoreId);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> transfer(uint8_t bus_id, const spi::TransferDesc& desc,
-                                                                  data::ConstDataSpan tx, size_t rx_len,
-                                                                  uint8_t store_id = kDiscardStoreId);
+    m5::hal::v1::result_t<void> transfer(uint8_t bus_id, const i2c::TransferDesc& desc, data::ConstDataSpan tx,
+                                         size_t rx_len, uint8_t store_id = kDiscardStoreId);
+    m5::hal::v1::result_t<void> transfer(uint8_t bus_id, const spi::TransferDesc& desc, data::ConstDataSpan tx,
+                                         size_t rx_len, uint8_t store_id = kDiscardStoreId);
     /*! @brief UART transfer: write `tx`, then read up to `rx_len` bytes. */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> uartTransfer(uint8_t bus_id, data::ConstDataSpan tx,
-                                                                      size_t rx_len,
-                                                                      uint8_t store_id = kDiscardStoreId);
+    m5::hal::v1::result_t<void> uartTransfer(uint8_t bus_id, data::ConstDataSpan tx, size_t rx_len,
+                                             uint8_t store_id = kDiscardStoreId);
 
-    m5::stl::expected<void, m5::hal::v1::error::error_t> gpioSetMode(types::gpio_mode_t mode,
-                                                                     const types::gpio_number_t* pins, size_t count);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> gpioWriteHigh(const types::gpio_number_t* pins, size_t count);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> gpioWriteLow(const types::gpio_number_t* pins, size_t count);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> gpioRead(uint8_t store_id, const types::gpio_number_t* pins,
-                                                                  size_t count);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> gpioSubscribe(const types::gpio_number_t* pins, size_t count);
+    m5::hal::v1::result_t<void> gpioSetMode(types::gpio_mode_t mode, const types::gpio_number_t* pins, size_t count);
+    m5::hal::v1::result_t<void> gpioWriteHigh(const types::gpio_number_t* pins, size_t count);
+    m5::hal::v1::result_t<void> gpioWriteLow(const types::gpio_number_t* pins, size_t count);
+    m5::hal::v1::result_t<void> gpioRead(uint8_t store_id, const types::gpio_number_t* pins, size_t count);
+    m5::hal::v1::result_t<void> gpioSubscribe(const types::gpio_number_t* pins, size_t count);
     /*! @brief `count == 0` encodes "unsubscribe all". */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> gpioUnsubscribe(const types::gpio_number_t* pins,
-                                                                         size_t count);
+    m5::hal::v1::result_t<void> gpioUnsubscribe(const types::gpio_number_t* pins, size_t count);
     /*! @brief Event payload: changed pins with their new levels (parallel arrays). */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> evtGpioState(const types::gpio_number_t* pins,
-                                                                      const bool* levels, size_t count);
+    m5::hal::v1::result_t<void> evtGpioState(const types::gpio_number_t* pins, const bool* levels, size_t count);
 
     /*! @name Stream credit (spec §stream credit). @{ */
     /*! @brief Write `data` to a stream bus (currently I2S). data length is self-described. */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> busWriteStream(types::bus_kind_t kind, uint8_t bus_id,
-                                                                        const uint8_t* data, size_t len);
+    m5::hal::v1::result_t<void> busWriteStream(types::bus_kind_t kind, uint8_t bus_id, const uint8_t* data, size_t len);
     /*! @brief Query the stream bus credit ([free:u32][submitted:u32] into the slot). */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> busStreamStatus(types::bus_kind_t kind, uint8_t bus_id,
-                                                                         uint8_t store_id);
+    m5::hal::v1::result_t<void> busStreamStatus(types::bus_kind_t kind, uint8_t bus_id, uint8_t store_id);
     /*! @brief Event: device-side credit snapshot (free + cumulative submitted). */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> evtStreamCredit(types::bus_kind_t kind, uint8_t bus_id,
-                                                                         uint32_t free, uint32_t submitted);
+    m5::hal::v1::result_t<void> evtStreamCredit(types::bus_kind_t kind, uint8_t bus_id, uint32_t free,
+                                                uint32_t submitted);
     /*! @} */
 
-    m5::stl::expected<void, m5::hal::v1::error::error_t> storeData(uint8_t store_id, data::ConstDataSpan bytes);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> reportError(m5::hal::v1::error::error_t err, size_t offset);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> reportComplete(m5::hal::v1::error::error_t status);
+    m5::hal::v1::result_t<void> storeData(uint8_t store_id, data::ConstDataSpan bytes);
+    m5::hal::v1::result_t<void> reportError(m5::hal::v1::error::error_t err, size_t offset);
+    m5::hal::v1::result_t<void> reportComplete(m5::hal::v1::error::error_t status);
 
     /*! @brief Write the explicit script terminator (LenVar 0). */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> end(void);
+    m5::hal::v1::result_t<void> end(void);
 
 private:
     // Reserve one whole instruction, write the size prefix + opcode,
     // and expose the payload area. Committed by emit().
-    m5::stl::expected<data::DataSpan, m5::hal::v1::error::error_t> beginInstruction(OpCode opcode, size_t payload_size);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> emit(void);
+    m5::hal::v1::result_t<data::DataSpan> beginInstruction(OpCode opcode, size_t payload_size);
+    m5::hal::v1::result_t<void> emit(void);
 
     data::Sink* _sink  = nullptr;
     size_t _instr_size = 0;
@@ -228,9 +244,9 @@ public:
     {
     }
 
-    m5::stl::expected<void, m5::hal::v1::error::error_t> registerI2C(uint8_t bus_id, i2c::I2CMasterAccessor& acc);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> registerSPI(uint8_t bus_id, spi::SPIMasterAccessor& acc);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> registerUART(uint8_t bus_id, uart::UARTAccessor& acc);
+    m5::hal::v1::result_t<void> registerI2C(uint8_t bus_id, i2c::I2CMasterAccessor& acc);
+    m5::hal::v1::result_t<void> registerSPI(uint8_t bus_id, spi::SPIMasterAccessor& acc);
+    m5::hal::v1::result_t<void> registerUART(uint8_t bus_id, uart::UARTAccessor& acc);
     /*!
       @brief Register an I2S TX accessor as a stream bus (spec §stream credit).
 
@@ -239,7 +255,7 @@ public:
       runner binding, so the absolute-value credit scheme holds for local
       byte-array execution too (symmetric design).
      */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> registerI2S(uint8_t bus_id, i2s::I2STxAccessor& acc);
+    m5::hal::v1::result_t<void> registerI2S(uint8_t bus_id, i2s::I2STxAccessor& acc);
     void setGPIOGroup(gpio::GPIOGroup& group)
     {
         _gpio_group = &group;
@@ -262,9 +278,9 @@ public:
       (pin, level) entry and is silently ignored when none is installed.
       @{
      */
-    using gpio_subscribe_fn_t = m5::stl::expected<void, m5::hal::v1::error::error_t> (*)(
-        void* ctx, bool subscribe, const types::gpio_number_t* pins, size_t count);
-    using gpio_event_fn_t = void (*)(void* ctx, types::gpio_number_t pin, bool level);
+    using gpio_subscribe_fn_t = m5::hal::v1::result_t<void> (*)(void* ctx, bool subscribe,
+                                                                const types::gpio_number_t* pins, size_t count);
+    using gpio_event_fn_t     = void (*)(void* ctx, types::gpio_number_t pin, bool level);
 
     void setGpioSubscribeHandler(gpio_subscribe_fn_t fn, void* ctx)
     {
@@ -308,12 +324,12 @@ public:
              cumulative `submitted`. Fails with `INVALID_ARGUMENT` when the
              bus_id is out of range or has no I2S binding.
      */
-    m5::stl::expected<StreamStatus, m5::hal::v1::error::error_t> i2sStreamStatus(uint8_t bus_id);
+    m5::hal::v1::result_t<StreamStatus> i2sStreamStatus(uint8_t bus_id);
 
     /*! @brief Execute from any Source. Returns the consumed byte count. */
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> run(data::Source& script);
+    m5::hal::v1::result_t<size_t> run(data::Source& script);
     /*! @brief Execute straight from a local byte array. */
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> run(data::ConstDataSpan script);
+    m5::hal::v1::result_t<size_t> run(data::ConstDataSpan script);
 
     /*!
       @brief Execute an EVENT script without disturbing request state.
@@ -324,7 +340,7 @@ public:
       caller is still reading (S16 D8). Event dispatch (`evt_*` handlers)
       works as in `run`.
      */
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> runEvent(data::ConstDataSpan script);
+    m5::hal::v1::result_t<size_t> runEvent(data::ConstDataSpan script);
 
     /*!
       @brief Restrict dispatch to receive-side opcodes.
@@ -384,8 +400,7 @@ public:
       @brief Emit the current store slots and a final report as a
              response script into `out` (terminator included).
      */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> writeResponse(data::Sink& out,
-                                                                       m5::hal::v1::error::error_t status);
+    m5::hal::v1::result_t<void> writeResponse(data::Sink& out, m5::hal::v1::error::error_t status);
 
 private:
     struct Slot {
@@ -394,24 +409,24 @@ private:
         memory::TempBuffer buf;
     };
 
-    m5::stl::expected<Slot*, m5::hal::v1::error::error_t> allocStore(uint8_t store_id, size_t size);
+    m5::hal::v1::result_t<Slot*> allocStore(uint8_t store_id, size_t size);
 
-    m5::stl::expected<void, m5::hal::v1::error::error_t> dispatch(uint8_t opcode, data::ConstDataSpan payload);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> opDelay(data::ConstDataSpan payload);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> opBusConfigure(data::ConstDataSpan payload);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> opBusTransfer(data::ConstDataSpan payload);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> opGpio(uint8_t opcode, data::ConstDataSpan payload);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> opGpioSubscribe(uint8_t opcode, data::ConstDataSpan payload);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> opEvtGpioState(data::ConstDataSpan payload);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> opBusWriteStream(data::ConstDataSpan payload);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> opBusStreamStatus(data::ConstDataSpan payload);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> opEvtStreamCredit(data::ConstDataSpan payload);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> opStoreData(data::ConstDataSpan payload);
-    m5::stl::expected<void, m5::hal::v1::error::error_t> opReport(uint8_t opcode, data::ConstDataSpan payload);
+    m5::hal::v1::result_t<void> dispatch(uint8_t opcode, data::ConstDataSpan payload);
+    m5::hal::v1::result_t<void> opDelay(data::ConstDataSpan payload);
+    m5::hal::v1::result_t<void> opBusConfigure(data::ConstDataSpan payload);
+    m5::hal::v1::result_t<void> opBusTransfer(data::ConstDataSpan payload);
+    m5::hal::v1::result_t<void> opGpio(uint8_t opcode, data::ConstDataSpan payload);
+    m5::hal::v1::result_t<void> opGpioSubscribe(uint8_t opcode, data::ConstDataSpan payload);
+    m5::hal::v1::result_t<void> opEvtGpioState(data::ConstDataSpan payload);
+    m5::hal::v1::result_t<void> opBusWriteStream(data::ConstDataSpan payload);
+    m5::hal::v1::result_t<void> opBusStreamStatus(data::ConstDataSpan payload);
+    m5::hal::v1::result_t<void> opEvtStreamCredit(data::ConstDataSpan payload);
+    m5::hal::v1::result_t<void> opStoreData(data::ConstDataSpan payload);
+    m5::hal::v1::result_t<void> opReport(uint8_t opcode, data::ConstDataSpan payload);
 
     // Shared instruction loop behind run()/runEvent(); state resets stay
     // in the entry points.
-    m5::stl::expected<size_t, m5::hal::v1::error::error_t> runLoop(data::Source& script);
+    m5::hal::v1::result_t<size_t> runLoop(data::Source& script);
 
     memory::Allocator* _alloc                     = nullptr;
     i2c::I2CMasterAccessor* _i2c[kMaxBusBindings] = {};

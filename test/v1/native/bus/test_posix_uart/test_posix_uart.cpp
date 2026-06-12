@@ -27,6 +27,8 @@
 #include <thread>
 #include <vector>
 
+using ::m5::hal::v1::result_t;
+
 namespace {
 
 namespace uart  = ::m5::hal::v1::uart;
@@ -386,7 +388,7 @@ TEST(PosixUART, BytecodeRoundtripOverFramedUART)
     const size_t script_len = 1 + (1 + 1 + sizeof(payload)) + 1;  // lenvar+opcode+id+data, terminator
 
     uint8_t wire[frame::kMaxWireSize] = {};
-    auto framed = frame::encodeData({wire, sizeof(wire)}, 0x01, {script, script_len});
+    auto framed                       = frame::encodeData({wire, sizeof(wire)}, 0x01, {script, script_len});
     ASSERT_TRUE(framed.has_value());
     ASSERT_EQ(::write(pty.master, wire, framed.value()), static_cast<ssize_t>(framed.value()));
 
@@ -403,8 +405,7 @@ TEST(PosixUART, BytecodeRoundtripOverFramedUART)
     const uint8_t stream_id = view.kind_body.data[0];
 
     bytecode::BytecodeRunner device_runner;
-    auto executed =
-        device_runner.run(data::ConstDataSpan{view.kind_body.data + 1, view.kind_body.size - 1});
+    auto executed = device_runner.run(data::ConstDataSpan{view.kind_body.data + 1, view.kind_body.size - 1});
     ASSERT_TRUE(executed.has_value());
 
     uint8_t resp_script[64] = {};
@@ -436,8 +437,7 @@ TEST(PosixUART, BytecodeRoundtripOverFramedUART)
     EXPECT_EQ(resp_view.kind_body.data[0], stream_id);
 
     bytecode::BytecodeRunner host_runner;
-    auto host_run =
-        host_runner.run(data::ConstDataSpan{resp_view.kind_body.data + 1, resp_view.kind_body.size - 1});
+    auto host_run = host_runner.run(data::ConstDataSpan{resp_view.kind_body.data + 1, resp_view.kind_body.size - 1});
     ASSERT_TRUE(host_run.has_value());
     auto stored = host_runner.storedData(3);
     ASSERT_EQ(stored.size, sizeof(payload));
@@ -464,16 +464,15 @@ TEST(PosixUART, RemoteSessionEndToEndOverPty)
     // Minimal device-side I2C hardware stand-in: answers reads with a
     // pattern and records the marshalled target address.
     struct StubI2CBus : public i2c::I2CBus {
-        uint16_t last_addr = 0;
+        uint16_t last_addr    = 0;
         error::error_t result = error::error_t::OK;
 
-        m5::stl::expected<void, error::error_t> init(const i2c::I2CBusConfig&)
+        result_t<void> init(const i2c::I2CBusConfig&)
         {
             return {};
         }
-        m5::stl::expected<size_t, error::error_t> transfer(bus::Accessor*, const i2c::I2CMasterAccessConfig& cfg,
-                                                           const i2c::TransferDesc& desc, data::Source* tx,
-                                                           data::Sink* rx) override
+        result_t<size_t> transfer(bus::Accessor*, const i2c::I2CMasterAccessConfig& cfg, const i2c::TransferDesc& desc,
+                                  data::Source* tx, data::Sink* rx) override
         {
             last_addr = cfg.i2c_addr;
             if (error::isError(result)) {
@@ -538,30 +537,28 @@ TEST(PosixUART, RemoteSessionEndToEndOverPty)
         int fd                              = -1;
         remote::RemoteServerService* device = nullptr;
 
-        m5::stl::expected<size_t, error::error_t> read(data::DataSpan dst) override
+        result_t<size_t> read(data::DataSpan dst) override
         {
             device->service(service::ServiceContext{});  // let the peer make progress
             if (!waitReadable(fd, 100)) {
                 return size_t{0};
             }
             ssize_t n = ::read(fd, dst.data, dst.size);
-            return n < 0 ? m5::stl::expected<size_t, error::error_t>{
-                               m5::stl::make_unexpected(error::error_t::IO_ERROR)}
-                         : m5::stl::expected<size_t, error::error_t>{static_cast<size_t>(n)};
+            return n < 0 ? result_t<size_t>{m5::stl::make_unexpected(error::error_t::IO_ERROR)}
+                         : result_t<size_t>{static_cast<size_t>(n)};
         }
-        m5::stl::expected<size_t, error::error_t> readableBytes(void) override
+        result_t<size_t> readableBytes(void) override
         {
             return waitReadable(fd, 0) ? size_t{1} : size_t{0};
         }
     };
     struct MasterWriter : public data::StreamWriter {
         int fd = -1;
-        m5::stl::expected<size_t, error::error_t> write(data::ConstDataSpan src) override
+        result_t<size_t> write(data::ConstDataSpan src) override
         {
             ssize_t n = ::write(fd, src.data, src.size);
-            return n < 0 ? m5::stl::expected<size_t, error::error_t>{
-                               m5::stl::make_unexpected(error::error_t::IO_ERROR)}
-                         : m5::stl::expected<size_t, error::error_t>{static_cast<size_t>(n)};
+            return n < 0 ? result_t<size_t>{m5::stl::make_unexpected(error::error_t::IO_ERROR)}
+                         : result_t<size_t>{static_cast<size_t>(n)};
         }
     };
 
@@ -637,39 +634,36 @@ TEST(PosixUART, ConnectRemoteSerialExplicitPathOverPty)
     // Device endpoint on the master fd (raw, no termios).
     struct FdReader : public data::StreamReader {
         int fd = -1;
-        m5::stl::expected<size_t, error::error_t> read(data::DataSpan dst) override
+        result_t<size_t> read(data::DataSpan dst) override
         {
             if (!waitReadable(fd, 5)) {
                 return size_t{0};
             }
             ssize_t n = ::read(fd, dst.data, dst.size);
-            return n < 0 ? m5::stl::expected<size_t, error::error_t>{
-                               m5::stl::make_unexpected(error::error_t::IO_ERROR)}
-                         : m5::stl::expected<size_t, error::error_t>{static_cast<size_t>(n)};
+            return n < 0 ? result_t<size_t>{m5::stl::make_unexpected(error::error_t::IO_ERROR)}
+                         : result_t<size_t>{static_cast<size_t>(n)};
         }
-        m5::stl::expected<size_t, error::error_t> readableBytes(void) override
+        result_t<size_t> readableBytes(void) override
         {
             return waitReadable(fd, 0) ? size_t{1} : size_t{0};
         }
     };
     struct FdWriter : public data::StreamWriter {
         int fd = -1;
-        m5::stl::expected<size_t, error::error_t> write(data::ConstDataSpan src) override
+        result_t<size_t> write(data::ConstDataSpan src) override
         {
             ssize_t n = ::write(fd, src.data, src.size);
-            return n < 0 ? m5::stl::expected<size_t, error::error_t>{
-                               m5::stl::make_unexpected(error::error_t::IO_ERROR)}
-                         : m5::stl::expected<size_t, error::error_t>{static_cast<size_t>(n)};
+            return n < 0 ? result_t<size_t>{m5::stl::make_unexpected(error::error_t::IO_ERROR)}
+                         : result_t<size_t>{static_cast<size_t>(n)};
         }
     };
     struct StubI2CBus : public i2c::I2CBus {
-        m5::stl::expected<void, error::error_t> init(const i2c::I2CBusConfig&)
+        result_t<void> init(const i2c::I2CBusConfig&)
         {
             return {};
         }
-        m5::stl::expected<size_t, error::error_t> transfer(bus::Accessor*, const i2c::I2CMasterAccessConfig&,
-                                                           const i2c::TransferDesc&, data::Source*,
-                                                           data::Sink*) override
+        result_t<size_t> transfer(bus::Accessor*, const i2c::I2CMasterAccessConfig&, const i2c::TransferDesc&,
+                                  data::Source*, data::Sink*) override
         {
             return size_t{0};  // data phase only (S16 D4)
         }

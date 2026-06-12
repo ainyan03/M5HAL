@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_I2S_I2S_HPP_
 #define M5_HAL_I2S_I2S_HPP_
 
@@ -53,14 +54,14 @@ struct I2STxAccessor : public bus::Accessor, public data::StreamWriter {
     }
     I2SBus& getI2SBus(void) const;
 
-    m5::stl::expected<void, error::error_t> setConfig(const I2SAccessConfig& cfg);
+    result_t<void> setConfig(const I2SAccessConfig& cfg);
 
-    m5::stl::expected<size_t, error::error_t> write(data::ConstDataSpan tx_bytes) override;
-    m5::stl::expected<size_t, error::error_t> write(data::Source& tx, size_t len);
-    m5::stl::expected<size_t, error::error_t> write(const uint8_t* tx, size_t len);
+    result_t<size_t> write(data::ConstDataSpan tx_bytes) override;
+    result_t<size_t> write(data::Source& tx, size_t len);
+    result_t<size_t> write(const uint8_t* tx, size_t len);
 
     /// Bytes that can be accepted by write() right now without blocking (DMA buffer free space).
-    m5::stl::expected<size_t, error::error_t> writableBytes(void);
+    result_t<size_t> writableBytes(void);
 
 protected:
     I2SAccessConfig _access_config;
@@ -74,9 +75,8 @@ struct I2SBus : public bus::Bus {
 
     /// Returns the byte count accepted within write_timeout_ms; a short return is normal.
     /// Underrun is not an error: the DMA outputs silence and resumes on the next write.
-    virtual m5::stl::expected<size_t, error::error_t> write(bus::Accessor* owner, const I2SAccessConfig& cfg,
-                                                            data::Source* tx, size_t len);
-    virtual m5::stl::expected<size_t, error::error_t> writableBytes(bus::Accessor* owner, const I2SAccessConfig& cfg);
+    virtual result_t<size_t> write(bus::Accessor* owner, const I2SAccessConfig& cfg, data::Source* tx, size_t len);
+    virtual result_t<size_t> writableBytes(bus::Accessor* owner, const I2SAccessConfig& cfg);
 
 protected:
     I2SBusConfig _config;

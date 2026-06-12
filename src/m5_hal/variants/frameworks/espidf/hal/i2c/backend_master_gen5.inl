@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_I2C_BACKEND_MASTER_GEN5_INL
 #define M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_I2C_BACKEND_MASTER_GEN5_INL
 
@@ -66,7 +67,7 @@ bool isValidAddress(const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg)
     return ::m5::hal::v1::error::error_t::OK;
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig& config)
+::m5::hal::v1::result_t<void> Bus::init(const BusConfig& config)
 {
     _config = config;
     if (_config.pin_scl < 0 || _config.pin_sda < 0) {
@@ -94,7 +95,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig
     return {};
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::release(void)
+::m5::hal::v1::result_t<void> Bus::release(void)
 {
     auto removed = removeDevice();
     if (!removed.has_value()) {
@@ -116,7 +117,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::release(void)
     return {};
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::removeDevice(void)
+::m5::hal::v1::result_t<void> Bus::removeDevice(void)
 {
     if (_dev_handle == nullptr) {
         return {};
@@ -134,8 +135,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::removeDevice(void)
     return {};
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::ensureDevice(
-    const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg)
+::m5::hal::v1::result_t<void> Bus::ensureDevice(const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg)
 {
 #if !SOC_I2C_SUPPORT_10BIT_ADDR
     if (cfg.address_is_10bit) {
@@ -178,9 +178,10 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::ensureDevice(
     return {};
 }
 
-m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
-    ::m5::hal::v1::bus::Accessor* owner, const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg,
-    const ::m5::hal::v1::i2c::TransferDesc& desc, ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
+::m5::hal::v1::result_t<size_t> Bus::transfer(::m5::hal::v1::bus::Accessor* owner,
+                                              const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg,
+                                              const ::m5::hal::v1::i2c::TransferDesc& desc,
+                                              ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
 {
     (void)owner;
     if (_bus_handle == nullptr) {
@@ -221,7 +222,7 @@ m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> Bus::transfer(
     // prefix is not counted in the return value (matches SPI, S16 D4).
     size_t total = write_bytes.size() - desc.prefix_len;
 
-    auto finish = [&](::esp_err_t result) -> m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> {
+    auto finish = [&](::esp_err_t result) -> ::m5::hal::v1::result_t<size_t> {
         auto result_map = mapEspErr(result);
         if (::m5::hal::v1::error::isError(result_map)) {
             return m5::stl::make_unexpected(result_map);

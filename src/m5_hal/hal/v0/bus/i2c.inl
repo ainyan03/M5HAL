@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 
 #include "i2c.hpp"
 #include "../error.hpp"

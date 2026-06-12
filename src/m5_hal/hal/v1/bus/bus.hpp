@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 
 #ifndef M5_HAL_BUS_HPP_
 #define M5_HAL_BUS_HPP_
@@ -122,12 +123,12 @@ struct Accessor {
                        (currently advisory, see `Bus::lock`).
       @return Empty success, or an error code on lock failure.
      */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> beginAccess(uint32_t timeout_ms = 0);
+    m5::hal::v1::result_t<void> beginAccess(uint32_t timeout_ms = 0);
     /*!
       @brief Close one nesting level of the access window; release the
              bus lock on the outermost call.
      */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> endAccess(void);
+    m5::hal::v1::result_t<void> endAccess(void);
     /*! @brief Return whether the accessor currently holds an access window. */
     bool inAccess(void) const
     {
@@ -170,7 +171,7 @@ public:
     // `if (auto r = bus.init(cfg); !r) ...` uniformly.
 
     /*! @brief Release any resources acquired by the concrete bus's `init`. */
-    virtual m5::stl::expected<void, error::error_t> release(void)
+    virtual result_t<void> release(void)
     {
         return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
     }
@@ -192,7 +193,7 @@ public:
       @retval BUSY              The bus is already locked.
       @retval INVALID_ARGUMENT  `owner` is null.
      */
-    virtual m5::stl::expected<void, error::error_t> lock(Accessor* owner, uint32_t timeout_ms = 0)
+    virtual result_t<void> lock(Accessor* owner, uint32_t timeout_ms = 0)
     {
         (void)timeout_ms;
         if (owner == nullptr) {
@@ -211,7 +212,7 @@ public:
       `owner` must match the accessor that took the lock; a mismatch or
       an unlock without a preceding lock returns `INVALID_ARGUMENT`.
      */
-    virtual m5::stl::expected<void, error::error_t> unlock(Accessor* owner)
+    virtual result_t<void> unlock(Accessor* owner)
     {
         if (owner == nullptr || _lock_owner != owner) {
             return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
@@ -228,7 +229,7 @@ protected:
 // Definitions of Accessor::beginAccess / endAccess. Bus is only
 // forward-declared inside Accessor, so the bodies live here after the
 // full Bus definition.
-inline m5::stl::expected<void, m5::hal::v1::error::error_t> Accessor::beginAccess(uint32_t timeout_ms)
+inline m5::hal::v1::result_t<void> Accessor::beginAccess(uint32_t timeout_ms)
 {
     if (_access_depth == 0) {
         auto r = _bus.lock(this, timeout_ms);
@@ -240,7 +241,7 @@ inline m5::stl::expected<void, m5::hal::v1::error::error_t> Accessor::beginAcces
     return {};
 }
 
-inline m5::stl::expected<void, m5::hal::v1::error::error_t> Accessor::endAccess(void)
+inline m5::hal::v1::result_t<void> Accessor::endAccess(void)
 {
     if (_access_depth == 0) {
         return m5::stl::make_unexpected(m5::hal::v1::error::error_t::INVALID_ARGUMENT);
@@ -260,6 +261,12 @@ inline m5::stl::expected<void, m5::hal::v1::error::error_t> Accessor::endAccess(
   counter folds the layers naturally. Both move and copy are deleted
   because the scope is not meant to outlive its lexical block. A
   lock-acquisition failure is observed via `has_error()` / `error()`.
+
+  Polarity: success = `!scope.has_error()`. There is deliberately no
+  `operator bool` - "truthy scope = acquired" and "truthy = has error"
+  are both plausible readings, so the check must spell the polarity
+  out. `error()` is `OK` exactly when `has_error()` is false. The
+  same applies to `ScopedLock` below.
  */
 class ScopedAccess {
 public:
@@ -338,6 +345,37 @@ private:
     Accessor* _owner                   = nullptr;
     m5::hal::v1::error::error_t _error = m5::hal::v1::error::error_t::OK;
 };
+
+/*!
+  @brief Run `body` bracketed by `begin` / `end` with the shared
+         release-error policy.
+
+  The policy every accessor sugar method follows: a `begin` failure
+  returns immediately (nothing to release), the `body` error wins over
+  an `end` error, but a clean body must not hide a broken release —
+  depth-counter corruption would otherwise go unnoticed. `end` always
+  runs once `begin` succeeded, even when the body failed.
+
+  All three callables return a `result_t`; the body's result type is
+  the call's result type.
+ */
+template <typename BeginFn, typename BodyFn, typename EndFn>
+auto guarded(BeginFn&& begin, BodyFn&& body, EndFn&& end) -> decltype(body())
+{
+    auto b = begin();
+    if (!b.has_value()) {
+        return m5::stl::make_unexpected(b.error());
+    }
+    auto result = body();
+    auto e      = end();
+    if (!result.has_value()) {
+        return result;
+    }
+    if (!e.has_value()) {
+        return m5::stl::make_unexpected(e.error());
+    }
+    return result;
+}
 
 }  // namespace m5::hal::v1::bus
 
