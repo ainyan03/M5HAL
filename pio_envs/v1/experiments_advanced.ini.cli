@@ -31,7 +31,7 @@ build_flags =
     -DM5HAL_EXPERIMENT_SOFTWARE_SPI_FREQ=5000000
     -DNDEBUG
 
-; --- RemoteMenu の WiFi/TCP transport 版 (decisions/024) ---
+; --- RemoteMenu の WiFi/TCP transport 版 ---
 ; WiFi 資格情報は環境変数 M5HAL_WIFI_SSID / M5HAL_WIFI_PASS から define へ注入
 ; する (未設定でもビルドは通る = build fence。実機は要設定)。GUI からは外す。
 ; UART transport 版と PC 側メニューは GUI-facing (pio_envs/v1/experiments.ini)。

@@ -21,7 +21,7 @@
 
 // The platform checkers keep generation-separated macro namespaces:
 // v0 owns the unprefixed names, v1 reports through the variant-id
-// registry (S18). On native both must resolve to "unknown" / NONE
+// registry. On native both must resolve to "unknown" / NONE
 // independently.
 static_assert(M5HAL_TARGET_PLATFORM_NUMBER == M5HAL_PLATFORM_NUMBER_UNKNOWN,
               "v0 platform number clobbered");

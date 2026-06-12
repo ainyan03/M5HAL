@@ -27,7 +27,6 @@
         "exclude": [
             "experiments",
             "test",
-            "spec",
             "pio_envs",
             ".github",
             "platformio.ini",

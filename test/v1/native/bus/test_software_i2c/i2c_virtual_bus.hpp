@@ -15,7 +15,7 @@ using IService      = m5::hal::v1::service::IService;
 using ServiceResult = m5::hal::v1::service::ServiceResult;
 using ServiceRunner = m5::hal::v1::service::ServiceRunner;
 
-class VirtualOpenDrainBus : public m5::hal::v1::i2c::I2CSlaveLineDriver {
+class VirtualOpenDrainBus : public m5::hal::v1::i2c::SlaveLineDriver {
 public:
     void setRunner(ServiceRunner* runner)
     {
@@ -119,7 +119,7 @@ private:
     uint32_t _slave_sda_mask                    = 0;
 };
 
-class VirtualOpenDrainSlaveLineDriver : public m5::hal::v1::i2c::I2CSlaveLineDriver {
+class VirtualOpenDrainSlaveLineDriver : public m5::hal::v1::i2c::SlaveLineDriver {
 public:
     VirtualOpenDrainSlaveLineDriver(VirtualOpenDrainBus& bus, size_t index) : _bus(bus), _index(index)
     {
@@ -243,24 +243,24 @@ private:
     VirtualI2CGPIO _gpio;
 };
 
-class I2CSlaveService : public m5::hal::v1::i2c::I2CSlaveService {
+class SlaveService : public m5::hal::v1::i2c::SlaveService {
 public:
-    I2CSlaveService(VirtualOpenDrainBus& bus, uint8_t address) : m5::hal::v1::i2c::I2CSlaveService{}
+    SlaveService(VirtualOpenDrainBus& bus, uint8_t address) : m5::hal::v1::i2c::SlaveService{}
     {
         initBus(bus, address);
     }
-    I2CSlaveService(m5::hal::v1::i2c::I2CSlaveLineDriver& lines, uint8_t address) : m5::hal::v1::i2c::I2CSlaveService{}
+    SlaveService(m5::hal::v1::i2c::SlaveLineDriver& lines, uint8_t address) : m5::hal::v1::i2c::SlaveService{}
     {
         initBus(lines, address);
     }
-    I2CSlaveService(VirtualOpenDrainBus& bus, uint8_t address, const std::vector<uint8_t>& tx_bytes)
-        : m5::hal::v1::i2c::I2CSlaveService{}, _tx_bytes(tx_bytes)
+    SlaveService(VirtualOpenDrainBus& bus, uint8_t address, const std::vector<uint8_t>& tx_bytes)
+        : m5::hal::v1::i2c::SlaveService{}, _tx_bytes(tx_bytes)
     {
         initBus(bus, address);
         setTxBuffer(m5::hal::v1::data::ConstDataSpan{_tx_bytes.data(), _tx_bytes.size()});
     }
-    I2CSlaveService(m5::hal::v1::i2c::I2CSlaveLineDriver& lines, uint8_t address, const std::vector<uint8_t>& tx_bytes)
-        : m5::hal::v1::i2c::I2CSlaveService{}, _tx_bytes(tx_bytes)
+    SlaveService(m5::hal::v1::i2c::SlaveLineDriver& lines, uint8_t address, const std::vector<uint8_t>& tx_bytes)
+        : m5::hal::v1::i2c::SlaveService{}, _tx_bytes(tx_bytes)
     {
         initBus(lines, address);
         setTxBuffer(m5::hal::v1::data::ConstDataSpan{_tx_bytes.data(), _tx_bytes.size()});
@@ -268,7 +268,7 @@ public:
 
     const std::vector<uint8_t>& received() const
     {
-        const auto span = m5::hal::v1::i2c::I2CSlaveService::received();
+        const auto span = m5::hal::v1::i2c::SlaveService::received();
         _received.assign(span.data, span.data + span.size);
         return _received;
     }
@@ -282,12 +282,12 @@ public:
     }
 
 private:
-    void initBus(m5::hal::v1::i2c::I2CSlaveLineDriver& lines, uint8_t address)
+    void initBus(m5::hal::v1::i2c::SlaveLineDriver& lines, uint8_t address)
     {
-        m5::hal::v1::i2c::I2CSlaveConfig cfg;
+        m5::hal::v1::i2c::SlaveConfig cfg;
         cfg.address = address;
         auto r      = init(lines, cfg);
-        assert(r.has_value() && "I2CSlaveService: init failed");
+        assert(r.has_value() && "SlaveService: init failed");
         (void)r;
         setRxBuffer(m5::hal::v1::data::DataSpan{_rx_buffer, sizeof(_rx_buffer)});
     }

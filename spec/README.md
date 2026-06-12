@@ -24,7 +24,9 @@
 | リモートバス機構を知る | [design/remote.md](design/remote.md) (下層: frame / bytecode / data_io) |
 | I2C / SPI / UART / I2S を実装・レビューする | [design/i2c.md](design/i2c.md), [design/spi.md](design/spi.md), [design/uart.md](design/uart.md), [design/i2s.md](design/i2s.md), [verification.md](verification.md) |
 | GPIO / variant を実装・レビューする | [design/gpio.md](design/gpio.md), [design/variants.md](design/variants.md), [reference/directory-layout.md](reference/directory-layout.md) |
+| runtime 設備 (time / mutex) と Bus 排他の意味論を知る | [design/runtime.md](design/runtime.md), [design/bus_accessor.md](design/bus_accessor.md) §排他制御の意味論 |
 | ビルド時の挙動を設定する (`M5HAL_CONFIG_*`) | [design/configuration.md](design/configuration.md) |
+| エラーコードの意味と対処を調べる | [design/errors.md](design/errors.md) |
 | プロジェクト全体の方針を確認する | [goals.md](goals.md), [architecture.md](architecture.md) |
 
 初見で迷った場合は、まず [goals.md](goals.md) → [architecture.md](architecture.md) →

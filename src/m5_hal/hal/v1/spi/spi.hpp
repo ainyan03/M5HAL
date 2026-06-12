@@ -19,7 +19,7 @@ namespace m5::hal::v1::spi {
   is a `gpio_number_t` (`int16_t`); the default `-1` is the invalid
   sentinel. Variants resolve a non-negative value during `init()`
   via `m5::hal::v1::M5_Hal.Gpio.getPin(num)` (same singleton
-  `GPIOGroup` convention as `I2CBusConfig`).
+  `GPIOGroup` convention as `IBusConfig`).
 
   QSPI / OSPI use `pin_mosi` / `pin_miso` / `pin_d2..d7` as the data
   lines. They are kept as named fields rather than a union with an
@@ -27,9 +27,9 @@ namespace m5::hal::v1::spi {
   multiply edge cases. If indexed access becomes useful, add a helper
   (`gpio_number_t dataPin(uint8_t idx) const`) instead.
  */
-struct SPIBusConfig : public bus::BusConfig {
-    types::gpio_number_t pin_clk  = -1;
-    types::gpio_number_t pin_dc   = -1;
+struct IBusConfig : public bus::IBusConfig {
+    types::gpio_number_t pin_clk = -1;
+    types::gpio_number_t pin_dc  = -1;  ///< Bus-wide D/C default; `MasterAccessConfig::pin_dc` overrides it per device.
     types::gpio_number_t pin_mosi = -1;  ///< data0
     types::gpio_number_t pin_miso = -1;  ///< data1
     types::gpio_number_t pin_d2   = -1;  ///< data2
@@ -39,7 +39,7 @@ struct SPIBusConfig : public bus::BusConfig {
     types::gpio_number_t pin_d6   = -1;  ///< data6
     types::gpio_number_t pin_d7   = -1;  ///< data7
 
-    constexpr SPIBusConfig(void) : bus::BusConfig{types::bus_kind_t::SPI}
+    constexpr IBusConfig(void) : bus::IBusConfig{types::bus_kind_t::SPI}
     {
     }
 };
@@ -48,29 +48,37 @@ struct SPIBusConfig : public bus::BusConfig {
   @brief Data-path mode of an SPI transfer.
  */
 enum class SpiDataMode {
-    spi_halfduplex,              ///< Half duplex.
-    spi_fullduplex,              ///< Full duplex.
-    spi_halfduplex_with_dc_pin,  ///< Half duplex with a separate D/C pin.
-    spi_fullduplex_with_dc_pin,  ///< Full duplex with a separate D/C pin.
-    spi_halfduplex_with_dc_bit,  ///< Half duplex with an in-band D/C bit (9-bit SPI).
-    spi_fullduplex_with_dc_bit,  ///< Full duplex with an in-band D/C bit (9-bit SPI).
-    spi_dual_output,
-    spi_dual_io,
-    spi_quad_output,
-    spi_quad_io,
-    spi_octal_output,
-    spi_octal_io,
+    halfduplex,              ///< Half duplex.
+    fullduplex,              ///< Full duplex.
+    halfduplex_with_dc_pin,  ///< Half duplex with a separate D/C pin.
+    fullduplex_with_dc_pin,  ///< Full duplex with a separate D/C pin.
+    halfduplex_with_dc_bit,  ///< Half duplex with an in-band D/C bit (9-bit SPI).
+    fullduplex_with_dc_bit,  ///< Full duplex with an in-band D/C bit (9-bit SPI).
+    dual_output,
+    dual_io,
+    quad_output,
+    quad_io,
+    octal_output,
+    octal_io,
 };
 typedef SpiDataMode spi_data_mode_t;
 
 /*!
   @brief Accessor-level configuration for an SPI master target.
  */
-struct SPIMasterAccessConfig : public bus::AccessConfig {
-    types::gpio_number_t pin_cs   = -1;
-    uint32_t freq                 = 1000000;  ///< Bus clock frequency in Hz. Default 1 MHz.
-    uint32_t timeout_ms           = 1000;
-    spi_data_mode_t spi_data_mode = spi_data_mode_t::spi_fullduplex;  ///< Default full duplex.
+struct MasterAccessConfig : public bus::IAccessConfig {
+    types::gpio_number_t pin_cs = -1;
+    /*!
+      @brief Per-device D/C pin override.
+
+      `-1` (the default) falls back to the bus-level `pin_dc` — the
+      common single-display wiring. Set a non-negative pin to give this
+      device its own D/C line, so two display-class devices with
+      different D/C wiring can share one bus.
+     */
+    types::gpio_number_t pin_dc   = -1;
+    uint32_t freq                 = 1000000;                      ///< Bus clock frequency in Hz. Default 1 MHz.
+    spi_data_mode_t spi_data_mode = spi_data_mode_t::fullduplex;  ///< Default full duplex.
     struct {
         uint8_t spi_mode : 2;   ///< SPI mode 0..3, zero-initialized by the ctor.
         uint8_t spi_order : 1;  ///< 0 = MSB first, zero-initialized by the ctor.
@@ -84,15 +92,66 @@ struct SPIMasterAccessConfig : public bus::AccessConfig {
     // in C++17 (relaxed in C++20), so the anonymous-member names are
     // visible in the outer scope and zero-initialized via the mem-
     // initializer list.
-    constexpr SPIMasterAccessConfig(void) : bus::AccessConfig{types::bus_kind_t::SPI}, spi_mode{0}, spi_order{0}
+    constexpr MasterAccessConfig(void) : bus::IAccessConfig{types::bus_kind_t::SPI}, spi_mode{0}, spi_order{0}
     {
     }
+
+    /*!
+      @name Display-style setup presets.
+
+      Field-assignment sugar for the display-class workload: each method
+      sets the fields that the `writeCommand*` sugars depend on, named
+      after how the D/C (data/command) distinction travels. The
+      datasheet vocabulary maps as: "4-wire / 4-line serial" =
+      `setupWithDCPin`, "3-wire / 3-line serial" = `setupWithDCBit`
+      (those wire-count names collide with the sensor-world meaning of
+      3/4-wire SPI, so the methods name the D/C transport instead —
+      matching the `halfduplex_with_dc_pin` / `_with_dc_bit` enumerators
+      they select).
+
+      Both return `*this` so the call chains with further assignments:
+      @code
+      spi::AccessConfig cfg;
+      cfg.setupWithDCPin(PIN_DC).pin_cs = PIN_CS;
+      cfg.freq = 40000000;
+      @endcode
+      @{
+     */
+    /*! @brief D/C on a dedicated pin (datasheet: 4-wire / 4-line serial).
+               Sets the per-device D/C pin, the matching data-path mode,
+               and the 8-bit command phase `writeCommand` expects. */
+    MasterAccessConfig& setupWithDCPin(types::gpio_number_t pin_dc_)
+    {
+        pin_dc             = pin_dc_;
+        spi_data_mode      = spi_data_mode_t::halfduplex_with_dc_pin;
+        spi_command_length = 8;
+        return *this;
+    }
+    /*! @brief D/C as the 9th in-band bit (datasheet: 3-wire / 3-line
+               serial). No D/C pin; the data-path mode carries the bit. */
+    MasterAccessConfig& setupWithDCBit(void)
+    {
+        pin_dc             = -1;
+        spi_data_mode      = spi_data_mode_t::halfduplex_with_dc_bit;
+        spi_command_length = 8;
+        return *this;
+    }
+    /*! @} */
 };
+
+/*!
+  @brief Primary short name for the master access config.
+
+  Master is the overwhelmingly common role, so it owns the short name;
+  spell out `MasterAccessConfig` only where the contrast with a slave
+  configuration matters.
+ */
+using AccessConfig = MasterAccessConfig;
 
 /*!
   @brief Per-call SPI transfer descriptor.
 
-  Inherits the empty `bus::TransferDesc` marker and adds SPI-specific
+  Inherits the empty `bus::ITransferDesc` marker and adds SPI-specific
   per-call directives: D/C pin levels, command / address phases, and
   dummy clock counts. Concrete variants decide which directives they
   can honor, but software SPI already consumes this full vocabulary.
@@ -105,7 +164,7 @@ struct SPIMasterAccessConfig : public bus::AccessConfig {
   the remainder with `INVALID_ARGUMENT`. Specify multiples of 8 to stay
   portable across every backend.
  */
-struct TransferDesc : public bus::TransferDesc {
+struct TransferDesc : public bus::ITransferDesc {
     bool dc_level_valid     = false;
     bool dc_level           = true;
     uint32_t command        = 0;
@@ -118,7 +177,7 @@ struct TransferDesc : public bus::TransferDesc {
     int8_t data_dc_level    = -1;
 };
 
-struct SPIBus;
+struct IBus;
 
 /*!
   @brief Master-side accessor for an SPI bus.
@@ -128,18 +187,40 @@ struct SPIBus;
   and exposes the `write` / `read` / `writeCommand*` / `read*` sugars
   that all funnel into a single `transfer` call.
  */
-struct SPIMasterAccessor : public bus::Accessor {
-    SPIMasterAccessor(SPIBus& bus, const SPIMasterAccessConfig& access_config);
+struct MasterAccessor : public bus::IAccessor {
+    MasterAccessor(IBus& bus, const MasterAccessConfig& access_config);
 
-    const SPIMasterAccessConfig& getConfig(void) const override
+    /*!
+      @name Unbound construction + typed bind.
+
+      Same contract as the I2C accessor: the unbound gate sits on the
+      window openers (`beginAccess` / `beginTransaction`).
+      @{
+     */
+    MasterAccessor(void) = default;
+    explicit MasterAccessor(const MasterAccessConfig& access_config) : _access_config{access_config}
+    {
+    }
+    /*! @brief Bind (or rebind) to an SPI bus; rejected while a window is open. */
+    m5::hal::v1::result_t<void> bind(IBus& bus);
+    /*! @} */
+
+    const MasterAccessConfig& getConfig(void) const override
     {
         return _access_config;
     }
-    /*! @brief Return the underlying bus as `SPIBus&` (kind fixed at ctor). */
-    SPIBus& getSPIBus(void) const;
+    /*! @brief Return the underlying bus as `IBus&` (kind fixed at ctor). */
+    IBus& getBus(void) const;
 
-    /*! @brief Replace the per-target configuration; same contract as I2C. */
-    m5::hal::v1::result_t<void> setConfig(const SPIMasterAccessConfig& cfg);
+    /*!
+      @brief Replace the per-target configuration.
+
+      Fails with `INVALID_ARGUMENT` while a transaction or access
+      window is open — swapping the config mid-transfer would leave
+      the active transaction undefined (same contract as the I2C
+      accessor).
+     */
+    m5::hal::v1::result_t<void> setConfig(const MasterAccessConfig& cfg);
 
     /*!
       @brief Sole span-based transfer sugar.
@@ -191,12 +272,13 @@ struct SPIMasterAccessor : public bus::Accessor {
     m5::hal::v1::result_t<size_t> readCommandAddressData(uint32_t command, uint32_t address, data::DataSpan rx_bytes);
     m5::hal::v1::result_t<size_t> readCommandAddressData(uint32_t command, uint32_t address, data::Sink& rx,
                                                          size_t len);
-    /*! @brief Drive `count` dummy clock cycles. */
+    /*! @brief Drive `count` dummy clock cycles (`count` <= 255,
+               larger values fail with `INVALID_ARGUMENT`). */
     m5::hal::v1::result_t<void> sendDummyClock(size_t count);
     /*! @} */
 
 protected:
-    SPIMasterAccessConfig _access_config;
+    MasterAccessConfig _access_config;
     uint32_t _transaction_depth = 0;
 };
 
@@ -205,22 +287,22 @@ protected:
 /*!
   @brief Concrete SPI bus base.
 
-  Signature is aligned with `I2CBus` so accessor sugars converge here.
+  Signature is aligned with `IBus` so accessor sugars converge here.
   Default implementations return `NOT_IMPLEMENTED` until a concrete
   variant overrides them.
  */
-struct SPIBus : public bus::Bus {
-    const SPIBusConfig& getConfig(void) const override
+struct IBus : public bus::IBus {
+    const IBusConfig& getConfig(void) const override
     {
         return _config;
     }
 
-    virtual m5::hal::v1::result_t<void> beginTransaction(bus::Accessor* owner, const SPIMasterAccessConfig& cfg);
-    virtual m5::hal::v1::result_t<void> endTransaction(bus::Accessor* owner, const SPIMasterAccessConfig& cfg);
+    virtual m5::hal::v1::result_t<void> beginTransaction(bus::IAccessor* owner, const MasterAccessConfig& cfg);
+    virtual m5::hal::v1::result_t<void> endTransaction(bus::IAccessor* owner, const MasterAccessConfig& cfg);
     /*!
       @brief Core SPI transfer entry point.
 
-      Return-value contract (matches `I2CBus::transfer` since S16 D4):
+      Return-value contract (matches `IBus::transfer`):
       the bus returns the byte count of the DATA phase only (`tx + rx`
       as driven on the wire). The command / address phases encoded by
       `desc` are NOT included here. Variant implementations MUST follow
@@ -234,12 +316,84 @@ struct SPIBus : public bus::Bus {
       `tx` / `rx` are nullable (`nullptr` = no data for that direction).
       The default implementation returns `NOT_IMPLEMENTED`.
      */
-    virtual m5::hal::v1::result_t<size_t> transfer(bus::Accessor* owner, const SPIMasterAccessConfig& cfg,
+    virtual m5::hal::v1::result_t<size_t> transfer(bus::IAccessor* owner, const MasterAccessConfig& cfg,
                                                    const TransferDesc& desc, data::Source* tx, data::Sink* rx);
 
 protected:
-    SPIBusConfig _config;
+    IBusConfig _config;
 };
+
+//-------------------------------------------------------------------------
+/*!
+  @brief RAII helper that wraps `MasterAccessor::beginTransaction` /
+         `endTransaction` (the CS assert/deassert scope).
+
+  Display-init style code with many early returns kept leaking
+  `endTransaction` on the error paths; the scope closes the transaction
+  on every exit. Polarity follows `bus::ScopedAccess`: success =
+  `!scope.has_error()`, deliberately no `operator bool`.
+
+  The destructor cannot report an `endTransaction` failure. When the
+  release error must be observed (strict bring-up code), use
+  `bus::guarded` instead — its policy keeps a body success from hiding
+  a broken release (spec/design/bus_accessor.md §guarded).
+
+  The bus lock under the transaction is taken with the infinite default
+  budget. To bound it, hold an outer `bus::ScopedAccess{dev, budget}` —
+  the depth counter folds the inner lock into the outer one.
+ */
+class ScopedTransaction {
+public:
+    explicit ScopedTransaction(MasterAccessor& accessor) : _accessor{&accessor}
+    {
+        auto r = _accessor->beginTransaction();
+        if (!r.has_value()) {
+            _error    = r.error();
+            _accessor = nullptr;  // dtor will not call endTransaction
+        }
+    }
+    ~ScopedTransaction()
+    {
+        if (_accessor != nullptr) {
+            (void)_accessor->endTransaction();
+        }
+    }
+    ScopedTransaction(const ScopedTransaction&)            = delete;
+    ScopedTransaction& operator=(const ScopedTransaction&) = delete;
+    ScopedTransaction(ScopedTransaction&&)                 = delete;
+    ScopedTransaction& operator=(ScopedTransaction&&)      = delete;
+
+    bool has_error(void) const
+    {
+        return _accessor == nullptr;
+    }
+    m5::hal::v1::error::error_t error(void) const
+    {
+        return _error;
+    }
+
+private:
+    MasterAccessor* _accessor          = nullptr;
+    m5::hal::v1::error::error_t _error = m5::hal::v1::error::error_t::OK;
+};
+
+//-------------------------------------------------------------------------
+// bind() is defined below the concrete IBus: at the accessor's point of
+// declaration the kind IBus is still an incomplete type, so the
+// derived-to-base conversion _bindBus needs is not visible yet.
+inline m5::hal::v1::result_t<void> MasterAccessor::bind(IBus& bus)
+{
+    if (inAccess() || _transaction_depth != 0) {
+        return m5::stl::make_unexpected(m5::hal::v1::error::error_t::INVALID_ARGUMENT);
+    }
+    _bindBus(bus);
+    return {};
+}
+
+/*!
+  @brief Non-owning SPI bus registry (`M5_Hal.SPI`); see `bus::BusGroup`.
+ */
+using BusGroup = bus::BusGroup<IBus>;
 
 }  // namespace m5::hal::v1::spi
 

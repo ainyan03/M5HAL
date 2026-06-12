@@ -13,7 +13,8 @@
 #define M5HAL_VARIANT_CURRENT_BASE_NS_ variants::frameworks::stub
 #define M5HAL_VARIANT_CURRENT_ID_      M5HAL_V1_VARIANT_ID_FRAMEWORK_STUB
 
-#define M5HAL_VARIANT_CURRENT_HAS_HAL_GPIO_ 1
+#define M5HAL_VARIANT_CURRENT_HAS_HAL_GPIO_    1
+#define M5HAL_VARIANT_CURRENT_HAS_HAL_RUNTIME_ 1
 // I2C / SPI / UART are not yet declared because their abstract bases
 // are not finalized. As stubs are added in later stages, the matching
 // HAS_HAL_*_ macros will be appended here.

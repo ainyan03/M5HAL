@@ -13,6 +13,7 @@
 #include "hal/spi/spi.hpp"
 #include "hal/uart/uart.hpp"
 #include "hal/i2s/i2s.hpp"
+#include "hal/runtime/runtime.hpp"
 #include "hal/tcp/tcp.hpp"
 
 #endif

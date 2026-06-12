@@ -9,7 +9,7 @@
 // makes the final call by actually talking to the port (e.g. the remote
 // `hello` exchange, spec/design/remote.md).
 
-#if M5HAL_FRAMEWORK_HAS_POSIX
+#if M5HAL_FRAMEWORK_HAS_POSIX && M5HAL_CONFIG_POSIX_UART
 
 #include <stddef.h>
 #include <stdint.h>
@@ -49,6 +49,6 @@ size_t listSerialPorts(SerialPortInfo* out, size_t capacity);
 
 }  // namespace m5::variants::frameworks::posix::hal::v1::uart
 
-#endif  // M5HAL_FRAMEWORK_HAS_POSIX
+#endif  // M5HAL_FRAMEWORK_HAS_POSIX && M5HAL_CONFIG_POSIX_UART
 
 #endif

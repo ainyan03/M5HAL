@@ -7,20 +7,19 @@
 
 // Host POSIX UART variant: a real serial port driven through termios. It
 // is offered (and flat-injected as the host UART) only on a POSIX host
-// build; gated by M5HAL_FRAMEWORK_HAS_POSIX (frameworks/_checker.hpp),
-// which defaults on for non-ESP/non-Arduino hosts and is suppressed by
-// setting M5HAL_CONFIG_POSIX_UART=0.
+// build; gated by M5HAL_FRAMEWORK_HAS_POSIX (frameworks/_checker.hpp,
+// on for non-ESP/non-Arduino hosts) plus the M5HAL_CONFIG_POSIX_UART
+// opt-out, which suppresses this UART kind only (the variant's runtime
+// kind is unaffected).
 
-#if M5HAL_FRAMEWORK_HAS_POSIX
+#if M5HAL_FRAMEWORK_HAS_POSIX && M5HAL_CONFIG_POSIX_UART
 
-namespace m5::variants::frameworks::posix::hal::v1::uart {
-
-using namespace ::m5::hal::v1;
+namespace m5::hal::v1::uart {
 
 // Variant-specific bus config: a host serial device path
 // (e.g. "/dev/ttyUSB0", "/dev/tty.usbserial-XXXX") instead of MCU pins.
 // Mirrors the arduino variant carrying a `HardwareSerial*`.
-struct BusConfig : public ::m5::hal::v1::uart::UARTBusConfig {
+struct BusConfig_posix : public ::m5::hal::v1::uart::IBusConfig {
     const char* device_path = nullptr;
 
     /*! Coalesce writes in user space and flush them in batches of up to this
@@ -32,36 +31,36 @@ struct BusConfig : public ::m5::hal::v1::uart::UARTBusConfig {
         await-reply pattern can never deadlock on buffered output. */
     size_t tx_coalesce_bytes = 0;
 
-    constexpr BusConfig(void) : ::m5::hal::v1::uart::UARTBusConfig{}
+    constexpr BusConfig_posix(void) : ::m5::hal::v1::uart::IBusConfig{}
     {
     }
 };
 
-class Bus : public ::m5::hal::v1::uart::UARTBus {
+class Bus_posix : public ::m5::hal::v1::uart::IBus {
 public:
-    ~Bus() override
+    ~Bus_posix() override
     {
         (void)release();
     }
 
-    // Typed init: takes this variant's BusConfig (S17 E1). Passing the
-    // abstract UARTBusConfig (or a sibling variant's config) is a
+    // Typed init: takes this variant's BusConfig_posix. Passing the
+    // abstract IBusConfig (or a sibling variant's config) is a
     // compile error instead of a silent bad downcast.
-    ::m5::hal::v1::result_t<void> init(const BusConfig& config);
+    ::m5::hal::v1::result_t<void> init(const BusConfig_posix& config);
     ::m5::hal::v1::result_t<void> release(void) override;
 
-    ::m5::hal::v1::result_t<size_t> write(::m5::hal::v1::bus::Accessor* owner,
-                                          const ::m5::hal::v1::uart::UARTAccessConfig& cfg,
-                                          ::m5::hal::v1::data::Source* tx, size_t len) override;
-    ::m5::hal::v1::result_t<size_t> read(::m5::hal::v1::bus::Accessor* owner,
-                                         const ::m5::hal::v1::uart::UARTAccessConfig& cfg,
-                                         ::m5::hal::v1::data::Sink* rx, size_t len) override;
-    ::m5::hal::v1::result_t<size_t> readableBytes(::m5::hal::v1::bus::Accessor* owner,
-                                                  const ::m5::hal::v1::uart::UARTAccessConfig& cfg) override;
+    ::m5::hal::v1::result_t<size_t> write(::m5::hal::v1::bus::IAccessor* owner,
+                                          const ::m5::hal::v1::uart::AccessConfig& cfg, ::m5::hal::v1::data::Source* tx,
+                                          size_t len) override;
+    ::m5::hal::v1::result_t<size_t> read(::m5::hal::v1::bus::IAccessor* owner,
+                                         const ::m5::hal::v1::uart::AccessConfig& cfg, ::m5::hal::v1::data::Sink* rx,
+                                         size_t len) override;
+    ::m5::hal::v1::result_t<size_t> readableBytes(::m5::hal::v1::bus::IAccessor* owner,
+                                                  const ::m5::hal::v1::uart::AccessConfig& cfg) override;
 
     // Open the named device (owning the fd), or adopt a caller-owned fd
     // (e.g. one end of an openpty() pair). Both leave termios setup to the
-    // first write/read via the per-access UARTAccessConfig.
+    // first write/read via the per-access AccessConfig.
     ::m5::hal::v1::error::error_t open(const char* device_path, uint32_t baud = 115200);
     ::m5::hal::v1::error::error_t attach(int fd);
     int nativeHandle() const
@@ -76,7 +75,7 @@ public:
     static bool baudToSpeed(uint32_t baud, uint32_t& out_speed);
 
 private:
-    ::m5::hal::v1::result_t<void> applyConfig(const ::m5::hal::v1::uart::UARTAccessConfig& cfg);
+    ::m5::hal::v1::result_t<void> applyConfig(const ::m5::hal::v1::uart::AccessConfig& cfg);
     // Push one span to the fd, honouring EAGAIN + the write timeout.
     ::m5::hal::v1::result_t<size_t> rawWrite(const uint8_t* data, size_t len, uint32_t timeout_ms);
     // Drain the coalescing buffer (no-op when empty / coalescing disabled).
@@ -85,17 +84,17 @@ private:
     static constexpr size_t kCoalesceCapacity = 4096;
 
     const char* _device_path = nullptr;
-    size_t _tx_coalesce      = 0;  // from BusConfig::tx_coalesce_bytes (the base _config slices)
+    size_t _tx_coalesce      = 0;  // from BusConfig_posix::tx_coalesce_bytes (the base _config slices)
     int _fd                  = -1;
     bool _owns_fd            = false;
     bool _begun              = false;
-    ::m5::hal::v1::uart::UARTAccessConfig _applied_cfg;
+    ::m5::hal::v1::uart::AccessConfig _applied_cfg;
     size_t _co_used = 0;
     uint8_t _co_buf[kCoalesceCapacity];
 };
 
-}  // namespace m5::variants::frameworks::posix::hal::v1::uart
+}  // namespace m5::hal::v1::uart
 
-#endif  // M5HAL_FRAMEWORK_HAS_POSIX
+#endif  // M5HAL_FRAMEWORK_HAS_POSIX && M5HAL_CONFIG_POSIX_UART
 
 #endif

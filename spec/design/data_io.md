@@ -4,7 +4,7 @@
 
 ## 設計目標
 
-- Bus 抽象側 (`Bus::transfer` の signature) では Source/Sink 一本に統一、 利用者向けの `uint8_t* / size_t` sugar は Accessor 側に集約
+- Bus 抽象側 (`IBus::transfer` の signature) では Source/Sink 一本に統一、 利用者向けの `uint8_t* / size_t` sugar は Accessor 側に集約
 - zero-copy 通信経路を阻害しない (借用 Span の lifetime と冪等性を明確化)
 - 同期 API として最小限の状態モデル (cursor 位置のみ) で説明できる
 
@@ -89,11 +89,11 @@ Source / Sink の 4 つの core API (`peek` / `advance` / `reserve` / `commit`) 
 
 ### caller 側の遵守事項
 
-`Source*` / `Sink*` を受け取る一般 API (例: `Bus::transfer(..., Source*, Sink*)`) を実装する側、 もしくは Source / Sink を直接利用する caller は以下を遵守:
+`Source*` / `Sink*` を受け取る一般 API (例: `IBus::transfer(..., Source*, Sink*)`) を実装する側、 もしくは Source / Sink を直接利用する caller は以下を遵守:
 
 - **4 API すべての戻り値で `has_value()` チェックを行い、 error 時の path を持つ**
 - 「現状 error を返さない派生 (`MemorySource` 等) を渡している」 を根拠に caller 側で error path を **省略してはいけない**。 同じ caller 関数が将来 stream 派生を渡されたとき、 error path 不在は silent fail を生む
-- `Bus::transfer` のように渡される派生を限定しない契約の API では、 caller の error path 整備は必須。 派生型を限定して compile-time に省略可能と判断する path は、 将来別途 trait / template ベースで設計余地があるが、 現状の virtual API ではサポート対象外
+- `IBus::transfer` のように渡される派生を限定しない契約の API では、 caller の error path 整備は必須。 派生型を限定して compile-time に省略可能と判断する path は、 将来別途 trait / template ベースで設計余地があるが、 現状の virtual API ではサポート対象外
 
 ### 派生実装者の責務
 
@@ -139,7 +139,7 @@ stream / frame / remote 系で必要になる粒度は v1 `error_t` に追加済
 
 ### Limited 装飾の意義 (partial transfer)
 
-`Bus::transfer` は Source / Sink から長さを決める設計のため、 以下が素朴には表現できない:
+`IBus::transfer` は Source / Sink から長さを決める設計のため、 以下が素朴には表現できない:
 
 - 長いバッファの一部だけ送信したい (例: `MemorySource{base, 1024}` から先頭 128 byte だけ送る)
 - 容量不明 / 無限な Sink (ringbuffer 等) に「N byte だけ受信」 を指定したい
@@ -178,7 +178,7 @@ struct StreamWriter {   // push 側
 };
 ```
 
-UART の split accessor (`UARTTxAccessor` / `UARTRxAccessor`、 [uart.md](uart.md)) はこのインタフェースを実装する。
+UART の split accessor (`TxAccessor` / `RxAccessor`、 [uart.md](uart.md)) はこのインタフェースを実装する。
 
 ### アダプタの契約
 

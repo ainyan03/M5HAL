@@ -18,33 +18,38 @@ namespace error = m5::hal::v1::error;
 namespace gpio  = m5::hal::v1::gpio;
 namespace types = m5::hal::v1::types;
 
-class StubSPIBus : public spi::SPIBus {
+class StubIBus : public spi::IBus {
 public:
     struct Call {
-        const bus::Accessor* owner = nullptr;
-        spi::SPIMasterAccessConfig cfg;
+        const bus::IAccessor* owner = nullptr;
+        spi::MasterAccessConfig cfg;
         spi::TransferDesc desc;
         std::vector<uint8_t> tx;
         size_t rx_len = 0;
     };
 
-    // Typed init (S17 E1): the fake adds no fields, so it takes the
+    // Typed init: the fake adds no fields, so it takes the
     // abstract kind config.
-    result_t<void> init(const spi::SPIBusConfig& config)
+    result_t<void> init(const spi::IBusConfig& config)
     {
         _config = config;
         return {};
     }
 
-    result_t<void> beginTransaction(bus::Accessor* owner, const spi::SPIMasterAccessConfig& cfg) override
+    result_t<void> beginTransaction(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg) override
     {
+        if (fail_begin_transaction) {
+            return m5::stl::make_unexpected(m5::hal::v1::error::error_t::NOT_IMPLEMENTED);
+        }
         transaction_owners.push_back(owner);
         transaction_cfgs.push_back(cfg);
         ++begin_transaction_count;
         return {};
     }
 
-    result_t<void> endTransaction(bus::Accessor* owner, const spi::SPIMasterAccessConfig& cfg) override
+    bool fail_begin_transaction = false;
+
+    result_t<void> endTransaction(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg) override
     {
         transaction_owners.push_back(owner);
         transaction_cfgs.push_back(cfg);
@@ -52,7 +57,7 @@ public:
         return {};
     }
 
-    result_t<size_t> transfer(bus::Accessor* owner, const spi::SPIMasterAccessConfig& cfg,
+    result_t<size_t> transfer(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg,
                               const spi::TransferDesc& desc, data::Source* tx, data::Sink* rx) override
     {
         Call call;
@@ -97,8 +102,8 @@ public:
     }
 
     std::vector<Call> calls;
-    std::vector<const bus::Accessor*> transaction_owners;
-    std::vector<spi::SPIMasterAccessConfig> transaction_cfgs;
+    std::vector<const bus::IAccessor*> transaction_owners;
+    std::vector<spi::MasterAccessConfig> transaction_cfgs;
     size_t begin_transaction_count = 0;
     size_t end_transaction_count   = 0;
     uint8_t rx_seed                = 0x40;
@@ -211,18 +216,40 @@ size_t firstWriteIndex(const std::vector<RecordingPort::Event>& events, types::g
 
 }  // namespace
 
-TEST(SPIMasterAccessor, WriteWrapsTransferAndCopiesTx)
+TEST(MasterAccessConfig, SetupWithDCPinSelectsPinModeAndCommandLength)
 {
-    StubSPIBus bus;
-    spi::SPIBusConfig bus_cfg;
+    spi::AccessConfig cfg;
+    cfg.setupWithDCPin(27).pin_cs = 5;
+
+    EXPECT_EQ(cfg.pin_dc, 27);
+    EXPECT_EQ(cfg.spi_data_mode, spi::spi_data_mode_t::halfduplex_with_dc_pin);
+    EXPECT_EQ(cfg.spi_command_length, 8);
+    EXPECT_EQ(cfg.pin_cs, 5);  // the preset chains into further assignments
+}
+
+TEST(MasterAccessConfig, SetupWithDCBitSelectsBitModeAndClearsPin)
+{
+    spi::AccessConfig cfg;
+    cfg.pin_dc = 27;  // a previously set pin must be cleared by the bit preset
+    cfg.setupWithDCBit();
+
+    EXPECT_EQ(cfg.pin_dc, -1);
+    EXPECT_EQ(cfg.spi_data_mode, spi::spi_data_mode_t::halfduplex_with_dc_bit);
+    EXPECT_EQ(cfg.spi_command_length, 8);
+}
+
+TEST(MasterAccessor, WriteWrapsTransferAndCopiesTx)
+{
+    StubIBus bus;
+    spi::BusConfig_software bus_cfg;
     bus_cfg.pin_clk  = 18;
     bus_cfg.pin_mosi = 23;
     ASSERT_TRUE(bus.init(bus_cfg).has_value());
 
-    spi::SPIMasterAccessConfig cfg;
+    spi::MasterAccessConfig cfg;
     cfg.pin_cs = 5;
     cfg.freq   = 40000000;
-    spi::SPIMasterAccessor accessor{bus, cfg};
+    spi::MasterAccessor accessor{bus, cfg};
 
     const uint8_t tx[] = {0x9F, 0x00, 0x01};
     auto result        = accessor.write(tx, sizeof(tx));
@@ -237,12 +264,12 @@ TEST(SPIMasterAccessor, WriteWrapsTransferAndCopiesTx)
     EXPECT_EQ(bus.calls[0].rx_len, 0u);
 }
 
-TEST(SPIMasterAccessor, ReadWrapsTransferAndFillsRx)
+TEST(MasterAccessor, ReadWrapsTransferAndFillsRx)
 {
-    StubSPIBus bus;
-    ASSERT_TRUE(bus.init(spi::SPIBusConfig{}).has_value());
+    StubIBus bus;
+    ASSERT_TRUE(bus.init(spi::IBusConfig{}).has_value());
 
-    spi::SPIMasterAccessor accessor{bus, spi::SPIMasterAccessConfig{}};
+    spi::MasterAccessor accessor{bus, spi::MasterAccessConfig{}};
     uint8_t rx[4] = {};
     auto result   = accessor.read(rx, sizeof(rx));
 
@@ -253,12 +280,12 @@ TEST(SPIMasterAccessor, ReadWrapsTransferAndFillsRx)
     EXPECT_EQ(bus.calls[0].rx_len, sizeof(rx));
 }
 
-TEST(SPIMasterAccessor, WriteSourceLimitsTransferLength)
+TEST(MasterAccessor, WriteSourceLimitsTransferLength)
 {
-    StubSPIBus bus;
-    ASSERT_TRUE(bus.init(spi::SPIBusConfig{}).has_value());
+    StubIBus bus;
+    ASSERT_TRUE(bus.init(spi::IBusConfig{}).has_value());
 
-    spi::SPIMasterAccessor accessor{bus, spi::SPIMasterAccessConfig{}};
+    spi::MasterAccessor accessor{bus, spi::MasterAccessConfig{}};
     const uint8_t bytes[] = {0x10, 0x11, 0x12, 0x13, 0x14};
     data::MemorySource src{data::ConstDataSpan{bytes, sizeof(bytes)}};
 
@@ -275,12 +302,12 @@ TEST(SPIMasterAccessor, WriteSourceLimitsTransferLength)
     EXPECT_EQ(next->data[0], 0x13);
 }
 
-TEST(SPIMasterAccessor, ReadSinkLimitsTransferLength)
+TEST(MasterAccessor, ReadSinkLimitsTransferLength)
 {
-    StubSPIBus bus;
-    ASSERT_TRUE(bus.init(spi::SPIBusConfig{}).has_value());
+    StubIBus bus;
+    ASSERT_TRUE(bus.init(spi::IBusConfig{}).has_value());
 
-    spi::SPIMasterAccessor accessor{bus, spi::SPIMasterAccessConfig{}};
+    spi::MasterAccessor accessor{bus, spi::MasterAccessConfig{}};
     uint8_t rx[5] = {};
     data::MemorySink sink{data::DataSpan{rx, sizeof(rx)}};
 
@@ -293,15 +320,15 @@ TEST(SPIMasterAccessor, ReadSinkLimitsTransferLength)
     EXPECT_EQ((std::vector<uint8_t>{rx, rx + sizeof(rx)}), (std::vector<uint8_t>{0x40, 0x41, 0, 0, 0}));
 }
 
-TEST(SPIMasterAccessor, SetConfigRejectsWhileAccessIsHeld)
+TEST(MasterAccessor, SetConfigRejectsWhileAccessIsHeld)
 {
-    StubSPIBus bus;
-    ASSERT_TRUE(bus.init(spi::SPIBusConfig{}).has_value());
+    StubIBus bus;
+    ASSERT_TRUE(bus.init(spi::IBusConfig{}).has_value());
 
-    spi::SPIMasterAccessor accessor{bus, spi::SPIMasterAccessConfig{}};
+    spi::MasterAccessor accessor{bus, spi::MasterAccessConfig{}};
     ASSERT_TRUE(accessor.beginAccess().has_value());
 
-    spi::SPIMasterAccessConfig next;
+    spi::MasterAccessConfig next;
     next.freq   = 2000000;
     auto result = accessor.setConfig(next);
 
@@ -312,14 +339,14 @@ TEST(SPIMasterAccessor, SetConfigRejectsWhileAccessIsHeld)
     EXPECT_EQ(accessor.getConfig().freq, 2000000u);
 }
 
-TEST(SPIMasterAccessor, TransferWrapsTransaction)
+TEST(MasterAccessor, TransferWrapsTransaction)
 {
-    StubSPIBus bus;
-    ASSERT_TRUE(bus.init(spi::SPIBusConfig{}).has_value());
+    StubIBus bus;
+    ASSERT_TRUE(bus.init(spi::IBusConfig{}).has_value());
 
-    spi::SPIMasterAccessConfig cfg;
+    spi::MasterAccessConfig cfg;
     cfg.pin_cs = 5;
-    spi::SPIMasterAccessor accessor{bus, cfg};
+    spi::MasterAccessor accessor{bus, cfg};
 
     const uint8_t tx[] = {0x12};
     auto result        = accessor.write(data::ConstDataSpan{tx, sizeof(tx)});
@@ -334,12 +361,12 @@ TEST(SPIMasterAccessor, TransferWrapsTransaction)
     EXPECT_EQ(bus.transaction_cfgs[0].pin_cs, 5);
 }
 
-TEST(SPIMasterAccessor, ExplicitTransactionSpansNestedTransfers)
+TEST(MasterAccessor, ExplicitTransactionSpansNestedTransfers)
 {
-    StubSPIBus bus;
-    ASSERT_TRUE(bus.init(spi::SPIBusConfig{}).has_value());
+    StubIBus bus;
+    ASSERT_TRUE(bus.init(spi::IBusConfig{}).has_value());
 
-    spi::SPIMasterAccessor accessor{bus, spi::SPIMasterAccessConfig{}};
+    spi::MasterAccessor accessor{bus, spi::MasterAccessConfig{}};
 
     ASSERT_TRUE(accessor.beginTransaction().has_value());
     const uint8_t first[]  = {0x12};
@@ -353,14 +380,14 @@ TEST(SPIMasterAccessor, ExplicitTransactionSpansNestedTransfers)
     EXPECT_EQ(bus.end_transaction_count, 1u);
 }
 
-TEST(SPIMasterAccessor, WriteCommandDataSplitsDcLevel)
+TEST(MasterAccessor, WriteCommandDataSplitsDcLevel)
 {
-    StubSPIBus bus;
-    ASSERT_TRUE(bus.init(spi::SPIBusConfig{}).has_value());
+    StubIBus bus;
+    ASSERT_TRUE(bus.init(spi::IBusConfig{}).has_value());
 
-    spi::SPIMasterAccessConfig cfg;
+    spi::MasterAccessConfig cfg;
     cfg.spi_command_length = 8;
-    spi::SPIMasterAccessor accessor{bus, cfg};
+    spi::MasterAccessor accessor{bus, cfg};
 
     const uint8_t tx[] = {0x2A, 0x00, 0xEF};
     auto result        = accessor.writeCommandData(data::ConstDataSpan{tx, sizeof(tx)});
@@ -377,14 +404,14 @@ TEST(SPIMasterAccessor, WriteCommandDataSplitsDcLevel)
     EXPECT_EQ(bus.calls[0].tx, (std::vector<uint8_t>{0x00, 0xEF}));
 }
 
-TEST(SPIMasterAccessor, WriteCommandDataCanTakeSeparateCommand)
+TEST(MasterAccessor, WriteCommandDataCanTakeSeparateCommand)
 {
-    StubSPIBus bus;
-    ASSERT_TRUE(bus.init(spi::SPIBusConfig{}).has_value());
+    StubIBus bus;
+    ASSERT_TRUE(bus.init(spi::IBusConfig{}).has_value());
 
-    spi::SPIMasterAccessConfig cfg;
+    spi::MasterAccessConfig cfg;
     cfg.spi_command_length = 8;
-    spi::SPIMasterAccessor accessor{bus, cfg};
+    spi::MasterAccessor accessor{bus, cfg};
 
     const uint8_t tx[] = {0x11, 0x22};
     auto result        = accessor.writeCommandData(0x2C, data::ConstDataSpan{tx, sizeof(tx)});
@@ -397,14 +424,14 @@ TEST(SPIMasterAccessor, WriteCommandDataCanTakeSeparateCommand)
     EXPECT_EQ(bus.calls[0].tx, (std::vector<uint8_t>{0x11, 0x22}));
 }
 
-TEST(SPIMasterAccessor, WriteCommandDataSourceLimitsTransferLength)
+TEST(MasterAccessor, WriteCommandDataSourceLimitsTransferLength)
 {
-    StubSPIBus bus;
-    ASSERT_TRUE(bus.init(spi::SPIBusConfig{}).has_value());
+    StubIBus bus;
+    ASSERT_TRUE(bus.init(spi::IBusConfig{}).has_value());
 
-    spi::SPIMasterAccessConfig cfg;
+    spi::MasterAccessConfig cfg;
     cfg.spi_command_length = 8;
-    spi::SPIMasterAccessor accessor{bus, cfg};
+    spi::MasterAccessor accessor{bus, cfg};
 
     const uint8_t bytes[] = {0xA0, 0xA1, 0xA2, 0xA3};
     data::MemorySource src{data::ConstDataSpan{bytes, sizeof(bytes)}};
@@ -418,16 +445,16 @@ TEST(SPIMasterAccessor, WriteCommandDataSourceLimitsTransferLength)
     EXPECT_EQ(bus.calls[0].tx, (std::vector<uint8_t>{0xA0, 0xA1}));
 }
 
-TEST(SPIMasterAccessor, WriteCommandDataUsesWriteDummyCycle)
+TEST(MasterAccessor, WriteCommandDataUsesWriteDummyCycle)
 {
-    StubSPIBus bus;
-    ASSERT_TRUE(bus.init(spi::SPIBusConfig{}).has_value());
+    StubIBus bus;
+    ASSERT_TRUE(bus.init(spi::IBusConfig{}).has_value());
 
-    spi::SPIMasterAccessConfig cfg;
+    spi::MasterAccessConfig cfg;
     cfg.spi_command_length    = 8;
     cfg.spi_read_dummy_cycle  = 9;
     cfg.spi_write_dummy_cycle = 4;
-    spi::SPIMasterAccessor accessor{bus, cfg};
+    spi::MasterAccessor accessor{bus, cfg};
 
     const uint8_t tx[] = {0x01};
     auto result        = accessor.writeCommandData(0x2C, data::ConstDataSpan{tx, sizeof(tx)});
@@ -437,16 +464,16 @@ TEST(SPIMasterAccessor, WriteCommandDataUsesWriteDummyCycle)
     EXPECT_EQ(bus.calls[0].desc.dummy_cycles, 4u);
 }
 
-TEST(SPIMasterAccessor, ReadCommandDataUsesReadDummyCycle)
+TEST(MasterAccessor, ReadCommandDataUsesReadDummyCycle)
 {
-    StubSPIBus bus;
-    ASSERT_TRUE(bus.init(spi::SPIBusConfig{}).has_value());
+    StubIBus bus;
+    ASSERT_TRUE(bus.init(spi::IBusConfig{}).has_value());
 
-    spi::SPIMasterAccessConfig cfg;
+    spi::MasterAccessConfig cfg;
     cfg.spi_command_length    = 8;
     cfg.spi_read_dummy_cycle  = 8;
     cfg.spi_write_dummy_cycle = 4;
-    spi::SPIMasterAccessor accessor{bus, cfg};
+    spi::MasterAccessor accessor{bus, cfg};
 
     uint8_t rx[1] = {};
     auto result   = accessor.readCommandData(0x0B, data::DataSpan{rx, sizeof(rx)});
@@ -456,17 +483,17 @@ TEST(SPIMasterAccessor, ReadCommandDataUsesReadDummyCycle)
     EXPECT_EQ(bus.calls[0].desc.dummy_cycles, 8u);
 }
 
-TEST(SPIMasterAccessor, WriteCommandAddressDataBuildsSingleTransfer)
+TEST(MasterAccessor, WriteCommandAddressDataBuildsSingleTransfer)
 {
-    StubSPIBus bus;
-    ASSERT_TRUE(bus.init(spi::SPIBusConfig{}).has_value());
+    StubIBus bus;
+    ASSERT_TRUE(bus.init(spi::IBusConfig{}).has_value());
 
-    spi::SPIMasterAccessConfig cfg;
+    spi::MasterAccessConfig cfg;
     cfg.spi_command_length    = 8;
     cfg.spi_address_length    = 24;
     cfg.spi_read_dummy_cycle  = 9;
     cfg.spi_write_dummy_cycle = 4;
-    spi::SPIMasterAccessor accessor{bus, cfg};
+    spi::MasterAccessor accessor{bus, cfg};
 
     const uint8_t tx[] = {0xDE, 0xAD};
     auto result        = accessor.writeCommandAddressData(0x02, 0x00123456, data::ConstDataSpan{tx, sizeof(tx)});
@@ -485,17 +512,17 @@ TEST(SPIMasterAccessor, WriteCommandAddressDataBuildsSingleTransfer)
     EXPECT_EQ(bus.calls[0].tx, (std::vector<uint8_t>{0xDE, 0xAD}));
 }
 
-TEST(SPIMasterAccessor, WriteCommandAddressDataSourceLimitsTransferLength)
+TEST(MasterAccessor, WriteCommandAddressDataSourceLimitsTransferLength)
 {
-    StubSPIBus bus;
-    ASSERT_TRUE(bus.init(spi::SPIBusConfig{}).has_value());
+    StubIBus bus;
+    ASSERT_TRUE(bus.init(spi::IBusConfig{}).has_value());
 
-    spi::SPIMasterAccessConfig cfg;
+    spi::MasterAccessConfig cfg;
     cfg.spi_command_length    = 8;
     cfg.spi_address_length    = 24;
     cfg.spi_read_dummy_cycle  = 9;
     cfg.spi_write_dummy_cycle = 4;
-    spi::SPIMasterAccessor accessor{bus, cfg};
+    spi::MasterAccessor accessor{bus, cfg};
 
     const uint8_t tx[] = {0xA0, 0xA1, 0xA2};
     data::MemorySource src{data::ConstDataSpan{tx, sizeof(tx)}};
@@ -513,17 +540,17 @@ TEST(SPIMasterAccessor, WriteCommandAddressDataSourceLimitsTransferLength)
     EXPECT_EQ(bus.calls[0].tx, (std::vector<uint8_t>{0xA0, 0xA1}));
 }
 
-TEST(SPIMasterAccessor, ReadCommandAddressDataBuildsSingleTransfer)
+TEST(MasterAccessor, ReadCommandAddressDataBuildsSingleTransfer)
 {
-    StubSPIBus bus;
-    ASSERT_TRUE(bus.init(spi::SPIBusConfig{}).has_value());
+    StubIBus bus;
+    ASSERT_TRUE(bus.init(spi::IBusConfig{}).has_value());
 
-    spi::SPIMasterAccessConfig cfg;
+    spi::MasterAccessConfig cfg;
     cfg.spi_command_length    = 8;
     cfg.spi_address_length    = 16;
     cfg.spi_read_dummy_cycle  = 8;
     cfg.spi_write_dummy_cycle = 4;
-    spi::SPIMasterAccessor accessor{bus, cfg};
+    spi::MasterAccessor accessor{bus, cfg};
 
     uint8_t rx[3] = {};
     auto result   = accessor.readCommandAddressData(0x0B, 0x1234, data::DataSpan{rx, sizeof(rx)});
@@ -540,12 +567,12 @@ TEST(SPIMasterAccessor, ReadCommandAddressDataBuildsSingleTransfer)
     EXPECT_EQ(bus.calls[0].rx_len, 3u);
 }
 
-TEST(SPIMasterAccessor, SendDummyClockUsesTransferDesc)
+TEST(MasterAccessor, SendDummyClockUsesTransferDesc)
 {
-    StubSPIBus bus;
-    ASSERT_TRUE(bus.init(spi::SPIBusConfig{}).has_value());
+    StubIBus bus;
+    ASSERT_TRUE(bus.init(spi::IBusConfig{}).has_value());
 
-    spi::SPIMasterAccessor accessor{bus, spi::SPIMasterAccessConfig{}};
+    spi::MasterAccessor accessor{bus, spi::MasterAccessConfig{}};
     auto result = accessor.sendDummyClock(12);
 
     ASSERT_TRUE(result.has_value());
@@ -559,14 +586,14 @@ TEST(SPIMasterAccessor, SendDummyClockUsesTransferDesc)
 // rather than silently degrading to write(). Setting a command length is
 // mandatory for the command-sugar family; callers that want a plain write
 // must call write() directly.
-TEST(SPIMasterAccessor, WriteCommandDataSpanRejectsZeroCommandLength)
+TEST(MasterAccessor, WriteCommandDataSpanRejectsZeroCommandLength)
 {
-    StubSPIBus bus;
-    ASSERT_TRUE(bus.init(spi::SPIBusConfig{}).has_value());
+    StubIBus bus;
+    ASSERT_TRUE(bus.init(spi::IBusConfig{}).has_value());
 
-    spi::SPIMasterAccessConfig cfg;
+    spi::MasterAccessConfig cfg;
     // spi_command_length defaults to 0 — no command configured.
-    spi::SPIMasterAccessor accessor{bus, cfg};
+    spi::MasterAccessor accessor{bus, cfg};
 
     const uint8_t tx[] = {0xDE, 0xAD};
     auto result        = accessor.writeCommandData(data::ConstDataSpan{tx, sizeof(tx)});
@@ -577,10 +604,10 @@ TEST(SPIMasterAccessor, WriteCommandDataSpanRejectsZeroCommandLength)
     EXPECT_TRUE(bus.calls.empty());
 }
 
-TEST(SPIBus, DefaultTransferReturnsNotImplemented)
+TEST(IBus, DefaultTransferReturnsNotImplemented)
 {
-    spi::SPIBus bus;
-    spi::SPIMasterAccessConfig cfg;
+    spi::IBus bus;
+    spi::MasterAccessConfig cfg;
     spi::TransferDesc desc;
     auto result = bus.transfer(nullptr, cfg, desc, nullptr, nullptr);
 
@@ -588,24 +615,57 @@ TEST(SPIBus, DefaultTransferReturnsNotImplemented)
     EXPECT_EQ(result.error(), error::error_t::NOT_IMPLEMENTED);
 }
 
-TEST(SoftwareSPIBus, WriteDrivesCsDcClockAndMosi)
+// ---- ScopedTransaction (CS scope RAII) ---------------------------------
+
+TEST(ScopedTransaction, ClosesTheTransactionOnScopeExit)
+{
+    StubIBus bus;
+    spi::MasterAccessConfig cfg;
+    spi::MasterAccessor dev{bus, cfg};
+
+    {
+        spi::ScopedTransaction scope{dev};
+        ASSERT_FALSE(scope.has_error());
+        EXPECT_EQ(scope.error(), m5::hal::v1::error::error_t::OK);
+        EXPECT_EQ(bus.begin_transaction_count, 1u);
+        EXPECT_EQ(bus.end_transaction_count, 0u);
+    }  // scope exit = endTransaction, even on an early return
+    EXPECT_EQ(bus.end_transaction_count, 1u);
+}
+
+TEST(ScopedTransaction, SurfacesABeginFailureWithoutClosing)
+{
+    StubIBus bus;
+    bus.fail_begin_transaction = true;
+    spi::MasterAccessConfig cfg;
+    spi::MasterAccessor dev{bus, cfg};
+
+    {
+        spi::ScopedTransaction scope{dev};
+        EXPECT_TRUE(scope.has_error());
+        EXPECT_EQ(scope.error(), m5::hal::v1::error::error_t::NOT_IMPLEMENTED);
+    }
+    EXPECT_EQ(bus.end_transaction_count, 0u);  // nothing to close
+}
+
+TEST(SoftwareIBus, WriteDrivesCsDcClockAndMosi)
 {
     auto& gpio = softwareSpiGPIO();
     auto& port = gpio._port;
 
-    m5::hal::v1::spi::variant::software::Bus bus;
-    spi::SPIBusConfig bus_cfg;
+    m5::hal::v1::spi::Bus_software bus;
+    spi::BusConfig_software bus_cfg;
     bus_cfg.pin_clk  = softPin(0);
     bus_cfg.pin_dc   = softPin(1);
     bus_cfg.pin_mosi = softPin(2);
     ASSERT_TRUE(bus.init(bus_cfg).has_value());
     port.clear();
 
-    spi::SPIMasterAccessConfig cfg;
+    spi::MasterAccessConfig cfg;
     cfg.pin_cs             = softPin(3);
     cfg.freq               = 20000000;
     cfg.spi_command_length = 8;
-    spi::SPIMasterAccessor accessor{bus, cfg};
+    spi::MasterAccessor accessor{bus, cfg};
 
     const uint8_t tx[] = {0xA5, 0x5A};
     auto result        = accessor.writeCommandData(data::ConstDataSpan{tx, sizeof(tx)});
@@ -622,16 +682,50 @@ TEST(SoftwareSPIBus, WriteDrivesCsDcClockAndMosi)
     EXPECT_EQ(countWrites(port.events, softPin(3), true), 1u);
 }
 
-// S16 D10 rejection boundary for the single-lane variants: multi-lane
+// Per-device D/C override: a non-negative MasterAccessConfig::pin_dc
+// beats the bus-level pin_dc — the bus-level pin must stay untouched.
+TEST(SoftwareIBus, AccessorPinDcOverridesBusPinDc)
+{
+    auto& gpio = softwareSpiGPIO();
+    auto& port = gpio._port;
+
+    m5::hal::v1::spi::Bus_software bus;
+    spi::BusConfig_software bus_cfg;
+    bus_cfg.pin_clk  = softPin(0);
+    bus_cfg.pin_dc   = softPin(1);  // bus-level default D/C
+    bus_cfg.pin_mosi = softPin(2);
+    ASSERT_TRUE(bus.init(bus_cfg).has_value());
+    port.clear();
+
+    spi::MasterAccessConfig cfg;
+    cfg.pin_cs             = softPin(3);
+    cfg.pin_dc             = softPin(4);  // device-level override
+    cfg.freq               = 20000000;
+    cfg.spi_command_length = 8;
+    spi::MasterAccessor accessor{bus, cfg};
+
+    const uint8_t tx[] = {0xA5, 0x5A};
+    auto result        = accessor.writeCommandData(data::ConstDataSpan{tx, sizeof(tx)});
+
+    ASSERT_TRUE(result.has_value());
+    // The override pin carries the command/data D/C swing...
+    EXPECT_EQ(countWrites(port.events, softPin(4), false), 1u);
+    EXPECT_GE(countWrites(port.events, softPin(4), true), 1u);
+    // ...and the bus-level D/C pin stays silent.
+    EXPECT_EQ(countWrites(port.events, softPin(1), false), 0u);
+    EXPECT_EQ(countWrites(port.events, softPin(1), true), 0u);
+}
+
+// Rejection boundary for the single-lane variants: multi-lane
 // modes (dual/quad/octal) are always NOT_IMPLEMENTED; half-duplex modes
 // are rejected only when one transfer carries BOTH tx and rx data
 // (full-duplex clocking would corrupt the response). One-directional
 // half-duplex transfers keep working — the DC-pin demos depend on them.
-TEST(SoftwareSPIBus, UnimplementedDataModesAreRejected)
+TEST(SoftwareIBus, UnimplementedDataModesAreRejected)
 {
     auto& gpio = softwareSpiGPIO();
-    m5::hal::v1::spi::variant::software::Bus bus;
-    spi::SPIBusConfig bus_cfg;
+    m5::hal::v1::spi::Bus_software bus;
+    spi::BusConfig_software bus_cfg;
     bus_cfg.pin_clk  = softPin(0);
     bus_cfg.pin_miso = softPin(1);
     bus_cfg.pin_mosi = softPin(2);
@@ -643,10 +737,10 @@ TEST(SoftwareSPIBus, UnimplementedDataModesAreRejected)
 
     // Multi-lane: rejected even for a one-directional write.
     {
-        spi::SPIMasterAccessConfig cfg;
+        spi::MasterAccessConfig cfg;
         cfg.freq          = 20000000;
-        cfg.spi_data_mode = spi::spi_data_mode_t::spi_quad_output;
-        spi::SPIMasterAccessor accessor{bus, cfg};
+        cfg.spi_data_mode = spi::spi_data_mode_t::quad_output;
+        spi::MasterAccessor accessor{bus, cfg};
         auto result = accessor.write(data::ConstDataSpan{tx, sizeof(tx)});
         ASSERT_FALSE(result.has_value());
         EXPECT_EQ(result.error(), error::error_t::NOT_IMPLEMENTED);
@@ -654,10 +748,10 @@ TEST(SoftwareSPIBus, UnimplementedDataModesAreRejected)
 
     // Half-duplex carrying both tx and rx data: rejected.
     {
-        spi::SPIMasterAccessConfig cfg;
+        spi::MasterAccessConfig cfg;
         cfg.freq          = 20000000;
-        cfg.spi_data_mode = spi::spi_data_mode_t::spi_halfduplex;
-        spi::SPIMasterAccessor accessor{bus, cfg};
+        cfg.spi_data_mode = spi::spi_data_mode_t::halfduplex;
+        spi::MasterAccessor accessor{bus, cfg};
         auto result =
             accessor.transfer(spi::TransferDesc{}, data::ConstDataSpan{tx, sizeof(tx)}, data::DataSpan{rx, sizeof(rx)});
         ASSERT_FALSE(result.has_value());
@@ -666,31 +760,31 @@ TEST(SoftwareSPIBus, UnimplementedDataModesAreRejected)
 
     // Half-duplex one-directional write: still works.
     {
-        spi::SPIMasterAccessConfig cfg;
+        spi::MasterAccessConfig cfg;
         cfg.freq          = 20000000;
-        cfg.spi_data_mode = spi::spi_data_mode_t::spi_halfduplex_with_dc_pin;
-        spi::SPIMasterAccessor accessor{bus, cfg};
+        cfg.spi_data_mode = spi::spi_data_mode_t::halfduplex_with_dc_pin;
+        spi::MasterAccessor accessor{bus, cfg};
         auto result = accessor.write(data::ConstDataSpan{tx, sizeof(tx)});
         EXPECT_TRUE(result.has_value());
     }
 }
 
-TEST(SoftwareSPIBus, ReadSamplesMiso)
+TEST(SoftwareIBus, ReadSamplesMiso)
 {
     auto& gpio = softwareSpiGPIO();
     auto& port = gpio._port;
 
-    m5::hal::v1::spi::variant::software::Bus bus;
-    spi::SPIBusConfig bus_cfg;
+    m5::hal::v1::spi::Bus_software bus;
+    spi::BusConfig_software bus_cfg;
     bus_cfg.pin_clk  = softPin(0);
     bus_cfg.pin_miso = softPin(4);
     ASSERT_TRUE(bus.init(bus_cfg).has_value());
     port.clear();
     port.setReadValue(true);
 
-    spi::SPIMasterAccessConfig cfg;
+    spi::MasterAccessConfig cfg;
     cfg.freq = 20000000;
-    spi::SPIMasterAccessor accessor{bus, cfg};
+    spi::MasterAccessor accessor{bus, cfg};
 
     uint8_t rx[1] = {};
     auto result   = accessor.read(rx, sizeof(rx));
@@ -702,20 +796,20 @@ TEST(SoftwareSPIBus, ReadSamplesMiso)
     EXPECT_GE(countWrites(port.events, softPin(0), false), 8u);
 }
 
-TEST(SoftwareSPIBus, DummyClockCountIsCycleCount)
+TEST(SoftwareIBus, DummyClockCountIsCycleCount)
 {
     auto& gpio = softwareSpiGPIO();
     auto& port = gpio._port;
 
-    m5::hal::v1::spi::variant::software::Bus bus;
-    spi::SPIBusConfig bus_cfg;
+    m5::hal::v1::spi::Bus_software bus;
+    spi::BusConfig_software bus_cfg;
     bus_cfg.pin_clk = softPin(0);
     ASSERT_TRUE(bus.init(bus_cfg).has_value());
     port.clear();
 
-    spi::SPIMasterAccessConfig cfg;
+    spi::MasterAccessConfig cfg;
     cfg.freq = 20000000;
-    spi::SPIMasterAccessor accessor{bus, cfg};
+    spi::MasterAccessor accessor{bus, cfg};
 
     auto result = accessor.sendDummyClock(16);
 
@@ -724,23 +818,23 @@ TEST(SoftwareSPIBus, DummyClockCountIsCycleCount)
     EXPECT_GE(countWrites(port.events, softPin(0), false), 16u);
 }
 
-TEST(SoftwareSPIBus, CpolHighIsAppliedBeforeCsAssert)
+TEST(SoftwareIBus, CpolHighIsAppliedBeforeCsAssert)
 {
     auto& gpio = softwareSpiGPIO();
     auto& port = gpio._port;
 
-    m5::hal::v1::spi::variant::software::Bus bus;
-    spi::SPIBusConfig bus_cfg;
+    m5::hal::v1::spi::Bus_software bus;
+    spi::BusConfig_software bus_cfg;
     bus_cfg.pin_clk  = softPin(0);
     bus_cfg.pin_mosi = softPin(2);
     ASSERT_TRUE(bus.init(bus_cfg).has_value());
     port.clear();
 
-    spi::SPIMasterAccessConfig cfg;
+    spi::MasterAccessConfig cfg;
     cfg.pin_cs   = softPin(3);
     cfg.freq     = 20000000;
     cfg.spi_mode = 2;  // CPOL=1, CPHA=0
-    spi::SPIMasterAccessor accessor{bus, cfg};
+    spi::MasterAccessor accessor{bus, cfg};
 
     const uint8_t tx[] = {0x00};
     auto result        = accessor.write(data::ConstDataSpan{tx, sizeof(tx)});
@@ -751,22 +845,22 @@ TEST(SoftwareSPIBus, CpolHighIsAppliedBeforeCsAssert)
     EXPECT_LT(firstWriteIndex(port.events, softPin(0), true), firstWriteIndex(port.events, softPin(3), false));
 }
 
-TEST(SoftwareSPIBus, ExplicitTransactionKeepsCsAssertedAcrossTransfers)
+TEST(SoftwareIBus, ExplicitTransactionKeepsCsAssertedAcrossTransfers)
 {
     auto& gpio = softwareSpiGPIO();
     auto& port = gpio._port;
 
-    m5::hal::v1::spi::variant::software::Bus bus;
-    spi::SPIBusConfig bus_cfg;
+    m5::hal::v1::spi::Bus_software bus;
+    spi::BusConfig_software bus_cfg;
     bus_cfg.pin_clk  = softPin(0);
     bus_cfg.pin_mosi = softPin(2);
     ASSERT_TRUE(bus.init(bus_cfg).has_value());
     port.clear();
 
-    spi::SPIMasterAccessConfig cfg;
+    spi::MasterAccessConfig cfg;
     cfg.pin_cs = softPin(3);
     cfg.freq   = 20000000;
-    spi::SPIMasterAccessor accessor{bus, cfg};
+    spi::MasterAccessor accessor{bus, cfg};
 
     const uint8_t first[]  = {0x12};
     const uint8_t second[] = {0x34};

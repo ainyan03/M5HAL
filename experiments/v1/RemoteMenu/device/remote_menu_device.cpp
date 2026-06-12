@@ -2,7 +2,7 @@
 // =============================================================================
 // M5HAL — RemoteMenu device side
 //
-// Permanent acceptance harness for decisions/022-024.  Combines the four
+// Permanent acceptance harness for the remote bus stack (spec/design/remote.md).  Combines the four
 // former Remote examples (RemoteBus / RemoteI2S / RemoteBusTcp /
 // RemoteI2STcp, removed from examples/) into a single translation unit.
 //
@@ -169,7 +169,7 @@ private:
 // Shared resources
 // ---------------------------------------------------------------------------
 static m5hal::i2c::Bus i2c_bus;
-static m5hal::i2c::I2CMasterAccessConfig i2c_acc_cfg;
+static m5hal::i2c::MasterAccessConfig i2c_acc_cfg;
 
 // server_scratch: working buffer where the server unpacks received messages
 static uint8_t server_scratch[m5hal::remote::kMaxMessageSize];
@@ -190,13 +190,13 @@ static m5hal::service::ServiceRunner runner;
 #if defined(ESP_PLATFORM) && M5HAL_ESPIDF_I2S_HAS_STD
 
 static m5hal::i2s::Bus i2s_bus;
-static m5hal::i2s::I2SBusConfig i2s_bus_cfg;
-static m5hal::i2s::I2SAccessConfig i2s_acc_cfg;
-static m5hal::i2s::I2STxAccessor* i2s_acc_ptr = nullptr;
+static m5hal::i2s::BusConfig i2s_bus_cfg;
+static m5hal::i2s::AccessConfig i2s_acc_cfg;
+static m5hal::i2s::TxAccessor* i2s_acc_ptr = nullptr;
 
 // Enable the Core2 V1.1 speaker amplifier: AXP2101 ALDO3 -> 3300 mV.
 // Source: I2SAudio example (M5Unified AXP2101 branch).
-static void enableAmplifier(m5hal::i2c::I2CMasterAccessor& acc)
+static void enableAmplifier(m5hal::i2c::MasterAccessor& acc)
 {
     // reg 0x94 = (3300 - 500) / 100 = 0x1C  (ALDO3 = 3300 mV)
     uint8_t set_voltage[2] = {0x94, 0x1C};
@@ -217,13 +217,13 @@ static void enableAmplifier(m5hal::i2c::I2CMasterAccessor& acc)
 // also a bootstrap-strapping pin on classic ESP32. Boards without an
 // AXP2101 (e.g. Core BASIC) skip amp and I2S entirely, eliminating any
 // risk of accidentally driving those pins (safety boundary).
-static bool tryInitI2S(m5hal::i2c::I2CMasterAccessor& main_i2c_acc)
+static bool tryInitI2S(m5hal::i2c::MasterAccessor& main_i2c_acc)
 {
     // Probe AXP2101 (0x34) via the I2C accessor
-    m5hal::i2c::I2CMasterAccessConfig axp_cfg;
+    m5hal::i2c::MasterAccessConfig axp_cfg;
     axp_cfg.i2c_addr = AXP2101_ADDR;
     axp_cfg.freq     = 400000;
-    m5hal::i2c::I2CMasterAccessor axp_acc{main_i2c_acc.getI2CBus(), axp_cfg};
+    m5hal::i2c::MasterAccessor axp_acc{main_i2c_acc.getBus(), axp_cfg};
     if (!axp_acc.probe().has_value()) {
         // AXP2101 absent (e.g. Core BASIC) -> skip I2S
         return false;
@@ -238,11 +238,11 @@ static bool tryInitI2S(m5hal::i2c::I2CMasterAccessor& main_i2c_acc)
     // Generous DMA so every supported config rides out the link's rough
     // moments (WiFi shares airtime; expect coarser arrival clumps than the
     // USB bridge). Sizing rule: spec/design/remote.md §stream credit;
-    // T-2 of decisions/024 calibrates the TCP numbers.
+    // the TCP numbers were calibrated on hardware.
     i2s_bus_cfg.tx_buffer_size = 49152;
 #else
     // UART path: 2x the measured floor of 6144 at 48 kHz stereo over the
-    // USB bridge (decisions/024).
+    // USB bridge (measured on hardware).
     i2s_bus_cfg.tx_buffer_size = 12288;
 #endif
 
@@ -255,7 +255,7 @@ static bool tryInitI2S(m5hal::i2c::I2CMasterAccessor& main_i2c_acc)
     i2s_acc_cfg.channels         = 2;
     i2s_acc_cfg.write_timeout_ms = 0;  // the remote side drives flow via credit
 
-    static m5hal::i2s::I2STxAccessor i2s_acc{i2s_bus, i2s_acc_cfg};
+    static m5hal::i2s::TxAccessor i2s_acc{i2s_bus, i2s_acc_cfg};
     i2s_acc_ptr = &i2s_acc;
     return true;
 }
@@ -269,13 +269,18 @@ static void commonDeviceInit()
 {
     // Initialise the internal I2C bus
 #if M5HAL_FRAMEWORK_HAS_ARDUINO
-    m5hal::i2c::BusConfig i2c_cfg{&Wire, PIN_I2C_SCL, PIN_I2C_SDA};
+    m5hal::i2c::BusConfig i2c_cfg;
+    i2c_cfg.wire    = &Wire;
+    i2c_cfg.pin_scl = PIN_I2C_SCL;
+    i2c_cfg.pin_sda = PIN_I2C_SDA;
 #else
-    m5hal::i2c::BusConfig i2c_cfg{PIN_I2C_SCL, PIN_I2C_SDA};
+    m5hal::i2c::BusConfig i2c_cfg;
+    i2c_cfg.pin_scl = PIN_I2C_SCL;
+    i2c_cfg.pin_sda = PIN_I2C_SDA;
 #endif
     (void)i2c_bus.init(i2c_cfg);
 
-    static m5hal::i2c::I2CMasterAccessor i2c_acc{i2c_bus, i2c_acc_cfg};
+    static m5hal::i2c::MasterAccessor i2c_acc{i2c_bus, i2c_acc_cfg};
 
     // Server + cooperative poll service. Registering the accessor as
     // bus_id 0 is what makes it reachable (and nothing else is).
@@ -309,7 +314,7 @@ static void commonDeviceInit()
 
 // ---- arduino UART0 ----
 static m5hal::uart::Bus uart_bus;
-static m5hal::uart::UARTAccessConfig uart_cfg;
+static m5hal::uart::AccessConfig uart_cfg;
 
 static void uartTransportInit()
 {
@@ -328,8 +333,8 @@ static void uartTransportInit()
     uart_cfg.inter_byte_timeout_ms = 1;
     uart_cfg.write_timeout_ms      = 100;
 
-    static m5hal::uart::UARTTxAccessor uart_tx{uart_bus, uart_cfg};
-    static m5hal::uart::UARTRxAccessor uart_rx{uart_bus, uart_cfg};
+    static m5hal::uart::TxAccessor uart_tx{uart_bus, uart_cfg};
+    static m5hal::uart::RxAccessor uart_rx{uart_bus, uart_cfg};
 
     static m5hal::data::StreamSource link_src{uart_rx, m5hal::data::DataSpan{rx_scratch, sizeof(rx_scratch)}};
     static m5hal::data::StreamSink link_snk{uart_tx, m5hal::data::DataSpan{tx_scratch, sizeof(tx_scratch)}};
@@ -356,8 +361,8 @@ void loop()
 #else  // espidf UART
 
 // ---- espidf UART0 ----
-static m5hal::uart::variant::espidf::Bus uart_bus;
-static m5hal::uart::UARTAccessConfig uart_cfg;
+static m5hal::uart::Bus_espidf uart_bus;
+static m5hal::uart::AccessConfig uart_cfg;
 
 static void uartTransportInit()
 {
@@ -365,7 +370,7 @@ static void uartTransportInit()
     // would corrupt the protocol stream. Silence it.
     esp_log_level_set("*", ESP_LOG_NONE);
 
-    m5hal::uart::variant::espidf::BusConfig bus_cfg;
+    m5hal::uart::BusConfig_espidf bus_cfg;
     bus_cfg.port_num       = 0;  // UART0 = USB bridge
     bus_cfg.pin_tx         = PIN_UART_TX;
     bus_cfg.pin_rx         = PIN_UART_RX;
@@ -378,8 +383,8 @@ static void uartTransportInit()
     uart_cfg.inter_byte_timeout_ms = 1;
     uart_cfg.write_timeout_ms      = 100;
 
-    static m5hal::uart::UARTTxAccessor uart_tx{uart_bus, uart_cfg};
-    static m5hal::uart::UARTRxAccessor uart_rx{uart_bus, uart_cfg};
+    static m5hal::uart::TxAccessor uart_tx{uart_bus, uart_cfg};
+    static m5hal::uart::RxAccessor uart_rx{uart_bus, uart_cfg};
 
     static m5hal::data::StreamSource link_src{uart_rx, m5hal::data::DataSpan{rx_scratch, sizeof(rx_scratch)}};
     static m5hal::data::StreamSink link_snk{uart_tx, m5hal::data::DataSpan{tx_scratch, sizeof(tx_scratch)}};

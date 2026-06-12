@@ -57,17 +57,17 @@ namespace {
 
 namespace cap = ::wire_capture;
 
-using EspidfSPIBus = ::m5::hal::v1::spi::variant::espidf::Bus;
+using EspidfSpiBus = ::m5::hal::v1::spi::Bus_espidf;
 
-EspidfSPIBus& makeBus()
+EspidfSpiBus& makeBus()
 {
     // Static instance + re-init per test: a Unity assert failure
     // longjmps out of the test body, skipping local destructors - a
     // local Bus would leak the initialized SPI host and fail every
     // later init with INVALID_STATE. Bus::init releases the previous
     // ownership first, so re-init doubles as the cleanup path.
-    static EspidfSPIBus bus;
-    ::m5::hal::v1::spi::variant::espidf::BusConfig bus_config;
+    static EspidfSpiBus bus;
+    ::m5::hal::v1::spi::BusConfig_espidf bus_config;
     bus_config.host     = M5HAL_TEST_ESPIDF_SPI_HOST;
     bus_config.pin_clk  = M5HAL_TEST_ESPIDF_SPI_PIN_CLK;
     bus_config.pin_mosi = M5HAL_TEST_ESPIDF_SPI_PIN_MOSI;
@@ -78,9 +78,9 @@ EspidfSPIBus& makeBus()
     return bus;
 }
 
-::m5::hal::v1::spi::SPIMasterAccessConfig makeAccessConfig(uint8_t mode = 0, uint8_t order = 0)
+::m5::hal::v1::spi::MasterAccessConfig makeAccessConfig(uint8_t mode = 0, uint8_t order = 0)
 {
-    ::m5::hal::v1::spi::SPIMasterAccessConfig cfg;
+    ::m5::hal::v1::spi::MasterAccessConfig cfg;
     cfg.pin_cs                = M5HAL_TEST_ESPIDF_SPI_PIN_CS;
     cfg.freq                  = M5HAL_TEST_ESPIDF_SPI_FREQ;
     cfg.spi_mode              = mode & 0x03;
@@ -103,9 +103,9 @@ void printWiring()
 
 void testWriteCommandAddressDataWirePhases()
 {
-    EspidfSPIBus& bus = makeBus();
+    EspidfSpiBus& bus = makeBus();
     auto cfg          = makeAccessConfig();
-    ::m5::hal::v1::spi::SPIMasterAccessor spi{bus, cfg};
+    ::m5::hal::v1::spi::MasterAccessor spi{bus, cfg};
 
     const uint8_t tx[] = {0xDE, 0xAD};
     cap::start();
@@ -129,9 +129,9 @@ void testWriteCommandAddressDataWirePhases()
 
 void testReadCommandAddressDataWirePhases()
 {
-    EspidfSPIBus& bus = makeBus();
+    EspidfSpiBus& bus = makeBus();
     auto cfg          = makeAccessConfig();
-    ::m5::hal::v1::spi::SPIMasterAccessor spi{bus, cfg};
+    ::m5::hal::v1::spi::MasterAccessor spi{bus, cfg};
 
     uint8_t rx[4]{};
     cap::start();
@@ -154,9 +154,9 @@ void testReadCommandAddressDataWirePhases()
 
 void testWriteUsesLsbFirstBitOrder()
 {
-    EspidfSPIBus& bus = makeBus();
+    EspidfSpiBus& bus = makeBus();
     auto cfg          = makeAccessConfig(0, 1);
-    ::m5::hal::v1::spi::SPIMasterAccessor spi{bus, cfg};
+    ::m5::hal::v1::spi::MasterAccessor spi{bus, cfg};
 
     const uint8_t tx[] = {0x96};
     cap::start();
@@ -178,9 +178,9 @@ void testSpiModesSetExpectedClockEdges()
     const uint8_t tx[] = {0xA5};
 
     for (uint8_t mode = 0; mode < 4; ++mode) {
-        EspidfSPIBus& bus = makeBus();
+        EspidfSpiBus& bus = makeBus();
         auto cfg          = makeAccessConfig(mode, 0);
-        ::m5::hal::v1::spi::SPIMasterAccessor spi{bus, cfg};
+        ::m5::hal::v1::spi::MasterAccessor spi{bus, cfg};
 
         cap::start();
         auto result = spi.write(::m5::hal::v1::data::ConstDataSpan{tx, sizeof(tx)});

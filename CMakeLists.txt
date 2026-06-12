@@ -40,6 +40,26 @@ if(COMMAND idf_component_register)
         set(m5hal_uart_req driver)
     endif()
 
+    # Arduino as an IDF component: when the arduino-esp32 core is part of the
+    # same build, M5HAL must be compiled with ARDUINO visible too. The variant
+    # offer headers pick the winner in EVERY including TU, so if user code sees
+    # ARDUINO (via its arduino-esp32 dependency) while this component does not,
+    # the two disagree on the winning variant and the link fails (undefined
+    # reference to Bus_arduino members). Depending on the core component
+    # propagates its public ARDUINO defines into M5HAL's own TUs. The core may
+    # appear under its registry name (espressif__arduino-esp32) or as a plain
+    # local component (arduino / arduino-esp32).
+    idf_build_get_property(m5hal_component_targets __COMPONENT_TARGETS)
+    if("___idf_espressif__arduino-esp32" IN_LIST m5hal_component_targets)
+        set(m5hal_arduino_req espressif__arduino-esp32)
+    elseif("___idf_arduino-esp32" IN_LIST m5hal_component_targets)
+        set(m5hal_arduino_req arduino-esp32)
+    elseif("___idf_arduino" IN_LIST m5hal_component_targets)
+        set(m5hal_arduino_req arduino)
+    else()
+        set(m5hal_arduino_req "")
+    endif()
+
     # I2C is special on IDF v5.3+: the default backend uses esp_driver_i2c
     # (driver/i2c_master.h), while M5HAL_CONFIG_IDF_I2C_LEGACY=1 switches the
     # C++ headers to driver/i2c.h. That config is usually a compiler definition,
@@ -47,15 +67,17 @@ if(COMMAND idf_component_register)
     # declares both public dependencies. The C++ feature selection still compiles
     # exactly one backend.
     #
-    # v0/v1 coexistence: register two translation units (M5HAL_v0.cpp and
-    # M5HAL_v1.cpp) separately. The shared macros (M5HAL_FRAMEWORK_HAS_* /
-    # M5HAL_TARGET_PLATFORM_*) collide between v0 and v1, so they cannot be
-    # merged into a single TU.
+    # v0/v1 coexistence: each generation keeps its own implementation TU
+    # (M5HAL_v0.cpp / M5HAL_v1.cpp), registered separately.
     # See spec/design/v0_v1_coexistence.md for the public design rationale.
+    # esp_timer backs the v1 runtime kind (millis/micros, S7) and is included
+    # from a public header, so the dependency must be public. It is NOT one of
+    # ESP-IDF's implicit common components (unlike esp_rom / freertos, which
+    # the runtime kind also uses).
     idf_component_register(
         SRCS "src/M5HAL_v0.cpp" "src/M5HAL_v1.cpp"
         INCLUDE_DIRS "src"
-        REQUIRES M5Utility ${m5hal_gpio_req} ${m5hal_i2c_req} ${m5hal_spi_req} ${m5hal_uart_req}
+        REQUIRES M5Utility esp_timer ${m5hal_gpio_req} ${m5hal_i2c_req} ${m5hal_spi_req} ${m5hal_uart_req} ${m5hal_arduino_req}
     )
 else()
     # PlatformIO espidf standalone build path.

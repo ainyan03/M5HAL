@@ -101,8 +101,8 @@ static constexpr uint8_t AXP2101_ADDR = 0x34;
 // I2C bus: arduino variant when using Arduino framework, espidf variant
 // (flat-injected default) when using ESP-IDF framework.
 #ifdef ARDUINO
-static m5hal::i2c::variant::arduino::Bus i2c_bus;
-static m5hal::i2c::variant::arduino::BusConfig i2c_bus_cfg;
+static m5hal::i2c::Bus_arduino i2c_bus;
+static m5hal::i2c::BusConfig_arduino i2c_bus_cfg;
 #else
 static m5hal::i2c::Bus i2c_bus;
 static m5hal::i2c::BusConfig i2c_bus_cfg;
@@ -110,8 +110,8 @@ static m5hal::i2c::BusConfig i2c_bus_cfg;
 
 // I2S: flat-injected default bus (espidf variant via IDF gen5 driver).
 static m5hal::i2s::Bus i2s_bus;
-static m5hal::i2s::I2SBusConfig i2s_bus_cfg;
-static m5hal::i2s::I2SAccessConfig i2s_access_cfg;
+static m5hal::i2s::BusConfig i2s_bus_cfg;
+static m5hal::i2s::AccessConfig i2s_access_cfg;
 
 static bool audio_ready = false;
 
@@ -121,10 +121,10 @@ static bool audio_ready = false;
 
 static bool i2cWriteReg8(uint8_t dev_addr, uint8_t reg, uint8_t value)
 {
-    m5hal::i2c::I2CMasterAccessConfig cfg;
+    m5hal::i2c::MasterAccessConfig cfg;
     cfg.i2c_addr = dev_addr;
     cfg.freq     = 400000;
-    m5hal::i2c::I2CMasterAccessor acc{i2c_bus, cfg};
+    m5hal::i2c::MasterAccessor acc{i2c_bus, cfg};
     uint8_t buf[2] = {reg, value};
     auto r         = acc.write(buf, sizeof(buf));
     return r.has_value() && r.value() == sizeof(buf);
@@ -134,20 +134,20 @@ static bool i2cWriteReg16BE(uint8_t dev_addr, uint8_t reg, uint16_t value)
 {
     // AW88298 expects MSB first (big-endian)
     uint8_t buf[3] = {reg, static_cast<uint8_t>(value >> 8), static_cast<uint8_t>(value & 0xFF)};
-    m5hal::i2c::I2CMasterAccessConfig cfg;
+    m5hal::i2c::MasterAccessConfig cfg;
     cfg.i2c_addr = dev_addr;
     cfg.freq     = 400000;
-    m5hal::i2c::I2CMasterAccessor acc{i2c_bus, cfg};
+    m5hal::i2c::MasterAccessor acc{i2c_bus, cfg};
     auto r = acc.write(buf, sizeof(buf));
     return r.has_value() && r.value() == sizeof(buf);
 }
 
 static bool i2cReadReg8(uint8_t dev_addr, uint8_t reg, uint8_t& out)
 {
-    m5hal::i2c::I2CMasterAccessConfig cfg;
+    m5hal::i2c::MasterAccessConfig cfg;
     cfg.i2c_addr = dev_addr;
     cfg.freq     = 400000;
-    m5hal::i2c::I2CMasterAccessor acc{i2c_bus, cfg};
+    m5hal::i2c::MasterAccessor acc{i2c_bus, cfg};
     auto r = acc.readRegister(static_cast<int>(reg), &out, 1);
     return r.has_value();
 }
@@ -252,7 +252,8 @@ static void i2sAudioInit(void)
     i2c_bus_cfg.pin_scl = PIN_I2C_SCL;
     i2c_bus_cfg.pin_sda = PIN_I2C_SDA;
 #else
-    i2c_bus_cfg = m5hal::i2c::BusConfig{PIN_I2C_SCL, PIN_I2C_SDA};
+    i2c_bus_cfg.pin_scl = PIN_I2C_SCL;
+    i2c_bus_cfg.pin_sda = PIN_I2C_SDA;
 #endif
     auto r_i2c = i2c_bus.init(i2c_bus_cfg);
     if (!r_i2c.has_value()) {
@@ -293,7 +294,7 @@ static void i2sAudioLoop(void)
     static uint8_t chunk[CHUNK_BYTES];
     fillSineChunk(chunk);
 
-    m5hal::i2s::I2STxAccessor acc{i2s_bus, i2s_access_cfg};
+    m5hal::i2s::TxAccessor acc{i2s_bus, i2s_access_cfg};
     auto r = acc.write(chunk, sizeof(chunk));
     if (!r.has_value()) {
         LOG_PRINTF("I2S write failed: %d\n", static_cast<int>(r.error()));

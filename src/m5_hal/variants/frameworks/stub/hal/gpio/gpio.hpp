@@ -2,9 +2,9 @@
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_STUB_HAL_GPIO_GPIO_HPP
 #define M5_HAL_VARIANTS_FRAMEWORKS_STUB_HAL_GPIO_GPIO_HPP
 
-// GPIO implementation for the `stub` variant — keeps internal state
+// GPIO_stub implementation for the `stub` variant — keeps internal state
 // in memory so native gtests can observe behaviour. The encoded
-// value is the bit position inside the Port (0 .. width - 1).
+// value is the bit position inside the Port_stub (0 .. width - 1).
 // Authoritative spec: spec/design/gpio.md, spec/design/variants.md.
 
 #include "../../../../../hal/v1/gpio/port.hpp"
@@ -12,13 +12,13 @@
 #include "../../../../../hal/v1/gpio/group.hpp"
 #include "../../../../../hal/v1/assert.hpp"
 
-namespace m5::variants::frameworks::stub::hal::v1::gpio {
+namespace m5::hal::v1::gpio {
 
-class Port : public ::m5::hal::v1::gpio::IPort {
+class Port_stub : public ::m5::hal::v1::gpio::IPort {
 public:
     static constexpr uint8_t kMaxWidth = 32;
 
-    explicit Port(uint8_t width = kMaxWidth, ::m5::hal::v1::types::gpio_local_pin_t base = 0)
+    explicit Port_stub(uint8_t width = kMaxWidth, ::m5::hal::v1::types::gpio_local_pin_t base = 0)
         : _width{width}, _base{base}
     {
         M5HAL_ASSERT(width <= kMaxWidth, "width exceeds kMaxWidth");
@@ -65,16 +65,16 @@ private:
     ::m5::hal::v1::types::gpio_local_pin_t _base;
 };
 
-// One built-in Port (32-bit, base = 0). The mutable state forbids
+// One built-in Port_stub (32-bit, base = 0). The mutable state forbids
 // `constexpr`, so this is placed in RAM via a function-local static.
 // `_port` is `mutable` so the `const` virtual overrides can drive it.
-class GPIO : public ::m5::hal::v1::gpio::IGPIO {
+class GPIO_stub : public ::m5::hal::v1::gpio::IGPIO {
 public:
-    GPIO() = default;
+    GPIO_stub() = default;
 
     ::m5::hal::v1::gpio::IPort* portForPin(::m5::hal::v1::types::gpio_local_pin_t pin_index) const override
     {
-        M5HAL_ASSERT(pin_index < static_cast<::m5::hal::v1::types::gpio_local_pin_t>(Port::kMaxWidth),
+        M5HAL_ASSERT(pin_index < static_cast<::m5::hal::v1::types::gpio_local_pin_t>(Port_stub::kMaxWidth),
                      "pin_index out of range");
         return &_port;
     }
@@ -85,7 +85,7 @@ public:
     }
     uint16_t getPinCount() const override
     {
-        return Port::kMaxWidth;
+        return Port_stub::kMaxWidth;
     }
     uint8_t getPortCount() const override
     {
@@ -93,28 +93,28 @@ public:
     }
 
 private:
-    mutable Port _port{};
+    mutable Port_stub _port{};
 };
 
-// MCU-internal GPIO (mutable state means it cannot be constexpr; uses
+// MCU-internal GPIO_stub (mutable state means it cannot be constexpr; uses
 // a function-local static).
-inline const ::m5::hal::v1::gpio::IGPIO* getMCUGPIO()
+inline const ::m5::hal::v1::gpio::IGPIO* getMCUGPIO_stub()
 {
-    static GPIO s_instance;
+    static GPIO_stub s_instance;
     return &s_instance;
 }
 
-// Flat-injection entry: the MCU-internal GPIO as an `IGPIO*` (the
+// Flat-injection entry: the MCU-internal GPIO_stub as an `IGPIO*` (the
 // local pin space). `M5HALCore::ctor` uses this as the slot-0
 // bootstrap source.
-inline const ::m5::hal::v1::gpio::IGPIO* getGPIO()
+inline const ::m5::hal::v1::gpio::IGPIO* getGPIO_stub()
 {
-    return getMCUGPIO();
+    return getMCUGPIO_stub();
 }
 
 // `getGPIOGroup()` / `pin()` free functions are gone. Global lookups
 // go through `m5::hal::v1::M5_Hal.Gpio.getPin(num)`.
 
-}  // namespace m5::variants::frameworks::stub::hal::v1::gpio
+}  // namespace m5::hal::v1::gpio
 
 #endif

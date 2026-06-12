@@ -77,9 +77,9 @@ result_t<size_t> drainAndFeed(data::Source* tx, data::Sink* rx, Vec& tx_log, con
     return done;
 }
 
-class CaptureI2CBus : public i2c::I2CBus {
+class CaptureI2cBus : public i2c::IBus {
 public:
-    result_t<void> init(const i2c::I2CBusConfig&)
+    result_t<void> init(const i2c::IBusConfig&)
     {
         return {};
     }
@@ -87,7 +87,7 @@ public:
     {
         return {};
     }
-    result_t<size_t> transfer(bus::Accessor*, const i2c::I2CMasterAccessConfig& cfg, const i2c::TransferDesc& desc,
+    result_t<size_t> transfer(bus::IAccessor*, const i2c::MasterAccessConfig& cfg, const i2c::TransferDesc& desc,
                               data::Source* tx, data::Sink* rx) override
     {
         ++transfer_count;
@@ -105,9 +105,9 @@ public:
     std::vector<uint8_t> rx_script;
 };
 
-class CaptureSPIBus : public spi::SPIBus {
+class CaptureSpiBus : public spi::IBus {
 public:
-    result_t<void> init(const spi::SPIBusConfig&)
+    result_t<void> init(const spi::IBusConfig&)
     {
         return {};
     }
@@ -115,7 +115,7 @@ public:
     {
         return {};
     }
-    result_t<size_t> transfer(bus::Accessor*, const spi::SPIMasterAccessConfig&, const spi::TransferDesc& desc,
+    result_t<size_t> transfer(bus::IAccessor*, const spi::MasterAccessConfig&, const spi::TransferDesc& desc,
                               data::Source* tx, data::Sink* rx) override
     {
         ++transfer_count;
@@ -129,22 +129,22 @@ public:
     std::vector<uint8_t> rx_script;
 };
 
-class CaptureUARTBus : public uart::UARTBus {
+class CaptureUartBus : public uart::IBus {
 public:
-    result_t<size_t> write(bus::Accessor*, const uart::UARTAccessConfig&, data::Source* tx, size_t len) override
+    result_t<size_t> write(bus::IAccessor*, const uart::AccessConfig&, data::Source* tx, size_t len) override
     {
         (void)len;
         std::vector<uint8_t> ignored;
         return drainAndFeed(tx, nullptr, tx_bytes, ignored);
     }
-    result_t<size_t> read(bus::Accessor*, const uart::UARTAccessConfig&, data::Sink* rx, size_t len) override
+    result_t<size_t> read(bus::IAccessor*, const uart::AccessConfig&, data::Sink* rx, size_t len) override
     {
         std::vector<uint8_t> ignored;
         std::vector<uint8_t> chunk{rx_script.begin(),
                                    rx_script.begin() + static_cast<ptrdiff_t>(std::min(len, rx_script.size()))};
         return drainAndFeed(nullptr, rx, ignored, chunk);
     }
-    result_t<size_t> readableBytes(bus::Accessor*, const uart::UARTAccessConfig&) override
+    result_t<size_t> readableBytes(bus::IAccessor*, const uart::AccessConfig&) override
     {
         return rx_script.size();
     }
@@ -156,14 +156,14 @@ public:
 // Stream-bus fake: accepts at most `accept_limit` bytes per write (the
 // rest is "dropped" so the runner sees a short accept), logs config, and
 // reports a programmable writableBytes.
-class StubI2SBus : public i2s::I2SBus {
+class StubI2sBus : public i2s::IBus {
 public:
-    result_t<void> init(const i2s::I2SBusConfig& config)
+    result_t<void> init(const i2s::IBusConfig& config)
     {
         _config = config;
         return {};
     }
-    result_t<size_t> write(bus::Accessor*, const i2s::I2SAccessConfig& cfg, data::Source* tx, size_t len) override
+    result_t<size_t> write(bus::IAccessor*, const i2s::AccessConfig& cfg, data::Source* tx, size_t len) override
     {
         last_cfg = cfg;
         // Drain everything from tx, but only "accept" up to accept_limit.
@@ -180,7 +180,7 @@ public:
         written.insert(written.end(), buf.begin(), buf.begin() + static_cast<ptrdiff_t>(accepted));
         return accepted;
     }
-    result_t<size_t> writableBytes(bus::Accessor*, const i2s::I2SAccessConfig&) override
+    result_t<size_t> writableBytes(bus::IAccessor*, const i2s::AccessConfig&) override
     {
         return writable;
     }
@@ -188,7 +188,7 @@ public:
     size_t accept_limit = static_cast<size_t>(-1);  // bytes accepted per write
     size_t writable     = 4096;                     // writableBytes() report
     std::vector<uint8_t> written;
-    i2s::I2SAccessConfig last_cfg{};
+    i2s::AccessConfig last_cfg{};
 };
 
 // Recording GPIO port: scripted read levels, logged writes / modes.
@@ -311,21 +311,21 @@ TEST(BytecodeLenVar, ShortInputAndReservedMarker)
 // ============================================================================
 
 struct Rig {
-    CaptureI2CBus i2c_bus;
-    CaptureSPIBus spi_bus;
-    CaptureUARTBus uart_bus;
-    StubI2SBus i2s_bus;
+    CaptureI2cBus i2c_bus;
+    CaptureSpiBus spi_bus;
+    CaptureUartBus uart_bus;
+    StubI2sBus i2s_bus;
     RecordingGPIO gpio_dev;
     gpio::GPIOGroup gpio_group{&gpio_dev};
 
-    i2c::I2CMasterAccessConfig i2c_cfg{};
-    spi::SPIMasterAccessConfig spi_cfg{};
-    uart::UARTAccessConfig uart_cfg{};
-    i2s::I2SAccessConfig i2s_cfg{};
-    i2c::I2CMasterAccessor i2c_acc{i2c_bus, i2c_cfg};
-    spi::SPIMasterAccessor spi_acc{spi_bus, spi_cfg};
-    uart::UARTAccessor uart_acc{uart_bus, uart_cfg};
-    i2s::I2STxAccessor i2s_acc{i2s_bus, i2s_cfg};
+    i2c::MasterAccessConfig i2c_cfg{};
+    spi::MasterAccessConfig spi_cfg{};
+    uart::AccessConfig uart_cfg{};
+    i2s::AccessConfig i2s_cfg{};
+    i2c::MasterAccessor i2c_acc{i2c_bus, i2c_cfg};
+    spi::MasterAccessor spi_acc{spi_bus, spi_cfg};
+    uart::Accessor uart_acc{uart_bus, uart_cfg};
+    i2s::TxAccessor i2s_acc{i2s_bus, i2s_cfg};
 
     bytecode::BytecodeRunner runner;
 
@@ -359,7 +359,7 @@ TEST(BytecodeRunner, DelayDispatchesToInjectedFn)
 TEST(BytecodeRunner, ConfigureReachesAccessor)
 {
     Rig rig;
-    i2c::I2CMasterAccessConfig cfg;
+    i2c::MasterAccessConfig cfg;
     cfg.freq             = 400000;
     cfg.i2c_addr         = 0x42;
     cfg.address_is_10bit = true;
@@ -372,7 +372,7 @@ TEST(BytecodeRunner, ConfigureReachesAccessor)
     ASSERT_TRUE(enc.end().has_value());
 
     ASSERT_TRUE(rig.runner.run(data::ConstDataSpan{buf, sizeof(buf)}).has_value());
-    const auto& applied = static_cast<const i2c::I2CMasterAccessConfig&>(rig.i2c_acc.getConfig());
+    const auto& applied = static_cast<const i2c::MasterAccessConfig&>(rig.i2c_acc.getConfig());
     EXPECT_EQ(applied.freq, 400000u);
     EXPECT_EQ(applied.i2c_addr, 0x42);
     EXPECT_TRUE(applied.address_is_10bit);
@@ -463,9 +463,8 @@ TEST(BytecodeRunner, UARTTransferTracksActualReadCount)
 TEST(BytecodeStream, ConfigureDecodesI2S)
 {
     Rig rig;
-    i2s::I2SAccessConfig cfg;
+    i2s::AccessConfig cfg;
     cfg.sample_rate_hz   = 48000;
-    cfg.timeout_ms       = 250;
     cfg.write_timeout_ms = 0;
     cfg.bits_per_sample  = 16;
     cfg.channels         = 1;
@@ -477,9 +476,8 @@ TEST(BytecodeStream, ConfigureDecodesI2S)
     ASSERT_TRUE(enc.end().has_value());
 
     ASSERT_TRUE(rig.runner.run(data::ConstDataSpan{buf, sink.written()}).has_value());
-    const auto& applied = static_cast<const i2s::I2SAccessConfig&>(rig.i2s_acc.getConfig());
+    const auto& applied = static_cast<const i2s::AccessConfig&>(rig.i2s_acc.getConfig());
     EXPECT_EQ(applied.sample_rate_hz, 48000u);
-    EXPECT_EQ(applied.timeout_ms, 250u);
     EXPECT_EQ(applied.write_timeout_ms, 0u);
     EXPECT_EQ(applied.bits_per_sample, 16);
     EXPECT_EQ(applied.channels, 1);
@@ -904,7 +902,7 @@ TEST(BytecodeRunner, RunsFromChunkedStream)
     EXPECT_EQ(rig.runner.storedData(3).size, 1u);
 }
 
-// ---- S16 D8: symmetric trust boundary -----------------------------------------
+// ---- Symmetric trust boundary -----------------------------------------
 
 TEST(BytecodeRunner, ReceiveOnlyRejectsExecutableOpcodes)
 {

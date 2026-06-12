@@ -4,7 +4,7 @@
 
 #include "uart.hpp"
 
-#if M5HAL_FRAMEWORK_HAS_POSIX
+#if M5HAL_FRAMEWORK_HAS_POSIX && M5HAL_CONFIG_POSIX_UART
 
 #include <algorithm>
 #include <errno.h>
@@ -21,9 +21,10 @@
 #include <IOKit/serial/ioss.h>
 #endif
 
-namespace m5::variants::frameworks::posix::hal::v1::uart {
+namespace m5::hal::v1::uart {
 
 namespace {
+namespace impl_posix {
 
 // Map a numeric baud rate to a termios speed_t, returning false if this libc
 // has no B* constant for it. Rates above the POSIX-standard set are #ifdef
@@ -31,7 +32,7 @@ namespace {
 // B460800..B4000000, so those high rates take this path there. macOS termios
 // stops at B230400; higher rates return false here and applyConfig() sets them
 // via the IOSSIOSPEED ioctl instead (validated to 3 Mbaud against real hardware
-// in LovyanAPI). Single source of truth for the table; Bus::baudToSpeed() is a
+// in LovyanAPI). Single source of truth for the table; Bus_posix::baudToSpeed() is a
 // thin public wrapper over it for unit tests.
 bool baudConstant(uint32_t baud, speed_t& out)
 {
@@ -128,7 +129,7 @@ bool baudConstant(uint32_t baud, speed_t& out)
     }
 }
 
-bool sameConfig(const ::m5::hal::v1::uart::UARTAccessConfig& lhs, const ::m5::hal::v1::uart::UARTAccessConfig& rhs)
+bool sameConfig(const ::m5::hal::v1::uart::AccessConfig& lhs, const ::m5::hal::v1::uart::AccessConfig& rhs)
 {
     return lhs.baud_rate == rhs.baud_rate && lhs.data_bits == rhs.data_bits && lhs.stop_bits == rhs.stop_bits &&
            lhs.parity == rhs.parity && lhs.invert == rhs.invert;
@@ -156,19 +157,20 @@ int waitFd(int fd, bool for_write, uint32_t timeout_ms)
     return ::m5::hal::v1::error::error_t::IO_ERROR;
 }
 
+}  // namespace impl_posix
 }  // namespace
 
-bool Bus::baudToSpeed(uint32_t baud, uint32_t& out_speed)
+bool Bus_posix::baudToSpeed(uint32_t baud, uint32_t& out_speed)
 {
     speed_t s = 0;
-    if (!baudConstant(baud, s)) {
+    if (!impl_posix::baudConstant(baud, s)) {
         return false;
     }
     out_speed = static_cast<uint32_t>(s);
     return true;
 }
 
-::m5::hal::v1::result_t<void> Bus::init(const BusConfig& config)
+::m5::hal::v1::result_t<void> Bus_posix::init(const BusConfig_posix& config)
 {
     (void)release();
     _config      = config;
@@ -177,7 +179,7 @@ bool Bus::baudToSpeed(uint32_t baud, uint32_t& out_speed)
     return {};
 }
 
-::m5::hal::v1::result_t<void> Bus::release(void)
+::m5::hal::v1::result_t<void> Bus_posix::release(void)
 {
     if (_owns_fd && _fd >= 0) {
         ::close(_fd);
@@ -188,7 +190,7 @@ bool Bus::baudToSpeed(uint32_t baud, uint32_t& out_speed)
     return {};
 }
 
-::m5::hal::v1::error::error_t Bus::open(const char* device_path, uint32_t baud)
+::m5::hal::v1::error::error_t Bus_posix::open(const char* device_path, uint32_t baud)
 {
     (void)release();
     if (device_path == nullptr) {
@@ -196,13 +198,13 @@ bool Bus::baudToSpeed(uint32_t baud, uint32_t& out_speed)
     }
     int fd = ::open(device_path, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) {
-        return posixIOError();
+        return impl_posix::posixIOError();
     }
     _fd      = fd;
     _owns_fd = true;
     _begun   = false;
 
-    ::m5::hal::v1::uart::UARTAccessConfig cfg;
+    ::m5::hal::v1::uart::AccessConfig cfg;
     cfg.baud_rate = baud;
     auto applied  = applyConfig(cfg);
     if (!applied.has_value()) {
@@ -212,7 +214,7 @@ bool Bus::baudToSpeed(uint32_t baud, uint32_t& out_speed)
     return ::m5::hal::v1::error::error_t::OK;
 }
 
-::m5::hal::v1::error::error_t Bus::attach(int fd)
+::m5::hal::v1::error::error_t Bus_posix::attach(int fd)
 {
     (void)release();
     _fd      = fd;
@@ -223,7 +225,7 @@ bool Bus::baudToSpeed(uint32_t baud, uint32_t& out_speed)
     // that writes before our first read sees a raw — not canonical — slave and
     // the bytes are delivered rather than line-buffered. The real per-access
     // baud/format is re-applied on the first write/read if it differs.
-    ::m5::hal::v1::uart::UARTAccessConfig cfg;
+    ::m5::hal::v1::uart::AccessConfig cfg;
     auto applied = applyConfig(cfg);
     if (!applied.has_value()) {
         return applied.error();
@@ -231,7 +233,7 @@ bool Bus::baudToSpeed(uint32_t baud, uint32_t& out_speed)
     return ::m5::hal::v1::error::error_t::OK;
 }
 
-::m5::hal::v1::result_t<void> Bus::applyConfig(const ::m5::hal::v1::uart::UARTAccessConfig& cfg)
+::m5::hal::v1::result_t<void> Bus_posix::applyConfig(const ::m5::hal::v1::uart::AccessConfig& cfg)
 {
     if (cfg.baud_rate == 0 || cfg.data_bits != 8 || (cfg.stop_bits != 1 && cfg.stop_bits != 2)) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
@@ -244,19 +246,19 @@ bool Bus::baudToSpeed(uint32_t baud, uint32_t& out_speed)
         }
         int fd = ::open(_device_path, O_RDWR | O_NOCTTY | O_NONBLOCK);
         if (fd < 0) {
-            return m5::stl::make_unexpected(posixIOError());
+            return m5::stl::make_unexpected(impl_posix::posixIOError());
         }
         _fd      = fd;
         _owns_fd = true;
         _begun   = false;
     }
 
-    if (_begun && sameConfig(_applied_cfg, cfg)) {
+    if (_begun && impl_posix::sameConfig(_applied_cfg, cfg)) {
         return {};
     }
 
     speed_t speed          = 0;
-    const bool have_bconst = baudConstant(cfg.baud_rate, speed);
+    const bool have_bconst = impl_posix::baudConstant(cfg.baud_rate, speed);
 #if !defined(__APPLE__)
     // Linux/other: only rates that have a termios B* constant are supported.
     // glibc/musl provide B460800..B4000000, covering the standard high rates.
@@ -267,7 +269,7 @@ bool Bus::baudToSpeed(uint32_t baud, uint32_t& out_speed)
 
     struct termios tio;
     if (::tcgetattr(_fd, &tio) != 0) {
-        return m5::stl::make_unexpected(posixIOError());
+        return m5::stl::make_unexpected(impl_posix::posixIOError());
     }
     ::cfmakeraw(&tio);
     // A rate without a B* constant (macOS high baud) gets a placeholder here; the
@@ -299,12 +301,12 @@ bool Bus::baudToSpeed(uint32_t baud, uint32_t& out_speed)
             return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
     tio.c_cflag |= static_cast<tcflag_t>(CLOCAL | CREAD);
-    // Non-blocking semantics; timeouts are enforced by waitFd()/select().
+    // Non-blocking semantics; timeouts are enforced by impl_posix::waitFd()/select().
     tio.c_cc[VMIN]  = 0;
     tio.c_cc[VTIME] = 0;
 
     if (::tcsetattr(_fd, TCSANOW, &tio) != 0) {
-        return m5::stl::make_unexpected(posixIOError());
+        return m5::stl::make_unexpected(impl_posix::posixIOError());
     }
 #if defined(__APPLE__)
     // Set a baud that termios has no B* constant for (e.g. 0.5/1/2/3 Mbaud).
@@ -330,7 +332,7 @@ bool Bus::baudToSpeed(uint32_t baud, uint32_t& out_speed)
     return {};
 }
 
-::m5::hal::v1::result_t<size_t> Bus::rawWrite(const uint8_t* data, size_t len, uint32_t timeout_ms)
+::m5::hal::v1::result_t<size_t> Bus_posix::rawWrite(const uint8_t* data, size_t len, uint32_t timeout_ms)
 {
     size_t done = 0;
     while (done < len) {
@@ -340,12 +342,12 @@ bool Bus::baudToSpeed(uint32_t baud, uint32_t& out_speed)
                 continue;
             }
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                if (waitFd(_fd, true, timeout_ms) > 0) {
+                if (impl_posix::waitFd(_fd, true, timeout_ms) > 0) {
                     continue;
                 }
                 break;  // write timeout
             }
-            return m5::stl::make_unexpected(posixIOError());
+            return m5::stl::make_unexpected(impl_posix::posixIOError());
         }
         if (n == 0) {
             break;
@@ -355,7 +357,7 @@ bool Bus::baudToSpeed(uint32_t baud, uint32_t& out_speed)
     return done;
 }
 
-::m5::hal::v1::result_t<void> Bus::flushCoalesced(uint32_t timeout_ms)
+::m5::hal::v1::result_t<void> Bus_posix::flushCoalesced(uint32_t timeout_ms)
 {
     if (_co_used == 0) {
         return {};
@@ -372,9 +374,9 @@ bool Bus::baudToSpeed(uint32_t baud, uint32_t& out_speed)
     return {};
 }
 
-::m5::hal::v1::result_t<size_t> Bus::write(::m5::hal::v1::bus::Accessor* owner,
-                                           const ::m5::hal::v1::uart::UARTAccessConfig& cfg,
-                                           ::m5::hal::v1::data::Source* tx, size_t len)
+::m5::hal::v1::result_t<size_t> Bus_posix::write(::m5::hal::v1::bus::IAccessor* owner,
+                                                 const ::m5::hal::v1::uart::AccessConfig& cfg,
+                                                 ::m5::hal::v1::data::Source* tx, size_t len)
 {
     (void)owner;
     auto applied = applyConfig(cfg);
@@ -433,9 +435,9 @@ bool Bus::baudToSpeed(uint32_t baud, uint32_t& out_speed)
     return done;
 }
 
-::m5::hal::v1::result_t<size_t> Bus::read(::m5::hal::v1::bus::Accessor* owner,
-                                          const ::m5::hal::v1::uart::UARTAccessConfig& cfg,
-                                          ::m5::hal::v1::data::Sink* rx, size_t len)
+::m5::hal::v1::result_t<size_t> Bus_posix::read(::m5::hal::v1::bus::IAccessor* owner,
+                                                const ::m5::hal::v1::uart::AccessConfig& cfg,
+                                                ::m5::hal::v1::data::Sink* rx, size_t len)
 {
     (void)owner;
     auto applied = applyConfig(cfg);
@@ -452,9 +454,9 @@ bool Bus::baudToSpeed(uint32_t baud, uint32_t& out_speed)
     while (rx != nullptr && !rx->closed() && done < len) {
         // first byte vs. inter-byte gap timeout (mirrors the arduino variant).
         const uint32_t timeout = (done == 0) ? cfg.first_byte_timeout_ms : cfg.inter_byte_timeout_ms;
-        int ready              = waitFd(_fd, false, timeout);
+        int ready              = impl_posix::waitFd(_fd, false, timeout);
         if (ready < 0) {
-            return m5::stl::make_unexpected(posixIOError());
+            return m5::stl::make_unexpected(impl_posix::posixIOError());
         }
         if (ready == 0) {
             break;  // timed out waiting for (more) data
@@ -471,7 +473,7 @@ bool Bus::baudToSpeed(uint32_t baud, uint32_t& out_speed)
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
                 continue;
             }
-            return m5::stl::make_unexpected(posixIOError());
+            return m5::stl::make_unexpected(impl_posix::posixIOError());
         }
         if (n == 0) {
             break;  // EOF / hang-up
@@ -485,8 +487,8 @@ bool Bus::baudToSpeed(uint32_t baud, uint32_t& out_speed)
     return done;
 }
 
-::m5::hal::v1::result_t<size_t> Bus::readableBytes(::m5::hal::v1::bus::Accessor* owner,
-                                                   const ::m5::hal::v1::uart::UARTAccessConfig& cfg)
+::m5::hal::v1::result_t<size_t> Bus_posix::readableBytes(::m5::hal::v1::bus::IAccessor* owner,
+                                                         const ::m5::hal::v1::uart::AccessConfig& cfg)
 {
     (void)owner;
     auto applied = applyConfig(cfg);
@@ -501,13 +503,13 @@ bool Bus::baudToSpeed(uint32_t baud, uint32_t& out_speed)
     }
     int avail = 0;
     if (::ioctl(_fd, FIONREAD, &avail) != 0 || avail < 0) {
-        return m5::stl::make_unexpected(posixIOError());
+        return m5::stl::make_unexpected(impl_posix::posixIOError());
     }
     return static_cast<size_t>(avail);
 }
 
-}  // namespace m5::variants::frameworks::posix::hal::v1::uart
+}  // namespace m5::hal::v1::uart
 
-#endif  // M5HAL_FRAMEWORK_HAS_POSIX
+#endif  // M5HAL_FRAMEWORK_HAS_POSIX && M5HAL_CONFIG_POSIX_UART
 
 #endif

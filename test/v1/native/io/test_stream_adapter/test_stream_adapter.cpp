@@ -370,7 +370,7 @@ TEST(StreamSink, ShortWriteIsTimeout)
     auto committed = snk.commit(4);
     ASSERT_FALSE(committed.has_value());
     // Short writes classify as TIMEOUT_ERROR (retryable), symmetric with
-    // the read side (S16 D10).
+    // the read side.
     EXPECT_EQ(committed.error(), error_t::TIMEOUT_ERROR);
 }
 

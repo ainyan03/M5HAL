@@ -42,16 +42,19 @@
 #define M5HAL_FRAMEWORK_HAS_FREERTOS 0
 #endif
 
-// POSIX host framework variant (termios serial). Opt-out, not opt-in: on a
-// plain POSIX host (no Arduino / ESP-IDF SDK in the build) the host serial
-// port is what a real application wants, so posix is the default UART
-// provider there. stub keeps no-op'ing the HAL kinds that have no host
-// implementation. Set M5HAL_CONFIG_POSIX_UART=0 to suppress it (e.g. a host
-// test that wants UART left unprovided).
+// POSIX host framework variant: active on a plain POSIX host (no Arduino /
+// ESP-IDF SDK in the build). Offers UART (termios serial) and runtime
+// (CLOCK_MONOTONIC time + std::timed_mutex). UART is opt-out, not opt-in:
+// the host serial port is what a real application wants, so posix is the
+// default UART provider there; set M5HAL_CONFIG_POSIX_UART=0 to leave UART
+// unprovided (e.g. a host test). The opt-out is scoped to the UART kind —
+// it must not deactivate the variant, or every Bus on the host would
+// silently fall back to the stub fake mutex. stub keeps no-op'ing the
+// HAL kinds that have no host implementation.
 #ifndef M5HAL_CONFIG_POSIX_UART
 #define M5HAL_CONFIG_POSIX_UART 1
 #endif
-#if M5HAL_CONFIG_POSIX_UART && !defined(ESP_PLATFORM) && !defined(ARDUINO) && __has_include(<termios.h>)
+#if !defined(ESP_PLATFORM) && !defined(ARDUINO) && __has_include(<termios.h>)
 #define M5HAL_FRAMEWORK_HAS_POSIX 1
 #else
 #define M5HAL_FRAMEWORK_HAS_POSIX 0

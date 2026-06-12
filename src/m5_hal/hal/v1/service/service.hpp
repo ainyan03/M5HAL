@@ -51,7 +51,7 @@ M5HAL_INLINE_V1 namespace v1
         // with elapsedTicks()/hasReached(). Converting an ABSOLUTE tick
         // to nanoseconds is forbidden here: the conversion is not
         // continuous across the 2^32 wrap unless the factor divides
-        // exactly (S16 D2), which is why the context carries the raw
+        // exactly, which is why the context carries the raw
         // tick and durations are converted the other way
         // (nsecToFastTickCeil) instead.
         fast_tick_t now_tick = 0;
@@ -79,7 +79,7 @@ M5HAL_INLINE_V1 namespace v1
       factor K = (1e9<<16)/f makes the mapping discontinuous at the
       2^32 boundary unless K is a multiple of 2^16 (at 240 MHz the
       timeline jumps ~0.717 s every ~17.9 s). Absolute time stays in
-      ticks (S16 D2).
+      ticks.
      */
     constexpr tick_nsec_t fastTickToNsec(fast_tick_t tick, uint32_t frequency_hz)
     {
@@ -147,7 +147,7 @@ M5HAL_INLINE_V1 namespace v1
     /*! @brief Default ServiceContext clock: the raw fastTick() count.
         (The former defaultNowNsec()/fastTickNsec() converted the absolute
         tick through fastTickToNsec, inheriting its wrap discontinuity —
-        removed, S16 D2.) */
+        removed.) */
     inline fast_tick_t defaultNowTick()
     {
         return fastTick();

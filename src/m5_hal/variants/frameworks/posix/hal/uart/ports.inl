@@ -4,7 +4,7 @@
 
 #include "./ports.hpp"
 
-#if M5HAL_FRAMEWORK_HAS_POSIX
+#if M5HAL_FRAMEWORK_HAS_POSIX && M5HAL_CONFIG_POSIX_UART
 
 #include <dirent.h>
 #include <stdio.h>
@@ -114,6 +114,6 @@ size_t listSerialPorts(SerialPortInfo* out, size_t capacity)
 
 }  // namespace m5::variants::frameworks::posix::hal::v1::uart
 
-#endif  // M5HAL_FRAMEWORK_HAS_POSIX
+#endif  // M5HAL_FRAMEWORK_HAS_POSIX && M5HAL_CONFIG_POSIX_UART
 
 #endif

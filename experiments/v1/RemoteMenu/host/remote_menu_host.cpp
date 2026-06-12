@@ -2,7 +2,7 @@
 //
 // M5HAL — RemoteMenu (host side, PC)
 //
-// Integrated stdin menu CLI for the decisions/022-024 acceptance harness.
+// Integrated stdin menu CLI for the remote bus acceptance harness.
 // Combines the former RemoteBus / RemoteI2S example host programs into one
 // TU (their device sketches are folded into ../device/remote_menu_device.cpp).
 //
@@ -27,7 +27,7 @@
 #include <unistd.h>
 
 namespace m5hal      = m5::hal::v1;
-namespace posix_uart = m5hal::uart::variant::posix;
+namespace posix_uart = ::m5::variants::frameworks::posix::hal::v1::uart;
 // The TCP transport is not a bus kind, so it has no `variant::` alias —
 // name the posix variant namespace directly.
 namespace posix_tcp = m5::variants::frameworks::posix::hal::v1::tcp;
@@ -162,12 +162,12 @@ static unsigned long runToneLoop(uint32_t run_sec, bool mute, uint32_t rate, uin
         remote_i2s.setStreamWindow(window_override);
         ::printf("stream window override: %u bytes\n", static_cast<unsigned>(window_override));
     }
-    m5hal::i2s::I2SAccessConfig acc_cfg;
+    m5hal::i2s::AccessConfig acc_cfg;
     acc_cfg.sample_rate_hz   = s_sample_rate;
     acc_cfg.bits_per_sample  = 16;
     acc_cfg.channels         = static_cast<uint8_t>(s_channels);
     acc_cfg.write_timeout_ms = 100;
-    m5hal::i2s::I2STxAccessor dev{remote_i2s, acc_cfg};
+    m5hal::i2s::TxAccessor dev{remote_i2s, acc_cfg};
 
     uint8_t chunk[kChunkSamples * 2 * sizeof(int16_t)];  // max channels = 2
 
@@ -203,7 +203,12 @@ static unsigned long runToneLoop(uint32_t run_sec, bool mute, uint32_t rate, uin
     unsigned long last_sent  = 0;
     size_t credit_log_len    = 0;
 
-    ::printf("streaming to remote I2S bus %d — press Enter to stop\n", i2s_bus_id);
+    if (run_sec > 0) {
+        ::printf("streaming to remote I2S bus %d for %us (stdin ignored — deterministic run)\n", i2s_bus_id,
+                 static_cast<unsigned>(run_sec));
+    } else {
+        ::printf("streaming to remote I2S bus %d — press Enter to stop\n", i2s_bus_id);
+    }
 
     for (;;) {
         // Drain pending acks (credit events) BEFORE staging more data: this
@@ -230,8 +235,11 @@ static unsigned long runToneLoop(uint32_t run_sec, bool mute, uint32_t rate, uin
             }
             if (pace_budget < slice_bytes) {
                 (void)g_session->poll(1);
-                // Check for Enter between pacing ticks.
-                if (stdinHasData()) {
+                // Check for Enter between pacing ticks — interactive
+                // (open-ended) runs only: a timed run ignores stdin so
+                // scripted/piped invocations are deterministic (queued
+                // bytes such as a trailing 'quit' must not cut it short).
+                if (run_sec == 0 && stdinHasData()) {
                     (void)::getchar();
                     break;
                 }
@@ -275,8 +283,9 @@ static unsigned long runToneLoop(uint32_t run_sec, bool mute, uint32_t rate, uin
             }
         }
 
-        // Check for Enter (non-blocking) to abort.
-        if (!g_serial_link && stdinHasData()) {
+        // Check for Enter (non-blocking) to abort — interactive runs
+        // only (see the pacing-tick check above for the rationale).
+        if (run_sec == 0 && !g_serial_link && stdinHasData()) {
             (void)::getchar();
             break;
         }
@@ -345,9 +354,9 @@ void cmdPing(char* args)
 void cmdScan(char* /*args*/)
 {
     m5hal::remote::RemoteI2CBus remote_bus{*g_session, 0};
-    m5hal::i2c::I2CMasterAccessConfig acc_cfg;
-    acc_cfg.timeout_ms = 100;
-    m5hal::i2c::I2CMasterAccessor dev{remote_bus, acc_cfg};
+    m5hal::i2c::MasterAccessConfig acc_cfg;
+    acc_cfg.wire_timeout_ms = 100;
+    m5hal::i2c::MasterAccessor dev{remote_bus, acc_cfg};
 
     ::printf("scanning remote I2C bus...\n");
     size_t found = 0;
@@ -399,10 +408,10 @@ void cmdReg(char* args)
     }
 
     m5hal::remote::RemoteI2CBus remote_bus{*g_session, 0};
-    m5hal::i2c::I2CMasterAccessConfig acc_cfg;
-    acc_cfg.timeout_ms = 100;
+    m5hal::i2c::MasterAccessConfig acc_cfg;
+    acc_cfg.wire_timeout_ms = 100;
     acc_cfg.i2c_addr   = static_cast<uint16_t>(i2c_a);
-    m5hal::i2c::I2CMasterAccessor dev{remote_bus, acc_cfg};
+    m5hal::i2c::MasterAccessor dev{remote_bus, acc_cfg};
 
     // Read each byte via single-byte readRegister calls.
     ::printf("I2C 0x%02X reg 0x%02X [%u byte(s)]:", static_cast<unsigned>(i2c_a), static_cast<unsigned>(reg_a),
@@ -593,6 +602,7 @@ void cmdTone(char* args)
     uint32_t ch     = 2;
     uint32_t window = 0;
     uint32_t hz     = 440;
+    uint32_t sec    = 0;  // 0 = run until Enter; >0 = run exactly that long
 
     const char* p = (args != nullptr) ? args : "";
     if (parseU32(p, &rate)) {
@@ -601,12 +611,15 @@ void cmdTone(char* args)
             p = nextToken(p);
             if (parseU32(p, &window)) {
                 p = nextToken(p);
-                (void)parseU32(p, &hz);
+                if (parseU32(p, &hz)) {
+                    p = nextToken(p);
+                    (void)parseU32(p, &sec);
+                }
             }
         }
     }
 
-    (void)runToneLoop(0, false, rate, ch, window, hz, nullptr, 0, nullptr);
+    (void)runToneLoop(sec, false, rate, ch, window, hz, nullptr, 0, nullptr);
 }
 
 void cmdSoak(char* args)
@@ -727,8 +740,8 @@ static const Command kCommands[] = {
     {"gpio-read", "", "snapshot of pins 39/38/37", cmdGpioRead},
     {"gpio-write", "<pin> <0|1>", "write to any pin (allowlist outside 39/38/37 is denied)", cmdGpioWrite},
     {"watch", "", "subscribe pin 39/38/37 push events, Enter to stop", cmdWatch},
-    {"tone", "[rate] [ch] [window] [hz]", "sine stream (44100/2/lib/440), Enter to stop", cmdTone},
-    {"soak", "<sec> [rate] [ch] [window]", "mute tone for <sec>s, print credit/rate judgment", cmdSoak},
+    {"tone", "[rate] [ch] [window] [hz] [sec]", "sine stream (44100/2/lib/440); sec>0 = timed, else Enter stops", cmdTone},
+    {"soak", "<sec> [rate] [ch] [window]", "mute tone for <sec>s (stdin ignored), credit/rate judgment", cmdSoak},
     {"quit", "", "exit", nullptr},
 };
 constexpr size_t kCommandCount = sizeof(kCommands) / sizeof(kCommands[0]);

@@ -80,9 +80,9 @@ struct PtyPair {
     }
 };
 
-uart::UARTAccessConfig makeConfig()
+uart::AccessConfig makeConfig()
 {
-    uart::UARTAccessConfig cfg;
+    uart::AccessConfig cfg;
     cfg.baud_rate = 115200;
     // Short timeouts: a pty delivers in microseconds, and StreamSource's
     // peek blocks up to first_byte/inter_byte when a request cannot be
@@ -101,12 +101,12 @@ TEST(PosixUART, AttachAndConfigure)
     PtyPair pty;
     ASSERT_TRUE(pty.open()) << "failed to open pty pair";
 
-    uart::variant::posix::Bus bus;
+    uart::Bus_posix bus;
     ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
     EXPECT_EQ(bus.nativeHandle(), pty.slave);
 
     auto cfg = makeConfig();
-    uart::UARTAccessor dev{bus, cfg};
+    uart::Accessor dev{bus, cfg};
     ASSERT_TRUE(dev.setConfig(cfg).has_value());
 }
 
@@ -115,10 +115,10 @@ TEST(PosixUART, WriteReachesMaster)
     PtyPair pty;
     ASSERT_TRUE(pty.open());
 
-    uart::variant::posix::Bus bus;
+    uart::Bus_posix bus;
     ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
     auto cfg = makeConfig();
-    uart::UARTAccessor dev{bus, cfg};
+    uart::Accessor dev{bus, cfg};
     ASSERT_TRUE(dev.setConfig(cfg).has_value());
 
     const uint8_t tx[] = {0xDE, 0xAD, 0xBE, 0xEF};
@@ -138,10 +138,10 @@ TEST(PosixUART, ReadReceivesFromMaster)
     PtyPair pty;
     ASSERT_TRUE(pty.open());
 
-    uart::variant::posix::Bus bus;
+    uart::Bus_posix bus;
     ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
     auto cfg = makeConfig();
-    uart::UARTAccessor dev{bus, cfg};
+    uart::Accessor dev{bus, cfg};
     ASSERT_TRUE(dev.setConfig(cfg).has_value());
 
     const uint8_t pat[] = {0x01, 0x02, 0x03};
@@ -161,10 +161,10 @@ TEST(PosixUART, ReadableBytesReportsPending)
     PtyPair pty;
     ASSERT_TRUE(pty.open());
 
-    uart::variant::posix::Bus bus;
+    uart::Bus_posix bus;
     ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
     auto cfg = makeConfig();
-    uart::UARTAccessor dev{bus, cfg};
+    uart::Accessor dev{bus, cfg};
     ASSERT_TRUE(dev.setConfig(cfg).has_value());
 
     const uint8_t pat[] = {0x55, 0x66};
@@ -181,11 +181,11 @@ TEST(PosixUART, ReadTimesOutWhenIdle)
     PtyPair pty;
     ASSERT_TRUE(pty.open());
 
-    uart::variant::posix::Bus bus;
+    uart::Bus_posix bus;
     ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
     auto cfg                  = makeConfig();
     cfg.first_byte_timeout_ms = 50;  // keep the test quick
-    uart::UARTAccessor dev{bus, cfg};
+    uart::Accessor dev{bus, cfg};
     ASSERT_TRUE(dev.setConfig(cfg).has_value());
 
     uint8_t rx[8] = {};
@@ -202,10 +202,10 @@ TEST(PosixUART, StreamSourcePullsFromRxAccessor)
     PtyPair pty;
     ASSERT_TRUE(pty.open());
 
-    uart::variant::posix::Bus bus;
+    uart::Bus_posix bus;
     ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
     auto cfg = makeConfig();
-    uart::UARTAccessor dev{bus, cfg};
+    uart::Accessor dev{bus, cfg};
     ASSERT_TRUE(dev.setConfig(cfg).has_value());
 
     const uint8_t pat[] = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5};
@@ -234,11 +234,11 @@ TEST(PosixUART, StreamSourceTimesOutWhenIdle)
     PtyPair pty;
     ASSERT_TRUE(pty.open());
 
-    uart::variant::posix::Bus bus;
+    uart::Bus_posix bus;
     ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
     auto cfg                  = makeConfig();
     cfg.first_byte_timeout_ms = 50;  // keep the test quick
-    uart::UARTAccessor dev{bus, cfg};
+    uart::Accessor dev{bus, cfg};
     ASSERT_TRUE(dev.setConfig(cfg).has_value());
 
     uint8_t scratch[16] = {};
@@ -255,10 +255,10 @@ TEST(PosixUART, StreamSinkPushesToTxAccessor)
     PtyPair pty;
     ASSERT_TRUE(pty.open());
 
-    uart::variant::posix::Bus bus;
+    uart::Bus_posix bus;
     ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
     auto cfg = makeConfig();
-    uart::UARTAccessor dev{bus, cfg};
+    uart::Accessor dev{bus, cfg};
     ASSERT_TRUE(dev.setConfig(cfg).has_value());
 
     uint8_t scratch[16] = {};
@@ -290,10 +290,10 @@ TEST(PosixUART, FrameReaderExtractsFramesFromUART)
     PtyPair pty;
     ASSERT_TRUE(pty.open());
 
-    uart::variant::posix::Bus bus;
+    uart::Bus_posix bus;
     ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
     auto cfg = makeConfig();
-    uart::UARTAccessor dev{bus, cfg};
+    uart::Accessor dev{bus, cfg};
     ASSERT_TRUE(dev.setConfig(cfg).has_value());
 
     // One delimiter + one data frame, written raw by the peer.
@@ -330,10 +330,10 @@ TEST(PosixUART, FrameWriterTransmitsFramesOverUART)
     PtyPair pty;
     ASSERT_TRUE(pty.open());
 
-    uart::variant::posix::Bus bus;
+    uart::Bus_posix bus;
     ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
     auto cfg = makeConfig();
-    uart::UARTAccessor dev{bus, cfg};
+    uart::Accessor dev{bus, cfg};
     ASSERT_TRUE(dev.setConfig(cfg).has_value());
 
     uint8_t scratch[frame::kMaxWireSize] = {};
@@ -371,10 +371,10 @@ TEST(PosixUART, BytecodeRoundtripOverFramedUART)
     PtyPair pty;
     ASSERT_TRUE(pty.open());
 
-    uart::variant::posix::Bus bus;
+    uart::Bus_posix bus;
     ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
     auto cfg = makeConfig();
-    uart::UARTAccessor dev{bus, cfg};
+    uart::Accessor dev{bus, cfg};
     ASSERT_TRUE(dev.setConfig(cfg).has_value());
 
     // Host side: a command script (store_data keeps the test HW-free),
@@ -463,22 +463,22 @@ TEST(PosixUART, RemoteSessionEndToEndOverPty)
 
     // Minimal device-side I2C hardware stand-in: answers reads with a
     // pattern and records the marshalled target address.
-    struct StubI2CBus : public i2c::I2CBus {
+    struct StubIBus : public i2c::IBus {
         uint16_t last_addr    = 0;
         error::error_t result = error::error_t::OK;
 
-        result_t<void> init(const i2c::I2CBusConfig&)
+        result_t<void> init(const i2c::IBusConfig&)
         {
             return {};
         }
-        result_t<size_t> transfer(bus::Accessor*, const i2c::I2CMasterAccessConfig& cfg, const i2c::TransferDesc& desc,
+        result_t<size_t> transfer(bus::IAccessor*, const i2c::MasterAccessConfig& cfg, const i2c::TransferDesc& desc,
                                   data::Source* tx, data::Sink* rx) override
         {
             last_addr = cfg.i2c_addr;
             if (error::isError(result)) {
                 return m5::stl::make_unexpected(result);
             }
-            size_t total = 0;  // data phase only (S16 D4)
+            size_t total = 0;  // data phase only
             if (tx != nullptr) {
                 while (!tx->eof()) {
                     auto p = tx->peek(64);
@@ -508,14 +508,14 @@ TEST(PosixUART, RemoteSessionEndToEndOverPty)
     ASSERT_TRUE(pty.open());
 
     // --- device endpoint (pty slave via the posix UART variant) ---
-    uart::variant::posix::Bus dev_bus;
+    uart::Bus_posix dev_bus;
     ASSERT_EQ(dev_bus.attach(pty.slave), error::error_t::OK);
     auto dev_cfg = makeConfig();
     // Tiny first-byte timeout: the server poll must not stall when idle
     // (spec/design/remote.md, server execution model).
     dev_cfg.first_byte_timeout_ms = 2;
     dev_cfg.inter_byte_timeout_ms = 2;
-    uart::UARTAccessor dev{dev_bus, dev_cfg};
+    uart::Accessor dev{dev_bus, dev_cfg};
     ASSERT_TRUE(dev.setConfig(dev_cfg).has_value());
 
     uint8_t dev_rx_scratch[frame::kMaxWireSize] = {};
@@ -523,9 +523,9 @@ TEST(PosixUART, RemoteSessionEndToEndOverPty)
     data::StreamSource dev_src{dev.rx(), data::DataSpan{dev_rx_scratch, sizeof(dev_rx_scratch)}};
     data::StreamSink dev_snk{dev.tx(), data::DataSpan{dev_tx_scratch, sizeof(dev_tx_scratch)}};
 
-    StubI2CBus stub_bus;
-    i2c::I2CMasterAccessConfig stub_acc_cfg;
-    i2c::I2CMasterAccessor stub_acc{stub_bus, stub_acc_cfg};
+    StubIBus stub_bus;
+    i2c::MasterAccessConfig stub_acc_cfg;
+    i2c::MasterAccessor stub_acc{stub_bus, stub_acc_cfg};
 
     uint8_t server_scratch[remote::kMaxMessageSize] = {};
     remote::Server server{data::DataSpan{server_scratch, sizeof(server_scratch)}};
@@ -585,9 +585,9 @@ TEST(PosixUART, RemoteSessionEndToEndOverPty)
 
     // The proxy behaves like a local bus: register read over the wire.
     remote::RemoteI2CBus proxy{session, 0};
-    i2c::I2CMasterAccessConfig acc_cfg;
+    i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr = 0x68;
-    i2c::I2CMasterAccessor acc{proxy, acc_cfg};
+    i2c::MasterAccessor acc{proxy, acc_cfg};
 
     uint8_t rx[4] = {};
     auto r        = acc.readRegister(uint8_t{0x75}, rx, sizeof(rx));
@@ -620,7 +620,7 @@ TEST(PosixUART, ConnectRemoteSerialExplicitPathOverPty)
     namespace i2c        = ::m5::hal::v1::i2c;
     namespace remote     = ::m5::hal::v1::remote;
     namespace service    = ::m5::hal::v1::service;
-    namespace posix_uart = uart::variant::posix;
+    namespace posix_uart = ::m5::variants::frameworks::posix::hal::v1::uart;
 
     PtyPair pty;
     ASSERT_TRUE(pty.open());
@@ -657,15 +657,15 @@ TEST(PosixUART, ConnectRemoteSerialExplicitPathOverPty)
                          : result_t<size_t>{static_cast<size_t>(n)};
         }
     };
-    struct StubI2CBus : public i2c::I2CBus {
-        result_t<void> init(const i2c::I2CBusConfig&)
+    struct StubIBus : public i2c::IBus {
+        result_t<void> init(const i2c::IBusConfig&)
         {
             return {};
         }
-        result_t<size_t> transfer(bus::Accessor*, const i2c::I2CMasterAccessConfig&, const i2c::TransferDesc&,
+        result_t<size_t> transfer(bus::IAccessor*, const i2c::MasterAccessConfig&, const i2c::TransferDesc&,
                                   data::Source*, data::Sink*) override
         {
-            return size_t{0};  // data phase only (S16 D4)
+            return size_t{0};  // data phase only
         }
     };
 
@@ -678,9 +678,9 @@ TEST(PosixUART, ConnectRemoteSerialExplicitPathOverPty)
     data::StreamSource dev_src{dev_reader, data::DataSpan{dev_rx_scratch, sizeof(dev_rx_scratch)}};
     data::StreamSink dev_snk{dev_writer, data::DataSpan{dev_tx_scratch, sizeof(dev_tx_scratch)}};
 
-    StubI2CBus stub_bus;
-    i2c::I2CMasterAccessConfig stub_acc_cfg;
-    i2c::I2CMasterAccessor stub_acc{stub_bus, stub_acc_cfg};
+    StubIBus stub_bus;
+    i2c::MasterAccessConfig stub_acc_cfg;
+    i2c::MasterAccessor stub_acc{stub_bus, stub_acc_cfg};
     uint8_t server_scratch[remote::kMaxMessageSize] = {};
     remote::Server server{data::DataSpan{server_scratch, sizeof(server_scratch)}};
     ASSERT_TRUE(server.registerI2C(0, stub_acc).has_value());
@@ -721,7 +721,7 @@ TEST(PosixUART, ConnectRemoteSerialExplicitPathOverPty)
 
 TEST(PosixUART, ConnectRemoteSerialMissingPathReportsIoError)
 {
-    namespace posix_uart = uart::variant::posix;
+    namespace posix_uart = ::m5::variants::frameworks::posix::hal::v1::uart;
     posix_uart::SerialRemoteEndpoint ep;
     posix_uart::ConnectOptions opt;
     opt.path            = "/dev/m5hal-no-such-port";
@@ -737,7 +737,7 @@ TEST(PosixUART, ConnectRemoteSerialMissingPathReportsIoError)
 // host-dependent, so only the invariants are asserted).
 TEST(PosixUART, SerialPortNameRanking)
 {
-    namespace posix_uart = uart::variant::posix;
+    namespace posix_uart = ::m5::variants::frameworks::posix::hal::v1::uart;
 #if defined(__APPLE__)
     EXPECT_EQ(posix_uart::rankSerialPortName("cu.usbserial-1410"), 0);
     EXPECT_EQ(posix_uart::rankSerialPortName("cu.usbmodem401"), 0);
@@ -757,7 +757,7 @@ TEST(PosixUART, SerialPortNameRanking)
 
 TEST(PosixUART, ListSerialPortsSmoke)
 {
-    namespace posix_uart = uart::variant::posix;
+    namespace posix_uart = ::m5::variants::frameworks::posix::hal::v1::uart;
     posix_uart::SerialPortInfo ports[8];
     const size_t n = posix_uart::listSerialPorts(ports, sizeof(ports) / sizeof(ports[0]));
     ASSERT_LE(n, sizeof(ports) / sizeof(ports[0]));
@@ -773,7 +773,7 @@ TEST(PosixUART, ListSerialPortsSmoke)
 
 TEST(PosixUART, OpenMissingDeviceReportsIoError)
 {
-    uart::variant::posix::Bus bus;
+    uart::Bus_posix bus;
     EXPECT_EQ(bus.open("/dev/m5hal-this-device-should-not-exist", 115200), error::error_t::IO_ERROR);
 }
 
@@ -782,7 +782,7 @@ TEST(PosixUART, AttachNonTtyReportsIoError)
     int fds[2] = {-1, -1};
     ASSERT_EQ(::pipe(fds), 0);
 
-    uart::variant::posix::Bus bus;
+    uart::Bus_posix bus;
     EXPECT_EQ(bus.attach(fds[0]), error::error_t::IO_ERROR);
 
     ::close(fds[0]);
@@ -815,11 +815,11 @@ TEST(PosixUART, AcceptsHighBaudRates)
     for (uint32_t b : bauds) {
         PtyPair pty;
         ASSERT_TRUE(pty.open());
-        uart::variant::posix::Bus bus;
+        uart::Bus_posix bus;
         ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
         auto cfg      = makeConfig();
         cfg.baud_rate = b;
-        uart::UARTAccessor dev{bus, cfg};
+        uart::Accessor dev{bus, cfg};
         // write() triggers applyConfig(b) -> baudToSpeed(b) must succeed.
         EXPECT_TRUE(dev.write(data::ConstDataSpan{tx, sizeof(tx)}).has_value()) << "baud " << b;
     }
@@ -832,7 +832,7 @@ TEST(PosixUART, AcceptsHighBaudRates)
 // no — there IOSSIOSPEED handles it), so the test is correct on both.
 TEST(PosixUART, BaudTableMapsKnownConstants)
 {
-    using Bus  = uart::variant::posix::Bus;
+    using Bus  = uart::Bus_posix;
     uint32_t s = 0;
 
     EXPECT_TRUE(Bus::baudToSpeed(9600, s));

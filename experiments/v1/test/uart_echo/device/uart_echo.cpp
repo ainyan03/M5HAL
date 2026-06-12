@@ -32,7 +32,7 @@ constexpr int PIN_UART_RX = 3;  // UART0 RX (USB bridge) on classic ESP32
 constexpr uint32_t BAUD = M5HAL_HIL_ECHO_BAUD;
 
 m5hal::uart::Bus uart_bus;  // flat-injected = arduino UART variant on this build
-m5hal::uart::UARTAccessConfig uart_cfg;
+m5hal::uart::AccessConfig uart_cfg;
 
 }  // namespace
 
@@ -45,7 +45,7 @@ void setup()
     // Enlarge the RX/TX ring buffer (vs the Arduino default 256) so a high-baud
     // burst is absorbed while the echo loop drains it: at 3 Mbaud a 512-byte
     // burst arrives in ~1.7 ms and would overflow a 256-byte RX ring. The arduino
-    // UART variant honors UARTBusConfig.{rx,tx}_buffer_size (applied before its
+    // UART variant honors IBusConfig.{rx,tx}_buffer_size (applied before its
     // lazy begin()), so no direct Serial.setRxBufferSize() is needed.
     m5hal::uart::BusConfig bus_cfg;
     bus_cfg.serial         = &Serial;
@@ -63,8 +63,8 @@ void setup()
 
 void loop()
 {
-    m5hal::uart::UARTTxAccessor uart_tx{uart_bus, uart_cfg};
-    m5hal::uart::UARTRxAccessor uart_rx{uart_bus, uart_cfg};
+    m5hal::uart::TxAccessor uart_tx{uart_bus, uart_cfg};
+    m5hal::uart::RxAccessor uart_rx{uart_bus, uart_cfg};
 
     auto readable = uart_rx.readableBytes();
     if (!readable.has_value() || readable.value() == 0) {

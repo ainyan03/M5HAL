@@ -64,7 +64,7 @@ constexpr uint8_t KIND_SPI = static_cast<uint8_t>(m5hal::types::bus_kind_t::SPI)
 
 constexpr uint8_t BC_GPIO_OUTPUT = static_cast<uint8_t>(m5hal::types::gpio_mode_t::Output);
 constexpr uint8_t SPI_MODE_HALFDUPLEX_DC =
-    static_cast<uint8_t>(m5hal::spi::spi_data_mode_t::spi_halfduplex_with_dc_pin);
+    static_cast<uint8_t>(m5hal::spi::spi_data_mode_t::halfduplex_with_dc_pin);
 
 constexpr uint8_t STORE_DISCARD = bytecode::kDiscardStoreId;  // 0xFF: read and drop
 constexpr uint8_t END_OF_SCRIPT = 0x00;                       // LenVar 0 terminator
@@ -173,10 +173,10 @@ static constexpr uint8_t SCRIPT_LCD_INVERT_OFF[] = {BC_LCD_CMD(0x20), END_OF_SCR
 
 m5hal::i2c::Bus i2c_bus;
 m5hal::spi::Bus spi_bus;
-m5hal::i2c::I2CMasterAccessConfig i2c_initial_cfg;  // overwritten by bus_configure scripts
-m5hal::spi::SPIMasterAccessConfig spi_initial_cfg;
-m5hal::i2c::I2CMasterAccessor i2c_dev{i2c_bus, i2c_initial_cfg};
-m5hal::spi::SPIMasterAccessor spi_dev{spi_bus, spi_initial_cfg};
+m5hal::i2c::MasterAccessConfig i2c_initial_cfg;  // overwritten by bus_configure scripts
+m5hal::spi::MasterAccessConfig spi_initial_cfg;
+m5hal::i2c::MasterAccessor i2c_dev{i2c_bus, i2c_initial_cfg};
+m5hal::spi::MasterAccessor spi_dev{spi_bus, spi_initial_cfg};
 
 bytecode::BytecodeRunner runner;
 
@@ -225,7 +225,10 @@ void setup()
     pinMode(PIN_BTN_B, INPUT);
     pinMode(PIN_BTN_C, INPUT);
 
-    m5hal::i2c::BusConfig i2c_cfg{&Wire, PIN_I2C_SCL, PIN_I2C_SDA};
+    m5hal::i2c::BusConfig i2c_cfg;
+    i2c_cfg.wire    = &Wire;
+    i2c_cfg.pin_scl = PIN_I2C_SCL;
+    i2c_cfg.pin_sda = PIN_I2C_SDA;
     if (auto r = i2c_bus.init(i2c_cfg); !r.has_value()) {
         Serial.printf("i2c bus init failed: %d\n", static_cast<int>(r.error()));
         return;

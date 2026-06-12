@@ -19,7 +19,7 @@
 namespace {
 
 using ::m5::hal::v1::types::gpio_mode_t;
-using StubGPIO = ::m5::variants::frameworks::stub::hal::v1::gpio::GPIO;
+using StubGPIO = ::m5::hal::v1::gpio::GPIO_stub;
 
 TEST(GpioSkeleton, GetPinReturnsValidPin)
 {
@@ -67,8 +67,8 @@ TEST(GpioSkeleton, PortDirectAndPinViewsAreConsistent)
 
 TEST(GpioSkeleton, StubGetGPIOReturnsStaticInstance)
 {
-    auto* a = ::m5::variants::frameworks::stub::hal::v1::gpio::getGPIO();
-    auto* b = ::m5::variants::frameworks::stub::hal::v1::gpio::getGPIO();
+    auto* a = ::m5::hal::v1::gpio::getGPIO_stub();
+    auto* b = ::m5::hal::v1::gpio::getGPIO_stub();
     EXPECT_EQ(a, b);
     EXPECT_NE(a, nullptr);
 }

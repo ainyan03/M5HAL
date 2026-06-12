@@ -9,9 +9,10 @@
 #include <esp_err.h>
 #include <freertos/FreeRTOS.h>
 
-namespace m5::variants::frameworks::espidf::hal::v1::i2s {
+namespace m5::hal::v1::i2s {
 
 namespace {
+namespace impl_espidf {
 
 ::m5::hal::v1::error::error_t mapEspErr(::esp_err_t err)
 {
@@ -57,7 +58,7 @@ void calcDmaParams(size_t target_bytes, size_t frame_bytes, uint32_t& out_desc_n
     out_capacity  = static_cast<size_t>(desc_num) * kFrameNum * frame_bytes;
 }
 
-bool sameAccessConfig(const ::m5::hal::v1::i2s::I2SAccessConfig& a, const ::m5::hal::v1::i2s::I2SAccessConfig& b)
+bool sameAccessConfig(const ::m5::hal::v1::i2s::AccessConfig& a, const ::m5::hal::v1::i2s::AccessConfig& b)
 {
     return a.sample_rate_hz == b.sample_rate_hz && a.bits_per_sample == b.bits_per_sample && a.channels == b.channels;
 }
@@ -67,17 +68,18 @@ bool sameAccessConfig(const ::m5::hal::v1::i2s::I2SAccessConfig& a, const ::m5::
     return timeout_ms == 0 ? 0 : pdMS_TO_TICKS(timeout_ms);
 }
 
+}  // namespace impl_espidf
 }  // namespace
 
 // ---------------------------------------------------------------------------
 // static callback
 // ---------------------------------------------------------------------------
-bool Bus::onSentCallback(::i2s_chan_handle_t /*handle*/, ::i2s_event_data_t* event, void* user_ctx)
+bool Bus_espidf::onSentCallback(::i2s_chan_handle_t /*handle*/, ::i2s_event_data_t* event, void* user_ctx)
 {
     if (event == nullptr || user_ctx == nullptr) {
         return false;
     }
-    auto* self = static_cast<Bus*>(user_ctx);
+    auto* self = static_cast<Bus_espidf*>(user_ctx);
     // Clamped subtraction (CAS loop, ISR-safe): silence buffers played during
     // an underrun also land here, but must not push in-flight below zero.
     size_t cur = self->_dma_in_flight.load(std::memory_order_relaxed);
@@ -94,7 +96,7 @@ bool Bus::onSentCallback(::i2s_chan_handle_t /*handle*/, ::i2s_event_data_t* eve
 // ---------------------------------------------------------------------------
 // init
 // ---------------------------------------------------------------------------
-::m5::hal::v1::result_t<void> Bus::init(const BusConfig& config)
+::m5::hal::v1::result_t<void> Bus_espidf::init(const BusConfig_espidf& config)
 {
     // Re-init: tear down any existing channel first — clearing the handle
     // without `i2s_del_channel` would leak the old channel with its DMA
@@ -111,13 +113,13 @@ bool Bus::onSentCallback(::i2s_chan_handle_t /*handle*/, ::i2s_event_data_t* eve
 // ---------------------------------------------------------------------------
 // release
 // ---------------------------------------------------------------------------
-::m5::hal::v1::result_t<void> Bus::release(void)
+::m5::hal::v1::result_t<void> Bus_espidf::release(void)
 {
     destroyChannel();
     return {};
 }
 
-void Bus::destroyChannel(void)
+void Bus_espidf::destroyChannel(void)
 {
     if (_tx_handle != nullptr) {
         if (_channel_enabled) {
@@ -135,7 +137,7 @@ void Bus::destroyChannel(void)
 // ---------------------------------------------------------------------------
 // ensureChannel
 // ---------------------------------------------------------------------------
-::m5::hal::v1::result_t<void> Bus::ensureChannel(const ::m5::hal::v1::i2s::I2SAccessConfig& cfg)
+::m5::hal::v1::result_t<void> Bus_espidf::ensureChannel(const ::m5::hal::v1::i2s::AccessConfig& cfg)
 {
     // Only 16-bit samples are supported.
     if (cfg.bits_per_sample != 16) {
@@ -146,7 +148,7 @@ void Bus::destroyChannel(void)
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
 
-    const bool need_reconfig = !_configured || !sameAccessConfig(_applied_cfg, cfg);
+    const bool need_reconfig = !_configured || !impl_espidf::sameAccessConfig(_applied_cfg, cfg);
     if (!need_reconfig) {
         return {};
     }
@@ -175,7 +177,7 @@ void Bus::destroyChannel(void)
     // --- DMA sizing
     uint32_t dma_desc_num  = 0;
     uint32_t dma_frame_num = 0;
-    calcDmaParams(_config.tx_buffer_size, frame_bytes, dma_desc_num, dma_frame_num, _dma_capacity);
+    impl_espidf::calcDmaParams(_config.tx_buffer_size, frame_bytes, dma_desc_num, dma_frame_num, _dma_capacity);
 
     // --- Channel allocation
     ::i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
@@ -186,7 +188,7 @@ void Bus::destroyChannel(void)
     esp_err_t ret = ::i2s_new_channel(&chan_cfg, &_tx_handle, nullptr);
     if (ret != ESP_OK) {
         _tx_handle = nullptr;
-        return m5::stl::make_unexpected(mapEspErr(ret));
+        return m5::stl::make_unexpected(impl_espidf::mapEspErr(ret));
     }
 
     // --- Slot / clock config (Philips standard; stereo slots when
@@ -235,17 +237,17 @@ void Bus::destroyChannel(void)
     if (ret != ESP_OK) {
         ::i2s_del_channel(_tx_handle);
         _tx_handle = nullptr;
-        return m5::stl::make_unexpected(mapEspErr(ret));
+        return m5::stl::make_unexpected(impl_espidf::mapEspErr(ret));
     }
 
     // --- Register the on_sent callback for DMA consumption tracking
     ::i2s_event_callbacks_t cbs = {};
-    cbs.on_sent                 = &Bus::onSentCallback;
+    cbs.on_sent                 = &Bus_espidf::onSentCallback;
     ret                         = ::i2s_channel_register_event_callback(_tx_handle, &cbs, this);
     if (ret != ESP_OK) {
         ::i2s_del_channel(_tx_handle);
         _tx_handle = nullptr;
-        return m5::stl::make_unexpected(mapEspErr(ret));
+        return m5::stl::make_unexpected(impl_espidf::mapEspErr(ret));
     }
 
     // --- Preload silence before enabling. Starting the DMA engine on an
@@ -274,7 +276,7 @@ void Bus::destroyChannel(void)
     if (ret != ESP_OK) {
         ::i2s_del_channel(_tx_handle);
         _tx_handle = nullptr;
-        return m5::stl::make_unexpected(mapEspErr(ret));
+        return m5::stl::make_unexpected(impl_espidf::mapEspErr(ret));
     }
     _channel_enabled = true;
 
@@ -290,9 +292,9 @@ void Bus::destroyChannel(void)
 // ---------------------------------------------------------------------------
 // write
 // ---------------------------------------------------------------------------
-::m5::hal::v1::result_t<size_t> Bus::write(::m5::hal::v1::bus::Accessor* owner,
-                                           const ::m5::hal::v1::i2s::I2SAccessConfig& cfg,
-                                           ::m5::hal::v1::data::Source* tx, size_t len)
+::m5::hal::v1::result_t<size_t> Bus_espidf::write(::m5::hal::v1::bus::IAccessor* owner,
+                                                  const ::m5::hal::v1::i2s::AccessConfig& cfg,
+                                                  ::m5::hal::v1::data::Source* tx, size_t len)
 {
     (void)owner;
 
@@ -301,7 +303,7 @@ void Bus::destroyChannel(void)
         return m5::stl::make_unexpected(ensure.error());
     }
 
-    const ::TickType_t timeout_ticks = toTicks(cfg.write_timeout_ms);
+    const ::TickType_t timeout_ticks = impl_espidf::toTicks(cfg.write_timeout_ms);
     size_t done                      = 0;
 
     while (tx != nullptr && !tx->eof() && done < len) {
@@ -358,7 +360,7 @@ void Bus::destroyChannel(void)
             }
             if (mret != ESP_OK && mret != ESP_ERR_TIMEOUT) {
                 if (done == 0) {
-                    return m5::stl::make_unexpected(mapEspErr(mret));
+                    return m5::stl::make_unexpected(impl_espidf::mapEspErr(mret));
                 }
                 break;
             }
@@ -387,7 +389,7 @@ void Bus::destroyChannel(void)
         // Other errors are propagated.
         if (ret != ESP_OK && ret != ESP_ERR_TIMEOUT) {
             if (done == 0) {
-                return m5::stl::make_unexpected(mapEspErr(ret));
+                return m5::stl::make_unexpected(impl_espidf::mapEspErr(ret));
             }
             break;
         }
@@ -414,8 +416,8 @@ void Bus::destroyChannel(void)
 // ---------------------------------------------------------------------------
 // writableBytes
 // ---------------------------------------------------------------------------
-::m5::hal::v1::result_t<size_t> Bus::writableBytes(::m5::hal::v1::bus::Accessor* owner,
-                                                   const ::m5::hal::v1::i2s::I2SAccessConfig& cfg)
+::m5::hal::v1::result_t<size_t> Bus_espidf::writableBytes(::m5::hal::v1::bus::IAccessor* owner,
+                                                          const ::m5::hal::v1::i2s::AccessConfig& cfg)
 {
     (void)owner;
 
@@ -430,7 +432,7 @@ void Bus::destroyChannel(void)
     return _expand_mono ? free_phys / 2 : free_phys;
 }
 
-}  // namespace m5::variants::frameworks::espidf::hal::v1::i2s
+}  // namespace m5::hal::v1::i2s
 
 #endif  // defined(ESP_PLATFORM) && M5HAL_ESPIDF_I2S_HAS_STD
 

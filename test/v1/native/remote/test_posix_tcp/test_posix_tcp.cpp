@@ -172,22 +172,22 @@ TEST(PosixTCP, ConnectRefusedReportsIoError)
 
 // Device-side I2C hardware stand-in: answers reads with a pattern and
 // records the marshalled target address (same stub as the pty E2E).
-struct StubI2CBus : public i2c::I2CBus {
+struct StubIBus : public i2c::IBus {
     uint16_t last_addr    = 0;
     error::error_t result = error::error_t::OK;
 
-    result_t<void> init(const i2c::I2CBusConfig&)
+    result_t<void> init(const i2c::IBusConfig&)
     {
         return {};
     }
-    result_t<size_t> transfer(bus::Accessor*, const i2c::I2CMasterAccessConfig& cfg, const i2c::TransferDesc& desc,
+    result_t<size_t> transfer(bus::IAccessor*, const i2c::MasterAccessConfig& cfg, const i2c::TransferDesc& desc,
                               data::Source* tx, data::Sink* rx) override
     {
         last_addr = cfg.i2c_addr;
         if (error::isError(result)) {
             return m5::stl::make_unexpected(result);
         }
-        size_t total = 0;  // data phase only (S16 D4)
+        size_t total = 0;  // data phase only
         if (tx != nullptr) {
             while (!tx->eof()) {
                 auto p = tx->peek(64);
@@ -233,9 +233,9 @@ TEST(PosixTCP, ConnectRemoteTcpEndToEndOverLoopback)
     data::StreamSource dev_src{dev_stream, data::DataSpan{dev_rx_scratch, sizeof(dev_rx_scratch)}};
     data::StreamSink dev_snk{dev_stream, data::DataSpan{dev_tx_scratch, sizeof(dev_tx_scratch)}};
 
-    StubI2CBus stub_bus;
-    i2c::I2CMasterAccessConfig stub_acc_cfg;
-    i2c::I2CMasterAccessor stub_acc{stub_bus, stub_acc_cfg};
+    StubIBus stub_bus;
+    i2c::MasterAccessConfig stub_acc_cfg;
+    i2c::MasterAccessor stub_acc{stub_bus, stub_acc_cfg};
     uint8_t server_scratch[remote::kMaxMessageSize] = {};
     remote::Server server{data::DataSpan{server_scratch, sizeof(server_scratch)}};
     ASSERT_TRUE(server.registerI2C(0, stub_acc).has_value());
@@ -269,9 +269,9 @@ TEST(PosixTCP, ConnectRemoteTcpEndToEndOverLoopback)
 
     // The proxy behaves like a local bus: register read over the wire.
     remote::RemoteI2CBus proxy{ep.link.session(), 0};
-    i2c::I2CMasterAccessConfig acc_cfg;
+    i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr = 0x68;
-    i2c::I2CMasterAccessor acc{proxy, acc_cfg};
+    i2c::MasterAccessor acc{proxy, acc_cfg};
     uint8_t rx[4] = {};
     auto r        = acc.readRegister(uint8_t{0x75}, rx, sizeof(rx));
 

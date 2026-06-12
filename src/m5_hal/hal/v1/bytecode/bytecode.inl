@@ -92,20 +92,20 @@ struct FieldReader {
 // the server prescan); the remaining offsets are local to the
 // encode/decode pairs below.
 
-void encodeConfig(uint8_t* dst, const i2c::I2CMasterAccessConfig& cfg)
+void encodeConfig(uint8_t* dst, const i2c::MasterAccessConfig& cfg)
 {
     putU32(dst + 0, cfg.freq);
-    putU32(dst + kI2CConfigTimeoutOffset, cfg.timeout_ms);
+    putU32(dst + kI2CConfigWireTimeoutOffset, cfg.wire_timeout_ms);
     putU16(dst + 8, cfg.i2c_addr);
     dst[10] = static_cast<uint8_t>((cfg.address_is_10bit ? 0x01 : 0x00) | (cfg.use_restart ? 0x02 : 0x00));
     dst[11] = cfg.register_address_bytes;
 }
 
-void decodeConfig(data::ConstDataSpan src, i2c::I2CMasterAccessConfig& cfg)
+void decodeConfig(data::ConstDataSpan src, i2c::MasterAccessConfig& cfg)
 {
     FieldReader r{src};
     uint8_t flags = 0;
-    if (!r.u32(cfg.freq) || !r.u32(cfg.timeout_ms) || !r.u16(cfg.i2c_addr) || !r.u8(flags)) {
+    if (!r.u32(cfg.freq) || !r.u32(cfg.wire_timeout_ms) || !r.u16(cfg.i2c_addr) || !r.u8(flags)) {
         return;
     }
     cfg.address_is_10bit = (flags & 0x01) != 0;
@@ -113,25 +113,25 @@ void decodeConfig(data::ConstDataSpan src, i2c::I2CMasterAccessConfig& cfg)
     (void)r.u8(cfg.register_address_bytes);
 }
 
-void encodeConfig(uint8_t* dst, const spi::SPIMasterAccessConfig& cfg)
+void encodeConfig(uint8_t* dst, const spi::MasterAccessConfig& cfg)
 {
     putU16(dst + 0, static_cast<uint16_t>(cfg.pin_cs));
-    putU32(dst + 2, cfg.freq);
-    putU32(dst + kSPIConfigTimeoutOffset, cfg.timeout_ms);
-    dst[10] = static_cast<uint8_t>(cfg.spi_data_mode);
-    dst[11] = static_cast<uint8_t>((cfg.spi_mode & 0x03) | (cfg.spi_order ? 0x04 : 0x00));
-    dst[12] = cfg.spi_command_length;
-    dst[13] = cfg.spi_address_length;
-    dst[14] = cfg.spi_read_dummy_cycle;
-    dst[15] = cfg.spi_write_dummy_cycle;
+    putU16(dst + 2, static_cast<uint16_t>(cfg.pin_dc));
+    putU32(dst + 4, cfg.freq);
+    dst[8]  = static_cast<uint8_t>(cfg.spi_data_mode);
+    dst[9]  = static_cast<uint8_t>((cfg.spi_mode & 0x03) | (cfg.spi_order ? 0x04 : 0x00));
+    dst[10] = cfg.spi_command_length;
+    dst[11] = cfg.spi_address_length;
+    dst[12] = cfg.spi_read_dummy_cycle;
+    dst[13] = cfg.spi_write_dummy_cycle;
 }
 
-void decodeConfig(data::ConstDataSpan src, spi::SPIMasterAccessConfig& cfg)
+void decodeConfig(data::ConstDataSpan src, spi::MasterAccessConfig& cfg)
 {
     FieldReader r{src};
     uint8_t data_mode = 0;
     uint8_t mode_bits = 0;
-    if (!r.i16(cfg.pin_cs) || !r.u32(cfg.freq) || !r.u32(cfg.timeout_ms) || !r.u8(data_mode) || !r.u8(mode_bits)) {
+    if (!r.i16(cfg.pin_cs) || !r.i16(cfg.pin_dc) || !r.u32(cfg.freq) || !r.u8(data_mode) || !r.u8(mode_bits)) {
         return;
     }
     cfg.spi_data_mode = static_cast<spi::spi_data_mode_t>(data_mode);
@@ -146,25 +146,24 @@ void decodeConfig(data::ConstDataSpan src, spi::SPIMasterAccessConfig& cfg)
     (void)r.u8(cfg.spi_write_dummy_cycle);
 }
 
-void encodeConfig(uint8_t* dst, const uart::UARTAccessConfig& cfg)
+void encodeConfig(uint8_t* dst, const uart::AccessConfig& cfg)
 {
     putU32(dst + 0, cfg.baud_rate);
-    putU32(dst + kUARTConfigTimeoutOffset, cfg.timeout_ms);
     putU32(dst + kUARTConfigFirstByteTimeoutOffset, cfg.first_byte_timeout_ms);
     putU32(dst + kUARTConfigInterByteTimeoutOffset, cfg.inter_byte_timeout_ms);
     putU32(dst + kUARTConfigWriteTimeoutOffset, cfg.write_timeout_ms);
-    dst[20] = cfg.data_bits;
-    dst[21] = cfg.stop_bits;
-    dst[22] = static_cast<uint8_t>(cfg.parity);
-    dst[23] = cfg.invert ? 1 : 0;
+    dst[16] = cfg.data_bits;
+    dst[17] = cfg.stop_bits;
+    dst[18] = static_cast<uint8_t>(cfg.parity);
+    dst[19] = cfg.invert ? 1 : 0;
 }
 
-void decodeConfig(data::ConstDataSpan src, uart::UARTAccessConfig& cfg)
+void decodeConfig(data::ConstDataSpan src, uart::AccessConfig& cfg)
 {
     FieldReader r{src};
     uint8_t parity = 0;
-    if (!r.u32(cfg.baud_rate) || !r.u32(cfg.timeout_ms) || !r.u32(cfg.first_byte_timeout_ms) ||
-        !r.u32(cfg.inter_byte_timeout_ms) || !r.u32(cfg.write_timeout_ms)) {
+    if (!r.u32(cfg.baud_rate) || !r.u32(cfg.first_byte_timeout_ms) || !r.u32(cfg.inter_byte_timeout_ms) ||
+        !r.u32(cfg.write_timeout_ms)) {
         return;
     }
     if (!r.u8(cfg.data_bits) || !r.u8(cfg.stop_bits) || !r.u8(parity)) {
@@ -174,19 +173,18 @@ void decodeConfig(data::ConstDataSpan src, uart::UARTAccessConfig& cfg)
     (void)r.boolean(cfg.invert);
 }
 
-void encodeConfig(uint8_t* dst, const i2s::I2SAccessConfig& cfg)
+void encodeConfig(uint8_t* dst, const i2s::AccessConfig& cfg)
 {
     putU32(dst + 0, cfg.sample_rate_hz);
-    putU32(dst + kI2SConfigTimeoutOffset, cfg.timeout_ms);
     putU32(dst + kI2SConfigWriteTimeoutOffset, cfg.write_timeout_ms);
-    dst[12] = cfg.bits_per_sample;
-    dst[13] = cfg.channels;
+    dst[8] = cfg.bits_per_sample;
+    dst[9] = cfg.channels;
 }
 
-void decodeConfig(data::ConstDataSpan src, i2s::I2SAccessConfig& cfg)
+void decodeConfig(data::ConstDataSpan src, i2s::AccessConfig& cfg)
 {
     FieldReader r{src};
-    if (!r.u32(cfg.sample_rate_hz) || !r.u32(cfg.timeout_ms) || !r.u32(cfg.write_timeout_ms)) {
+    if (!r.u32(cfg.sample_rate_hz) || !r.u32(cfg.write_timeout_ms)) {
         return;
     }
     if (!r.u8(cfg.bits_per_sample)) {
@@ -395,7 +393,7 @@ result_t<void> BytecodeEncoder::delayMs(uint32_t ms)
     return emit();
 }
 
-result_t<void> BytecodeEncoder::configure(uint8_t bus_id, const i2c::I2CMasterAccessConfig& cfg)
+result_t<void> BytecodeEncoder::configure(uint8_t bus_id, const i2c::MasterAccessConfig& cfg)
 {
     auto payload = beginInstruction(OpCode::bus_configure, 2 + kI2CConfigSize);
     if (!payload.has_value()) {
@@ -408,7 +406,7 @@ result_t<void> BytecodeEncoder::configure(uint8_t bus_id, const i2c::I2CMasterAc
     return emit();
 }
 
-result_t<void> BytecodeEncoder::configure(uint8_t bus_id, const spi::SPIMasterAccessConfig& cfg)
+result_t<void> BytecodeEncoder::configure(uint8_t bus_id, const spi::MasterAccessConfig& cfg)
 {
     auto payload = beginInstruction(OpCode::bus_configure, 2 + kSPIConfigSize);
     if (!payload.has_value()) {
@@ -421,7 +419,7 @@ result_t<void> BytecodeEncoder::configure(uint8_t bus_id, const spi::SPIMasterAc
     return emit();
 }
 
-result_t<void> BytecodeEncoder::configure(uint8_t bus_id, const uart::UARTAccessConfig& cfg)
+result_t<void> BytecodeEncoder::configure(uint8_t bus_id, const uart::AccessConfig& cfg)
 {
     auto payload = beginInstruction(OpCode::bus_configure, 2 + kUARTConfigSize);
     if (!payload.has_value()) {
@@ -434,7 +432,7 @@ result_t<void> BytecodeEncoder::configure(uint8_t bus_id, const uart::UARTAccess
     return emit();
 }
 
-result_t<void> BytecodeEncoder::i2sConfig(uint8_t bus_id, const i2s::I2SAccessConfig& cfg)
+result_t<void> BytecodeEncoder::i2sConfig(uint8_t bus_id, const i2s::AccessConfig& cfg)
 {
     auto payload = beginInstruction(OpCode::bus_configure, 2 + kI2SConfigSize);
     if (!payload.has_value()) {
@@ -786,7 +784,7 @@ result_t<void> BytecodeEncoder::end(void)
 
 // ---- BytecodeRunner ---------------------------------------------------------
 
-result_t<void> BytecodeRunner::registerI2C(uint8_t bus_id, i2c::I2CMasterAccessor& acc)
+result_t<void> BytecodeRunner::registerI2C(uint8_t bus_id, i2c::MasterAccessor& acc)
 {
     if (bus_id >= kMaxBusBindings) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -795,7 +793,7 @@ result_t<void> BytecodeRunner::registerI2C(uint8_t bus_id, i2c::I2CMasterAccesso
     return {};
 }
 
-result_t<void> BytecodeRunner::registerSPI(uint8_t bus_id, spi::SPIMasterAccessor& acc)
+result_t<void> BytecodeRunner::registerSPI(uint8_t bus_id, spi::MasterAccessor& acc)
 {
     if (bus_id >= kMaxBusBindings) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -804,7 +802,7 @@ result_t<void> BytecodeRunner::registerSPI(uint8_t bus_id, spi::SPIMasterAccesso
     return {};
 }
 
-result_t<void> BytecodeRunner::registerUART(uint8_t bus_id, uart::UARTAccessor& acc)
+result_t<void> BytecodeRunner::registerUART(uint8_t bus_id, uart::Accessor& acc)
 {
     if (bus_id >= kMaxBusBindings) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -813,7 +811,7 @@ result_t<void> BytecodeRunner::registerUART(uint8_t bus_id, uart::UARTAccessor& 
     return {};
 }
 
-result_t<void> BytecodeRunner::registerI2S(uint8_t bus_id, i2s::I2STxAccessor& acc)
+result_t<void> BytecodeRunner::registerI2S(uint8_t bus_id, i2s::TxAccessor& acc)
 {
     if (bus_id >= kMaxBusBindings) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -932,9 +930,9 @@ result_t<size_t> BytecodeRunner::runEvent(data::ConstDataSpan script)
 {
     // Event scripts execute WITHOUT touching the request state: no slot
     // clear, no report reset, and store/report instructions inside the
-    // script are ignored by their handlers while _event_mode is set
-    // (S16 D8). No early-return path exists between here and runLoop's
-    // exit, so the flag reset below is reliable.
+    // script are ignored by their handlers while _event_mode is set.
+    // No early-return path exists between here and runLoop's exit, so
+    // the flag reset below is reliable.
     data::MemorySource source{script};
     _event_mode = true;
     auto r      = runLoop(source);
@@ -1018,7 +1016,7 @@ result_t<void> BytecodeRunner::dispatch(uint8_t opcode, data::ConstDataSpan payl
 {
     // Receive-only runners (the host session's) accept only the
     // receive-side opcodes: a peer's script fills data and reports
-    // status, it never drives local buses, pins, or the clock (S16 D8).
+    // status, it never drives local buses, pins, or the clock.
     // Unknown opcodes still reach the forward-compatibility default.
     if (_receive_only) {
         switch (static_cast<OpCode>(opcode)) {
@@ -1104,7 +1102,7 @@ result_t<void> BytecodeRunner::opBusConfigure(data::ConstDataSpan payload)
             if (acc == nullptr) {
                 return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
             }
-            i2c::I2CMasterAccessConfig cfg = acc->getConfig();
+            i2c::MasterAccessConfig cfg = acc->getConfig();
             decodeConfig(cfg_bytes, cfg);
             return acc->setConfig(cfg);
         }
@@ -1113,7 +1111,7 @@ result_t<void> BytecodeRunner::opBusConfigure(data::ConstDataSpan payload)
             if (acc == nullptr) {
                 return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
             }
-            spi::SPIMasterAccessConfig cfg = acc->getConfig();
+            spi::MasterAccessConfig cfg = acc->getConfig();
             decodeConfig(cfg_bytes, cfg);
             return acc->setConfig(cfg);
         }
@@ -1122,7 +1120,7 @@ result_t<void> BytecodeRunner::opBusConfigure(data::ConstDataSpan payload)
             if (acc == nullptr) {
                 return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
             }
-            uart::UARTAccessConfig cfg = acc->getConfig();
+            uart::AccessConfig cfg = acc->getConfig();
             decodeConfig(cfg_bytes, cfg);
             return acc->setConfig(cfg);
         }
@@ -1131,7 +1129,7 @@ result_t<void> BytecodeRunner::opBusConfigure(data::ConstDataSpan payload)
             if (acc == nullptr) {
                 return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
             }
-            i2s::I2SAccessConfig cfg = acc->getConfig();
+            i2s::AccessConfig cfg = acc->getConfig();
             decodeConfig(cfg_bytes, cfg);
             return acc->setConfig(cfg);
         }
@@ -1311,7 +1309,7 @@ result_t<void> BytecodeRunner::opGpio(uint8_t opcode, data::ConstDataSpan payloa
 result_t<void> BytecodeRunner::opStoreData(data::ConstDataSpan payload)
 {
     if (_event_mode) {
-        return {};  // events must not clobber request slots (S16 D8)
+        return {};  // events must not clobber request slots
     }
     FieldReader r{payload};
     uint8_t store_id = 0;
@@ -1332,7 +1330,7 @@ result_t<void> BytecodeRunner::opStoreData(data::ConstDataSpan payload)
 result_t<void> BytecodeRunner::opReport(uint8_t opcode, data::ConstDataSpan payload)
 {
     if (_event_mode) {
-        return {};  // events must not clobber the report state (S16 D8)
+        return {};  // events must not clobber the report state
     }
     FieldReader r{payload};
     uint8_t raw_status = 0;

@@ -40,7 +40,7 @@
 
 // ----- M5HALCore ctor + M5_Hal definition -----
 //
-// The includes above leave this TU in a "flat-injection complete"
+// The includes above leave this TU in a "winner-binding complete"
 // context, so `m5::hal::v1::gpio::getGPIO()` (the variant-supplied
 // MCU GPIO `IGPIO*`) is resolvable here. Closing the
 // `M5HALCore::ctor` body and the `M5_Hal` reference definition in
@@ -48,7 +48,7 @@
 // `m5_hal.hpp` (no separate `src/m5_hal/hal/v1/m5_hal.cpp`).
 //
 // An `addGPIO` failure inside the ctor is an invariant break — a
-// correctly flat-injected variant must succeed — so we assert /
+// correctly bound variant must succeed — so we assert /
 // fail fast.
 
 #include <cassert>

@@ -26,7 +26,9 @@
 | depth counter による吸収 | absorbed via depth counter | nested access の自然な扱い |
 | 再 lock / 二重 lock | re-lock / re-acquire | |
 | アクセス権限の所有者 | lock owner | コード上 `_lock_owner` |
-| タイムアウト (lock 取得待ち) | acquisition timeout | `timeout_ms` の意味 |
+| タイムアウト (lock 取得待ち) | acquisition timeout | lock 系 API の `timeout_ms` 引数 (省略 = `types::TIMEOUT_FOREVER` = 無限待ち、 0 = 即時 try-lock) |
+| runtime 設備 (time / mutex) | runtime kind | `m5::hal::v1::runtime` ([design/runtime.md](../design/runtime.md))。 bus 構造を持たない設備 kind |
+| 非再帰 (mutex) | non-recursive | 保有タスク自身の再 lock も timeout まで待って失敗 |
 
 ## Source / Sink (stream I/O)
 
@@ -113,7 +115,7 @@
 | platform variant | platform variant | esp32 / esp32s3 等 |
 | 抽象階層 | abstract layer | `m5::hal::v1::` |
 | 具象階層 | concrete layer | `m5::variants::frameworks::*` |
-| flat 注入 (using namespace) | flat injection via `using namespace` | `_macro/offer_all.inl` |
+| 勝者バインド (winner alias) | winner binding via type aliases (runtime kind のみ `using namespace`) | `_macro/offer_all.inl` |
 | capability 申告 | capability declaration | `_offer.hpp` |
 | re-include 前提 | re-includable | `*.inl` の意 |
 

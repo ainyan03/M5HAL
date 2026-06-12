@@ -45,6 +45,8 @@ enum class ErrorType : int8_t {
     DISCONNECTED     = -16,  ///< Transport to a remote endpoint was lost.
     REMOTE_FAULT     = -17,  ///< The remote endpoint reported an internal failure (or an unknown code).
     UNSUPPORTED      = -18,  ///< The remote endpoint does not support the requested capability.
+    DEVICE_MISMATCH  = -19,  ///< A probed/identified device is not the one the caller expected (e.g. a chip-ID check
+                             ///< failed). Reserved for driver layers; the HAL core never returns it.
 };
 using error_t = ErrorType;
 
@@ -59,6 +61,81 @@ constexpr bool isOk(const error_t e)
 {
     return e == error_t::OK;
 }
+
+// Config knob (spec/design/configuration.md): the code->name table
+// below is on by default; build with -DM5HAL_CONFIG_ERROR_STRINGS=0 to
+// drop the string literals from builds that cannot spare the bytes.
+#ifndef M5HAL_CONFIG_ERROR_STRINGS
+#define M5HAL_CONFIG_ERROR_STRINGS 1
+#endif
+
+#if M5HAL_CONFIG_ERROR_STRINGS
+/*!
+  @brief Stable identifier name of an error code (for logs and
+         diagnostics).
+
+  Returns the enumerator's spelling (`"I2C_NO_ACK"`); unknown values —
+  e.g. a wire-decoded byte from a newer peer — map to `"UNKNOWN"`.
+  The strings are identifiers, not prose: they are stable enough to
+  grep for, and the troubleshooting hints live in
+  spec/design/errors.md (error hint table) rather than in RAM.
+  Build with `M5HAL_CONFIG_ERROR_STRINGS=0` to compile the table out
+  (the function then stays usable and returns `""` for every code).
+ */
+constexpr const char* toString(const error_t e)
+{
+    switch (e) {
+        case error_t::ASYNC_RUNNING:
+            return "ASYNC_RUNNING";
+        case error_t::OK:
+            return "OK";
+        case error_t::UNKNOWN_ERROR:
+            return "UNKNOWN_ERROR";
+        case error_t::TIMEOUT_ERROR:
+            return "TIMEOUT_ERROR";
+        case error_t::INVALID_ARGUMENT:
+            return "INVALID_ARGUMENT";
+        case error_t::NOT_IMPLEMENTED:
+            return "NOT_IMPLEMENTED";
+        case error_t::I2C_BUS_ERROR:
+            return "I2C_BUS_ERROR";
+        case error_t::I2C_NO_ACK:
+            return "I2C_NO_ACK";
+        case error_t::BUSY:
+            return "BUSY";
+        case error_t::IO_ERROR:
+            return "IO_ERROR";
+        case error_t::CLOSED:
+            return "CLOSED";
+        case error_t::OUT_OF_RESOURCE:
+            return "OUT_OF_RESOURCE";
+        case error_t::BUFFER_OVERFLOW:
+            return "BUFFER_OVERFLOW";
+        case error_t::BUFFER_UNDERFLOW:
+            return "BUFFER_UNDERFLOW";
+        case error_t::END_OF_STREAM:
+            return "END_OF_STREAM";
+        case error_t::CHECKSUM_ERROR:
+            return "CHECKSUM_ERROR";
+        case error_t::PROTOCOL_ERROR:
+            return "PROTOCOL_ERROR";
+        case error_t::DISCONNECTED:
+            return "DISCONNECTED";
+        case error_t::REMOTE_FAULT:
+            return "REMOTE_FAULT";
+        case error_t::UNSUPPORTED:
+            return "UNSUPPORTED";
+        case error_t::DEVICE_MISMATCH:
+            return "DEVICE_MISMATCH";
+    }
+    return "UNKNOWN";
+}
+#else
+constexpr const char* toString(const error_t)
+{
+    return "";
+}
+#endif  // M5HAL_CONFIG_ERROR_STRINGS
 
 }  // namespace m5::hal::v1::error
 

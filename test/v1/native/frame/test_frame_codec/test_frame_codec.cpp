@@ -541,7 +541,7 @@ TEST(FrameWriter, ShortWriteAndArgumentErrors)
     const uint8_t payload[] = {1, 2, 3};
     auto written            = writer.writeData(1, {payload, sizeof(payload)});
     ASSERT_FALSE(written.has_value());
-    EXPECT_EQ(written.error(), error_t::TIMEOUT_ERROR);  // short write = retryable (S16 D10)
+    EXPECT_EQ(written.error(), error_t::TIMEOUT_ERROR);  // short write = retryable
 
     std::array<uint8_t, 300> big{};
     auto invalid = writer.writeData(1, {big.data(), frame::kMaxDataPayload + 1});

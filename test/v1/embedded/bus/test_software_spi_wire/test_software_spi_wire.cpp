@@ -51,12 +51,12 @@ namespace {
 
 namespace cap = ::wire_capture;
 
-using SoftwareSPIBus = ::m5::hal::v1::spi::variant::software::Bus;
+using SoftwareSpiBus = ::m5::hal::v1::spi::Bus_software;
 
-SoftwareSPIBus makeBus()
+SoftwareSpiBus makeBus()
 {
-    SoftwareSPIBus bus;
-    ::m5::hal::v1::spi::SPIBusConfig bus_config;
+    SoftwareSpiBus bus;
+    ::m5::hal::v1::spi::IBusConfig bus_config;
     bus_config.pin_clk  = M5HAL_TEST_SOFTWARE_SPI_PIN_CLK;
     bus_config.pin_mosi = M5HAL_TEST_SOFTWARE_SPI_PIN_MOSI;
     bus_config.pin_miso = -1;
@@ -66,9 +66,9 @@ SoftwareSPIBus makeBus()
     return bus;
 }
 
-::m5::hal::v1::spi::SPIMasterAccessConfig makeAccessConfig(uint8_t mode = 0, uint8_t order = 0)
+::m5::hal::v1::spi::MasterAccessConfig makeAccessConfig(uint8_t mode = 0, uint8_t order = 0)
 {
-    ::m5::hal::v1::spi::SPIMasterAccessConfig cfg;
+    ::m5::hal::v1::spi::MasterAccessConfig cfg;
     cfg.pin_cs                = M5HAL_TEST_SOFTWARE_SPI_PIN_CS;
     cfg.freq                  = M5HAL_TEST_SOFTWARE_SPI_FREQ;
     cfg.spi_mode              = mode & 0x03;
@@ -112,9 +112,9 @@ void printWiring()
 
 void testWriteCommandAddressDataWirePhases()
 {
-    SoftwareSPIBus bus = makeBus();
+    SoftwareSpiBus bus = makeBus();
     auto cfg           = makeAccessConfig();
-    ::m5::hal::v1::spi::SPIMasterAccessor spi{bus, cfg};
+    ::m5::hal::v1::spi::MasterAccessor spi{bus, cfg};
 
     const uint8_t tx[] = {0xDE, 0xAD};
     cap::start();
@@ -138,9 +138,9 @@ void testWriteCommandAddressDataWirePhases()
 
 void testReadCommandAddressDataWirePhases()
 {
-    SoftwareSPIBus bus = makeBus();
+    SoftwareSpiBus bus = makeBus();
     auto cfg           = makeAccessConfig();
-    ::m5::hal::v1::spi::SPIMasterAccessor spi{bus, cfg};
+    ::m5::hal::v1::spi::MasterAccessor spi{bus, cfg};
 
     uint8_t rx[4]{};
     cap::start();
@@ -163,9 +163,9 @@ void testReadCommandAddressDataWirePhases()
 
 void testWriteUsesLsbFirstBitOrder()
 {
-    SoftwareSPIBus bus = makeBus();
+    SoftwareSpiBus bus = makeBus();
     auto cfg           = makeAccessConfig(0, 1);
-    ::m5::hal::v1::spi::SPIMasterAccessor spi{bus, cfg};
+    ::m5::hal::v1::spi::MasterAccessor spi{bus, cfg};
 
     const uint8_t tx[] = {0x96};
     cap::start();
@@ -187,9 +187,9 @@ void testSpiModesSetExpectedClockEdges()
     const uint8_t tx[] = {0xA5};
 
     for (uint8_t mode = 0; mode < 4; ++mode) {
-        SoftwareSPIBus bus = makeBus();
+        SoftwareSpiBus bus = makeBus();
         auto cfg           = makeAccessConfig(mode, 0);
-        ::m5::hal::v1::spi::SPIMasterAccessor spi{bus, cfg};
+        ::m5::hal::v1::spi::MasterAccessor spi{bus, cfg};
 
         cap::start();
         auto result = spi.write(::m5::hal::v1::data::ConstDataSpan{tx, sizeof(tx)});

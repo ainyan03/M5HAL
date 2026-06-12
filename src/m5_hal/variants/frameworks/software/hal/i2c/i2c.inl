@@ -28,11 +28,15 @@
 #define M5HAL_DEBUG_SOFTWARE_I2C_NO_WAIT 0
 #endif
 
-namespace m5::variants::frameworks::software::hal::v1::i2c {
-
-using namespace ::m5::hal::v1;  // resolve unqualified interface::/types::/bus:: refs
+namespace m5::hal::v1::i2c {
 
 namespace {
+namespace impl_software {
+
+// The bit-bang machinery stays in the variant namespace
+// (software/hal/i2c/i2c.hpp); this TU-local alias keeps the `detail::`
+// spelling working for Bus_software's implementation below.
+namespace detail = ::m5::variants::frameworks::software::hal::v1::i2c::detail;
 
 class PinMasterLineDriver : public detail::MasterLineDriver {
 public:
@@ -101,7 +105,7 @@ template <typename Service>
 #endif
     for (;;) {
         const auto now_tick = serviceNowTick();
-        // Whole-transfer deadline (S16 D10): `timeout_ms` bounds the
+        // Whole-transfer deadline: `timeout_ms` bounds the
         // ENTIRE transfer, matching the espidf backend's per-transfer
         // semantics. Without this, only individual clock stretches were
         // bounded and a transfer could stall indefinitely in aggregate.
@@ -191,26 +195,27 @@ template <typename Service>
     return runErrorReportingService(transaction, serviceNowTick() + timing.timeout);
 }
 
+}  // namespace impl_software
 }  // anonymous namespace
 
-::m5::hal::v1::result_t<void> Bus::init(const BusConfig& config)
+::m5::hal::v1::result_t<void> Bus_software::init(const BusConfig_software& config)
 {
     _config = config;
 
-    // BusConfig uses the single gpio_number_t path. Resolve through
+    // BusConfig_software uses the single gpio_number_t path. Resolve through
     // `M5HALCore::Gpio` (the singleton GPIOGroup) with the CHECKED
     // `tryGetPin` — the pin numbers are caller input, so a bad value
     // must come back through the expected path, not the assert/UB
     // fast path of `getPin`. Cache the resulting `Pin` into
     // `_pin_scl` / `_pin_sda` so the transfer hot path skips the lookup.
     if (_config.pin_scl < 0 || _config.pin_sda < 0) {
-        M5_LIB_LOGE("software::i2c::Bus::init: pins not set");
+        M5_LIB_LOGE("software::i2c::Bus_software::init: pins not set");
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
     auto scl_pin = ::m5::hal::v1::M5_Hal.Gpio.tryGetPin(_config.pin_scl);
     auto sda_pin = ::m5::hal::v1::M5_Hal.Gpio.tryGetPin(_config.pin_sda);
     if (!scl_pin.has_value() || !sda_pin.has_value()) {
-        M5_LIB_LOGE("software::i2c::Bus::init: pin resolution failed");
+        M5_LIB_LOGE("software::i2c::Bus_software::init: pin resolution failed");
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
     _pin_scl = scl_pin.value();
@@ -225,10 +230,10 @@ template <typename Service>
     return {};
 }
 
-::m5::hal::v1::result_t<size_t> Bus::transfer(::m5::hal::v1::bus::Accessor* owner,
-                                              const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg,
-                                              const ::m5::hal::v1::i2c::TransferDesc& desc,
-                                              ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
+::m5::hal::v1::result_t<size_t> Bus_software::transfer(::m5::hal::v1::bus::IAccessor* owner,
+                                                       const ::m5::hal::v1::i2c::MasterAccessConfig& cfg,
+                                                       const ::m5::hal::v1::i2c::TransferDesc& desc,
+                                                       ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
 {
     // `owner` is reserved for future lock / unlock semantics
     // (the M5UU lock migration is currently on hold); ignored here.
@@ -245,15 +250,15 @@ template <typename Service>
     if (cfg.address_is_10bit || cfg.i2c_addr > 0x007Fu) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
-    auto timing = detail::MasterTiming::fromConfig(cfg);
+    auto timing = impl_software::detail::MasterTiming::fromConfig(cfg);
     if (!timing.has_value()) {
         return m5::stl::make_unexpected(timing.error());
     }
-    const auto service_timing = serviceTimingToTicks(*timing);
-    // Whole-transfer deadline: cfg.timeout_ms bounds this entire transfer
-    // (espidf-equivalent per-transfer semantics, S16 D10). The per-stretch
+    const auto service_timing = impl_software::serviceTimingToTicks(*timing);
+    // Whole-transfer deadline: cfg.wire_timeout_ms bounds this entire transfer
+    // (espidf-equivalent per-transfer semantics). The per-stretch
     // timeout inside MasterServiceTiming still applies on top.
-    const auto deadline_tick = serviceNowTick() + service_timing.timeout;
+    const auto deadline_tick = impl_software::serviceNowTick() + service_timing.timeout;
 
     // Pass `desc.prefix` into the legacy code path (header.data /
     // header.size) as a local `ConstDataSpan`. `desc` lives as a
@@ -266,7 +271,7 @@ template <typename Service>
 
     auto write_addr = [&](bool read_bit) -> ::m5::hal::v1::result_t<void> {
         uint8_t addr_byte = static_cast<uint8_t>((cfg.i2c_addr << 1) | (read_bit ? 1 : 0));
-        return sendAddressWithServices(*scl, *sda, service_timing, addr_byte, deadline_tick);
+        return impl_software::sendAddressWithServices(*scl, *sda, service_timing, addr_byte, deadline_tick);
     };
 
     bool have_tx = (tx != nullptr && !tx->eof());
@@ -280,7 +285,7 @@ template <typename Service>
     if (!header.size && !have_tx && !have_rx) {
         auto wa = write_addr(false);
         // Always emit a stop to return the bus to idle, even if the address NACKed.
-        auto s = sendStopWithService(*scl, *sda, service_timing);
+        auto s = impl_software::sendStopWithService(*scl, *sda, service_timing);
         if (!wa) {
             return m5::stl::make_unexpected(wa.error());
         }
@@ -297,34 +302,36 @@ template <typename Service>
         }
         write_phase_open = true;
         if (header.size) {
-            auto w = writeBytesWithService(*scl, *sda, service_timing, header.data, header.size, deadline_tick);
+            auto w = impl_software::writeBytesWithService(*scl, *sda, service_timing, header.data, header.size,
+                                                          deadline_tick);
             if (!w) {
-                sendStopWithService(*scl, *sda, service_timing);
+                impl_software::sendStopWithService(*scl, *sda, service_timing);
                 return m5::stl::make_unexpected(w.error());
             }
             // Prefix bytes are NOT counted: the return value is the data
-            // phase only (tx + rx), matching SPI (S16 D4).
+            // phase only (tx + rx), matching SPI.
         }
         if (tx) {
             // Drain Source via peek/advance, writing each peeked chunk.
             while (!tx->eof()) {
                 auto peeked = tx->peek(SIZE_MAX);
                 if (!peeked.has_value()) {
-                    sendStopWithService(*scl, *sda, service_timing);
+                    impl_software::sendStopWithService(*scl, *sda, service_timing);
                     return m5::stl::make_unexpected(peeked.error());
                 }
                 auto span = peeked.value();
                 if (span.size == 0) {
                     break;  // explicit end-of-stream
                 }
-                auto w = writeBytesWithService(*scl, *sda, service_timing, span.data, span.size, deadline_tick);
+                auto w = impl_software::writeBytesWithService(*scl, *sda, service_timing, span.data, span.size,
+                                                              deadline_tick);
                 if (!w) {
-                    sendStopWithService(*scl, *sda, service_timing);
+                    impl_software::sendStopWithService(*scl, *sda, service_timing);
                     return m5::stl::make_unexpected(w.error());
                 }
                 auto adv = tx->advance(*w);
                 if (!adv.has_value()) {
-                    sendStopWithService(*scl, *sda, service_timing);
+                    impl_software::sendStopWithService(*scl, *sda, service_timing);
                     return m5::stl::make_unexpected(adv.error());
                 }
                 total += *w;
@@ -335,43 +342,44 @@ template <typename Service>
     if (rx) {
         auto rsv = rx->reserve(SIZE_MAX);
         if (!rsv.has_value()) {
-            if (write_phase_open) sendStopWithService(*scl, *sda, service_timing);
+            if (write_phase_open) impl_software::sendStopWithService(*scl, *sda, service_timing);
             return m5::stl::make_unexpected(rsv.error());
         }
         auto rx_span = rsv.value();
         if (rx_span.size > 0) {
             if (write_phase_open && !cfg.use_restart) {
                 // Stop + Start (no repeated start).
-                auto s = sendStopWithService(*scl, *sda, service_timing);
+                auto s = impl_software::sendStopWithService(*scl, *sda, service_timing);
                 if (!s) return m5::stl::make_unexpected(s.error());
                 write_phase_open = false;
             }
             auto wa = write_addr(true);
             if (!wa) {
-                if (write_phase_open) sendStopWithService(*scl, *sda, service_timing);
+                if (write_phase_open) impl_software::sendStopWithService(*scl, *sda, service_timing);
                 return m5::stl::make_unexpected(wa.error());
             }
-            auto rd = readBytesWithService(*scl, *sda, service_timing, rx_span.data, rx_span.size, true, deadline_tick);
+            auto rd = impl_software::readBytesWithService(*scl, *sda, service_timing, rx_span.data, rx_span.size, true,
+                                                          deadline_tick);
             if (!rd) {
-                sendStopWithService(*scl, *sda, service_timing);
+                impl_software::sendStopWithService(*scl, *sda, service_timing);
                 return m5::stl::make_unexpected(rd.error());
             }
             auto com = rx->commit(*rd);
             if (!com.has_value()) {
-                sendStopWithService(*scl, *sda, service_timing);
+                impl_software::sendStopWithService(*scl, *sda, service_timing);
                 return m5::stl::make_unexpected(com.error());
             }
             total += *rd;
         }
     }
 
-    auto s = sendStopWithService(*scl, *sda, service_timing);
+    auto s = impl_software::sendStopWithService(*scl, *sda, service_timing);
     if (!s) {
         return m5::stl::make_unexpected(s.error());
     }
     return total;
 }
 
-}  // namespace m5::variants::frameworks::software::hal::v1::i2c
+}  // namespace m5::hal::v1::i2c
 
 #endif

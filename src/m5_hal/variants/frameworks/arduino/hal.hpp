@@ -10,5 +10,6 @@
 #include "hal/i2c/i2c.hpp"
 #include "hal/spi/spi.hpp"
 #include "hal/uart/uart.hpp"
+#include "hal/runtime/runtime.hpp"
 
 #endif

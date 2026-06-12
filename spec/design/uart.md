@@ -23,7 +23,7 @@ enum class Channel : uint8_t {
     txrx,
 };
 
-struct UARTBusConfig : public bus::BusConfig {
+struct IBusConfig : public bus::IBusConfig {
     gpio_number_t pin_tx;
     gpio_number_t pin_rx;
     gpio_number_t pin_rts;
@@ -32,9 +32,8 @@ struct UARTBusConfig : public bus::BusConfig {
     size_t tx_buffer_size;
 };
 
-struct UARTAccessConfig : public bus::AccessConfig {
+struct AccessConfig : public bus::IAccessConfig {
     uint32_t baud_rate;
-    uint32_t timeout_ms;             // bus lock timeout
     uint32_t first_byte_timeout_ms;  // read first byte wait
     uint32_t inter_byte_timeout_ms;  // read continuation wait
     uint32_t write_timeout_ms;       // physical TX drain wait
@@ -44,13 +43,13 @@ struct UARTAccessConfig : public bus::AccessConfig {
     bool invert;
 };
 
-class UARTTxAccessor : public bus::Accessor, public data::StreamWriter {
+class TxAccessor : public bus::IAccessor, public data::StreamWriter {
     expected<size_t, error_t> write(data::ConstDataSpan tx) override;  // StreamWriter
     expected<size_t, error_t> write(data::Source& tx, size_t len);
     expected<size_t, error_t> write(const uint8_t* tx, size_t len);
 };
 
-class UARTRxAccessor : public bus::Accessor, public data::StreamReader {
+class RxAccessor : public bus::IAccessor, public data::StreamReader {
     expected<size_t, error_t> read(data::DataSpan rx) override;  // StreamReader
     expected<size_t, error_t> read(data::Sink& rx, size_t len);
     expected<size_t, error_t> read(uint8_t* dst, size_t len);
@@ -58,9 +57,9 @@ class UARTRxAccessor : public bus::Accessor, public data::StreamReader {
     expected<size_t, error_t> readableBytes() override;  // StreamReader
 };
 
-class UARTAccessor {
-    UARTTxAccessor& tx();
-    UARTRxAccessor& rx();
+class Accessor {
+    TxAccessor& tx();
+    RxAccessor& rx();
 
     expected<size_t, error_t> write(data::ConstDataSpan tx);
     expected<size_t, error_t> read(data::DataSpan rx);
@@ -70,21 +69,26 @@ class UARTAccessor {
 }
 ```
 
-`timeout_ms` は `UARTTxAccessor::beginTxAccess()` /
-`UARTRxAccessor::beginRxAccess()` / facade の `UARTAccessor::beginAccess()`
-で使う channel lock timeout。UART の受信待ちは
+channel lock の取得待ちは `TxAccessor::beginTxAccess(timeout_ms)` /
+`RxAccessor::beginRxAccess(timeout_ms)` / facade の
+`Accessor::beginAccess(timeout_ms)` の **呼び出し引数** (省略 = 無限待ち、
+0 = 即時 try-lock。config には置かない)。UART の受信待ちは
 `first_byte_timeout_ms` と `inter_byte_timeout_ms`、送信 drain 待ちは
 `write_timeout_ms` で表す。
 
 ## channel semantics
 
-`UARTBus` は `Channel::tx` と `Channel::rx` を別々に lock する。
-`UARTTxAccessor` は TX channel のみ、`UARTRxAccessor` は RX channel のみを
+`IBus` は `Channel::tx` と `Channel::rx` を別々に lock する
+(チャネルごとに `runtime::Mutex` を 1 本持つ)。
+`TxAccessor` は TX channel のみ、`RxAccessor` は RX channel のみを
 開く。これにより write と read は同時に進められる。同一 channel に対する
-複数 owner の競合は `BUSY`。
+複数 owner の競合は timeout まで待って `TIMEOUT_ERROR`
+([bus_accessor.md](bus_accessor.md) §排他制御の意味論)。複合 lock (`txrx`) は
+TX → RX の順に取得し、2 本目には timeout の残余を充てる (呼び出し全体として
+timeout_ms を守る)。RX 取得失敗時は取得済みの TX を巻き戻す。
 
-`UARTAccessor` は `UARTTxAccessor` と `UARTRxAccessor` を内包する
-convenience facade。`UARTAccessor::beginAccess()` は `txrx` を開き、
+`Accessor` は `TxAccessor` と `RxAccessor` を内包する
+convenience facade。`Accessor::beginAccess()` は `txrx` を開き、
 `write()` / `read()` sugar はそれぞれ内包する split accessor へ委譲する。
 設計上の主 API は split accessor 側とし、facade は単純なコマンド応答型の
 利用を短く書くために残す。
@@ -102,14 +106,23 @@ split accessor は最小ストリーム I/O インタフェース (`data::Stream
 時間は `inter_byte_timeout_ms`。timeout は正常な短い read として扱い、
 それまでに受信した byte 数を返す。
 
+行指向プロトコル (NMEA / AT 応答等) には `RxAccessor::readUntil(delim,
+dst, max_len)` を使う (facade にも転送あり)。1 つの RX チャネルロック窓の
+中で delimiter まで読み、**delimiter を含めた** byte 数を返す — 「最終
+byte が delimiter か」だけで完結行と部分行が区別できる (Arduino の
+`readBytesUntil` が delimiter を捨てて両者を区別不能にする不満への回答)。
+timeout は部分行 (0 を含む短い戻り) で表れ、エラーではない。中核ロジックは
+`data::readUntil(StreamReader&, delim, DataSpan)` にあり、UART 以外の
+`StreamReader` にも同じ契約で使える ([data_io.md](data_io.md))。
+
 ## write semantics
 
 `write(tx, len)` は最大 `len` byte を `Source` から送信する。戻り値は driver
 へ受け渡した byte 数。
 
 **完了保証の正準契約は ESP-IDF backend の意味 (timeout 付き物理 drain 待ち)**。
-他 backend は実装手段の制約により完全には一致しない。差は仕様として下表に固定する
-(S16 D10、2026-06-12 — 完全統一は不可能と判断し、契約表を正本とする):
+他 backend は実装手段の制約により完全には一致しない。完全統一は不可能なため、差は
+仕様として下表に固定し、この契約表を正本とする:
 
 | backend | write 復帰タイミング | `write_timeout_ms` の扱い |
 |---|---|---|
@@ -139,7 +152,7 @@ split accessor は最小ストリーム I/O インタフェース (`data::Stream
   variant 固有の `uart::BusConfig` は `device_path`（`/dev/ttyUSB0` 等）を持つ。
   `open(device_path, baud)` で device を所有開放し、`attach(int fd)` で
   caller-owned fd（pty の片端など）を採用する。termios は最初の write/read で
-  per-access `UARTAccessConfig` から適用（baud / 8bit / stop / parity）、timeout は
+  per-access `AccessConfig` から適用（baud / 8bit / stop / parity）、timeout は
   `select()` で実装する。read/write 以外の line は raw（`cfmakeraw`）。素の POSIX
   host で既定有効の opt-out（`M5HAL_CONFIG_POSIX_UART=0` で抑止）。高速 baud: Linux glibc/musl は
   `B460800`〜`B4000000` の定数経由、 macOS は B230400 超を `IOSSIOSPEED` ioctl で任意 baud 設定

@@ -55,8 +55,8 @@ protected:
 TEST_F(UartEcho, EchoesSmallPayload)
 {
     auto cfg = hil::ioConfig(baud_);
-    uart::UARTTxAccessor tx_dev{bus_, cfg};
-    uart::UARTRxAccessor rx_dev{bus_, cfg};
+    uart::TxAccessor tx_dev{bus_, cfg};
+    uart::RxAccessor rx_dev{bus_, cfg};
     const uint8_t tx[] = {0x01, 0x02, 0x03, 0x04, 0x05};
     ASSERT_TRUE(tx_dev.write(data::ConstDataSpan{tx, sizeof(tx)}).has_value());
 
@@ -68,8 +68,8 @@ TEST_F(UartEcho, EchoesSmallPayload)
 TEST_F(UartEcho, EchoesBinaryIncludingNulAndNewline)
 {
     auto cfg = hil::ioConfig(baud_);
-    uart::UARTTxAccessor tx_dev{bus_, cfg};
-    uart::UARTRxAccessor rx_dev{bus_, cfg};
+    uart::TxAccessor tx_dev{bus_, cfg};
+    uart::RxAccessor rx_dev{bus_, cfg};
     // Includes NUL, LF, CR, high bytes — must survive raw (no line discipline).
     const uint8_t tx[] = {0x00, 0x0A, 0x0D, 0xFF, 0x7F, 0x80, 0x00, 0x55};
     ASSERT_TRUE(tx_dev.write(data::ConstDataSpan{tx, sizeof(tx)}).has_value());
@@ -82,8 +82,8 @@ TEST_F(UartEcho, EchoesBinaryIncludingNulAndNewline)
 TEST_F(UartEcho, EchoesLargePayloadInOrder)
 {
     auto cfg = hil::ioConfig(baud_);
-    uart::UARTTxAccessor tx_dev{bus_, cfg};
-    uart::UARTRxAccessor rx_dev{bus_, cfg};
+    uart::TxAccessor tx_dev{bus_, cfg};
+    uart::RxAccessor rx_dev{bus_, cfg};
     std::vector<uint8_t> tx(512);
     for (size_t i = 0; i < tx.size(); ++i) {
         tx[i] = static_cast<uint8_t>(i * 7 + 1);

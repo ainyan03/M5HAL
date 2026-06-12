@@ -2,11 +2,11 @@
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_GPIO_GPIO_HPP
 #define M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_GPIO_GPIO_HPP
 
-// GPIO implementation for the espidf framework variant — wraps the
+// GPIO_espidf implementation for the espidf framework variant — wraps the
 // ESP-IDF SDK (`gpio_config` / `gpio_set_level` / `gpio_get_level`
 // from `driver/gpio.h`). Activation: `ESP_PLATFORM`. Even from
 // Arduino-on-IDF builds, this variant can be selected explicitly via
-// its alias. The encoded value is the gpio_number itself (one Port
+// its alias. The encoded value is the gpio_number itself (one Port_espidf
 // is enough because `gpio_num_t` already addresses pins directly).
 // Authoritative spec: spec/design/gpio.md, spec/design/variants.md.
 
@@ -20,15 +20,15 @@
 #include "driver/gpio.h"
 #include "soc/soc_caps.h"
 
-namespace m5::variants::frameworks::espidf::hal::v1::gpio {
+namespace m5::hal::v1::gpio {
 
-class Port : public ::m5::hal::v1::gpio::IPort {
+class Port_espidf : public ::m5::hal::v1::gpio::IPort {
 public:
     // Per chip (esp32 = 40 / s3 = 49 / c6 = 31 / p4 = 55). Out-of-range
     // checking is centralized in `_fromLocalPin`'s assert.
     static constexpr uint8_t kWidth = SOC_GPIO_PIN_COUNT;
 
-    constexpr Port() = default;
+    constexpr Port_espidf() = default;
 
 protected:
     void _writePinEncoded(uint32_t encoded_num, bool v) override
@@ -73,15 +73,15 @@ protected:
     }
 };
 
-// Minimal GPIO with a single built-in Port (one Port covers every
+// Minimal GPIO_espidf with a single built-in Port_espidf (one Port_espidf covers every
 // chip because `gpio_num_t` already addresses pins individually).
 // constexpr singleton — `getInstance()` returns a `static constexpr`
 // placed in rodata, so there is no guard variable.
-class GPIO : public ::m5::hal::v1::gpio::IGPIO {
+class GPIO_espidf : public ::m5::hal::v1::gpio::IGPIO {
 public:
     ::m5::hal::v1::gpio::IPort* portForPin(::m5::hal::v1::types::gpio_local_pin_t pin_index) const override
     {
-        M5HAL_ASSERT(pin_index < static_cast<::m5::hal::v1::types::gpio_local_pin_t>(Port::kWidth),
+        M5HAL_ASSERT(pin_index < static_cast<::m5::hal::v1::types::gpio_local_pin_t>(Port_espidf::kWidth),
                      "pin_index out of range");
         return &_port;
     }
@@ -92,51 +92,51 @@ public:
     }
     uint16_t getPinCount() const override
     {
-        return Port::kWidth;
+        return Port_espidf::kWidth;
     }
     uint8_t getPortCount() const override
     {
         return 1;
     }
 
-    static const GPIO* getInstance()
+    static const GPIO_espidf* getInstance()
     {
-        static constexpr GPIO s_gpio_instance{};
+        static constexpr GPIO_espidf s_gpio_instance{};
 
         return &s_gpio_instance;
     }
 
 protected:
-    constexpr GPIO() = default;
+    constexpr GPIO_espidf() = default;
 
     // Singleton: copy / move deleted (also required to keep the type literal).
-    constexpr GPIO(const GPIO&)            = delete;
-    constexpr GPIO& operator=(const GPIO&) = delete;
-    constexpr GPIO(GPIO&&)                 = delete;
-    constexpr GPIO& operator=(GPIO&&)      = delete;
+    constexpr GPIO_espidf(const GPIO_espidf&)            = delete;
+    constexpr GPIO_espidf& operator=(const GPIO_espidf&) = delete;
+    constexpr GPIO_espidf(GPIO_espidf&&)                 = delete;
+    constexpr GPIO_espidf& operator=(GPIO_espidf&&)      = delete;
 
 private:
-    mutable Port _port{};
+    mutable Port_espidf _port{};
 };
 
-// MCU-internal GPIO (constexpr instance).
-inline const ::m5::hal::v1::gpio::IGPIO* getMCUGPIO()
+// MCU-internal GPIO_espidf (constexpr instance).
+inline const ::m5::hal::v1::gpio::IGPIO* getMCUGPIO_espidf()
 {
-    return GPIO::getInstance();
+    return GPIO_espidf::getInstance();
 }
 
-// Flat-injection entry: the MCU-internal GPIO as an `IGPIO*` (the
+// Flat-injection entry: the MCU-internal GPIO_espidf as an `IGPIO*` (the
 // local pin space). `M5HALCore::ctor` uses this as the slot-0
 // bootstrap source.
-inline const ::m5::hal::v1::gpio::IGPIO* getGPIO()
+inline const ::m5::hal::v1::gpio::IGPIO* getGPIO_espidf()
 {
-    return getMCUGPIO();
+    return getMCUGPIO_espidf();
 }
 
 // `getGPIOGroup()` / `pin()` free functions are gone. Global lookups
 // go through `m5::hal::v1::M5_Hal.Gpio.getPin(num)`.
 
-}  // namespace m5::variants::frameworks::espidf::hal::v1::gpio
+}  // namespace m5::hal::v1::gpio
 
 #endif  // ESP_PLATFORM
 

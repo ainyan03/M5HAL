@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Skeleton tests for the Pin / Port abstraction (encoded-value
 // hiding + assert-based contracts). The stub variant's Port
-// (`m5::variants::frameworks::stub::hal::v1::gpio::Port`) drives
+// (`m5::hal::v1::gpio::Port_stub`) drives
 // these native gtests, covering:
 //   - Direct Port operations (write / read / setMode).
 //   - Pin operations (write / read / setMode / getLocalPin).
@@ -21,7 +21,7 @@
 namespace {
 
 using ::m5::hal::v1::types::gpio_mode_t;
-using StubPort = ::m5::variants::frameworks::stub::hal::v1::gpio::Port;
+using StubPort = ::m5::hal::v1::gpio::Port_stub;
 
 TEST(PortSkeleton, PortDirectWriteRead)
 {

@@ -6,11 +6,12 @@
 
 #if defined(ARDUINO)
 
-namespace m5::variants::frameworks::arduino::hal::v1::uart {
+namespace m5::hal::v1::uart {
 
 namespace {
+namespace impl_arduino {
 
-::m5::hal::v1::result_t<uint32_t> serialConfig(const ::m5::hal::v1::uart::UARTAccessConfig& cfg)
+::m5::hal::v1::result_t<uint32_t> serialConfig(const ::m5::hal::v1::uart::AccessConfig& cfg)
 {
     if (cfg.data_bits != 8 || (cfg.stop_bits != 1 && cfg.stop_bits != 2)) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
@@ -27,15 +28,16 @@ namespace {
     }
 }
 
-bool sameConfig(const ::m5::hal::v1::uart::UARTAccessConfig& lhs, const ::m5::hal::v1::uart::UARTAccessConfig& rhs)
+bool sameConfig(const ::m5::hal::v1::uart::AccessConfig& lhs, const ::m5::hal::v1::uart::AccessConfig& rhs)
 {
     return lhs.baud_rate == rhs.baud_rate && lhs.data_bits == rhs.data_bits && lhs.stop_bits == rhs.stop_bits &&
            lhs.parity == rhs.parity && lhs.invert == rhs.invert;
 }
 
+}  // namespace impl_arduino
 }  // namespace
 
-::m5::hal::v1::result_t<void> Bus::init(const BusConfig& config)
+::m5::hal::v1::result_t<void> Bus_arduino::init(const BusConfig_arduino& config)
 {
     _config = config;
     _serial = config.serial;
@@ -47,7 +49,7 @@ bool sameConfig(const ::m5::hal::v1::uart::UARTAccessConfig& lhs, const ::m5::ha
     return {};
 }
 
-::m5::hal::v1::result_t<void> Bus::release(void)
+::m5::hal::v1::result_t<void> Bus_arduino::release(void)
 {
     if (_serial != nullptr && _begun && !_attached) {
         _serial->end();
@@ -58,7 +60,7 @@ bool sameConfig(const ::m5::hal::v1::uart::UARTAccessConfig& lhs, const ::m5::ha
     return {};
 }
 
-::m5::hal::v1::error::error_t Bus::attach(::HardwareSerial& serial)
+::m5::hal::v1::error::error_t Bus_arduino::attach(::HardwareSerial& serial)
 {
     (void)release();
     _serial   = &serial;
@@ -69,28 +71,28 @@ bool sameConfig(const ::m5::hal::v1::uart::UARTAccessConfig& lhs, const ::m5::ha
     // accessor happened to ask for the default config — whether the
     // attached serial got (re)configured depended on the config VALUE,
     // which is the same class of trap as the i2c `_last_freq` sentinel
-    // this mirrors (S16 D10). Callers who configured the serial
+    // this mirrors. Callers who configured the serial
     // themselves should pass the same parameters in the accessor
     // config; attach does not try to preserve an unknown foreign setup.
     _begun = false;
     return ::m5::hal::v1::error::error_t::OK;
 }
 
-::m5::hal::v1::result_t<void> Bus::applyConfig(const ::m5::hal::v1::uart::UARTAccessConfig& cfg)
+::m5::hal::v1::result_t<void> Bus_arduino::applyConfig(const ::m5::hal::v1::uart::AccessConfig& cfg)
 {
     if (_serial == nullptr || cfg.baud_rate == 0) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
-    if (_begun && sameConfig(_applied_cfg, cfg)) {
+    if (_begun && impl_arduino::sameConfig(_applied_cfg, cfg)) {
         return {};
     }
-    auto native_cfg = serialConfig(cfg);
+    auto native_cfg = impl_arduino::serialConfig(cfg);
     if (!native_cfg.has_value()) {
         return m5::stl::make_unexpected(native_cfg.error());
     }
 #if defined(ESP_PLATFORM)
     // RX/TX ring buffer sizes must be set before begin() and only take effect on
-    // the first begin. Honors UARTBusConfig.{rx,tx}_buffer_size (a value of 0
+    // the first begin. Honors IBusConfig.{rx,tx}_buffer_size (a value of 0
     // leaves the Arduino default; rx default 256 == the Arduino default). A
     // larger RX ring matters for high-baud bursts (see the uart_echo HIL test).
     if (!_begun) {
@@ -114,9 +116,9 @@ bool sameConfig(const ::m5::hal::v1::uart::UARTAccessConfig& lhs, const ::m5::ha
     return {};
 }
 
-::m5::hal::v1::result_t<size_t> Bus::write(::m5::hal::v1::bus::Accessor* owner,
-                                           const ::m5::hal::v1::uart::UARTAccessConfig& cfg,
-                                           ::m5::hal::v1::data::Source* tx, size_t len)
+::m5::hal::v1::result_t<size_t> Bus_arduino::write(::m5::hal::v1::bus::IAccessor* owner,
+                                                   const ::m5::hal::v1::uart::AccessConfig& cfg,
+                                                   ::m5::hal::v1::data::Source* tx, size_t len)
 {
     (void)owner;
     auto applied = applyConfig(cfg);
@@ -146,9 +148,9 @@ bool sameConfig(const ::m5::hal::v1::uart::UARTAccessConfig& lhs, const ::m5::ha
     return done;
 }
 
-::m5::hal::v1::result_t<size_t> Bus::read(::m5::hal::v1::bus::Accessor* owner,
-                                          const ::m5::hal::v1::uart::UARTAccessConfig& cfg,
-                                          ::m5::hal::v1::data::Sink* rx, size_t len)
+::m5::hal::v1::result_t<size_t> Bus_arduino::read(::m5::hal::v1::bus::IAccessor* owner,
+                                                  const ::m5::hal::v1::uart::AccessConfig& cfg,
+                                                  ::m5::hal::v1::data::Sink* rx, size_t len)
 {
     (void)owner;
     auto applied = applyConfig(cfg);
@@ -194,8 +196,8 @@ bool sameConfig(const ::m5::hal::v1::uart::UARTAccessConfig& lhs, const ::m5::ha
     return done;
 }
 
-::m5::hal::v1::result_t<size_t> Bus::readableBytes(::m5::hal::v1::bus::Accessor* owner,
-                                                   const ::m5::hal::v1::uart::UARTAccessConfig& cfg)
+::m5::hal::v1::result_t<size_t> Bus_arduino::readableBytes(::m5::hal::v1::bus::IAccessor* owner,
+                                                           const ::m5::hal::v1::uart::AccessConfig& cfg)
 {
     (void)owner;
     auto applied = applyConfig(cfg);
@@ -205,7 +207,7 @@ bool sameConfig(const ::m5::hal::v1::uart::UARTAccessConfig& lhs, const ::m5::ha
     return static_cast<size_t>(_serial->available());
 }
 
-}  // namespace m5::variants::frameworks::arduino::hal::v1::uart
+}  // namespace m5::hal::v1::uart
 
 #endif
 

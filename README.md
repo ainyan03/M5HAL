@@ -9,9 +9,18 @@ The **v0 API is stable** and stays the default, so existing code keeps
 working unchanged. The **v1 API is under active development** and is
 opt-in — include `<M5HAL_v1.hpp>` explicitly to try it.
 
+## Requirements
+
+- An ESP32-family board. The published packages target the `espressif32`
+  platform (Arduino-ESP32 or ESP-IDF >= 4.4).
+- [M5Utility](https://github.com/m5stack/M5Utility) — PlatformIO and the
+  ESP-IDF component manager pull it in automatically; in the Arduino IDE,
+  install it alongside M5HAL.
+
 ## Documentation
 
-- Confirmed specification documents live under [`spec/`](spec/README.md).
+- Confirmed specification documents live under [`spec/`](spec/README.md)
+  (also bundled in the release packages).
 
 ## Where to start
 
@@ -69,19 +78,31 @@ library. The entry headers are:
 
 ## Trying the v1 API
 
-v1 is opt-in. Include `<M5HAL_v1.hpp>` and keep the v1 code in a
-translation unit that does not also include the v0 entry headers.
+v1 is opt-in. Include `<M5HAL_v1.hpp>`. Mixing a v0 entry header into the
+same translation unit is also supported (see
+[v0 / v1 coexistence](#v0--v1-coexistence)), but one generation per file
+reads better.
 
 The current v1 bus API is centered on:
 
 - **Bus** — the physical bus instance (`i2c::Bus`, `spi::Bus`, `uart::Bus`,
-  or an explicit variant such as `spi::variant::software::Bus`)
+  `i2s::Bus`, or an explicit variant such as `spi::Bus_software`)
 - **Accessor** — one target device on that bus, with per-device settings
   such as address, chip-select pin, baud rate, frequency, timeout, and SPI mode
 - **TransferDesc** — per-transfer metadata such as an I2C register prefix
   or SPI command/address/dummy phases; UART does not need a transfer descriptor
 - **Source / Sink** — streaming-friendly data input/output abstractions;
-  span and raw pointer overloads are available for simple buffers
+  span and raw pointer overloads are available
+
+**You own the buses**: v1 has no hidden singleton bus inside the HAL.
+Define the bus object yourself (usually static / global), init it, and
+hand it to accessors. To publish board wiring as "slot n is this bus",
+register it in the non-owning registries `M5_Hal.I2C` / `M5_Hal.SPI` /
+... (`M5_Hal.SPI.addBus(&bus, 1)`, then `M5_Hal.SPI.getBus(1)`; the
+same bus may sit in several slots — "SD and LCD share one bus").
+`M5_Hal` itself bundles the GPIO/bus registries and the service
+runner; you can ignore it unless you use expanders or a board-support
+layer. for simple buffers
 
 Minimal I2C shape:
 
@@ -95,16 +116,19 @@ m5hal::i2c::Bus i2c_bus;
 
 void setup()
 {
-    m5hal::i2c::BusConfig bus_cfg{&Wire, 22, 21};  // Wire, SCL, SDA
+    m5hal::i2c::BusConfig bus_cfg;
+    bus_cfg.wire    = &Wire;
+    bus_cfg.pin_scl = 22;
+    bus_cfg.pin_sda = 21;
     i2c_bus.init(bus_cfg);
 
-    m5hal::i2c::I2CMasterAccessConfig dev_cfg;
-    dev_cfg.i2c_addr = 0x76;
-    dev_cfg.freq = 100000;
-    dev_cfg.timeout_ms = 100;
+    m5hal::i2c::AccessConfig dev_cfg;
+    dev_cfg.i2c_addr        = 0x76;
+    dev_cfg.freq            = 100000;
+    dev_cfg.wire_timeout_ms = 100;
     // dev_cfg.register_address_bytes = 2;  // only for 2-byte register-address devices
 
-    m5hal::i2c::I2CMasterAccessor dev{i2c_bus, dev_cfg};
+    m5hal::i2c::MasterAccessor dev{i2c_bus, dev_cfg};
     auto id = dev.readRegister(0x00);
 }
 ```
@@ -115,13 +139,21 @@ The example scans the bus, creates an accessor for the first responding
 device, demonstrates register reads, and shows `ScopedAccess` for grouping
 multiple transfers under one bus lock.
 
-When you need a specific backend, use the explicit variant alias namespace.
+When you need a specific backend, use the suffixed variant type name.
 For example, the software I2C backend can be selected by changing the bus
 type in the example to:
 
 ```cpp
-using ExampleI2CBus = m5::hal::v1::i2c::variant::software::Bus;
+using ExampleBus = m5::hal::v1::i2c::Bus_software;
 ```
+
+`#include <Wire.h>` is needed because the default Arduino I2C backend
+(`i2c::Bus_arduino`) delegates to a `TwoWire` instance
+(`bus_cfg.wire = &Wire`); it goes away when you pin the software or
+ESP-IDF backend instead. The unsuffixed `i2c::Bus` / `i2c::BusConfig`
+spellings are type aliases to the first backend the build environment
+offered (`Bus_arduino`, ...), so the `BusConfig` field set (whether
+there is a `wire`, ...) follows the selected variant.
 
 SPI follows the same Bus / Accessor shape. Arduino SPI, ESP-IDF SPI, and
 software SPI are available as v1 backends when the build environment exposes
@@ -131,7 +163,14 @@ multiple transfers. Start with
 [`examples/v1/HowToUse/SPI`](examples/v1/HowToUse/SPI/) for a
 logic-analyzer-friendly sketch that needs no SPI slave.
 
-UART also follows the same Bus / Accessor shape. Start with
+UART also follows the same Bus / Accessor shape. **The baud rate lives
+on `uart::AccessConfig` (the accessor side), not on the bus** — the same
+physical port can serve different peers with different settings. Pick
+your accessor from three: TX-only (`TxAccessor`), RX-only
+(`RxAccessor`), or the two-way facade (`Accessor`) — use the split pair
+when separate tasks send and receive, the facade for simple
+command-response code (the split accessors are the primary API; see
+[`spec/design/uart.md`](spec/design/uart.md)). Start with
 [`examples/v1/HowToUse/UART`](examples/v1/HowToUse/UART/) for an Arduino
 sketch that uses USB Serial for logs and `Serial1` as the M5HAL UART bus.
 Connect TX to RX to confirm loopback receive without another UART device.
@@ -140,7 +179,15 @@ step further: it echoes everything received back to the sender through the
 `StreamSink` adapter, showing how the accessors compose with the
 Source / Sink stream model.
 
+[`examples/v1/HowToUse/I2SAudio`](examples/v1/HowToUse/I2SAudio/) plays a
+sine wave through the built-in speaker using the `i2s::Bus` TX path
+(I2S needs board-specific amplifier setup; the sketch covers M5Stack
+Core2 V1.1, with CoreS3 wiring included but not yet verified).
+
 [`examples/v1/HowToUse/Bytecode`](examples/v1/HowToUse/Bytecode/) drives
 GPIO, I2C, and SPI from bytecode scripts written out as plain byte arrays
 (the "init sequence as a const table" pattern), executed on the buttons of
 an M5Stack Core BASIC.
+
+An index of all examples, with wiring and expected output, is in
+[`examples/v1/HowToUse/README.md`](examples/v1/HowToUse/README.md).

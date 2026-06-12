@@ -26,7 +26,7 @@ using ::m5::hal::v1::types::gpio_mode_t;
 using ::m5::hal::v1::types::gpio_number_t;
 using ::m5::hal::v1::types::gpio_slot_t;
 using ::m5::hal::v1::types::makeGpioNumber;
-using StubPort = ::m5::variants::frameworks::stub::hal::v1::gpio::Port;
+using StubPort = ::m5::hal::v1::gpio::Port_stub;
 
 // Minimal concrete `IGPIO` for tests: wraps a single `stub::Port`
 // and takes its width from the ctor. The internal local pin space

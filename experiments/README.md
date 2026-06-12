@@ -137,8 +137,8 @@ temp allocation が fallback に回る時のコストを見る。
 
 ## リモートバス統合ハーネス (RemoteMenu)
 
-`RemoteMenu` はリモートバス機構 ([spec/design/remote.md](../spec/design/remote.md)、
-decisions/022-024) の常設受入ハーネス。 旧 examples の Remote 系 4 sketch + host 2 本
+`RemoteMenu` はリモートバス機構 ([spec/design/remote.md](../spec/design/remote.md)) の
+常設受入ハーネス。 旧 examples の Remote 系 4 sketch + host 2 本
 (RemoteBus / RemoteBusTcp / RemoteI2S / RemoteI2STcp) をここに一本化した。
 
 - **device** (`RemoteMenu/device/remote_menu_device.cpp`): 内蔵 I2C (`SDA=21/SCL=22`、bus_id 0) と
@@ -148,8 +148,12 @@ decisions/022-024) の常設受入ハーネス。 旧 examples の Remote 系 4 
   誤駆動を避ける安全ゲート。
 - **host** (`RemoteMenu/host/remote_menu_host.cpp`): stdin メニューの CLI。 caps / ping (RTT) /
   I2C scan / レジスタ read / GPIO スナップショット / gpio-write (allowlist 拒否の実演) /
-  push イベント監視 (watch) / 正弦波ストリーミング (tone、`hz=0` で無音) /
-  credit 会計ソーク (soak、終了時に avg vs 公称と credit 沈降の判定サマリ) を選択実行する。
+  push イベント監視 (watch) / 正弦波ストリーミング (tone、`hz=0` で無音。末尾の
+  `[sec]` 引数で時間指定可) / credit 会計ソーク (soak、終了時に avg vs 公称と
+  credit 沈降の判定サマリ) を選択実行する。**時間指定のある実行 (tone の `sec>0` と
+  soak) は stdin を見ずに走り切る** — パイプで後続コマンド (`quit` 等) を流し込む
+  スクリプト実行でも途中停止せず、決定的に回帰へ使える。Enter 停止は無期限 tone と
+  watch だけの対話機能。
 
 ```bash
 # UART transport (espidf、3 Mbaud。Core2 V1.1 なら I2S も公開される)
@@ -175,8 +179,7 @@ transport (UART/TCP) と framework (arduino/espidf) は同一ソースの build 
 **WiFi ゼロコスト対照**: M5HAL 自体は `<WiFi.h>` / esp_wifi を一切 include しないため、WiFi を
 使わない sketch のバイナリには WiFi スタックが入らない。 `v1_exp_remote_arduino` (WiFi include
 なし) と `v1_exp_remote_tcp_arduino` (同一 TU + WiFi) の ELF を `nm` / `size` で比較すると実測
-できる (flash 差 ~482 KB、WiFi 非使用側の wifi シンボルは arduino core 自前の wrapper ~73 B のみ。
-decisions/024)。
+できる (flash 差 ~482 KB、WiFi 非使用側の wifi シンボルは arduino core 自前の wrapper ~73 B のみ)。
 
 ## software SPI ロジアナ確認
 
@@ -193,12 +196,13 @@ decisions/024)。
 
 通常の Accessor sugar は内部で `beginTransaction` / `endTransaction` を呼び、1 回の
 transfer 前後で CS を assert/deassert する。command と data を別 transfer に分けつつ
-CS を維持したい実験では、明示的に `SPIMasterAccessor::beginTransaction()` を呼んでから
+CS を維持したい実験では、明示的に `MasterAccessor::beginTransaction()` を呼んでから
 複数の `write()` / `transfer()` を行い、最後に `endTransaction()` する。
 
 既定 pin は ESP32 VSPI で見やすい `CLK=18 MOSI=23 MISO=19 DC=2 CS=5`、既定周波数は 1MHz、mode 0、MSB first。
 
 ```bash
+export M5HAL_PIO_EXTRA_CONFIG=pio_envs/v1/experiments_advanced.ini.cli
 pio run -e v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino -t upload
 pio device monitor -e v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino
 ```
@@ -206,6 +210,7 @@ pio device monitor -e v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino
 5MHz 設定の上限観測用 env も用意している。
 
 ```bash
+# M5HAL_PIO_EXTRA_CONFIG は上と同じ (experiments_advanced.ini.cli)
 pio run -e v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino_5mhz -t upload
 pio device monitor -e v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino_5mhz
 ```
@@ -213,6 +218,7 @@ pio device monitor -e v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino_5mhz
 `M5HAL_ASSERT` の hot path 影響を切り分ける場合は `-DNDEBUG` 付き env を使う。
 
 ```bash
+# M5HAL_PIO_EXTRA_CONFIG は上と同じ (experiments_advanced.ini.cli)
 pio run -e v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino_5mhz_ndebug -t upload
 pio device monitor -e v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino_5mhz_ndebug
 ```

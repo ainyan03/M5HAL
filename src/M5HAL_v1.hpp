@@ -21,6 +21,14 @@ M5HAL_INLINE_V1 namespace v1
 #include "./m5_hal/variants/ids.hpp"
 #include "./m5_hal/variants/platforms/_checker.hpp"
 #include "./m5_hal/variants/frameworks/_checker.hpp"
+
+// runtime kind (time + mutex): resolved EARLY, before any bus header —
+// bus::IBus embeds runtime::Mutex by value, so the winning variant must
+// be known here. The header below runs its own runtime-only scan pass
+// (same dispatch block in offer_all.inl, other kinds masked); the main
+// scan further down only re-emits the runtime variant aliases.
+#include "./m5_hal/hal/v1/runtime/runtime.hpp"
+
 #include "./m5_hal/hal/v1/i2c/i2c.hpp"
 #include "./m5_hal/hal/v1/i2c/slave.hpp"
 #include "./m5_hal/hal/v1/spi/spi.hpp"
@@ -76,30 +84,29 @@ M5HAL_INLINE_V1 namespace v1
 // of the same HAL kind. Always included.
 #include "./m5_hal/variants/frameworks/software/hal.hpp"
 
-// Public access to the active variant's HAL goes through the flat injection
-// performed by _macro/offer_all.inl below (e.g. m5::hal::gpio::Pin).
-// The legacy `using namespace frameworks::arduino;` injection into m5::hal
-// is not used.
+// Public access to the active variant's HAL goes through the winner
+// aliases emitted by _macro/offer_all.inl below (e.g. m5::hal::i2c::Bus
+// = i2c::Bus_<variant>). The legacy `using namespace` flat injection
+// is retained only by the runtime kind (free functions + Mutex).
 
-// === variant scan and namespace alias generation ===
+// === variant scan and winner alias generation ===
 //
 // Scan order: platform -> arduino framework -> espidf framework -> posix
 // framework -> software framework -> stub fallback.
 // Each pass includes the variant's _offer.hpp followed by
-// offer_all.inl, which generates namespace aliases under
-// m5::hal::<hal>::variant::* for HALs the variant offers and
-// undefs the M5HAL_VARIANT_CURRENT_*_ macros. The first variant
-// to offer a given HAL is also flat-injected into m5::hal::<hal>.
+// offer_all.inl, which on the first hit per kind binds the winner's
+// suffixed types (`Bus_<variant>` etc., defined directly in
+// m5::hal::v1::<kind>) to the unsuffixed names (`using Bus =
+// Bus_<variant>;`) and undefs the M5HAL_VARIANT_CURRENT_*_ macros.
+// Non-winning variants stay addressable by their suffixed names.
 
 #include "./m5_hal/variants/frameworks/stub/hal.hpp"
 
 // 1. platform _offer.hpp scan
 #define M5HAL_STATIC_MACRO_PATH_OFFER M5HAL_STATIC_MACRO_CONCAT(M5HAL_V1_TARGET_PLATFORM_PATH, _offer.hpp)
 #if M5HAL_V1_TARGET_PLATFORM_VARIANT_ID != M5HAL_V1_VARIANT_ID_NONE
-#define M5HAL_VARIANT_PLATFORM_ 1
 #include M5HAL_STATIC_MACRO_PATH_OFFER
 #include "./m5_hal/_macro/offer_all.inl"
-#undef M5HAL_VARIANT_PLATFORM_
 #endif
 #undef M5HAL_STATIC_MACRO_PATH_OFFER
 
@@ -136,7 +143,10 @@ M5HAL_INLINE_V1 namespace v1
 // Selected-variant markers: the scan passes above burned the winner's id
 // into M5HAL_V1_SELECTED_VARIANT_<KIND> for every offered kind. Default
 // the unoffered kinds to NONE so `#if M5HAL_V1_SELECTED_VARIANT_<KIND>
-// == ...` comparisons are always well-formed.
+// == ...` comparisons are always well-formed. RUNTIME has no NONE
+// default on purpose: bus::IBus depends on the type existing, so the
+// early scan in hal/v1/runtime/runtime.hpp #errors instead when no
+// variant offers it (the stub fallback always does).
 #ifndef M5HAL_V1_SELECTED_VARIANT_GPIO
 #define M5HAL_V1_SELECTED_VARIANT_GPIO M5HAL_V1_VARIANT_ID_NONE
 #endif

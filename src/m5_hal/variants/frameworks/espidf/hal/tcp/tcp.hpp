@@ -8,7 +8,7 @@
 // lwIP serves the BSD API through the ESP-IDF VFS, so the SAME
 // implementation backs both the espidf and the arduino-esp32 framework
 // — the framework difference is the WiFi bring-up, which is example
-// responsibility (decisions/024). The host (PC) sibling lives in the
+// responsibility (spec/design/remote.md). The host (PC) sibling lives in the
 // posix variant; the device side is the server, so this header exposes
 // listen / accept / attach and deliberately no client connect.
 //

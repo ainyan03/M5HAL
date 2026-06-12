@@ -38,17 +38,17 @@ constexpr int PIN_UART_RX = 16;
 
 // m5hal::uart::Bus resolves to the first backend the build offers
 // (framework scan order; see spec/design/variants.md).
-using ExampleUARTBus = m5hal::uart::Bus;
-// using ExampleUARTBus = m5hal::uart::variant::arduino::Bus;
+using ExampleBus = m5hal::uart::Bus;
+// using ExampleBus = m5hal::uart::Bus_arduino;
 
-ExampleUARTBus uart_bus;
-m5hal::uart::UARTAccessConfig uart_cfg;
+ExampleBus uart_bus;
+m5hal::uart::AccessConfig uart_cfg;
 bool uart_ready      = false;
 uint32_t echo_total  = 0;
 
 static void printError(const char* label, m5hal::error::error_t error)
 {
-    Serial.printf("%s failed: %d\n", label, static_cast<int>(error));
+    Serial.printf("%s failed: %s (%d)\n", label, m5hal::error::toString(error), static_cast<int>(error));
 }
 
 void setup()
@@ -87,8 +87,8 @@ void loop()
         return;
     }
 
-    m5hal::uart::UARTRxAccessor uart_rx{uart_bus, uart_cfg};
-    m5hal::uart::UARTTxAccessor uart_tx{uart_bus, uart_cfg};
+    m5hal::uart::RxAccessor uart_rx{uart_bus, uart_cfg};
+    m5hal::uart::TxAccessor uart_tx{uart_bus, uart_cfg};
 
     // The TX accessor implements data::StreamWriter, so StreamSink can
     // lift it into a Sink. scratch is the staging buffer the Sink lends

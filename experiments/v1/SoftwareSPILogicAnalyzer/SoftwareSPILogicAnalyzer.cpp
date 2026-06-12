@@ -36,10 +36,10 @@
 
 namespace {
 
-using SoftwareSPIBus = ::m5::hal::v1::spi::variant::software::Bus;
+using SoftwareSpiBus = ::m5::hal::v1::spi::Bus_software;
 
-SoftwareSPIBus bus;
-::m5::hal::v1::spi::SPIMasterAccessConfig access_config;
+SoftwareSpiBus bus;
+::m5::hal::v1::spi::MasterAccessConfig access_config;
 
 void printConfig()
 {
@@ -60,7 +60,7 @@ void printConfig()
 
 void runPattern()
 {
-    ::m5::hal::v1::spi::SPIMasterAccessor spi{bus, access_config};
+    ::m5::hal::v1::spi::MasterAccessor spi{bus, access_config};
 
     const uint8_t command_data[] = {0x9F, 0xA5, 0x5A, 0x00, 0xFF};
     auto cd = spi.writeCommandData(::m5::hal::v1::data::ConstDataSpan{command_data, sizeof(command_data)});
@@ -105,7 +105,7 @@ void setup()
     delay(500);
     printConfig();
 
-    ::m5::hal::v1::spi::SPIBusConfig bus_config;
+    ::m5::hal::v1::spi::IBusConfig bus_config;
     bus_config.pin_clk  = M5HAL_EXPERIMENT_SOFTWARE_SPI_PIN_CLK;
     bus_config.pin_mosi = M5HAL_EXPERIMENT_SOFTWARE_SPI_PIN_MOSI;
     bus_config.pin_miso = M5HAL_EXPERIMENT_SOFTWARE_SPI_PIN_MISO;

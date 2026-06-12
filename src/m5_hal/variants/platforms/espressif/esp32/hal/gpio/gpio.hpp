@@ -151,6 +151,24 @@ inline const ::m5::hal::v1::gpio::IGPIO* getGPIO()
 
 }  // namespace m5::variants::platforms::espressif::esp32::hal::v1::gpio
 
+// Winner-bindable names in the kind namespace (variant naming rule,
+// spec/design/variants.md). The implementation stays in the platform
+// namespace because it leans on the lowlevel register layer; these
+// bridges keep the `_esp32`-suffixed names addressable next to the
+// framework variants.
+namespace m5::hal::v1::gpio {
+using Port_esp32 = ::m5::variants::platforms::espressif::esp32::hal::v1::gpio::Port;
+using GPIO_esp32 = ::m5::variants::platforms::espressif::esp32::hal::v1::gpio::GPIO;
+inline const IGPIO* getMCUGPIO_esp32(void)
+{
+    return ::m5::variants::platforms::espressif::esp32::hal::v1::gpio::getMCUGPIO();
+}
+inline const IGPIO* getGPIO_esp32(void)
+{
+    return ::m5::variants::platforms::espressif::esp32::hal::v1::gpio::getGPIO();
+}
+}  // namespace m5::hal::v1::gpio
+
 #endif  // ESP_PLATFORM
 
 #endif

@@ -6,5 +6,6 @@
 // concretes for every HAL kind that needs an unconditional fallback.
 // No impl.inl hub is needed because all stub concretes are inline.
 #include "hal/gpio/gpio.hpp"
+#include "hal/runtime/runtime.hpp"
 
 #endif

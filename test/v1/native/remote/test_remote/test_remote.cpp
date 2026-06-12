@@ -104,8 +104,8 @@ private:
 
 // Captures the transfer (config, prefix, tx) and answers reads from a
 // pattern, standing in for real hardware behind the server.
-struct StubI2CBus : public i2c::I2CBus {
-    i2c::I2CMasterAccessConfig last_cfg{};
+struct StubI2cBus : public i2c::IBus {
+    i2c::MasterAccessConfig last_cfg{};
     uint8_t last_prefix[i2c::TransferDesc::PREFIX_CAPACITY]{};
     size_t last_prefix_len = 0;
     std::vector<uint8_t> last_tx;
@@ -113,13 +113,13 @@ struct StubI2CBus : public i2c::I2CBus {
     uint8_t rx_pattern    = 0xA0;         // rx byte i = rx_pattern + i
     error_t result        = error_t::OK;  // forced outcome
 
-    result_t<void> init(const i2c::I2CBusConfig& config)
+    result_t<void> init(const i2c::IBusConfig& config)
     {
         _config = config;
         return {};
     }
 
-    result_t<size_t> transfer(bus::Accessor*, const i2c::I2CMasterAccessConfig& cfg, const i2c::TransferDesc& desc,
+    result_t<size_t> transfer(bus::IAccessor*, const i2c::MasterAccessConfig& cfg, const i2c::TransferDesc& desc,
                               data::Source* tx, data::Sink* rx) override
     {
         ++transfer_count;
@@ -130,7 +130,7 @@ struct StubI2CBus : public i2c::I2CBus {
         if (error::isError(result)) {
             return m5::stl::make_unexpected(result);
         }
-        size_t total = 0;  // data phase only (S16 D4)
+        size_t total = 0;  // data phase only
         if (tx != nullptr) {
             while (!tx->eof()) {
                 auto p = tx->peek(64);
@@ -168,9 +168,9 @@ struct Loopback : public ::testing::Test {
     VecSink server_tx{to_host};
     VecSource server_rx{to_server};
 
-    StubI2CBus stub_bus;
-    i2c::I2CMasterAccessConfig stub_acc_cfg{};
-    i2c::I2CMasterAccessor stub_acc{stub_bus, stub_acc_cfg};
+    StubI2cBus stub_bus;
+    i2c::MasterAccessConfig stub_acc_cfg{};
+    i2c::MasterAccessor stub_acc{stub_bus, stub_acc_cfg};
 
     uint8_t server_scratch[remote::kMaxMessageSize]{};
     remote::Server server{data::DataSpan{server_scratch, sizeof(server_scratch)}};
@@ -224,9 +224,9 @@ TEST_F(Loopback, PingPong)
 TEST_F(Loopback, ProxyRegisterReadRoundtrip)
 {
     remote::RemoteI2CBus proxy{session, 0};
-    i2c::I2CMasterAccessConfig cfg;
+    i2c::MasterAccessConfig cfg;
     cfg.i2c_addr = 0x68;
-    i2c::I2CMasterAccessor acc{proxy, cfg};
+    i2c::MasterAccessor acc{proxy, cfg};
 
     uint8_t rx[4] = {};
     auto r        = acc.readRegister(uint8_t{0x75}, rx, sizeof(rx));
@@ -245,9 +245,9 @@ TEST_F(Loopback, ProxyRegisterReadRoundtrip)
 TEST_F(Loopback, ProxyWriteCarriesTxBytes)
 {
     remote::RemoteI2CBus proxy{session, 0};
-    i2c::I2CMasterAccessConfig cfg;
+    i2c::MasterAccessConfig cfg;
     cfg.i2c_addr = 0x10;
-    i2c::I2CMasterAccessor acc{proxy, cfg};
+    i2c::MasterAccessor acc{proxy, cfg};
 
     const uint8_t tx[] = {0x01, 0x02, 0x03};
     auto r             = acc.write(tx, sizeof(tx));
@@ -261,8 +261,8 @@ TEST_F(Loopback, RemoteBusErrorFoldsIntoCallResult)
     stub_bus.result = error_t::I2C_NO_ACK;
 
     remote::RemoteI2CBus proxy{session, 0};
-    i2c::I2CMasterAccessConfig cfg;
-    i2c::I2CMasterAccessor acc{proxy, cfg};
+    i2c::MasterAccessConfig cfg;
+    i2c::MasterAccessor acc{proxy, cfg};
 
     auto r = acc.probe();
     ASSERT_FALSE(r.has_value());
@@ -274,8 +274,8 @@ TEST_F(Loopback, UnregisteredBusReportsInvalidArgument)
     // bus 2 is a valid binding slot with nothing registered (a slot
     // outside kMaxBusBindings would be PROTOCOL_ERROR instead).
     remote::RemoteI2CBus proxy{session, 2};
-    i2c::I2CMasterAccessConfig cfg;
-    i2c::I2CMasterAccessor acc{proxy, cfg};
+    i2c::MasterAccessConfig cfg;
+    i2c::MasterAccessor acc{proxy, cfg};
 
     auto r = acc.probe();
     ASSERT_FALSE(r.has_value());
@@ -303,7 +303,7 @@ TEST_F(Loopback, NorespFailureArrivesAsPendingError)
     uint8_t script[32] = {};
     data::MemorySink sink{data::DataSpan{script, sizeof(script)}};
     bytecode::BytecodeEncoder enc{sink};
-    i2c::I2CMasterAccessConfig cfg;
+    i2c::MasterAccessConfig cfg;
     ASSERT_TRUE(enc.configure(2, cfg).has_value());  // valid slot, nothing registered
     ASSERT_TRUE(enc.end().has_value());
 
@@ -315,7 +315,7 @@ TEST_F(Loopback, NorespFailureArrivesAsPendingError)
     EXPECT_FALSE(server.hasPendingError());
 }
 
-// S16 D3 regression pair: the server clears its pending NORESP error as
+// Regression pair: the server clears its pending NORESP error as
 // soon as the error frame is SENT, so when that delivery crosses a
 // host-side timeout, the frame that eventually arrives carries the seq
 // of the timed-out exchange. It is the only copy — it must be recorded
@@ -330,7 +330,7 @@ TEST_F(Loopback, ErrorCrossingTimeoutIsRecordedBySubsequentRequest)
     uint8_t script[32] = {};
     data::MemorySink sink{data::DataSpan{script, sizeof(script)}};
     bytecode::BytecodeEncoder enc{sink};
-    i2c::I2CMasterAccessConfig cfg;
+    i2c::MasterAccessConfig cfg;
     ASSERT_TRUE(enc.configure(2, cfg).has_value());  // valid slot, nothing registered
     ASSERT_TRUE(enc.end().has_value());
     ASSERT_TRUE(fast_session.requestNoResponse(data::ConstDataSpan{script, sink.written()}).has_value());
@@ -364,7 +364,7 @@ TEST_F(Loopback, ErrorCrossingTimeoutIsRecordedByIdlePoll)
     uint8_t script[32] = {};
     data::MemorySink sink{data::DataSpan{script, sizeof(script)}};
     bytecode::BytecodeEncoder enc{sink};
-    i2c::I2CMasterAccessConfig cfg;
+    i2c::MasterAccessConfig cfg;
     ASSERT_TRUE(enc.configure(2, cfg).has_value());
     ASSERT_TRUE(enc.end().has_value());
     ASSERT_TRUE(fast_session.requestNoResponse(data::ConstDataSpan{script, sink.written()}).has_value());
@@ -389,7 +389,7 @@ TEST_F(Loopback, OversizedWireRxLenIsRejectedByPrescan)
 {
     // The wire LenVar can spell a full u32 rx_len and the runner
     // allocates it up front — the server prescan caps it
-    // (Config::max_transfer_rx, default 4096; S16 D8). Sent via a raw
+    // (Config::max_transfer_rx, default 4096). Sent via a raw
     // request: the host-side proxy limit (kMaxTransferRx) never sees it.
     uint8_t script[32] = {};
     data::MemorySink sink{data::DataSpan{script, sizeof(script)}};
@@ -405,8 +405,8 @@ TEST_F(Loopback, OversizedWireRxLenIsRejectedByPrescan)
 TEST_F(Loopback, OversizedReceiveIsRejectedLocally)
 {
     remote::RemoteI2CBus proxy{session, 0};
-    i2c::I2CMasterAccessConfig cfg;
-    i2c::I2CMasterAccessor acc{proxy, cfg};
+    i2c::MasterAccessConfig cfg;
+    i2c::MasterAccessor acc{proxy, cfg};
 
     uint8_t rx[remote::kMaxTransferRx + 1] = {};
     const size_t sent_before               = to_server.size();
@@ -419,8 +419,8 @@ TEST_F(Loopback, OversizedReceiveIsRejectedLocally)
 TEST_F(Loopback, MaxReceiveSizeRoundtrips)
 {
     remote::RemoteI2CBus proxy{session, 0};
-    i2c::I2CMasterAccessConfig cfg;
-    i2c::I2CMasterAccessor acc{proxy, cfg};
+    i2c::MasterAccessConfig cfg;
+    i2c::MasterAccessor acc{proxy, cfg};
 
     uint8_t rx[remote::kMaxTransferRx] = {};
     auto r                             = acc.read(rx, sizeof(rx));
@@ -461,18 +461,18 @@ namespace i2s   = ::m5::hal::v1::i2s;
 namespace spi   = ::m5::hal::v1::spi;
 namespace uart_ = ::m5::hal::v1::uart;
 
-struct StubSPIBus : public spi::SPIBus {
-    spi::SPIMasterAccessConfig last_cfg{};
+struct StubSpiBus : public spi::IBus {
+    spi::MasterAccessConfig last_cfg{};
     spi::TransferDesc last_desc{};
     std::vector<uint8_t> last_tx;
     uint8_t rx_pattern = 0xB0;
 
-    result_t<void> init(const spi::SPIBusConfig& config)
+    result_t<void> init(const spi::IBusConfig& config)
     {
         _config = config;
         return {};
     }
-    result_t<size_t> transfer(bus::Accessor*, const spi::SPIMasterAccessConfig& cfg, const spi::TransferDesc& desc,
+    result_t<size_t> transfer(bus::IAccessor*, const spi::MasterAccessConfig& cfg, const spi::TransferDesc& desc,
                               data::Source* tx, data::Sink* rx) override
     {
         last_cfg  = cfg;
@@ -505,17 +505,17 @@ struct StubSPIBus : public spi::SPIBus {
     }
 };
 
-struct StubUARTBus : public uart_::UARTBus {
+struct StubUartBus : public uart_::IBus {
     std::vector<uint8_t> written;
     std::vector<uint8_t> rx_data;  // bytes "already received" remotely
-    uart_::UARTAccessConfig last_cfg{};
+    uart_::AccessConfig last_cfg{};
 
-    result_t<void> init(const uart_::UARTBusConfig& config)
+    result_t<void> init(const uart_::IBusConfig& config)
     {
         _config = config;
         return {};
     }
-    result_t<size_t> write(bus::Accessor*, const uart_::UARTAccessConfig& cfg, data::Source* tx, size_t len) override
+    result_t<size_t> write(bus::IAccessor*, const uart_::AccessConfig& cfg, data::Source* tx, size_t len) override
     {
         last_cfg     = cfg;
         size_t total = 0;
@@ -530,7 +530,7 @@ struct StubUARTBus : public uart_::UARTBus {
         }
         return total;
     }
-    result_t<size_t> read(bus::Accessor*, const uart_::UARTAccessConfig& cfg, data::Sink* rx, size_t len) override
+    result_t<size_t> read(bus::IAccessor*, const uart_::AccessConfig& cfg, data::Sink* rx, size_t len) override
     {
         last_cfg = cfg;
         if (rx == nullptr) {
@@ -546,7 +546,7 @@ struct StubUARTBus : public uart_::UARTBus {
         (void)rx->commit(n);
         return n;  // short read when fewer bytes were "available"
     }
-    result_t<size_t> readableBytes(bus::Accessor*, const uart_::UARTAccessConfig&) override
+    result_t<size_t> readableBytes(bus::IAccessor*, const uart_::AccessConfig&) override
     {
         return rx_data.size();
     }
@@ -625,13 +625,13 @@ struct StageBLoopback : public ::testing::Test {
     VecSink server_tx{to_host};
     VecSource server_rx{to_server};
 
-    StubSPIBus stub_spi;
-    spi::SPIMasterAccessConfig spi_acc_cfg{};
-    spi::SPIMasterAccessor spi_acc{stub_spi, spi_acc_cfg};
+    StubSpiBus stub_spi;
+    spi::MasterAccessConfig spi_acc_cfg{};
+    spi::MasterAccessor spi_acc{stub_spi, spi_acc_cfg};
 
-    StubUARTBus stub_uart;
-    uart_::UARTAccessConfig uart_acc_cfg{};
-    uart_::UARTAccessor uart_acc{stub_uart, uart_acc_cfg};
+    StubUartBus stub_uart;
+    uart_::AccessConfig uart_acc_cfg{};
+    uart_::Accessor uart_acc{stub_uart, uart_acc_cfg};
 
     RecordingGPIO rec_gpio;
     gpio::GPIOGroup server_group;
@@ -669,7 +669,7 @@ TEST_F(StageBLoopback, HelloListsAllPublishedBuses)
 TEST_F(StageBLoopback, SpiTransferCarriesDescAndData)
 {
     remote::RemoteSPIBus proxy{session, 0};
-    spi::SPIMasterAccessConfig cfg;
+    spi::MasterAccessConfig cfg;
     cfg.freq = 1000000;
 
     // Direct transfer with a command/address-bearing desc: verifies the
@@ -699,8 +699,8 @@ TEST_F(StageBLoopback, SpiTransferCarriesDescAndData)
 TEST_F(StageBLoopback, SpiAccessorSugarWorks)
 {
     remote::RemoteSPIBus proxy{session, 0};
-    spi::SPIMasterAccessConfig cfg;
-    spi::SPIMasterAccessor acc{proxy, cfg};
+    spi::MasterAccessConfig cfg;
+    spi::MasterAccessor acc{proxy, cfg};
 
     uint8_t rx[3] = {};
     auto r        = acc.read(rx, sizeof(rx));
@@ -711,9 +711,9 @@ TEST_F(StageBLoopback, SpiAccessorSugarWorks)
 TEST_F(StageBLoopback, UartWriteAndReadRoundtrip)
 {
     remote::RemoteUARTBus proxy{session, 0};
-    uart_::UARTAccessConfig cfg;
-    uart_::UARTTxAccessor tx{proxy, cfg};
-    uart_::UARTRxAccessor rx{proxy, cfg};
+    uart_::AccessConfig cfg;
+    uart_::TxAccessor tx{proxy, cfg};
+    uart_::RxAccessor rx{proxy, cfg};
 
     const uint8_t out[] = {0x01, 0x02, 0x03, 0x04};
     auto w              = tx.write(out, sizeof(out));
@@ -734,8 +734,8 @@ TEST_F(StageBLoopback, UartWriteAndReadRoundtrip)
 TEST_F(StageBLoopback, UartReadableBytesIsUnsupported)
 {
     remote::RemoteUARTBus proxy{session, 0};
-    uart_::UARTAccessConfig cfg;
-    uart_::UARTRxAccessor rx{proxy, cfg};
+    uart_::AccessConfig cfg;
+    uart_::RxAccessor rx{proxy, cfg};
     auto r = rx.readableBytes();
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), error_t::UNSUPPORTED);
@@ -855,9 +855,9 @@ struct LinkLoopback : public ::testing::Test {
     VecSink server_tx{to_host};
     VecSource server_rx{to_server};
 
-    StubI2CBus stub_bus;
-    i2c::I2CMasterAccessConfig stub_acc_cfg{};
-    i2c::I2CMasterAccessor stub_acc{stub_bus, stub_acc_cfg};
+    StubI2cBus stub_bus;
+    i2c::MasterAccessConfig stub_acc_cfg{};
+    i2c::MasterAccessor stub_acc{stub_bus, stub_acc_cfg};
 
     uint8_t server_scratch[remote::kMaxMessageSize]{};
     remote::Server server{data::DataSpan{server_scratch, sizeof(server_scratch)}};
@@ -911,9 +911,9 @@ TEST_F(LinkLoopback, ResetStartsAFreshConnection)
 TEST_F(LinkLoopback, ProxyWorksOverRemoteLink)
 {
     remote::RemoteI2CBus proxy{link.session(), 0};
-    i2c::I2CMasterAccessConfig cfg;
+    i2c::MasterAccessConfig cfg;
     cfg.i2c_addr = 0x42;
-    i2c::I2CMasterAccessor acc{proxy, cfg};
+    i2c::MasterAccessor acc{proxy, cfg};
 
     uint8_t rx[2] = {};
     ASSERT_TRUE(acc.read(rx, sizeof(rx)).has_value());
@@ -1233,12 +1233,12 @@ TEST(BytecodeRunnerSubscribe, PlainRunnerRejectsSubscribe)
 // bytes that DMA drains explicitly (drain()). `submitted` is the cumulative
 // accepted byte count (mod 2^32); a write accepts at most the current free
 // space (credit violations show up as a short accept -> BUFFER_OVERFLOW).
-struct StubI2SBus : public i2s::I2SBus {
+struct StubI2sBus : public i2s::IBus {
     uint32_t capacity  = 4096;
     uint32_t in_buffer = 0;  // bytes currently pending in the "DMA buffer"
     uint32_t submitted = 0;  // cumulative accepted (mod 2^32)
     size_t write_calls = 0;
-    i2s::I2SAccessConfig last_cfg{};
+    i2s::AccessConfig last_cfg{};
 
     // Seed the cumulative counters so wrap-boundary behavior can be tested.
     void seed(uint32_t start)
@@ -1255,12 +1255,12 @@ struct StubI2SBus : public i2s::I2SBus {
         return capacity - in_buffer;
     }
 
-    result_t<void> init(const i2s::I2SBusConfig& config)
+    result_t<void> init(const i2s::IBusConfig& config)
     {
         _config = config;
         return {};
     }
-    result_t<size_t> write(bus::Accessor*, const i2s::I2SAccessConfig& cfg, data::Source* tx, size_t len) override
+    result_t<size_t> write(bus::IAccessor*, const i2s::AccessConfig& cfg, data::Source* tx, size_t len) override
     {
         ++write_calls;
         last_cfg = cfg;
@@ -1281,7 +1281,7 @@ struct StubI2SBus : public i2s::I2SBus {
         submitted += accepted;
         return static_cast<size_t>(accepted);
     }
-    result_t<size_t> writableBytes(bus::Accessor*, const i2s::I2SAccessConfig&) override
+    result_t<size_t> writableBytes(bus::IAccessor*, const i2s::AccessConfig&) override
     {
         return static_cast<size_t>(freeBytes());
     }
@@ -1296,9 +1296,9 @@ struct StageI2SLoopback : public ::testing::Test {
     VecSink server_tx{to_host};
     VecSource server_rx{to_server};
 
-    StubI2SBus stub_i2s;
-    i2s::I2SAccessConfig i2s_acc_cfg{};
-    i2s::I2STxAccessor i2s_acc{stub_i2s, i2s_acc_cfg};
+    StubI2sBus stub_i2s;
+    i2s::AccessConfig i2s_acc_cfg{};
+    i2s::TxAccessor i2s_acc{stub_i2s, i2s_acc_cfg};
 
     uint8_t server_scratch[remote::kMaxMessageSize]{};
     remote::Server::Config server_cfg{};
@@ -1342,7 +1342,7 @@ struct StageI2SLoopback : public ::testing::Test {
     }
 };
 
-TEST_F(StageI2SLoopback, HelloListsI2SBus)
+TEST_F(StageI2SLoopback, HelloListsIBus)
 {
     auto caps = session.hello();
     ASSERT_TRUE(caps.has_value());
@@ -1354,12 +1354,12 @@ TEST_F(StageI2SLoopback, HelloListsI2SBus)
 TEST_F(StageI2SLoopback, WriteConfiguresThenStreamsToServer)
 {
     remote::RemoteI2SBus proxy{session, 0};
-    i2s::I2SAccessConfig cfg;
+    i2s::AccessConfig cfg;
     cfg.sample_rate_hz   = 44100;
     cfg.bits_per_sample  = 16;
     cfg.channels         = 2;
     cfg.write_timeout_ms = 100;
-    i2s::I2STxAccessor acc{proxy, cfg};
+    i2s::TxAccessor acc{proxy, cfg};
 
     std::vector<uint8_t> audio(64);
     for (size_t i = 0; i < audio.size(); ++i) {
@@ -1384,9 +1384,9 @@ TEST_F(StageI2SLoopback, LargeWriteSplitsIntoChunks)
 {
     stub_i2s.capacity = 100000;  // plenty of credit
     remote::RemoteI2SBus proxy{session, 0};
-    i2s::I2SAccessConfig cfg;
+    i2s::AccessConfig cfg;
     cfg.write_timeout_ms = 500;
-    i2s::I2STxAccessor acc{proxy, cfg};
+    i2s::TxAccessor acc{proxy, cfg};
 
     std::vector<uint8_t> audio(1000, 0xAB);  // > one message body (238)
     auto w = acc.write(audio.data(), audio.size());
@@ -1408,9 +1408,9 @@ TEST_F(StageI2SLoopback, CreditExhaustionStallsThenResumesOnDrain)
     stub_i2s.capacity = 256;
 
     remote::RemoteI2SBus proxy{session, 0};
-    i2s::I2SAccessConfig cfg;
+    i2s::AccessConfig cfg;
     cfg.write_timeout_ms = 5000;  // generous: rely on the drain, not the timeout
-    i2s::I2STxAccessor acc{proxy, cfg};
+    i2s::TxAccessor acc{proxy, cfg};
 
     // 384 bytes > the 256 B buffer: the device drains 128 B per pump, so
     // credit returns over several poll cycles and the write completes.
@@ -1431,9 +1431,9 @@ TEST_F(StageI2SLoopback, CreditViolationSurfacesAsPendingError)
     // delivered on the next synchronous exchange (status re-sync / ping).
     stub_i2s.capacity = 1000000;  // host believes there is huge credit
     remote::RemoteI2SBus proxy{session, 0};
-    i2s::I2SAccessConfig cfg;
+    i2s::AccessConfig cfg;
     cfg.write_timeout_ms = 50;
-    i2s::I2STxAccessor acc{proxy, cfg};
+    i2s::TxAccessor acc{proxy, cfg};
 
     // Prime credit (config + status) with the large capacity.
     std::vector<uint8_t> warm(4, 0x00);
@@ -1459,9 +1459,9 @@ TEST_F(StageI2SLoopback, CreditMathWrapsAroundU32Boundary)
     stub_i2s.seed(0xFFFFFF00u);
 
     remote::RemoteI2SBus proxy{session, 0};
-    i2s::I2SAccessConfig cfg;
+    i2s::AccessConfig cfg;
     cfg.write_timeout_ms = 200;
-    i2s::I2STxAccessor acc{proxy, cfg};
+    i2s::TxAccessor acc{proxy, cfg};
 
     // Write enough to roll `submitted` (and the host's `_sent`) past 2^32.
     std::vector<uint8_t> audio(1024, 0x5A);
@@ -1495,9 +1495,9 @@ TEST_F(StageI2SLoopback, CreditPinnedAtZeroAfterFrameLossResolvesOnResync)
     stub_i2s.capacity = kBuf;  // exactly one write-chunk fills it
 
     remote::RemoteI2SBus proxy{session, 0};
-    i2s::I2SAccessConfig cfg;
+    i2s::AccessConfig cfg;
     cfg.write_timeout_ms = 500;  // long enough for 50 ms resync + margin
-    i2s::I2STxAccessor acc{proxy, cfg};
+    i2s::TxAccessor acc{proxy, cfg};
 
     // --- Prime: syncConfig (synchronous, pump active) sets _free=kBuf, _sent=0 ---
     // Trigger syncConfig by doing a zero-effect write of 0 bytes:

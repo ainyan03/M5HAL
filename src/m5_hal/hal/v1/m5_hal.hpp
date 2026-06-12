@@ -32,8 +32,12 @@
 #include "../../../m5_hal_config.hpp"  // M5HAL_INLINE_V1
 
 #include "gpio/group.hpp"
+#include "i2c/i2c.hpp"
+#include "i2s/i2s.hpp"
 #include "memory/allocator.hpp"
 #include "service/service.hpp"
+#include "spi/spi.hpp"
+#include "uart/uart.hpp"
 
 namespace m5 {
 namespace hal {
@@ -75,10 +79,27 @@ M5HAL_INLINE_V1 namespace v1
          */
         memory::Allocator Memory;
 
-        // Room to grow: future additions like `i2c::I2CBusGroup I2C;`
-        // or `spi::SPIBusGroup SPI;` would live here. Each addition
-        // should be evaluated for its startup-cost impact (eager
-        // initialization through `M5_Hal`) and its side-effect surface.
+        /*!
+          @name Non-owning bus registries (one per kind).
+
+          The HAL still neither creates nor owns buses; these tables
+          let a board-support layer PUBLISH user-owned bus instances
+          under slot numbers (`M5_Hal.SPI.addBus(&bus, 1)`) and any
+          code look them up (`M5_Hal.SPI.getBus(1)`). Aliasing — the
+          same bus under several slots — is expected; slot meanings
+          belong to the upper layer. See `bus::BusGroup`.
+          @{
+         */
+        i2c::BusGroup I2C;
+        spi::BusGroup SPI;
+        uart::BusGroup UART;
+        i2s::BusGroup I2S;
+        /*! @} */
+
+        // Room to grow: future sub-objects would live here. Each
+        // addition should be evaluated for its startup-cost impact
+        // (eager initialization through `M5_Hal`) and its side-effect
+        // surface.
 
         // Copy / move disabled (singleton).
         M5HALCore(const M5HALCore&)            = delete;
@@ -89,7 +110,7 @@ M5HAL_INLINE_V1 namespace v1
     private:
         // Private ctor: only `getM5_Hal()` can construct (via
         // friendship). The body lives in M5HAL_v1.cpp where
-        // flat-injection has already exposed `gpio::getGPIO()`.
+        // the winner binding has already exposed `gpio::getGPIO()`.
         M5HALCore();
 
         friend M5HALCore& getM5_Hal();

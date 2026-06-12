@@ -29,24 +29,24 @@ constexpr int PIN_UART_RX = 16;
 
 // m5hal::uart::Bus resolves to the first backend the build offers
 // (framework scan order; see spec/design/variants.md). Uncomment the
-// variant::* alias below to force a specific backend instead.
-using ExampleUARTBus = m5hal::uart::Bus;
-// using ExampleUARTBus = m5hal::uart::variant::arduino::Bus;
+// suffixed variant type below to force a specific backend instead.
+using ExampleBus = m5hal::uart::Bus;
+// using ExampleBus = m5hal::uart::Bus_arduino;
 
-ExampleUARTBus uart_bus;
-m5hal::uart::UARTAccessConfig uart_cfg;
+ExampleBus uart_bus;
+m5hal::uart::AccessConfig uart_cfg;
 bool uart_ready         = false;
 uint32_t tx_counter     = 0;
 uint32_t last_send_msec = 0;
 
 static void printError(const char* label, m5hal::error::error_t error)
 {
-    Serial.printf("%s failed: %d\n", label, static_cast<int>(error));
+    Serial.printf("%s failed: %s (%d)\n", label, m5hal::error::toString(error), static_cast<int>(error));
 }
 
 static void writeLine(const char* text)
 {
-    m5hal::uart::UARTTxAccessor uart_tx{uart_bus, uart_cfg};
+    m5hal::uart::TxAccessor uart_tx{uart_bus, uart_cfg};
     auto r = uart_tx.write(reinterpret_cast<const uint8_t*>(text), strlen(text));
     if (!r.has_value()) {
         printError("uart write", r.error());
@@ -60,7 +60,7 @@ static void writeLine(const char* text)
 // adapters — see the UARTEcho example and spec/design/data_io.md.
 static void readEcho(void)
 {
-    m5hal::uart::UARTRxAccessor uart_rx{uart_bus, uart_cfg};
+    m5hal::uart::RxAccessor uart_rx{uart_bus, uart_cfg};
     auto readable = uart_rx.readableBytes();
     if (!readable.has_value()) {
         printError("uart readableBytes", readable.error());
@@ -86,6 +86,32 @@ static void readEcho(void)
     Serial.printf("uart read: %u bytes: ", static_cast<unsigned>(r.value()));
     Serial.write(rx, r.value());
     Serial.println();
+}
+
+// Line-oriented protocols (NMEA sentences, AT command responses, ...):
+// readUntil collects one line inside a single RX lock window. The
+// delimiter is INCLUDED in the result, so the last byte tells a
+// complete line from a timeout-bounded partial one. A short count —
+// including zero — is normal, not an error: just call again.
+static void readLine(void)
+{
+    m5hal::uart::RxAccessor uart_rx{uart_bus, uart_cfg};
+
+    uint8_t line[80] = {};
+    auto r           = uart_rx.readUntil('\n', line, sizeof(line));
+    if (!r.has_value()) {
+        printError("uart readUntil", r.error());
+        return;
+    }
+    const size_t n = r.value();
+    if (n == 0) {
+        Serial.println("uart readUntil: no line yet");
+    } else if (line[n - 1] == '\n') {
+        Serial.printf("uart line (%u bytes): ", static_cast<unsigned>(n));
+        Serial.write(line, n);
+    } else {
+        Serial.printf("uart partial line (%u bytes, no delimiter yet)\n", static_cast<unsigned>(n));
+    }
 }
 
 void setup()
@@ -138,5 +164,9 @@ void loop()
     snprintf(line, sizeof(line), "M5HAL UART count=%lu\r\n", static_cast<unsigned long>(tx_counter++));
     writeLine(line);
     delay(20);
-    readEcho();
+    if ((tx_counter % 2) == 0) {
+        readEcho();  // raw bytes: whatever arrived so far
+    } else {
+        readLine();  // one line via readUntil (delimiter included)
+    }
 }

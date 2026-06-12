@@ -159,7 +159,7 @@ public:
 
           The runner allocates rx_len bytes up front, and the LenVar field
           can spell a full u32 — without a cap one hostile/buggy message
-          could exhaust the device's RAM (S16 D8). A response frame carries
+          could exhaust the device's RAM. A response frame carries
           at most `kMaxTransferRx` bytes back; the default leaves headroom
           for larger discard reads while staying allocation-safe.
          */
@@ -178,11 +178,11 @@ public:
         checkScratch();
     }
 
-    m5::hal::v1::result_t<void> registerI2C(uint8_t bus_id, i2c::I2CMasterAccessor& acc);
-    m5::hal::v1::result_t<void> registerSPI(uint8_t bus_id, spi::SPIMasterAccessor& acc);
-    m5::hal::v1::result_t<void> registerUART(uint8_t bus_id, uart::UARTAccessor& acc);
+    m5::hal::v1::result_t<void> registerI2C(uint8_t bus_id, i2c::MasterAccessor& acc);
+    m5::hal::v1::result_t<void> registerSPI(uint8_t bus_id, spi::MasterAccessor& acc);
+    m5::hal::v1::result_t<void> registerUART(uint8_t bus_id, uart::Accessor& acc);
     /*! @brief Publish an I2S TX accessor as a stream bus (spec §stream credit). */
-    m5::hal::v1::result_t<void> registerI2S(uint8_t bus_id, i2s::I2STxAccessor& acc);
+    m5::hal::v1::result_t<void> registerI2S(uint8_t bus_id, i2s::TxAccessor& acc);
     void setGPIOGroup(gpio::GPIOGroup& group)
     {
         _runner.setGPIOGroup(group);
@@ -410,14 +410,14 @@ public:
     {
         // Scripts arriving here come FROM the peer: restrict the runner
         // to receive-side opcodes so a buggy/hostile server cannot drive
-        // this side's buses, pins, or clock (S16 D8).
+        // this side's buses, pins, or clock.
         _runner.setReceiveOnly(true);
     }
     RemoteSession(data::Source& rx, data::Sink& tx, const Config& config,
                   memory::Allocator& alloc = memory::defaultAllocator())
         : _reader{rx}, _writer{tx}, _runner{alloc}, _config{config}
     {
-        _runner.setReceiveOnly(true);  // see the delegating ctor's note (S16 D8)
+        _runner.setReceiveOnly(true);  // see the delegating ctor's note
     }
 
     /*! @brief Exchange hello / hello_resp and cache the capabilities. */
@@ -631,10 +631,10 @@ private:
 };
 
 /*!
-  @brief I2C bus proxy: a local `i2c::I2CBus` whose transfers run remotely.
+  @brief I2C bus proxy: a local `i2c::IBus` whose transfers run remotely.
 
   Callers use it exactly like a local bus — build an
-  `I2CMasterAccessor` on top and every sugar (write / read /
+  `MasterAccessor` on top and every sugar (write / read /
   writeRegister / probe) works, because the single `transfer` override
   marshals one self-contained script (`bus_configure` + `bus_transfer`)
   per call (spec §host side). There is no remote lock: atomicity across
@@ -647,20 +647,20 @@ private:
   `remote_bus_id` selects the server-side registered bus (see the
   `hello` capability list).
  */
-struct RemoteI2CBus : public i2c::I2CBus {
+struct RemoteI2CBus : public i2c::IBus {
     RemoteI2CBus(RemoteSession& session, uint8_t remote_bus_id) : _session{&session}, _remote_bus_id{remote_bus_id}
     {
     }
 
     /*! @brief Local bookkeeping only — the physical bus is configured server-side.
-        Takes the abstract kind config: the proxy adds no fields (S17 E1). */
-    m5::hal::v1::result_t<void> init(const i2c::I2CBusConfig& config);
+        Takes the abstract kind config: the proxy adds no fields. */
+    m5::hal::v1::result_t<void> init(const i2c::IBusConfig& config);
     m5::hal::v1::result_t<void> release(void) override
     {
         return {};
     }
 
-    m5::hal::v1::result_t<size_t> transfer(bus::Accessor* owner, const i2c::I2CMasterAccessConfig& cfg,
+    m5::hal::v1::result_t<size_t> transfer(bus::IAccessor* owner, const i2c::MasterAccessConfig& cfg,
                                            const i2c::TransferDesc& desc, data::Source* tx, data::Sink* rx) override;
 
 private:
@@ -669,7 +669,7 @@ private:
 };
 
 /*!
-  @brief SPI bus proxy: a local `spi::SPIBus` whose transfers run remotely.
+  @brief SPI bus proxy: a local `spi::IBus` whose transfers run remotely.
 
   Same shape as `RemoteI2CBus`: one self-contained script
   (`bus_configure` + `bus_transfer`) per transfer, size caps checked
@@ -679,20 +679,20 @@ private:
   so a CS window spanning multiple transfers is not supported — compose
   command / address / data through one `TransferDesc` instead.
  */
-struct RemoteSPIBus : public spi::SPIBus {
+struct RemoteSPIBus : public spi::IBus {
     RemoteSPIBus(RemoteSession& session, uint8_t remote_bus_id) : _session{&session}, _remote_bus_id{remote_bus_id}
     {
     }
 
     /*! @brief Local bookkeeping only — the physical bus is configured server-side.
-        Takes the abstract kind config: the proxy adds no fields (S17 E1). */
-    m5::hal::v1::result_t<void> init(const spi::SPIBusConfig& config);
+        Takes the abstract kind config: the proxy adds no fields. */
+    m5::hal::v1::result_t<void> init(const spi::IBusConfig& config);
     m5::hal::v1::result_t<void> release(void) override
     {
         return {};
     }
 
-    m5::hal::v1::result_t<size_t> transfer(bus::Accessor* owner, const spi::SPIMasterAccessConfig& cfg,
+    m5::hal::v1::result_t<size_t> transfer(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg,
                                            const spi::TransferDesc& desc, data::Source* tx, data::Sink* rx) override;
 
 private:
@@ -701,7 +701,7 @@ private:
 };
 
 /*!
-  @brief UART bus proxy: a local `uart::UARTBus` whose I/O runs remotely.
+  @brief UART bus proxy: a local `uart::IBus` whose I/O runs remotely.
 
   `write` / `read` each marshal one self-contained script. Semantics
   that differ from a local UART (spec §UART proxy):
@@ -717,24 +717,24 @@ private:
     read/write timeouts (`first_byte + len * inter_byte + margin` for
     reads, `write_timeout + margin` for writes) and restored after.
  */
-struct RemoteUARTBus : public uart::UARTBus {
+struct RemoteUARTBus : public uart::IBus {
     RemoteUARTBus(RemoteSession& session, uint8_t remote_bus_id) : _session{&session}, _remote_bus_id{remote_bus_id}
     {
     }
 
     /*! @brief Local bookkeeping only — the physical bus is configured server-side.
-        Takes the abstract kind config: the proxy adds no fields (S17 E1). */
-    m5::hal::v1::result_t<void> init(const uart::UARTBusConfig& config);
+        Takes the abstract kind config: the proxy adds no fields. */
+    m5::hal::v1::result_t<void> init(const uart::IBusConfig& config);
     m5::hal::v1::result_t<void> release(void) override
     {
         return {};
     }
 
-    m5::hal::v1::result_t<size_t> write(bus::Accessor* owner, const uart::UARTAccessConfig& cfg, data::Source* tx,
+    m5::hal::v1::result_t<size_t> write(bus::IAccessor* owner, const uart::AccessConfig& cfg, data::Source* tx,
                                         size_t len) override;
-    m5::hal::v1::result_t<size_t> read(bus::Accessor* owner, const uart::UARTAccessConfig& cfg, data::Sink* rx,
+    m5::hal::v1::result_t<size_t> read(bus::IAccessor* owner, const uart::AccessConfig& cfg, data::Sink* rx,
                                        size_t len) override;
-    m5::hal::v1::result_t<size_t> readableBytes(bus::Accessor* owner, const uart::UARTAccessConfig& cfg) override;
+    m5::hal::v1::result_t<size_t> readableBytes(bus::IAccessor* owner, const uart::AccessConfig& cfg) override;
 
 private:
     m5::hal::v1::result_t<size_t> runScript(data::ConstDataSpan script, uint32_t required_timeout_ms);
@@ -744,7 +744,7 @@ private:
 };
 
 /*!
-  @brief I2S bus proxy: a local `i2s::I2SBus` whose playback runs remotely.
+  @brief I2S bus proxy: a local `i2s::IBus` whose playback runs remotely.
 
   `write` follows §stream credit: NORESP `bus_write_stream` bursts paced by
   a host-side credit estimate, plus a credit wait. It returns the bytes
@@ -765,7 +765,7 @@ private:
   the estimate. NOTE: a single session backing multiple RemoteI2SBus
   instances is not supported in this version (one handler slot per runner).
  */
-struct RemoteI2SBus : public i2s::I2SBus {
+struct RemoteI2SBus : public i2s::IBus {
     RemoteI2SBus(RemoteSession& session, uint8_t remote_bus_id);
     /*! @brief Unregisters the credit handler when this instance still owns the slot. */
     ~RemoteI2SBus() override;
@@ -778,16 +778,16 @@ struct RemoteI2SBus : public i2s::I2SBus {
     RemoteI2SBus& operator=(RemoteI2SBus&&)      = delete;
 
     /*! @brief Local bookkeeping only — the physical bus is configured server-side.
-        Takes the abstract kind config: the proxy adds no fields (S17 E1). */
-    m5::hal::v1::result_t<void> init(const i2s::I2SBusConfig& config);
+        Takes the abstract kind config: the proxy adds no fields. */
+    m5::hal::v1::result_t<void> init(const i2s::IBusConfig& config);
     m5::hal::v1::result_t<void> release(void) override
     {
         return {};
     }
 
-    m5::hal::v1::result_t<size_t> write(bus::Accessor* owner, const i2s::I2SAccessConfig& cfg, data::Source* tx,
+    m5::hal::v1::result_t<size_t> write(bus::IAccessor* owner, const i2s::AccessConfig& cfg, data::Source* tx,
                                         size_t len) override;
-    m5::hal::v1::result_t<size_t> writableBytes(bus::Accessor* owner, const i2s::I2SAccessConfig& cfg) override;
+    m5::hal::v1::result_t<size_t> writableBytes(bus::IAccessor* owner, const i2s::AccessConfig& cfg) override;
 
     /*!
       @brief Cap on un-acknowledged bytes in flight (the backpressure window).
@@ -822,7 +822,7 @@ private:
 
     // (Re)apply the AccessConfig and re-sync the credit baseline with a
     // synchronous bus_configure + bus_stream_status script.
-    m5::hal::v1::result_t<void> syncConfig(const i2s::I2SAccessConfig& cfg);
+    m5::hal::v1::result_t<void> syncConfig(const i2s::AccessConfig& cfg);
     // Ask the device for a fresh (free, submitted) snapshot synchronously.
     m5::hal::v1::result_t<void> syncStatus();
 
@@ -838,7 +838,7 @@ private:
     uint8_t _remote_bus_id  = 0;
 
     bool _configured = false;
-    i2s::I2SAccessConfig _applied_cfg{};
+    i2s::AccessConfig _applied_cfg{};
 
     // Credit state (all mod 2^32 / wrap-safe).
     uint32_t _sent      = 0;  // cumulative bytes the host has sent

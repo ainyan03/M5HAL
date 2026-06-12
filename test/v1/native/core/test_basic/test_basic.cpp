@@ -26,6 +26,34 @@ private:
     m5::hal::v1::service::ServiceResult _result;
 };
 
+TEST(ErrorToString, ReturnsTheEnumeratorSpelling)
+{
+    using m5::hal::v1::error::error_t;
+    using m5::hal::v1::error::toString;
+
+    EXPECT_STREQ(toString(error_t::OK), "OK");
+    EXPECT_STREQ(toString(error_t::I2C_NO_ACK), "I2C_NO_ACK");
+    EXPECT_STREQ(toString(error_t::TIMEOUT_ERROR), "TIMEOUT_ERROR");
+    EXPECT_STREQ(toString(error_t::DEVICE_MISMATCH), "DEVICE_MISMATCH");
+}
+
+TEST(ErrorToString, UnknownWireValuesDoNotCrash)
+{
+    using m5::hal::v1::error::error_t;
+    using m5::hal::v1::error::toString;
+
+    // A wire-decoded byte from a newer peer may not be in this build's
+    // enum; the name lookup must stay total.
+    EXPECT_STREQ(toString(static_cast<error_t>(-100)), "UNKNOWN");
+}
+
+TEST(ErrorCodes, DeviceMismatchStaysInsideTheWireRange)
+{
+    using m5::hal::v1::error::error_t;
+    // int8_t wire constraint (spec/design/errors.md).
+    EXPECT_EQ(static_cast<int8_t>(error_t::DEVICE_MISMATCH), -19);
+}
+
 TEST(NativeEnvironment, GoogleTestRuns)
 {
     EXPECT_EQ(1 + 1, 2);

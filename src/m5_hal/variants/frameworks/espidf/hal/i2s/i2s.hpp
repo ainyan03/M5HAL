@@ -11,14 +11,15 @@
 #include <atomic>
 #include <driver/i2s_std.h>
 
-namespace m5::variants::frameworks::espidf::hal::v1::i2s {
+namespace m5::hal::v1::i2s {
 
-using namespace ::m5::hal::v1;  // resolve unqualified types/bus:: refs
-
-// This variant needs no fields beyond the abstract kind config; the alias
-// keeps the `m5hal::i2s::BusConfig` spelling available in every build
-// (every variant publishes `Bus` + `BusConfig`, S17 E2).
-using BusConfig = ::m5::hal::v1::i2s::I2SBusConfig;
+// This variant needs no fields beyond the abstract kind config; the
+// empty derivation still gives `init` a variant-owned type, so a
+// sibling variant's config cannot be passed by accident (the same
+// typed-init guarantee as variants with extra fields).
+struct BusConfig_espidf : public ::m5::hal::v1::i2s::IBusConfig {
+    using IBusConfig::IBusConfig;
+};
 
 // ESP-IDF gen5 (driver/i2s_std.h) concrete I2S TX bus.
 // The channel is created lazily on the first write. On each call the
@@ -26,29 +27,26 @@ using BusConfig = ::m5::hal::v1::i2s::I2SBusConfig;
 // is disabled, reconfigured, then re-enabled. Underruns are silent (ESP-IDF
 // auto_clear = true). DMA bytes consumed are tracked via the on_sent event
 // callback to provide an accurate writableBytes() estimate.
-class Bus : public ::m5::hal::v1::i2s::I2SBus {
+class Bus_espidf : public ::m5::hal::v1::i2s::IBus {
 public:
-    ~Bus() override
+    ~Bus_espidf() override
     {
         (void)release();
     }
 
-    // Typed init (S17 E1). BusConfig is an alias of the abstract
-    // I2SBusConfig here; the signature still names the alias so every
-    // variant reads the same.
-    ::m5::hal::v1::result_t<void> init(const BusConfig& config);
+    ::m5::hal::v1::result_t<void> init(const BusConfig_espidf& config);
     ::m5::hal::v1::result_t<void> release(void) override;
 
-    ::m5::hal::v1::result_t<size_t> write(::m5::hal::v1::bus::Accessor* owner,
-                                          const ::m5::hal::v1::i2s::I2SAccessConfig& cfg,
-                                          ::m5::hal::v1::data::Source* tx, size_t len) override;
+    ::m5::hal::v1::result_t<size_t> write(::m5::hal::v1::bus::IAccessor* owner,
+                                          const ::m5::hal::v1::i2s::AccessConfig& cfg, ::m5::hal::v1::data::Source* tx,
+                                          size_t len) override;
 
-    ::m5::hal::v1::result_t<size_t> writableBytes(::m5::hal::v1::bus::Accessor* owner,
-                                                  const ::m5::hal::v1::i2s::I2SAccessConfig& cfg) override;
+    ::m5::hal::v1::result_t<size_t> writableBytes(::m5::hal::v1::bus::IAccessor* owner,
+                                                  const ::m5::hal::v1::i2s::AccessConfig& cfg) override;
 
 private:
     // Lazily open (or reconfigure) the I2S channel to match cfg.
-    ::m5::hal::v1::result_t<void> ensureChannel(const ::m5::hal::v1::i2s::I2SAccessConfig& cfg);
+    ::m5::hal::v1::result_t<void> ensureChannel(const ::m5::hal::v1::i2s::AccessConfig& cfg);
 
     // Close and delete the channel if it exists.
     void destroyChannel(void);
@@ -79,11 +77,11 @@ private:
     bool _expand_mono = false;
 
     // Last applied AccessConfig (used to detect when reconfiguration is needed).
-    ::m5::hal::v1::i2s::I2SAccessConfig _applied_cfg;
+    ::m5::hal::v1::i2s::AccessConfig _applied_cfg;
     bool _configured = false;
 };
 
-}  // namespace m5::variants::frameworks::espidf::hal::v1::i2s
+}  // namespace m5::hal::v1::i2s
 
 #endif  // defined(ESP_PLATFORM) && M5HAL_ESPIDF_I2S_HAS_STD
 

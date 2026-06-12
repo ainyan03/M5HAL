@@ -14,7 +14,7 @@
 
 namespace m5::hal::v1::i2c {
 
-struct I2CSlaveConfig {
+struct SlaveConfig {
     types::gpio_number_t pin_scl = -1;
     types::gpio_number_t pin_sda = -1;
     uint16_t address             = 0;
@@ -22,9 +22,9 @@ struct I2CSlaveConfig {
     uint32_t timeout_ms          = 1000;
 };
 
-class I2CSlaveLineDriver {
+class SlaveLineDriver {
 public:
-    virtual ~I2CSlaveLineDriver() = default;
+    virtual ~SlaveLineDriver() = default;
 
     virtual bool readScl() const           = 0;
     virtual bool readSda() const           = 0;
@@ -32,37 +32,37 @@ public:
     virtual void pullSclLow(bool pull_low) = 0;
 };
 
-class I2CSlaveDriver {
+class SlaveDriver {
 public:
-    virtual ~I2CSlaveDriver() = default;
+    virtual ~SlaveDriver() = default;
 
-    virtual result_t<void> init(const I2CSlaveConfig& cfg) = 0;
-    virtual result_t<void> release()                       = 0;
-    virtual service::IService* service()                   = 0;
+    virtual result_t<void> init(const SlaveConfig& cfg) = 0;
+    virtual result_t<void> release()                    = 0;
+    virtual service::IService* service()                = 0;
 };
 
-class ScopedI2CSlaveServiceRegistration {
+class ScopedSlaveServiceRegistration {
 public:
-    ScopedI2CSlaveServiceRegistration() = default;
-    ScopedI2CSlaveServiceRegistration(service::ServiceRunner& runner, I2CSlaveDriver& driver)
+    ScopedSlaveServiceRegistration() = default;
+    ScopedSlaveServiceRegistration(service::ServiceRunner& runner, SlaveDriver& driver)
     {
         (void)registerTo(runner, driver);
     }
-    ~ScopedI2CSlaveServiceRegistration()
+    ~ScopedSlaveServiceRegistration()
     {
         release();
     }
 
-    ScopedI2CSlaveServiceRegistration(const ScopedI2CSlaveServiceRegistration&)            = delete;
-    ScopedI2CSlaveServiceRegistration& operator=(const ScopedI2CSlaveServiceRegistration&) = delete;
+    ScopedSlaveServiceRegistration(const ScopedSlaveServiceRegistration&)            = delete;
+    ScopedSlaveServiceRegistration& operator=(const ScopedSlaveServiceRegistration&) = delete;
 
-    ScopedI2CSlaveServiceRegistration(ScopedI2CSlaveServiceRegistration&& other) noexcept
+    ScopedSlaveServiceRegistration(ScopedSlaveServiceRegistration&& other) noexcept
         : _runner{other._runner}, _service{other._service}
     {
         other._runner  = nullptr;
         other._service = nullptr;
     }
-    ScopedI2CSlaveServiceRegistration& operator=(ScopedI2CSlaveServiceRegistration&& other) noexcept
+    ScopedSlaveServiceRegistration& operator=(ScopedSlaveServiceRegistration&& other) noexcept
     {
         if (this != &other) {
             release();
@@ -74,7 +74,7 @@ public:
         return *this;
     }
 
-    result_t<void> registerTo(service::ServiceRunner& runner, I2CSlaveDriver& driver)
+    result_t<void> registerTo(service::ServiceRunner& runner, SlaveDriver& driver)
     {
         release();
         auto* svc = driver.service();
@@ -108,18 +108,28 @@ private:
     service::IService* _service     = nullptr;
 };
 
-class I2CSlaveService : public service::IService {
+/*!
+  @brief Cooperative software I2C slave state machine.
+
+  Runs as an `IService`: register it with a `service::ServiceRunner`
+  (or call `service()` directly) frequently enough to sample SCL/SDA
+  edges — it never blocks and never owns a task. `init()` rejects
+  10-bit addressing and addresses above 0x7F. The RX/TX buffers set
+  via `setRxBuffer` / `setTxBuffer` are NOT owned; the caller keeps
+  them alive while the service runs. Master writes beyond the RX
+  buffer (or beyond `maxAckedWriteBytes`) are NACKed.
+ */
+class SlaveService : public service::IService {
 public:
     static constexpr size_t kMaxObservedMasterAcks = 16;
 
     // Construction is two-phase by design: there is no (lines, config)
     // constructor because it would have to swallow init()'s expected —
     // a rejected config (10-bit / address > 0x7F) would leave a silently
-    // inert service. Construct, then call init() and check its result
-    // (S16 D6).
-    I2CSlaveService() = default;
+    // inert service. Construct, then call init() and check its result.
+    SlaveService() = default;
 
-    result_t<void> init(I2CSlaveLineDriver& lines, const I2CSlaveConfig& config)
+    result_t<void> init(SlaveLineDriver& lines, const SlaveConfig& config)
     {
         if (config.address_is_10bit || config.address > 0x7F) {
             return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
@@ -291,7 +301,7 @@ protected:
         _master_ack_count = 0;
         // NOTE: _max_acked_write_bytes is CONFIGURATION, not protocol
         // state — it survives init()/resetProtocol() so a value set
-        // before init() is not silently discarded (S16 D6).
+        // before init() is not silently discarded.
         for (size_t i = 0; i < kMaxObservedMasterAcks; ++i) {
             _master_acks[i] = false;
         }
@@ -330,8 +340,8 @@ private:
         _lines->pullSdaLow(!bit);
     }
 
-    I2CSlaveLineDriver* _lines = nullptr;
-    I2CSlaveConfig _config;
+    SlaveLineDriver* _lines = nullptr;
+    SlaveConfig _config;
     data::DataSpan _rx_buffer;
     data::ConstDataSpan _tx_buffer;
     State _state                              = State::Idle;

@@ -9,9 +9,10 @@
 #include <esp_err.h>
 #include <freertos/FreeRTOS.h>
 
-namespace m5::variants::frameworks::espidf::hal::v1::uart {
+namespace m5::hal::v1::uart {
 
 namespace {
+namespace impl_espidf {
 
 ::m5::hal::v1::error::error_t mapEspErr(::esp_err_t err)
 {
@@ -71,7 +72,7 @@ namespace {
     }
 }
 
-bool sameConfig(const ::m5::hal::v1::uart::UARTAccessConfig& lhs, const ::m5::hal::v1::uart::UARTAccessConfig& rhs)
+bool sameConfig(const ::m5::hal::v1::uart::AccessConfig& lhs, const ::m5::hal::v1::uart::AccessConfig& rhs)
 {
     return lhs.baud_rate == rhs.baud_rate && lhs.data_bits == rhs.data_bits && lhs.stop_bits == rhs.stop_bits &&
            lhs.parity == rhs.parity && lhs.invert == rhs.invert;
@@ -82,11 +83,12 @@ bool sameConfig(const ::m5::hal::v1::uart::UARTAccessConfig& lhs, const ::m5::ha
     return pdMS_TO_TICKS(timeout_ms);
 }
 
+}  // namespace impl_espidf
 }  // namespace
 
-::m5::hal::v1::result_t<void> Bus::init(const BusConfig& config)
+::m5::hal::v1::result_t<void> Bus_espidf::init(const BusConfig_espidf& config)
 {
-    const auto new_port = resolvePort(config.port_num);
+    const auto new_port = impl_espidf::resolvePort(config.port_num);
     if (new_port < UART_NUM_0 || new_port >= UART_NUM_MAX) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
@@ -101,7 +103,7 @@ bool sameConfig(const ::m5::hal::v1::uart::UARTAccessConfig& lhs, const ::m5::ha
 
     const int rx_size = static_cast<int>(_config.rx_buffer_size == 0 ? 256 : _config.rx_buffer_size);
     const int tx_size = static_cast<int>(_config.tx_buffer_size);
-    auto mapped       = mapEspErr(::uart_driver_install(_port, rx_size, tx_size, 0, nullptr, 0));
+    auto mapped       = impl_espidf::mapEspErr(::uart_driver_install(_port, rx_size, tx_size, 0, nullptr, 0));
     if (::m5::hal::v1::error::isError(mapped)) {
         return m5::stl::make_unexpected(mapped);
     }
@@ -118,10 +120,10 @@ bool sameConfig(const ::m5::hal::v1::uart::UARTAccessConfig& lhs, const ::m5::ha
     return {};
 }
 
-::m5::hal::v1::result_t<void> Bus::release(void)
+::m5::hal::v1::result_t<void> Bus_espidf::release(void)
 {
     if (_installed) {
-        auto mapped = mapEspErr(::uart_driver_delete(_port));
+        auto mapped = impl_espidf::mapEspErr(::uart_driver_delete(_port));
         _installed  = false;
         _configured = false;
         if (::m5::hal::v1::error::isError(mapped)) {
@@ -131,36 +133,38 @@ bool sameConfig(const ::m5::hal::v1::uart::UARTAccessConfig& lhs, const ::m5::ha
     return {};
 }
 
-::m5::hal::v1::result_t<void> Bus::applyConfig(const ::m5::hal::v1::uart::UARTAccessConfig& cfg)
+::m5::hal::v1::result_t<void> Bus_espidf::applyConfig(const ::m5::hal::v1::uart::AccessConfig& cfg)
 {
     if (!_installed || cfg.baud_rate == 0 || cfg.data_bits < 5 || cfg.data_bits > 8 ||
         (cfg.stop_bits != 1 && cfg.stop_bits != 2)) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
-    if (_configured && sameConfig(_applied_cfg, cfg)) {
+    if (_configured && impl_espidf::sameConfig(_applied_cfg, cfg)) {
         return {};
     }
 
     ::uart_config_t native_cfg = {};
     native_cfg.baud_rate       = static_cast<int>(cfg.baud_rate);
-    native_cfg.data_bits       = wordLength(cfg.data_bits);
-    native_cfg.parity          = parity(cfg.parity);
-    native_cfg.stop_bits       = stopBits(cfg.stop_bits);
+    native_cfg.data_bits       = impl_espidf::wordLength(cfg.data_bits);
+    native_cfg.parity          = impl_espidf::parity(cfg.parity);
+    native_cfg.stop_bits       = impl_espidf::stopBits(cfg.stop_bits);
     native_cfg.flow_ctrl       = UART_HW_FLOWCTRL_DISABLE;
 #if defined(UART_SCLK_DEFAULT)
     native_cfg.source_clk = UART_SCLK_DEFAULT;
 #endif
 
-    auto mapped = mapEspErr(::uart_param_config(_port, &native_cfg));
+    auto mapped = impl_espidf::mapEspErr(::uart_param_config(_port, &native_cfg));
     if (::m5::hal::v1::error::isError(mapped)) {
         return m5::stl::make_unexpected(mapped);
     }
-    mapped = mapEspErr(::uart_set_pin(_port, static_cast<int>(_config.pin_tx), static_cast<int>(_config.pin_rx),
-                                      static_cast<int>(_config.pin_rts), static_cast<int>(_config.pin_cts)));
+    mapped =
+        impl_espidf::mapEspErr(::uart_set_pin(_port, static_cast<int>(_config.pin_tx), static_cast<int>(_config.pin_rx),
+                                              static_cast<int>(_config.pin_rts), static_cast<int>(_config.pin_cts)));
     if (::m5::hal::v1::error::isError(mapped)) {
         return m5::stl::make_unexpected(mapped);
     }
-    mapped = mapEspErr(::uart_set_line_inverse(_port, cfg.invert ? UART_SIGNAL_TXD_INV | UART_SIGNAL_RXD_INV : 0));
+    mapped = impl_espidf::mapEspErr(
+        ::uart_set_line_inverse(_port, cfg.invert ? UART_SIGNAL_TXD_INV | UART_SIGNAL_RXD_INV : 0));
     if (::m5::hal::v1::error::isError(mapped)) {
         return m5::stl::make_unexpected(mapped);
     }
@@ -170,9 +174,9 @@ bool sameConfig(const ::m5::hal::v1::uart::UARTAccessConfig& lhs, const ::m5::ha
     return {};
 }
 
-::m5::hal::v1::result_t<size_t> Bus::write(::m5::hal::v1::bus::Accessor* owner,
-                                           const ::m5::hal::v1::uart::UARTAccessConfig& cfg,
-                                           ::m5::hal::v1::data::Source* tx, size_t len)
+::m5::hal::v1::result_t<size_t> Bus_espidf::write(::m5::hal::v1::bus::IAccessor* owner,
+                                                  const ::m5::hal::v1::uart::AccessConfig& cfg,
+                                                  ::m5::hal::v1::data::Source* tx, size_t len)
 {
     (void)owner;
     auto applied = applyConfig(cfg);
@@ -200,16 +204,16 @@ bool sameConfig(const ::m5::hal::v1::uart::UARTAccessConfig& lhs, const ::m5::ha
         done += static_cast<size_t>(written);
     }
 
-    auto mapped = mapEspErr(::uart_wait_tx_done(_port, ticks(cfg.write_timeout_ms)));
+    auto mapped = impl_espidf::mapEspErr(::uart_wait_tx_done(_port, impl_espidf::ticks(cfg.write_timeout_ms)));
     if (::m5::hal::v1::error::isError(mapped)) {
         return m5::stl::make_unexpected(mapped);
     }
     return done;
 }
 
-::m5::hal::v1::result_t<size_t> Bus::read(::m5::hal::v1::bus::Accessor* owner,
-                                          const ::m5::hal::v1::uart::UARTAccessConfig& cfg,
-                                          ::m5::hal::v1::data::Sink* rx, size_t len)
+::m5::hal::v1::result_t<size_t> Bus_espidf::read(::m5::hal::v1::bus::IAccessor* owner,
+                                                 const ::m5::hal::v1::uart::AccessConfig& cfg,
+                                                 ::m5::hal::v1::data::Sink* rx, size_t len)
 {
     (void)owner;
     auto applied = applyConfig(cfg);
@@ -226,8 +230,9 @@ bool sameConfig(const ::m5::hal::v1::uart::UARTAccessConfig& lhs, const ::m5::ha
         if (span.value().size == 0) {
             break;
         }
-        const auto timeout = done == 0 ? ticks(cfg.first_byte_timeout_ms) : ticks(cfg.inter_byte_timeout_ms);
-        const int read     = ::uart_read_bytes(_port, span.value().data, span.value().size, timeout);
+        const auto timeout =
+            done == 0 ? impl_espidf::ticks(cfg.first_byte_timeout_ms) : impl_espidf::ticks(cfg.inter_byte_timeout_ms);
+        const int read = ::uart_read_bytes(_port, span.value().data, span.value().size, timeout);
         if (read < 0) {
             return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::IO_ERROR);
         }
@@ -243,8 +248,8 @@ bool sameConfig(const ::m5::hal::v1::uart::UARTAccessConfig& lhs, const ::m5::ha
     return done;
 }
 
-::m5::hal::v1::result_t<size_t> Bus::readableBytes(::m5::hal::v1::bus::Accessor* owner,
-                                                   const ::m5::hal::v1::uart::UARTAccessConfig& cfg)
+::m5::hal::v1::result_t<size_t> Bus_espidf::readableBytes(::m5::hal::v1::bus::IAccessor* owner,
+                                                          const ::m5::hal::v1::uart::AccessConfig& cfg)
 {
     (void)owner;
     auto applied = applyConfig(cfg);
@@ -252,14 +257,14 @@ bool sameConfig(const ::m5::hal::v1::uart::UARTAccessConfig& lhs, const ::m5::ha
         return m5::stl::make_unexpected(applied.error());
     }
     size_t size = 0;
-    auto mapped = mapEspErr(::uart_get_buffered_data_len(_port, &size));
+    auto mapped = impl_espidf::mapEspErr(::uart_get_buffered_data_len(_port, &size));
     if (::m5::hal::v1::error::isError(mapped)) {
         return m5::stl::make_unexpected(mapped);
     }
     return size;
 }
 
-}  // namespace m5::variants::frameworks::espidf::hal::v1::uart
+}  // namespace m5::hal::v1::uart
 
 #endif
 

@@ -9,11 +9,11 @@ namespace {
 // -------------------------------------------------------------------------
 // Stub I2S bus that records all calls for inspection.
 // -------------------------------------------------------------------------
-class StubI2SBus : public m5::hal::v1::i2s::I2SBus {
+class StubIBus : public m5::hal::v1::i2s::IBus {
 public:
-    // Typed init (S17 E1): the fake adds no fields, so it takes the
+    // Typed init: the fake adds no fields, so it takes the
     // abstract kind config.
-    m5::hal::v1::result_t<void> init(const m5::hal::v1::i2s::I2SBusConfig& config)
+    m5::hal::v1::result_t<void> init(const m5::hal::v1::i2s::IBusConfig& config)
     {
         _config = config;
         return {};
@@ -25,7 +25,7 @@ public:
         return {};
     }
 
-    m5::hal::v1::result_t<size_t> write(m5::hal::v1::bus::Accessor* owner, const m5::hal::v1::i2s::I2SAccessConfig& cfg,
+    m5::hal::v1::result_t<size_t> write(m5::hal::v1::bus::IAccessor* owner, const m5::hal::v1::i2s::AccessConfig& cfg,
                                         m5::hal::v1::data::Source* tx, size_t len) override
     {
         last_owner  = owner;
@@ -49,8 +49,8 @@ public:
         return done;
     }
 
-    m5::hal::v1::result_t<size_t> writableBytes(m5::hal::v1::bus::Accessor* owner,
-                                                const m5::hal::v1::i2s::I2SAccessConfig& cfg) override
+    m5::hal::v1::result_t<size_t> writableBytes(m5::hal::v1::bus::IAccessor* owner,
+                                                const m5::hal::v1::i2s::AccessConfig& cfg) override
     {
         last_owner = owner;
         last_cfg   = cfg;
@@ -58,19 +58,19 @@ public:
     }
 
     std::vector<uint8_t> tx_recorded;
-    m5::hal::v1::bus::Accessor* last_owner = nullptr;
-    m5::hal::v1::i2s::I2SAccessConfig last_cfg;
+    m5::hal::v1::bus::IAccessor* last_owner = nullptr;
+    m5::hal::v1::i2s::AccessConfig last_cfg;
     size_t stub_writable = 1024;
 };
 
 }  // namespace
 
 // -------------------------------------------------------------------------
-// I2SBusConfig defaults
+// IBusConfig defaults
 // -------------------------------------------------------------------------
-TEST(I2SBusConfig, DefaultCtorSetsI2SKind)
+TEST(IBusConfig, DefaultCtorSetsI2SKind)
 {
-    m5::hal::v1::i2s::I2SBusConfig cfg;
+    m5::hal::v1::i2s::IBusConfig cfg;
     EXPECT_EQ(cfg.getBusKind(), m5::hal::v1::types::bus_kind_t::I2S);
     EXPECT_EQ(cfg.pin_bclk, -1);
     EXPECT_EQ(cfg.pin_ws, -1);
@@ -79,35 +79,35 @@ TEST(I2SBusConfig, DefaultCtorSetsI2SKind)
 }
 
 // -------------------------------------------------------------------------
-// I2SBus base default returns NOT_IMPLEMENTED
+// IBus base default returns NOT_IMPLEMENTED
 // -------------------------------------------------------------------------
-TEST(I2SBus, BaseDefaultWriteReturnsNotImplemented)
+TEST(IBus, BaseDefaultWriteReturnsNotImplemented)
 {
-    m5::hal::v1::i2s::I2SBus bus;
-    m5::hal::v1::i2s::I2SAccessConfig cfg;
+    m5::hal::v1::i2s::IBus bus;
+    m5::hal::v1::i2s::AccessConfig cfg;
     auto result = bus.write(nullptr, cfg, nullptr, 0);
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), m5::hal::v1::error::error_t::NOT_IMPLEMENTED);
 }
 
-TEST(I2SBus, BaseDefaultWritableBytesReturnsNotImplemented)
+TEST(IBus, BaseDefaultWritableBytesReturnsNotImplemented)
 {
-    m5::hal::v1::i2s::I2SBus bus;
-    m5::hal::v1::i2s::I2SAccessConfig cfg;
+    m5::hal::v1::i2s::IBus bus;
+    m5::hal::v1::i2s::AccessConfig cfg;
     auto result = bus.writableBytes(nullptr, cfg);
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), m5::hal::v1::error::error_t::NOT_IMPLEMENTED);
 }
 
 // -------------------------------------------------------------------------
-// I2STxAccessor forwards writes to bus
+// TxAccessor forwards writes to bus
 // -------------------------------------------------------------------------
-TEST(I2STxAccessor, WriteConstDataSpanForwardsTobus)
+TEST(TxAccessor, WriteConstDataSpanForwardsTobus)
 {
-    StubI2SBus bus;
-    m5::hal::v1::i2s::I2SAccessConfig cfg;
+    StubIBus bus;
+    m5::hal::v1::i2s::AccessConfig cfg;
     cfg.sample_rate_hz = 44100;
-    m5::hal::v1::i2s::I2STxAccessor acc{bus, cfg};
+    m5::hal::v1::i2s::TxAccessor acc{bus, cfg};
 
     const uint8_t payload[] = {0x01, 0x02, 0x03, 0x04};
     auto result             = acc.write(m5::hal::v1::data::ConstDataSpan{payload, sizeof(payload)});
@@ -120,11 +120,11 @@ TEST(I2STxAccessor, WriteConstDataSpanForwardsTobus)
     EXPECT_EQ(bus.last_cfg.sample_rate_hz, 44100u);
 }
 
-TEST(I2STxAccessor, WriteRawPtrForwardsTobus)
+TEST(TxAccessor, WriteRawPtrForwardsTobus)
 {
-    StubI2SBus bus;
-    m5::hal::v1::i2s::I2SAccessConfig cfg;
-    m5::hal::v1::i2s::I2STxAccessor acc{bus, cfg};
+    StubIBus bus;
+    m5::hal::v1::i2s::AccessConfig cfg;
+    m5::hal::v1::i2s::TxAccessor acc{bus, cfg};
 
     const uint8_t payload[] = {0xAA, 0xBB};
     auto result             = acc.write(payload, sizeof(payload));
@@ -135,11 +135,11 @@ TEST(I2STxAccessor, WriteRawPtrForwardsTobus)
     EXPECT_EQ(bus.tx_recorded[1], 0xBBu);
 }
 
-TEST(I2STxAccessor, WriteSourceForwardsTobus)
+TEST(TxAccessor, WriteSourceForwardsTobus)
 {
-    StubI2SBus bus;
-    m5::hal::v1::i2s::I2SAccessConfig cfg;
-    m5::hal::v1::i2s::I2STxAccessor acc{bus, cfg};
+    StubIBus bus;
+    m5::hal::v1::i2s::AccessConfig cfg;
+    m5::hal::v1::i2s::TxAccessor acc{bus, cfg};
 
     const uint8_t payload[] = {0x10, 0x20, 0x30};
     m5::hal::v1::data::MemorySource src{m5::hal::v1::data::ConstDataSpan{payload, sizeof(payload)}};
@@ -151,30 +151,30 @@ TEST(I2STxAccessor, WriteSourceForwardsTobus)
 }
 
 // All three write overloads must produce the same byte sequence.
-TEST(I2STxAccessor, WriteOverloadsAreEquivalent)
+TEST(TxAccessor, WriteOverloadsAreEquivalent)
 {
     const uint8_t payload[] = {0xDE, 0xAD};
 
     // via ConstDataSpan
     {
-        StubI2SBus bus;
-        m5::hal::v1::i2s::I2STxAccessor acc{bus, {}};
+        StubIBus bus;
+        m5::hal::v1::i2s::TxAccessor acc{bus, {}};
         acc.write(m5::hal::v1::data::ConstDataSpan{payload, sizeof(payload)});
         ASSERT_EQ(bus.tx_recorded.size(), sizeof(payload));
         EXPECT_EQ(bus.tx_recorded[0], 0xDEu);
     }
     // via raw pointer
     {
-        StubI2SBus bus;
-        m5::hal::v1::i2s::I2STxAccessor acc{bus, {}};
+        StubIBus bus;
+        m5::hal::v1::i2s::TxAccessor acc{bus, {}};
         acc.write(payload, sizeof(payload));
         ASSERT_EQ(bus.tx_recorded.size(), sizeof(payload));
         EXPECT_EQ(bus.tx_recorded[0], 0xDEu);
     }
     // via Source
     {
-        StubI2SBus bus;
-        m5::hal::v1::i2s::I2STxAccessor acc{bus, {}};
+        StubIBus bus;
+        m5::hal::v1::i2s::TxAccessor acc{bus, {}};
         m5::hal::v1::data::MemorySource src{m5::hal::v1::data::ConstDataSpan{payload, sizeof(payload)}};
         acc.write(src, sizeof(payload));
         ASSERT_EQ(bus.tx_recorded.size(), sizeof(payload));
@@ -185,11 +185,11 @@ TEST(I2STxAccessor, WriteOverloadsAreEquivalent)
 // -------------------------------------------------------------------------
 // writableBytes forwarding
 // -------------------------------------------------------------------------
-TEST(I2STxAccessor, WritableBytesForwardsTobus)
+TEST(TxAccessor, WritableBytesForwardsTobus)
 {
-    StubI2SBus bus;
+    StubIBus bus;
     bus.stub_writable = 2048;
-    m5::hal::v1::i2s::I2STxAccessor acc{bus, {}};
+    m5::hal::v1::i2s::TxAccessor acc{bus, {}};
 
     auto result = acc.writableBytes();
     ASSERT_TRUE(result.has_value());
@@ -200,11 +200,11 @@ TEST(I2STxAccessor, WritableBytesForwardsTobus)
 // -------------------------------------------------------------------------
 // setConfig rejects inside access, applies outside
 // -------------------------------------------------------------------------
-TEST(I2STxAccessor, SetConfigRejectsInsideAccess)
+TEST(TxAccessor, SetConfigRejectsInsideAccess)
 {
-    StubI2SBus bus;
-    m5::hal::v1::i2s::I2SAccessConfig cfg;
-    m5::hal::v1::i2s::I2STxAccessor acc{bus, cfg};
+    StubIBus bus;
+    m5::hal::v1::i2s::AccessConfig cfg;
+    m5::hal::v1::i2s::TxAccessor acc{bus, cfg};
 
     // Acquire the lock explicitly so inAccess() is true.
     ASSERT_TRUE(acc.beginAccess(0).has_value());
@@ -215,14 +215,14 @@ TEST(I2STxAccessor, SetConfigRejectsInsideAccess)
     ASSERT_TRUE(acc.endAccess().has_value());
 }
 
-TEST(I2STxAccessor, SetConfigAppliedOutsideAccess)
+TEST(TxAccessor, SetConfigAppliedOutsideAccess)
 {
-    StubI2SBus bus;
-    m5::hal::v1::i2s::I2SAccessConfig cfg;
+    StubIBus bus;
+    m5::hal::v1::i2s::AccessConfig cfg;
     cfg.sample_rate_hz = 44100;
-    m5::hal::v1::i2s::I2STxAccessor acc{bus, cfg};
+    m5::hal::v1::i2s::TxAccessor acc{bus, cfg};
 
-    m5::hal::v1::i2s::I2SAccessConfig new_cfg;
+    m5::hal::v1::i2s::AccessConfig new_cfg;
     new_cfg.sample_rate_hz = 48000;
     ASSERT_TRUE(acc.setConfig(new_cfg).has_value());
 
@@ -235,10 +235,10 @@ TEST(I2STxAccessor, SetConfigAppliedOutsideAccess)
 // -------------------------------------------------------------------------
 // Lock ownership: accessor passes itself as owner to the bus
 // -------------------------------------------------------------------------
-TEST(I2STxAccessor, WritePassesAccessorAsOwner)
+TEST(TxAccessor, WritePassesAccessorAsOwner)
 {
-    StubI2SBus bus;
-    m5::hal::v1::i2s::I2STxAccessor acc{bus, {}};
+    StubIBus bus;
+    m5::hal::v1::i2s::TxAccessor acc{bus, {}};
 
     const uint8_t d[] = {0xFF};
     acc.write(d, sizeof(d));
@@ -248,29 +248,29 @@ TEST(I2STxAccessor, WritePassesAccessorAsOwner)
 // -------------------------------------------------------------------------
 // Bus contention: second accessor while first holds access
 // -------------------------------------------------------------------------
-TEST(I2SBus, SecondAccessorIsBusyWhileFirstHoldsLock)
+TEST(IBus, SecondAccessorTimesOutWhileFirstHoldsLock)
 {
-    StubI2SBus bus;
-    m5::hal::v1::i2s::I2STxAccessor acc1{bus, {}};
-    m5::hal::v1::i2s::I2STxAccessor acc2{bus, {}};
+    StubIBus bus;
+    m5::hal::v1::i2s::TxAccessor acc1{bus, {}};
+    m5::hal::v1::i2s::TxAccessor acc2{bus, {}};
 
     ASSERT_TRUE(acc1.beginAccess(0).has_value());
 
     auto result = acc2.beginAccess(0);
     ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), m5::hal::v1::error::error_t::BUSY);
+    EXPECT_EQ(result.error(), m5::hal::v1::error::error_t::TIMEOUT_ERROR);
 
     ASSERT_TRUE(acc1.endAccess().has_value());
 }
 
 // -------------------------------------------------------------------------
-// getI2SBus returns the same bus object
+// getBus returns the same bus object
 // -------------------------------------------------------------------------
-TEST(I2STxAccessor, GetI2SBusReturnsSameBus)
+TEST(TxAccessor, GetIBusReturnsSameBus)
 {
-    StubI2SBus bus;
-    m5::hal::v1::i2s::I2STxAccessor acc{bus, {}};
-    EXPECT_EQ(&acc.getI2SBus(), &bus);
+    StubIBus bus;
+    m5::hal::v1::i2s::TxAccessor acc{bus, {}};
+    EXPECT_EQ(&acc.getBus(), &bus);
 }
 
 int main(int argc, char** argv)

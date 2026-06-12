@@ -11,9 +11,10 @@
 
 #include <cstddef>
 
-namespace m5::variants::frameworks::espidf::hal::v1::spi {
+namespace m5::hal::v1::spi {
 
 namespace {
+namespace impl_espidf {
 
 ::m5::hal::v1::error::error_t mapEspErr(::esp_err_t err)
 {
@@ -35,11 +36,11 @@ namespace {
 bool isHalfDuplexMode(::m5::hal::v1::spi::spi_data_mode_t mode)
 {
     using ::m5::hal::v1::spi::spi_data_mode_t;
-    return mode == spi_data_mode_t::spi_halfduplex || mode == spi_data_mode_t::spi_halfduplex_with_dc_pin ||
-           mode == spi_data_mode_t::spi_halfduplex_with_dc_bit || mode == spi_data_mode_t::spi_dual_output ||
-           mode == spi_data_mode_t::spi_dual_io || mode == spi_data_mode_t::spi_quad_output ||
-           mode == spi_data_mode_t::spi_quad_io || mode == spi_data_mode_t::spi_octal_output ||
-           mode == spi_data_mode_t::spi_octal_io;
+    return mode == spi_data_mode_t::halfduplex || mode == spi_data_mode_t::halfduplex_with_dc_pin ||
+           mode == spi_data_mode_t::halfduplex_with_dc_bit || mode == spi_data_mode_t::dual_output ||
+           mode == spi_data_mode_t::dual_io || mode == spi_data_mode_t::quad_output ||
+           mode == spi_data_mode_t::quad_io || mode == spi_data_mode_t::octal_output ||
+           mode == spi_data_mode_t::octal_io;
 }
 
 bool descNeedsHalfDuplex(const ::m5::hal::v1::spi::TransferDesc& desc)
@@ -66,10 +67,10 @@ void setPinOutput(::m5::hal::v1::types::gpio_number_t pin, bool level)
     }
 }
 
-void setDC(const ::m5::hal::v1::spi::SPIBusConfig& bus_cfg, int8_t level)
+void setDC(::m5::hal::v1::types::gpio_number_t dc_pin, int8_t level)
 {
-    if (level >= 0) {
-        setPinLevel(bus_cfg.pin_dc, level != 0);
+    if (level >= 0 && dc_pin >= 0) {
+        setPinLevel(dc_pin, level != 0);
     }
 }
 
@@ -155,9 +156,10 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
     return {};
 }
 
+}  // namespace impl_espidf
 }  // namespace
 
-::m5::hal::v1::error::error_t Bus::attach(::spi_host_device_t host)
+::m5::hal::v1::error::error_t Bus_espidf::attach(::spi_host_device_t host)
 {
     if (_owns_bus) {
         (void)release();
@@ -167,7 +169,7 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
     return ::m5::hal::v1::error::error_t::OK;
 }
 
-::m5::hal::v1::result_t<void> Bus::init(const BusConfig& config)
+::m5::hal::v1::result_t<void> Bus_espidf::init(const BusConfig_espidf& config)
 {
     // Release the previous bus while `_host` still names the OLD host;
     // adopting the new config first would free the wrong bus and leak
@@ -190,18 +192,18 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
     bus_config.data7_io_num       = static_cast<int>(_config.pin_d7);
     bus_config.max_transfer_sz    = 64 * 1024;
 
-    auto mapped = mapEspErr(::spi_bus_initialize(_host, &bus_config, SPI_DMA_CH_AUTO));
+    auto mapped = impl_espidf::mapEspErr(::spi_bus_initialize(_host, &bus_config, SPI_DMA_CH_AUTO));
     if (::m5::hal::v1::error::isError(mapped)) {
         return m5::stl::make_unexpected(mapped);
     }
     if (_config.pin_dc >= 0) {
-        setPinOutput(_config.pin_dc, true);
+        impl_espidf::setPinOutput(_config.pin_dc, true);
     }
     _owns_bus = true;
     return {};
 }
 
-::m5::hal::v1::result_t<void> Bus::release(void)
+::m5::hal::v1::result_t<void> Bus_espidf::release(void)
 {
     auto removed = removeDevice();
     if (!removed.has_value()) {
@@ -209,7 +211,7 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
     }
 
     if (_owns_bus) {
-        auto mapped = mapEspErr(::spi_bus_free(_host));
+        auto mapped = impl_espidf::mapEspErr(::spi_bus_free(_host));
         _owns_bus   = false;
         if (::m5::hal::v1::error::isError(mapped)) {
             return m5::stl::make_unexpected(mapped);
@@ -219,12 +221,12 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
     return {};
 }
 
-::m5::hal::v1::result_t<void> Bus::removeDevice(void)
+::m5::hal::v1::result_t<void> Bus_espidf::removeDevice(void)
 {
     if (_device == nullptr) {
         return {};
     }
-    auto mapped         = mapEspErr(::spi_bus_remove_device(_device));
+    auto mapped         = impl_espidf::mapEspErr(::spi_bus_remove_device(_device));
     _device             = nullptr;
     _device_freq        = 0;
     _device_mode        = 0;
@@ -236,7 +238,8 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
     return {};
 }
 
-::m5::hal::v1::result_t<bool> Bus::ensureDevice(const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg, bool half_duplex)
+::m5::hal::v1::result_t<bool> Bus_espidf::ensureDevice(const ::m5::hal::v1::spi::MasterAccessConfig& cfg,
+                                                       bool half_duplex)
 {
     if (_device != nullptr && _device_freq == cfg.freq && _device_mode == cfg.spi_mode &&
         _device_order == cfg.spi_order && _device_half_duplex == half_duplex) {
@@ -260,7 +263,7 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
         dev_config.flags |= SPI_DEVICE_HALFDUPLEX;
     }
 
-    auto mapped = mapEspErr(::spi_bus_add_device(_host, &dev_config, &_device));
+    auto mapped = impl_espidf::mapEspErr(::spi_bus_add_device(_host, &dev_config, &_device));
     if (::m5::hal::v1::error::isError(mapped)) {
         _device = nullptr;
         return m5::stl::make_unexpected(mapped);
@@ -273,8 +276,8 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
     return true;  // device (re)created — SCK idle level may not be settled yet
 }
 
-::m5::hal::v1::result_t<void> Bus::beginTransaction(::m5::hal::v1::bus::Accessor* owner,
-                                                    const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg)
+::m5::hal::v1::result_t<void> Bus_espidf::beginTransaction(::m5::hal::v1::bus::IAccessor* owner,
+                                                           const ::m5::hal::v1::spi::MasterAccessConfig& cfg)
 {
     (void)owner;
     if (cfg.freq == 0) {
@@ -295,21 +298,21 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
         return m5::stl::make_unexpected(dev.error());
     }
     if (dev.value()) {
-        auto settle = sendDummy(_device, 1);
+        auto settle = impl_espidf::sendDummy(_device, 1);
         if (!settle.has_value()) {
             return m5::stl::make_unexpected(settle.error());
         }
     }
     _transaction_active = true;
-    setPinOutput(cfg.pin_cs, false);
+    impl_espidf::setPinOutput(cfg.pin_cs, false);
     return {};
 }
 
-::m5::hal::v1::result_t<void> Bus::endTransaction(::m5::hal::v1::bus::Accessor* owner,
-                                                  const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg)
+::m5::hal::v1::result_t<void> Bus_espidf::endTransaction(::m5::hal::v1::bus::IAccessor* owner,
+                                                         const ::m5::hal::v1::spi::MasterAccessConfig& cfg)
 {
     (void)owner;
-    setPinLevel(cfg.pin_cs, true);
+    impl_espidf::setPinLevel(cfg.pin_cs, true);
     _transaction_active = false;
     // The device handle stays cached across transactions: ensureDevice
     // re-creates it only when the next transaction's config differs, so
@@ -320,46 +323,55 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
     return {};
 }
 
-::m5::hal::v1::result_t<size_t> Bus::transfer(::m5::hal::v1::bus::Accessor* owner,
-                                              const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg,
-                                              const ::m5::hal::v1::spi::TransferDesc& desc,
-                                              ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
+::m5::hal::v1::result_t<size_t> Bus_espidf::transfer(::m5::hal::v1::bus::IAccessor* owner,
+                                                     const ::m5::hal::v1::spi::MasterAccessConfig& cfg,
+                                                     const ::m5::hal::v1::spi::TransferDesc& desc,
+                                                     ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
 {
     (void)owner;
     if (!_transaction_active || cfg.freq == 0) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
 
-    const bool half_duplex =
-        isHalfDuplexMode(cfg.spi_data_mode) || descNeedsHalfDuplex(desc) || tx == nullptr || rx == nullptr;
+    const bool half_duplex = impl_espidf::isHalfDuplexMode(cfg.spi_data_mode) ||
+                             impl_espidf::descNeedsHalfDuplex(desc) || tx == nullptr || rx == nullptr;
     auto dev = ensureDevice(cfg, half_duplex);
     if (!dev.has_value()) {
         return m5::stl::make_unexpected(dev.error());
     }
 
+    // Per-device D/C override: a non-negative accessor pin_dc beats the
+    // bus-level default. The override pin is switched to output once and
+    // cached (the bus-level pin was set up in init()).
+    const ::m5::hal::v1::types::gpio_number_t dc_pin = cfg.pin_dc >= 0 ? cfg.pin_dc : _config.pin_dc;
+    if (cfg.pin_dc >= 0 && cfg.pin_dc != _last_acc_dc) {
+        impl_espidf::setPinOutput(cfg.pin_dc, true);
+        _last_acc_dc = cfg.pin_dc;
+    }
+
     const bool has_phase_dc = desc.command_dc_level >= 0 || desc.address_dc_level >= 0 || desc.data_dc_level >= 0;
     if (!has_phase_dc && desc.dc_level_valid) {
-        setDC(_config, desc.dc_level ? 1 : 0);
+        impl_espidf::setDC(dc_pin, desc.dc_level ? 1 : 0);
     }
 
-    setDC(_config, desc.command_dc_level);
-    auto meta = sendMeta(_device, desc.command, desc.command_bytes);
+    impl_espidf::setDC(dc_pin, desc.command_dc_level);
+    auto meta = impl_espidf::sendMeta(_device, desc.command, desc.command_bytes);
     if (!meta.has_value()) {
         return m5::stl::make_unexpected(meta.error());
     }
 
-    setDC(_config, desc.address_dc_level);
-    meta = sendMeta(_device, desc.address, desc.address_bytes);
+    impl_espidf::setDC(dc_pin, desc.address_dc_level);
+    meta = impl_espidf::sendMeta(_device, desc.address, desc.address_bytes);
     if (!meta.has_value()) {
         return m5::stl::make_unexpected(meta.error());
     }
 
-    auto dummy = sendDummy(_device, desc.dummy_cycles);
+    auto dummy = impl_espidf::sendDummy(_device, desc.dummy_cycles);
     if (!dummy.has_value()) {
         return m5::stl::make_unexpected(dummy.error());
     }
 
-    setDC(_config, desc.data_dc_level);
+    impl_espidf::setDC(dc_pin, desc.data_dc_level);
 
     size_t transferred = 0;
     while ((tx != nullptr && !tx->eof()) || (rx != nullptr && !rx->closed())) {
@@ -384,7 +396,7 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
         if (chunk_len == 0) {
             break;
         }
-        auto chunk = transferChunk(_device, tx_span, rx_span);
+        auto chunk = impl_espidf::transferChunk(_device, tx_span, rx_span);
         if (!chunk.has_value()) {
             return m5::stl::make_unexpected(chunk.error());
         }
@@ -406,7 +418,7 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
     return transferred;
 }
 
-}  // namespace m5::variants::frameworks::espidf::hal::v1::spi
+}  // namespace m5::hal::v1::spi
 
 #endif
 

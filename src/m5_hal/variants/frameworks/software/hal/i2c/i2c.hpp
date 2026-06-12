@@ -9,7 +9,7 @@
 
 // I2C bit-bang implementation. Drives SCL / SDA through the
 // `m5::hal::v1::gpio::Pin` value type; callers populate
-// `I2CBusConfig::pin_scl` / `pin_sda` with `gpio_number_t` values.
+// `IBusConfig::pin_scl` / `pin_sda` with `gpio_number_t` values.
 // `Bus::init` resolves them via `m5::hal::v1::M5_Hal.Gpio.getPin(num)`
 // (global lookup through the `M5HALCore` singleton) and stores the
 // resulting `IPort` / `Pin` in members. Any `gpio_number_t` is
@@ -45,9 +45,9 @@ struct MasterTiming {
     static constexpr uint32_t kNsecPerSec  = 1000000000u;
     static constexpr uint32_t kNsecPerMsec = 1000000u;
 
-    static ::m5::hal::v1::result_t<MasterTiming> fromConfig(const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg)
+    static ::m5::hal::v1::result_t<MasterTiming> fromConfig(const ::m5::hal::v1::i2c::MasterAccessConfig& cfg)
     {
-        if (cfg.freq == 0 || cfg.timeout_ms > (::m5::hal::v1::service::kMaxComparableDelayTicks / kNsecPerMsec)) {
+        if (cfg.freq == 0 || cfg.wire_timeout_ms > (::m5::hal::v1::service::kMaxComparableDelayTicks / kNsecPerMsec)) {
             return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
         }
 
@@ -61,7 +61,7 @@ struct MasterTiming {
             return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
         }
         timing.half_period = static_cast<::m5::hal::v1::service::fast_tick_t>(half);
-        timing.timeout     = static_cast<::m5::hal::v1::service::fast_tick_t>(cfg.timeout_ms * kNsecPerMsec);
+        timing.timeout     = static_cast<::m5::hal::v1::service::fast_tick_t>(cfg.wire_timeout_ms * kNsecPerMsec);
         return timing;
     }
 };
@@ -971,17 +971,26 @@ private:
 
 }  // namespace detail
 
-// This variant needs no fields beyond the abstract kind config; the alias
-// keeps the `m5hal::i2c::BusConfig` spelling available in every build
-// (every variant publishes `Bus` + `BusConfig`, S17 E2).
-using BusConfig = ::m5::hal::v1::i2c::I2CBusConfig;
+}  // namespace m5::variants::frameworks::software::hal::v1::i2c
 
-class Bus : public ::m5::hal::v1::i2c::I2CBus {
+// The user-facing surface (Bus_software / BusConfig_software) lives in the
+// kind namespace per the variant naming rule (spec/design/variants.md);
+// the bit-bang machinery above stays in the variant namespace as an
+// implementation detail.
+namespace m5::hal::v1::i2c {
+
+// This variant needs no fields beyond the abstract kind config; the
+// empty derivation still gives `init` a variant-owned type, so a
+// sibling variant's config cannot be passed by accident.
+struct BusConfig_software : public IBusConfig {
+    using IBusConfig::IBusConfig;
+};
+
+class Bus_software : public IBus {
 public:
-    // Typed init (S17 E1). BusConfig is an alias of the abstract
-    // I2CBusConfig here; the signature still names the alias so every
-    // variant reads the same.
-    ::m5::hal::v1::result_t<void> init(const BusConfig& config);
+    // Typed init: takes this variant's BusConfig_software, so a sibling
+    // variant's config is a compile error instead of a bad downcast.
+    ::m5::hal::v1::result_t<void> init(const BusConfig_software& config);
     // The bit-bang variant owns no resource beyond the high-Z state
     // of the pins it grabbed in `init`, so `release` is a no-op that
     // returns OK.
@@ -990,8 +999,8 @@ public:
         return {};
     }
 
-    ::m5::hal::v1::result_t<size_t> transfer(::m5::hal::v1::bus::Accessor* owner,
-                                             const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg,
+    ::m5::hal::v1::result_t<size_t> transfer(::m5::hal::v1::bus::IAccessor* owner,
+                                             const ::m5::hal::v1::i2c::MasterAccessConfig& cfg,
                                              const ::m5::hal::v1::i2c::TransferDesc& desc,
                                              ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx) override;
 
@@ -1003,6 +1012,6 @@ private:
     ::m5::hal::v1::gpio::Pin _pin_sda{};
 };
 
-}  // namespace m5::variants::frameworks::software::hal::v1::i2c
+}  // namespace m5::hal::v1::i2c
 
 #endif

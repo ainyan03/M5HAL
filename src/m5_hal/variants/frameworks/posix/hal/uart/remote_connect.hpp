@@ -8,7 +8,7 @@
 // heuristic only proposes candidates; a port is the peer if and only if
 // it answers hello (spec/design/remote.md §接続ユーティリティ).
 
-#if M5HAL_FRAMEWORK_HAS_POSIX
+#if M5HAL_FRAMEWORK_HAS_POSIX && M5HAL_CONFIG_POSIX_UART
 
 #include "../../../../../hal/v1/remote/remote.hpp"
 #include "./ports.hpp"
@@ -24,16 +24,16 @@ namespace m5::variants::frameworks::posix::hal::v1::uart {
   established session and `devicePath()` names the chosen port.
  */
 struct SerialRemoteEndpoint {
-    Bus bus;
-    ::m5::hal::v1::uart::UARTRxAccessor rx;
-    ::m5::hal::v1::uart::UARTTxAccessor tx;
+    ::m5::hal::v1::uart::Bus_posix bus;
+    ::m5::hal::v1::uart::RxAccessor rx;
+    ::m5::hal::v1::uart::TxAccessor tx;
     ::m5::hal::v1::remote::RemoteLink link;
 
     /*! @brief Host-friendly defaults (100 ms first-byte / 20 ms inter-byte read timeouts). */
     explicit SerialRemoteEndpoint(uint32_t baud = 115200) : SerialRemoteEndpoint(makeHostConfig(baud))
     {
     }
-    SerialRemoteEndpoint(const ::m5::hal::v1::uart::UARTAccessConfig& uart_cfg,
+    SerialRemoteEndpoint(const ::m5::hal::v1::uart::AccessConfig& uart_cfg,
                          const ::m5::hal::v1::remote::RemoteSession::Config& session_cfg =
                              ::m5::hal::v1::remote::RemoteSession::Config{})
         : rx{bus, uart_cfg}, tx{bus, uart_cfg}, link{rx, tx, session_cfg}
@@ -43,7 +43,7 @@ struct SerialRemoteEndpoint {
         // syscalls/USB transfers (measured ~35 % more sustained throughput on
         // a USB CDC bridge). The read paths auto-flush, so the request/reply
         // exchanges of connect/RPC are unaffected.
-        BusConfig bus_cfg;
+        ::m5::hal::v1::uart::BusConfig_posix bus_cfg;
         bus_cfg.tx_coalesce_bytes = 4096;
         (void)bus.init(bus_cfg);
     }
@@ -54,9 +54,9 @@ struct SerialRemoteEndpoint {
         return _device_path;
     }
 
-    static ::m5::hal::v1::uart::UARTAccessConfig makeHostConfig(uint32_t baud)
+    static ::m5::hal::v1::uart::AccessConfig makeHostConfig(uint32_t baud)
     {
-        ::m5::hal::v1::uart::UARTAccessConfig cfg;
+        ::m5::hal::v1::uart::AccessConfig cfg;
         cfg.baud_rate             = baud;
         cfg.first_byte_timeout_ms = 100;
         cfg.inter_byte_timeout_ms = 20;
@@ -117,6 +117,6 @@ struct ConnectOptions {
 
 }  // namespace m5::variants::frameworks::posix::hal::v1::uart
 
-#endif  // M5HAL_FRAMEWORK_HAS_POSIX
+#endif  // M5HAL_FRAMEWORK_HAS_POSIX && M5HAL_CONFIG_POSIX_UART
 
 #endif

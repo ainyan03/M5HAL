@@ -51,10 +51,10 @@ accessor の現在の config を起点に、既知フィールドだけ上書き
 
 | kind | layout (LE) | 計 |
 |---|---|---|
-| I2C | `freq:u32, timeout_ms:u32, i2c_addr:u16, flags:u8 (bit0=10bit, bit1=use_restart), register_address_bytes:u8` | 12 B |
-| SPI | `pin_cs:i16, freq:u32, timeout_ms:u32, data_mode:u8, mode:u8 (bit0-1=spi_mode, bit2=order), cmd_len:u8, addr_len:u8, read_dummy:u8, write_dummy:u8` | 16 B |
-| UART | `baud:u32, timeout_ms:u32, first_byte:u32, inter_byte:u32, write_timeout:u32, data_bits:u8, stop_bits:u8, parity:u8, invert:u8` | 24 B |
-| I2S | `sample_rate:u32, timeout_ms:u32, write_timeout:u32, bits_per_sample:u8, channels:u8` | 14 B |
+| I2C | `freq:u32, wire_timeout_ms:u32, i2c_addr:u16, flags:u8 (bit0=10bit, bit1=use_restart), register_address_bytes:u8` | 12 B |
+| SPI | `pin_cs:i16, pin_dc:i16, freq:u32, data_mode:u8, mode:u8 (bit0-1=spi_mode, bit2=order), cmd_len:u8, addr_len:u8, read_dummy:u8, write_dummy:u8` | 14 B |
+| UART | `baud:u32, first_byte:u32, inter_byte:u32, write_timeout:u32, data_bits:u8, stop_bits:u8, parity:u8, invert:u8` | 20 B |
+| I2S | `sample_rate:u32, write_timeout:u32, bits_per_sample:u8, channels:u8` | 10 B |
 
 ### bus_transfer の meta
 

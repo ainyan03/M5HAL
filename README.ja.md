@@ -9,9 +9,18 @@ M5 製品向けの HAL (ハードウェア抽象化レイヤ) です。
 **v1 API は開発中**で opt-in です — `<M5HAL_v1.hpp>` を明示的に include
 して試せます。
 
+## 動作要件
+
+- ESP32 系ボード。 公開パッケージは `espressif32` platform
+  (Arduino-ESP32 または ESP-IDF >= 4.4) を対象としています。
+- [M5Utility](https://github.com/m5stack/M5Utility) — PlatformIO と
+  ESP-IDF component manager は自動で取得します。 Arduino IDE では
+  M5HAL と併せてインストールしてください。
+
 ## ドキュメント
 
-- 確定した仕様文書は [`spec/`](spec/README.md) 配下にあります。
+- 確定した仕様文書は [`spec/`](spec/README.md) 配下にあります
+  (リリースパッケージにも同梱されます)。
 
 ## API 世代 (v0 / v1) とリリース番号の関係
 
@@ -38,12 +47,13 @@ v1 API を 1 ライブラリ内に**共存**させる戦略を採用していま
 | `<M5HAL_v0.hpp>` | `m5::hal::*` (= v0、 `inline namespace v0` 経由) | 明示的に v0 (legacy) API を選ぶコード |
 | `<M5HAL_v1.hpp>` | `m5::hal::v1::*` | 明示的に v1 API を選ぶコード |
 
-- **翻訳単位 (TU) ごとに一方を選択**。 ヘッダ群は共通マクロ
-  (`M5HAL_FRAMEWORK_HAS_*` / `M5HAL_TARGET_PLATFORM_*`) を持つため、
-  中間ライブラリは各 `.cpp` で v0 系エントリ (`<M5HAL.hpp>` shim か
-  `<M5HAL_v0.hpp>` 直接) か `<M5HAL_v1.hpp>` のいずれか一方を include
-  してください。 1 つの sketch 内で異なるヘッダを使うライブラリを
-  組み合わせることは可能 (各 TU で 1 つだけに抑える限り)。
+- **同一翻訳単位 (TU) での両エントリ include も可能**。 include ガードと
+  platform 検出マクロは世代分離済み (v0 = 無印 `M5HAL_TARGET_PLATFORM_*`、
+  v1 = `M5HAL_V1_TARGET_PLATFORM_*`) のため、 1 つの `.cpp` が v0 系
+  エントリ (`<M5HAL.hpp>` shim か `<M5HAL_v0.hpp>` 直接) と
+  `<M5HAL_v1.hpp>` を同時に include できます (ファイル単位で段階的に
+  移行する場合など)。 ただし中間ライブラリでは、 可読性のため TU ごとに
+  使う世代を明示することを推奨します。
 - **既定の切替**。 `M5HAL_V0_INLINE` マクロ (`src/m5_hal_config.hpp`、
   メジャー版数 `0` の間は既定 `1`) で v0 を `inline namespace v0` として
   expose するかを制御します。 将来メジャー版数が `1` に上がるタイミングで
@@ -64,13 +74,15 @@ v1 API を 1 ライブラリ内に**共存**させる戦略を採用していま
 
 ## v1 API を試す
 
-v1 は明示的に opt-in して使います。 `<M5HAL_v1.hpp>` を include し、
-同じ翻訳単位で v0 系エントリヘッダを混ぜないでください。
+v1 は明示的に opt-in して使います。 `<M5HAL_v1.hpp>` を include して
+ください。 同じ翻訳単位に v0 系エントリヘッダを混ぜることも可能です
+([v0 / v1 共存](#v0--v1-共存) 参照) が、 ファイルごとに一方の世代に
+揃えたほうが読みやすくなります。
 
 現在の v1 バス API は次の要素を中心に組み立てます:
 
-- **Bus** — 物理バスのインスタンス (`i2c::Bus`, `spi::Bus`, `uart::Bus`、
-  または `spi::variant::software::Bus` のような明示 variant)
+- **Bus** — 物理バスのインスタンス (`i2c::Bus`, `spi::Bus`, `uart::Bus`,
+  `i2s::Bus`、 または `spi::Bus_software` のような明示 variant)
 - **Accessor** — その bus 上の 1 つの通信相手。アドレス、CS pin、
   baud rate、周波数、タイムアウト、SPI mode などを保持
 - **TransferDesc** — I2C register prefix や SPI command/address/dummy
@@ -78,6 +90,15 @@ v1 は明示的に opt-in して使います。 `<M5HAL_v1.hpp>` を include し
   を必要としません
 - **Source / Sink** — stream も見据えた入出力抽象。単純な buffer には
   span / raw pointer overload も使えます
+
+**Bus はあなたが所有します**: v1 は HAL の中に隠れた singleton バスを
+持ちません。Bus object を (普通は static / グローバルで) 自分で定義し、
+init して、Accessor に渡します。ボード構成として「スロット n はこの
+バス」を公開したい場合は、非所有レジストリ `M5_Hal.I2C` / `M5_Hal.SPI`
+等に登録できます (`M5_Hal.SPI.addBus(&bus, 1)` → `M5_Hal.SPI.getBus(1)`。
+同じバスを複数スロットに登録して「SD と LCD は同一バス」も表現可能)。
+`M5_Hal` 自体は GPIO / バスのレジストリと service runner を束ねる
+singleton で、expander やボードサポート層を使わない限り意識は不要です。
 
 I2C の最小形:
 
@@ -91,19 +112,27 @@ m5hal::i2c::Bus i2c_bus;
 
 void setup()
 {
-    m5hal::i2c::BusConfig bus_cfg{&Wire, 22, 21};  // Wire, SCL, SDA
+    m5hal::i2c::BusConfig bus_cfg;
+    bus_cfg.wire    = &Wire;
+    bus_cfg.pin_scl = 22;
+    bus_cfg.pin_sda = 21;
     i2c_bus.init(bus_cfg);
 
-    m5hal::i2c::I2CMasterAccessConfig dev_cfg;
-    dev_cfg.i2c_addr = 0x76;
-    dev_cfg.freq = 100000;
-    dev_cfg.timeout_ms = 100;
+    m5hal::i2c::AccessConfig dev_cfg;
+    dev_cfg.i2c_addr        = 0x76;
+    dev_cfg.freq            = 100000;
+    dev_cfg.wire_timeout_ms = 100;
     // dev_cfg.register_address_bytes = 2;  // 2-byte register address の device だけ指定
 
-    m5hal::i2c::I2CMasterAccessor dev{i2c_bus, dev_cfg};
+    m5hal::i2c::MasterAccessor dev{i2c_bus, dev_cfg};
     auto id = dev.readRegister(0x00);
 }
 ```
+
+`#include <Wire.h>` が必要なのは、Arduino 環境の既定 I2C backend
+(`i2c::Bus_arduino`) が `TwoWire` への委譲で実装されているためです
+(`bus_cfg.wire = &Wire`)。software / ESP-IDF backend を明示する場合は
+不要になります。
 
 Arduino sketch として試す場合は
 [`examples/v1/HowToUse/I2C`](examples/v1/HowToUse/I2C/)
@@ -111,12 +140,17 @@ Arduino sketch として試す場合は
 register read、複数 transfer を 1 つの bus lock にまとめる `ScopedAccess`
 の例を含みます。
 
-backend を明示したい場合は variant alias namespace を使います。たとえば
+backend を明示したい場合は suffix 付きの variant 型名を使います。たとえば
 software I2C backend は example 内の bus 型を次のように差し替えます:
 
 ```cpp
-using ExampleI2CBus = m5::hal::v1::i2c::variant::software::Bus;
+using ExampleBus = m5::hal::v1::i2c::Bus_software;
 ```
+
+`i2c::Bus` / `i2c::BusConfig` という無印の名前は、ビルド環境で最初に
+申告した backend の suffix 付き型 (`Bus_arduino` 等) への型 alias です。
+`BusConfig` のフィールド構成 (`wire` の有無など) も選択された variant の
+ものになります。
 
 SPI も同じ Bus / Accessor の形で扱います。Arduino SPI、ESP-IDF SPI、
 software SPI は、対応する framework support が見えている環境で v1 backend
@@ -125,7 +159,13 @@ software SPI は、対応する framework support が見えている環境で v1
 送信波形を確認する最初の sketch として
 [`examples/v1/HowToUse/SPI`](examples/v1/HowToUse/SPI/) を用意しています。
 
-UART も同じ Bus / Accessor の形で扱います。
+UART も同じ Bus / Accessor の形で扱います。**baud rate は bus 側ではなく
+`uart::AccessConfig` (accessor 側) にあります** — 同じ物理ポートを相手ごとに
+異なる設定で使う形のためです。アクセサは TX 専用 (`TxAccessor`) / RX 専用
+(`RxAccessor`) / 両方向の facade (`Accessor`) の 3 つから選びます: 送信と
+受信を別タスクが扱うなら split を、単純なコマンド応答なら facade を
+(設計上の主 API は split 側。詳細は
+[`spec/design/uart.md`](spec/design/uart.md))。
 [`examples/v1/HowToUse/UART`](examples/v1/HowToUse/UART/) は、USB Serial をログ用、
 `Serial1` を M5HAL UART bus として使う Arduino sketch です。TX と RX を接続すると、
 外部 UART device なしで loopback 受信を確認できます。
@@ -133,7 +173,15 @@ UART も同じ Bus / Accessor の形で扱います。
 受信したバイトを `StreamSink` アダプタ経由でそのまま送信側へ返す echo sketch です。
 accessor を Source / Sink の stream モデルと組み合わせる方法を示します。
 
+[`examples/v1/HowToUse/I2SAudio`](examples/v1/HowToUse/I2SAudio/) は、`i2s::Bus` の
+TX パスで内蔵スピーカーから正弦波を再生する sketch です (I2S はボード固有の
+アンプ初期化が必要です。M5Stack Core2 V1.1 で動作確認済み、CoreS3 向けの配線も
+含みますが未検証)。
+
 [`examples/v1/HowToUse/Bytecode`](examples/v1/HowToUse/Bytecode/) は、GPIO / I2C / SPI の
 一連の操作を bytecode (byte 配列のまま sketch に記述) で表し、M5Stack Core BASIC の
 ボタン操作で実行するデモです。「初期化シーケンスを const テーブル化して再生する」
 使い方をそのまま示します。
+
+全 example の一覧 (配線・期待される出力つき) は
+[`examples/v1/HowToUse/README.md`](examples/v1/HowToUse/README.md) にあります。

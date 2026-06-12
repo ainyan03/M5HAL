@@ -2,15 +2,16 @@
 #include <M5HAL_v1.hpp>
 #include <gtest/gtest.h>
 
+#include <cstring>
 #include <vector>
 
 namespace {
 
-class RecordingUARTBus : public m5::hal::v1::uart::UARTBus {
+class RecordingIBus : public m5::hal::v1::uart::IBus {
 public:
-    // Typed init (S17 E1): the fake adds no fields, so it takes the
+    // Typed init: the fake adds no fields, so it takes the
     // abstract kind config.
-    m5::hal::v1::result_t<void> init(const m5::hal::v1::uart::UARTBusConfig& config)
+    m5::hal::v1::result_t<void> init(const m5::hal::v1::uart::IBusConfig& config)
     {
         _config = config;
         return {};
@@ -23,8 +24,8 @@ public:
         return {};
     }
 
-    m5::hal::v1::result_t<size_t> write(m5::hal::v1::bus::Accessor* owner,
-                                        const m5::hal::v1::uart::UARTAccessConfig& cfg, m5::hal::v1::data::Source* tx,
+    m5::hal::v1::result_t<size_t> write(m5::hal::v1::bus::IAccessor* owner,
+                                        const m5::hal::v1::uart::AccessConfig& cfg, m5::hal::v1::data::Source* tx,
                                         size_t len) override
     {
         last_owner  = owner;
@@ -48,8 +49,8 @@ public:
         return done;
     }
 
-    m5::hal::v1::result_t<size_t> read(m5::hal::v1::bus::Accessor* owner,
-                                       const m5::hal::v1::uart::UARTAccessConfig& cfg, m5::hal::v1::data::Sink* rx,
+    m5::hal::v1::result_t<size_t> read(m5::hal::v1::bus::IAccessor* owner,
+                                       const m5::hal::v1::uart::AccessConfig& cfg, m5::hal::v1::data::Sink* rx,
                                        size_t len) override
     {
         last_owner  = owner;
@@ -81,8 +82,8 @@ public:
         return done;
     }
 
-    m5::hal::v1::result_t<size_t> readableBytes(m5::hal::v1::bus::Accessor* owner,
-                                                const m5::hal::v1::uart::UARTAccessConfig& cfg) override
+    m5::hal::v1::result_t<size_t> readableBytes(m5::hal::v1::bus::IAccessor* owner,
+                                                const m5::hal::v1::uart::AccessConfig& cfg) override
     {
         last_owner = owner;
         last_cfg   = cfg;
@@ -91,15 +92,15 @@ public:
 
     std::vector<uint8_t> tx_recorded;
     std::vector<uint8_t> rx_queue;
-    m5::hal::v1::bus::Accessor* last_owner = nullptr;
-    m5::hal::v1::uart::UARTAccessConfig last_cfg;
+    m5::hal::v1::bus::IAccessor* last_owner = nullptr;
+    m5::hal::v1::uart::AccessConfig last_cfg;
 };
 
 }  // namespace
 
-TEST(UARTBusConfig, DefaultCtorSetsUARTKind)
+TEST(IBusConfig, DefaultCtorSetsUARTKind)
 {
-    m5::hal::v1::uart::UARTBusConfig cfg;
+    m5::hal::v1::uart::IBusConfig cfg;
     EXPECT_EQ(cfg.getBusKind(), m5::hal::v1::types::bus_kind_t::UART);
     EXPECT_EQ(cfg.pin_tx, -1);
     EXPECT_EQ(cfg.pin_rx, -1);
@@ -107,12 +108,12 @@ TEST(UARTBusConfig, DefaultCtorSetsUARTKind)
     EXPECT_EQ(cfg.tx_buffer_size, 0u);
 }
 
-TEST(UARTAccessor, WriteConsumesSource)
+TEST(Accessor, WriteConsumesSource)
 {
-    RecordingUARTBus bus;
-    m5::hal::v1::uart::UARTAccessConfig cfg;
+    RecordingIBus bus;
+    m5::hal::v1::uart::AccessConfig cfg;
     cfg.baud_rate = 921600;
-    m5::hal::v1::uart::UARTAccessor dev{bus, cfg};
+    m5::hal::v1::uart::Accessor dev{bus, cfg};
 
     const uint8_t payload[] = {0x11, 0x22, 0x33};
     auto result             = dev.write(payload, sizeof(payload));
@@ -125,12 +126,70 @@ TEST(UARTAccessor, WriteConsumesSource)
     EXPECT_EQ(bus.last_cfg.baud_rate, 921600u);
 }
 
-TEST(UARTAccessor, ReadFillsSink)
+TEST(RxAccessor, ReadUntilIncludesTheDelimiter)
 {
-    RecordingUARTBus bus;
+    RecordingIBus bus;
+    bus.rx_queue = {'O', 'K', '\r', '\n', 'X'};  // 'X' belongs to the next line
+    m5::hal::v1::uart::AccessConfig cfg;
+    m5::hal::v1::uart::RxAccessor rx{bus, cfg};
+
+    uint8_t line[16] = {};
+    auto r           = rx.readUntil('\n', line, sizeof(line));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r.value(), 4u);
+    EXPECT_EQ(line[3], '\n');  // delimiter included: complete-line test works
+    EXPECT_EQ(std::memcmp(line, "OK\r\n", 4), 0);
+    EXPECT_EQ(bus.rx_queue.size(), 1u);  // the next line's byte was not consumed
+}
+
+TEST(RxAccessor, ReadUntilReturnsThePartialLineOnTimeout)
+{
+    RecordingIBus bus;
+    bus.rx_queue = {'$', 'G', 'P'};  // no delimiter arrives
+    m5::hal::v1::uart::AccessConfig cfg;
+    m5::hal::v1::uart::RxAccessor rx{bus, cfg};
+
+    uint8_t line[16] = {};
+    auto r           = rx.readUntil('\n', line, sizeof(line));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r.value(), 3u);
+    EXPECT_NE(line[2], '\n');  // partial: the last byte is not the delimiter
+}
+
+TEST(RxAccessor, ReadUntilStopsAtTheBufferBound)
+{
+    RecordingIBus bus;
+    bus.rx_queue = {'1', '2', '3', '4', '\n'};
+    m5::hal::v1::uart::AccessConfig cfg;
+    m5::hal::v1::uart::RxAccessor rx{bus, cfg};
+
+    uint8_t line[3] = {};
+    auto r          = rx.readUntil('\n', line, sizeof(line));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r.value(), 3u);
+    EXPECT_NE(line[2], '\n');  // full buffer, still no delimiter = partial
+}
+
+TEST(Accessor, ReadUntilForwardsToTheRxChannel)
+{
+    RecordingIBus bus;
+    bus.rx_queue = {'A', 'T', '\n'};
+    m5::hal::v1::uart::AccessConfig cfg;
+    m5::hal::v1::uart::Accessor dev{bus, cfg};
+
+    uint8_t line[8] = {};
+    auto r          = dev.readUntil('\n', line, sizeof(line));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r.value(), 3u);
+    EXPECT_EQ(bus.last_owner, &dev.rx());
+}
+
+TEST(Accessor, ReadFillsSink)
+{
+    RecordingIBus bus;
     bus.rx_queue = {0xA0, 0xA1, 0xA2};
-    m5::hal::v1::uart::UARTAccessConfig cfg;
-    m5::hal::v1::uart::UARTAccessor dev{bus, cfg};
+    m5::hal::v1::uart::AccessConfig cfg;
+    m5::hal::v1::uart::Accessor dev{bus, cfg};
 
     uint8_t dst[2] = {};
     auto result    = dev.read(dst, sizeof(dst));
@@ -142,23 +201,23 @@ TEST(UARTAccessor, ReadFillsSink)
     EXPECT_EQ(bus.rx_queue[0], 0xA2);
 }
 
-TEST(UARTAccessor, ReadableBytesUsesBus)
+TEST(Accessor, ReadableBytesUsesBus)
 {
-    RecordingUARTBus bus;
+    RecordingIBus bus;
     bus.rx_queue = {1, 2, 3, 4};
-    m5::hal::v1::uart::UARTAccessConfig cfg;
-    m5::hal::v1::uart::UARTAccessor dev{bus, cfg};
+    m5::hal::v1::uart::AccessConfig cfg;
+    m5::hal::v1::uart::Accessor dev{bus, cfg};
 
     auto result = dev.readableBytes();
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result.value(), 4u);
 }
 
-TEST(UARTAccessor, SetConfigRejectsInsideAccess)
+TEST(Accessor, SetConfigRejectsInsideAccess)
 {
-    RecordingUARTBus bus;
-    m5::hal::v1::uart::UARTAccessConfig cfg;
-    m5::hal::v1::uart::UARTAccessor dev{bus, cfg};
+    RecordingIBus bus;
+    m5::hal::v1::uart::AccessConfig cfg;
+    m5::hal::v1::uart::Accessor dev{bus, cfg};
 
     auto locked = dev.beginAccess(0);
     ASSERT_TRUE(locked.has_value());
@@ -171,10 +230,10 @@ TEST(UARTAccessor, SetConfigRejectsInsideAccess)
 
 TEST(UARTTxRxAccessor, SplitAccessorsUseSeparateChannels)
 {
-    RecordingUARTBus bus;
-    m5::hal::v1::uart::UARTAccessConfig cfg;
-    m5::hal::v1::uart::UARTTxAccessor tx{bus, cfg};
-    m5::hal::v1::uart::UARTRxAccessor rx{bus, cfg};
+    RecordingIBus bus;
+    m5::hal::v1::uart::AccessConfig cfg;
+    m5::hal::v1::uart::TxAccessor tx{bus, cfg};
+    m5::hal::v1::uart::RxAccessor rx{bus, cfg};
 
     ASSERT_TRUE(tx.beginTxAccess(0).has_value());
     ASSERT_TRUE(rx.beginRxAccess(0).has_value());
@@ -185,18 +244,18 @@ TEST(UARTTxRxAccessor, SplitAccessorsUseSeparateChannels)
     ASSERT_TRUE(tx.endTxAccess().has_value());
 }
 
-TEST(UARTBus, SameChannelContentionStillReportsBusy)
+TEST(IBus, SameChannelContentionTimesOut)
 {
-    RecordingUARTBus bus;
-    m5::hal::v1::uart::UARTAccessConfig cfg;
-    m5::hal::v1::uart::UARTTxAccessor tx1{bus, cfg};
-    m5::hal::v1::uart::UARTTxAccessor tx2{bus, cfg};
-    m5::hal::v1::uart::UARTRxAccessor rx{bus, cfg};
+    RecordingIBus bus;
+    m5::hal::v1::uart::AccessConfig cfg;
+    m5::hal::v1::uart::TxAccessor tx1{bus, cfg};
+    m5::hal::v1::uart::TxAccessor tx2{bus, cfg};
+    m5::hal::v1::uart::RxAccessor rx{bus, cfg};
 
     ASSERT_TRUE(tx1.beginTxAccess(0).has_value());
     auto tx2_result = tx2.beginTxAccess(0);
     ASSERT_FALSE(tx2_result.has_value());
-    EXPECT_EQ(tx2_result.error(), m5::hal::v1::error::error_t::BUSY);
+    EXPECT_EQ(tx2_result.error(), m5::hal::v1::error::error_t::TIMEOUT_ERROR);
 
     auto rx_result = rx.beginRxAccess(0);
     ASSERT_TRUE(rx_result.has_value());
@@ -204,24 +263,24 @@ TEST(UARTBus, SameChannelContentionStillReportsBusy)
     ASSERT_TRUE(tx1.endTxAccess().has_value());
 }
 
-TEST(UARTAccessor, FacadeSessionLocksBothChannels)
+TEST(Accessor, FacadeSessionLocksBothChannels)
 {
-    RecordingUARTBus bus;
-    m5::hal::v1::uart::UARTAccessConfig cfg;
-    m5::hal::v1::uart::UARTAccessor dev{bus, cfg};
-    m5::hal::v1::uart::UARTTxAccessor other_tx{bus, cfg};
-    m5::hal::v1::uart::UARTRxAccessor other_rx{bus, cfg};
+    RecordingIBus bus;
+    m5::hal::v1::uart::AccessConfig cfg;
+    m5::hal::v1::uart::Accessor dev{bus, cfg};
+    m5::hal::v1::uart::TxAccessor other_tx{bus, cfg};
+    m5::hal::v1::uart::RxAccessor other_rx{bus, cfg};
 
     ASSERT_TRUE(dev.beginAccess(0).has_value());
     EXPECT_TRUE(dev.inAccess());
 
     auto tx_result = other_tx.beginTxAccess(0);
     ASSERT_FALSE(tx_result.has_value());
-    EXPECT_EQ(tx_result.error(), m5::hal::v1::error::error_t::BUSY);
+    EXPECT_EQ(tx_result.error(), m5::hal::v1::error::error_t::TIMEOUT_ERROR);
 
     auto rx_result = other_rx.beginRxAccess(0);
     ASSERT_FALSE(rx_result.has_value());
-    EXPECT_EQ(rx_result.error(), m5::hal::v1::error::error_t::BUSY);
+    EXPECT_EQ(rx_result.error(), m5::hal::v1::error::error_t::TIMEOUT_ERROR);
 
     ASSERT_TRUE(dev.endAccess().has_value());
     EXPECT_FALSE(dev.inAccess());

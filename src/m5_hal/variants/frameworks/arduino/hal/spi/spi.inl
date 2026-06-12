@@ -10,11 +10,10 @@
 
 #if defined(ARDUINO)
 
-namespace m5::variants::frameworks::arduino::hal::v1::spi {
-
-using namespace ::m5::hal::v1;
+namespace m5::hal::v1::spi {
 
 namespace {
+namespace impl_arduino {
 
 uint8_t spiBitOrder(uint8_t order)
 {
@@ -51,10 +50,10 @@ void setPinOutput(::m5::hal::v1::types::gpio_number_t pin, bool level)
     }
 }
 
-void setDC(const ::m5::hal::v1::spi::SPIBusConfig& bus_cfg, int8_t level)
+void setDC(::m5::hal::v1::types::gpio_number_t dc_pin, int8_t level)
 {
-    if (level >= 0 && bus_cfg.pin_dc >= 0) {
-        setPinLevel(bus_cfg.pin_dc, level != 0);
+    if (level >= 0 && dc_pin >= 0) {
+        setPinLevel(dc_pin, level != 0);
     }
 }
 
@@ -140,9 +139,10 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
     return {};
 }
 
+}  // namespace impl_arduino
 }  // namespace
 
-::m5::hal::v1::error::error_t Bus::attach(::SPIClass& spi)
+::m5::hal::v1::error::error_t Bus_arduino::attach(::SPIClass& spi)
 {
     if (_spi) {
         (void)release();
@@ -152,7 +152,7 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
     return ::m5::hal::v1::error::error_t::OK;
 }
 
-::m5::hal::v1::result_t<void> Bus::init(const BusConfig& config)
+::m5::hal::v1::result_t<void> Bus_arduino::init(const BusConfig_arduino& config)
 {
     _config = config;
     if (_spi) {
@@ -172,7 +172,7 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
         spi->begin();
     }
     if (_config.pin_dc >= 0) {
-        setPinOutput(_config.pin_dc, true);
+        impl_arduino::setPinOutput(_config.pin_dc, true);
     }
 
     auto err = attach(*spi);
@@ -184,7 +184,7 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
     return {};
 }
 
-::m5::hal::v1::result_t<void> Bus::release(void)
+::m5::hal::v1::result_t<void> Bus_arduino::release(void)
 {
     if (_spi && _owns_spi) {
         _spi->end();
@@ -194,33 +194,34 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
     return {};
 }
 
-::m5::hal::v1::result_t<void> Bus::beginTransaction(::m5::hal::v1::bus::Accessor* owner,
-                                                    const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg)
+::m5::hal::v1::result_t<void> Bus_arduino::beginTransaction(::m5::hal::v1::bus::IAccessor* owner,
+                                                            const ::m5::hal::v1::spi::MasterAccessConfig& cfg)
 {
     (void)owner;
     if (_spi == nullptr || cfg.freq == 0) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
-    _spi->beginTransaction(::SPISettings(cfg.freq, spiBitOrder(cfg.spi_order), spiDataMode(cfg.spi_mode)));
-    setPinOutput(cfg.pin_cs, false);
+    _spi->beginTransaction(
+        ::SPISettings(cfg.freq, impl_arduino::spiBitOrder(cfg.spi_order), impl_arduino::spiDataMode(cfg.spi_mode)));
+    impl_arduino::setPinOutput(cfg.pin_cs, false);
     return {};
 }
 
-::m5::hal::v1::result_t<void> Bus::endTransaction(::m5::hal::v1::bus::Accessor* owner,
-                                                  const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg)
+::m5::hal::v1::result_t<void> Bus_arduino::endTransaction(::m5::hal::v1::bus::IAccessor* owner,
+                                                          const ::m5::hal::v1::spi::MasterAccessConfig& cfg)
 {
     (void)owner;
-    setPinLevel(cfg.pin_cs, true);
+    impl_arduino::setPinLevel(cfg.pin_cs, true);
     if (_spi != nullptr) {
         _spi->endTransaction();
     }
     return {};
 }
 
-::m5::hal::v1::result_t<size_t> Bus::transfer(::m5::hal::v1::bus::Accessor* owner,
-                                              const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg,
-                                              const ::m5::hal::v1::spi::TransferDesc& desc,
-                                              ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
+::m5::hal::v1::result_t<size_t> Bus_arduino::transfer(::m5::hal::v1::bus::IAccessor* owner,
+                                                      const ::m5::hal::v1::spi::MasterAccessConfig& cfg,
+                                                      const ::m5::hal::v1::spi::TransferDesc& desc,
+                                                      ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
 {
     (void)owner;
     // This variant drives a single-lane MOSI/MISO pair through SPIClass.
@@ -229,17 +230,16 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
     // as long as a transfer carries data in only ONE direction (the
     // command/address meta phase is already sent sequentially — the DC
     // demos rely on that); what cannot be honored is half-duplex with
-    // BOTH tx and rx data, which full-duplex clocking would corrupt
-    // (S16 D10).
+    // BOTH tx and rx data, which full-duplex clocking would corrupt.
     {
         using ::m5::hal::v1::spi::spi_data_mode_t;
         const auto mode       = cfg.spi_data_mode;
-        const bool multi_lane = mode == spi_data_mode_t::spi_dual_output || mode == spi_data_mode_t::spi_dual_io ||
-                                mode == spi_data_mode_t::spi_quad_output || mode == spi_data_mode_t::spi_quad_io ||
-                                mode == spi_data_mode_t::spi_octal_output || mode == spi_data_mode_t::spi_octal_io;
-        const bool half_duplex = mode == spi_data_mode_t::spi_halfduplex ||
-                                 mode == spi_data_mode_t::spi_halfduplex_with_dc_pin ||
-                                 mode == spi_data_mode_t::spi_halfduplex_with_dc_bit;
+        const bool multi_lane = mode == spi_data_mode_t::dual_output || mode == spi_data_mode_t::dual_io ||
+                                mode == spi_data_mode_t::quad_output || mode == spi_data_mode_t::quad_io ||
+                                mode == spi_data_mode_t::octal_output || mode == spi_data_mode_t::octal_io;
+        const bool half_duplex = mode == spi_data_mode_t::halfduplex ||
+                                 mode == spi_data_mode_t::halfduplex_with_dc_pin ||
+                                 mode == spi_data_mode_t::halfduplex_with_dc_bit;
         if (multi_lane || (half_duplex && tx != nullptr && !tx->eof() && rx != nullptr)) {
             return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::NOT_IMPLEMENTED);
         }
@@ -248,29 +248,38 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
 
+    // Per-device D/C override: a non-negative accessor pin_dc beats the
+    // bus-level default. The override pin is switched to output once and
+    // cached (the bus-level pin was set up in init()).
+    const ::m5::hal::v1::types::gpio_number_t dc_pin = cfg.pin_dc >= 0 ? cfg.pin_dc : _config.pin_dc;
+    if (cfg.pin_dc >= 0 && cfg.pin_dc != _last_acc_dc) {
+        impl_arduino::setPinOutput(cfg.pin_dc, true);
+        _last_acc_dc = cfg.pin_dc;
+    }
+
     const bool has_phase_dc = desc.command_dc_level >= 0 || desc.address_dc_level >= 0 || desc.data_dc_level >= 0;
     if (!has_phase_dc && desc.dc_level_valid) {
-        setDC(_config, desc.dc_level ? 1 : 0);
+        impl_arduino::setDC(dc_pin, desc.dc_level ? 1 : 0);
     }
 
-    setDC(_config, desc.command_dc_level);
-    auto meta = sendMeta(*_spi, desc.command, desc.command_bytes);
+    impl_arduino::setDC(dc_pin, desc.command_dc_level);
+    auto meta = impl_arduino::sendMeta(*_spi, desc.command, desc.command_bytes);
     if (!meta.has_value()) {
         return m5::stl::make_unexpected(meta.error());
     }
 
-    setDC(_config, desc.address_dc_level);
-    meta = sendMeta(*_spi, desc.address, desc.address_bytes);
+    impl_arduino::setDC(dc_pin, desc.address_dc_level);
+    meta = impl_arduino::sendMeta(*_spi, desc.address, desc.address_bytes);
     if (!meta.has_value()) {
         return m5::stl::make_unexpected(meta.error());
     }
 
-    auto dummy = sendDummy(*_spi, desc.dummy_cycles);
+    auto dummy = impl_arduino::sendDummy(*_spi, desc.dummy_cycles);
     if (!dummy.has_value()) {
         return m5::stl::make_unexpected(dummy.error());
     }
 
-    setDC(_config, desc.data_dc_level);
+    impl_arduino::setDC(dc_pin, desc.data_dc_level);
 
     size_t transferred = 0;
     while ((tx != nullptr && !tx->eof()) || (rx != nullptr && !rx->closed())) {
@@ -295,7 +304,7 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
         if (chunk_len == 0) {
             break;
         }
-        auto chunk = transferChunk(*_spi, tx_span, rx_span);
+        auto chunk = impl_arduino::transferChunk(*_spi, tx_span, rx_span);
         if (!chunk.has_value()) {
             return m5::stl::make_unexpected(chunk.error());
         }
@@ -317,7 +326,7 @@ uint8_t metaByte(uint32_t value, uint8_t remaining)
     return transferred;
 }
 
-}  // namespace m5::variants::frameworks::arduino::hal::v1::spi
+}  // namespace m5::hal::v1::spi
 
 #endif
 

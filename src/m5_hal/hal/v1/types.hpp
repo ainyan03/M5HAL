@@ -145,6 +145,19 @@ enum class BusKind : uint8_t {
 };
 using bus_kind_t = BusKind;
 
+/*!
+  @brief Wait forever (lock-acquisition timeout sentinel).
+
+  Passing this as a `timeout_ms` lock-acquisition argument means "block
+  until the lock is obtained" (the same convention as FreeRTOS
+  `portMAX_DELAY`). It is the default of every lock-timeout parameter:
+  prefer passing an explicit budget you can handle on expiry; omitting
+  the argument is the sugar for call sites where handling a timeout
+  would be more trouble than it is worth. `0` stays an immediate
+  try-lock.
+ */
+constexpr uint32_t TIMEOUT_FOREVER = 0xFFFFFFFFu;
+
 }  // namespace m5::hal::v1::types
 
 #endif

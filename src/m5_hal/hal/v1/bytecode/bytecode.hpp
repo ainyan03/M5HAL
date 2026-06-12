@@ -85,22 +85,22 @@ constexpr size_t kMaxBusBindings = 4;  ///< Registered accessors per bus kind.
 // offsets are the single source shared by `encodeConfig` (bytecode.inl)
 // and the server's prescan policy checks (`Server::prescan`,
 // remote.inl) — both reference these names, never raw numbers.
+// Lock-acquisition timeouts are NOT part of the wire format: they are a
+// call-context property of the host-side API, and the device
+// serves one session at a time, so its local bus locks are uncontended.
+// The timeouts that remain on the wire all bound real wire/driver time.
 constexpr size_t kI2CConfigSize  = 12;
-constexpr size_t kSPIConfigSize  = 16;
-constexpr size_t kUARTConfigSize = 24;
-constexpr size_t kI2SConfigSize  = 14;
+constexpr size_t kSPIConfigSize  = 14;
+constexpr size_t kUARTConfigSize = 20;
+constexpr size_t kI2SConfigSize  = 10;
 
-constexpr size_t kI2CConfigTimeoutOffset           = 4;   ///< timeout_ms
-constexpr size_t kSPIConfigTimeoutOffset           = 6;   ///< timeout_ms
-constexpr size_t kUARTConfigTimeoutOffset          = 4;   ///< timeout_ms
-constexpr size_t kUARTConfigFirstByteTimeoutOffset = 8;   ///< first_byte_timeout_ms
-constexpr size_t kUARTConfigInterByteTimeoutOffset = 12;  ///< inter_byte_timeout_ms
-constexpr size_t kUARTConfigWriteTimeoutOffset     = 16;  ///< write_timeout_ms
-constexpr size_t kI2SConfigTimeoutOffset           = 4;   ///< timeout_ms
-constexpr size_t kI2SConfigWriteTimeoutOffset      = 8;   ///< write_timeout_ms
+constexpr size_t kI2CConfigWireTimeoutOffset       = 4;   ///< wire_timeout_ms
+constexpr size_t kUARTConfigFirstByteTimeoutOffset = 4;   ///< first_byte_timeout_ms
+constexpr size_t kUARTConfigInterByteTimeoutOffset = 8;   ///< inter_byte_timeout_ms
+constexpr size_t kUARTConfigWriteTimeoutOffset     = 12;  ///< write_timeout_ms
+constexpr size_t kI2SConfigWriteTimeoutOffset      = 4;   ///< write_timeout_ms
 
-static_assert(kI2CConfigTimeoutOffset + 4 <= kI2CConfigSize, "i2c timeout field must fit the config blob");
-static_assert(kSPIConfigTimeoutOffset + 4 <= kSPIConfigSize, "spi timeout field must fit the config blob");
+static_assert(kI2CConfigWireTimeoutOffset + 4 <= kI2CConfigSize, "i2c timeout field must fit the config blob");
 static_assert(kUARTConfigWriteTimeoutOffset + 4 <= kUARTConfigSize, "uart timeout fields must fit the config blob");
 static_assert(kI2SConfigWriteTimeoutOffset + 4 <= kI2SConfigSize, "i2s timeout fields must fit the config blob");
 
@@ -151,11 +151,11 @@ public:
 
     m5::hal::v1::result_t<void> delayMs(uint32_t ms);
 
-    m5::hal::v1::result_t<void> configure(uint8_t bus_id, const i2c::I2CMasterAccessConfig& cfg);
-    m5::hal::v1::result_t<void> configure(uint8_t bus_id, const spi::SPIMasterAccessConfig& cfg);
-    m5::hal::v1::result_t<void> configure(uint8_t bus_id, const uart::UARTAccessConfig& cfg);
+    m5::hal::v1::result_t<void> configure(uint8_t bus_id, const i2c::MasterAccessConfig& cfg);
+    m5::hal::v1::result_t<void> configure(uint8_t bus_id, const spi::MasterAccessConfig& cfg);
+    m5::hal::v1::result_t<void> configure(uint8_t bus_id, const uart::AccessConfig& cfg);
     /*! @brief Configure a registered I2S accessor (spec §stream credit). */
-    m5::hal::v1::result_t<void> i2sConfig(uint8_t bus_id, const i2s::I2SAccessConfig& cfg);
+    m5::hal::v1::result_t<void> i2sConfig(uint8_t bus_id, const i2s::AccessConfig& cfg);
 
     m5::hal::v1::result_t<void> transfer(uint8_t bus_id, const i2c::TransferDesc& desc, data::ConstDataSpan tx,
                                          size_t rx_len, uint8_t store_id = kDiscardStoreId);
@@ -244,9 +244,9 @@ public:
     {
     }
 
-    m5::hal::v1::result_t<void> registerI2C(uint8_t bus_id, i2c::I2CMasterAccessor& acc);
-    m5::hal::v1::result_t<void> registerSPI(uint8_t bus_id, spi::SPIMasterAccessor& acc);
-    m5::hal::v1::result_t<void> registerUART(uint8_t bus_id, uart::UARTAccessor& acc);
+    m5::hal::v1::result_t<void> registerI2C(uint8_t bus_id, i2c::MasterAccessor& acc);
+    m5::hal::v1::result_t<void> registerSPI(uint8_t bus_id, spi::MasterAccessor& acc);
+    m5::hal::v1::result_t<void> registerUART(uint8_t bus_id, uart::Accessor& acc);
     /*!
       @brief Register an I2S TX accessor as a stream bus (spec §stream credit).
 
@@ -255,7 +255,7 @@ public:
       runner binding, so the absolute-value credit scheme holds for local
       byte-array execution too (symmetric design).
      */
-    m5::hal::v1::result_t<void> registerI2S(uint8_t bus_id, i2s::I2STxAccessor& acc);
+    m5::hal::v1::result_t<void> registerI2S(uint8_t bus_id, i2s::TxAccessor& acc);
     void setGPIOGroup(gpio::GPIOGroup& group)
     {
         _gpio_group = &group;
@@ -337,7 +337,7 @@ public:
       Unlike `run`, this neither clears the stored slots nor resets the
       report state, and `store_data` / `report_*` inside the script are
       ignored — a poll-path event must not clobber the response data the
-      caller is still reading (S16 D8). Event dispatch (`evt_*` handlers)
+      caller is still reading. Event dispatch (`evt_*` handlers)
       works as in `run`.
      */
     m5::hal::v1::result_t<size_t> runEvent(data::ConstDataSpan script);
@@ -348,7 +348,7 @@ public:
       With receive-only set, executable opcodes (`delay_ms`, `bus_*`,
       `gpio_*`) are rejected with `PROTOCOL_ERROR`: a script received
       FROM a peer must fill in data and report status, never drive the
-      local buses, pins, or clock (S16 D8 — trust is symmetric; a buggy
+      local buses, pins, or clock (trust is symmetric; a buggy
       or hostile peer must not stall or actuate this side). Unknown
       non-critical opcodes still skip for forward compatibility. The
       host-side `RemoteSession` enables this on its runner; the
@@ -428,11 +428,11 @@ private:
     // in the entry points.
     m5::hal::v1::result_t<size_t> runLoop(data::Source& script);
 
-    memory::Allocator* _alloc                     = nullptr;
-    i2c::I2CMasterAccessor* _i2c[kMaxBusBindings] = {};
-    spi::SPIMasterAccessor* _spi[kMaxBusBindings] = {};
-    uart::UARTAccessor* _uart[kMaxBusBindings]    = {};
-    i2s::I2STxAccessor* _i2s[kMaxBusBindings]     = {};
+    memory::Allocator* _alloc                  = nullptr;
+    i2c::MasterAccessor* _i2c[kMaxBusBindings] = {};
+    spi::MasterAccessor* _spi[kMaxBusBindings] = {};
+    uart::Accessor* _uart[kMaxBusBindings]     = {};
+    i2s::TxAccessor* _i2s[kMaxBusBindings]     = {};
     // Per-binding cumulative bytes accepted by bus_write_stream (mod 2^32).
     uint32_t _stream_submitted[kMaxBusBindings] = {};
     gpio::GPIOGroup* _gpio_group                = nullptr;
@@ -450,7 +450,7 @@ private:
     size_t _reported_offset                      = 0;
     size_t _last_offset                          = 0;
     size_t _unknown_skipped                      = 0;
-    bool _receive_only                           = false;  // reject executable opcodes (S16 D8)
+    bool _receive_only                           = false;  // reject executable opcodes
     bool _event_mode                             = false;  // runEvent(): store/report are ignored
 };
 

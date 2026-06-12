@@ -4,7 +4,7 @@
 
 #include "./remote_connect.hpp"
 
-#if M5HAL_FRAMEWORK_HAS_POSIX
+#if M5HAL_FRAMEWORK_HAS_POSIX && M5HAL_CONFIG_POSIX_UART
 
 #include <stdio.h>
 #include <sys/ioctl.h>
@@ -12,6 +12,8 @@
 #include <unistd.h>
 
 namespace m5::variants::frameworks::posix::hal::v1::uart {
+
+using namespace ::m5::hal::v1;  // resolve unqualified result_t/error::/remote:: refs
 
 namespace {
 
@@ -116,6 +118,6 @@ result_t<::m5::hal::v1::remote::Capabilities> connectRemoteSerial(SerialRemoteEn
 
 }  // namespace m5::variants::frameworks::posix::hal::v1::uart
 
-#endif  // M5HAL_FRAMEWORK_HAS_POSIX
+#endif  // M5HAL_FRAMEWORK_HAS_POSIX && M5HAL_CONFIG_POSIX_UART
 
 #endif

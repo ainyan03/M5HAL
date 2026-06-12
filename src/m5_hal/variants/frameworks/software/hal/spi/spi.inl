@@ -11,16 +11,15 @@
 
 #include <cstddef>
 
-namespace m5::variants::frameworks::software::hal::v1::spi {
-
-using namespace ::m5::hal::v1;
+namespace m5::hal::v1::spi {
 
 namespace {
+namespace impl_software {
 
 constexpr uint32_t kNsecPerSec = 1000000000u;
 
 ::m5::hal::v1::result_t<::m5::hal::v1::service::fast_tick_t> halfPeriodTick(
-    const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg)
+    const ::m5::hal::v1::spi::MasterAccessConfig& cfg)
 {
     if (cfg.freq == 0) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
@@ -58,7 +57,7 @@ struct TransferPlan {
     uint8_t masks[8]{};
 };
 
-TransferPlan makePlan(const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg, bool has_mosi, bool has_miso)
+TransferPlan makePlan(const ::m5::hal::v1::spi::MasterAccessConfig& cfg, bool has_mosi, bool has_miso)
 {
     TransferPlan plan;
     plan.cpol     = (cfg.spi_mode & 0x02) != 0;
@@ -246,7 +245,7 @@ public:
     {
     }
 
-    void begin(const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg, const ::m5::hal::v1::spi::TransferDesc& desc,
+    void begin(const ::m5::hal::v1::spi::MasterAccessConfig& cfg, const ::m5::hal::v1::spi::TransferDesc& desc,
                ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx,
                ::m5::hal::v1::service::fast_tick_t half_tick, bool has_mosi, bool has_miso)
     {
@@ -613,14 +612,15 @@ private:
     ::m5::hal::v1::error::error_t _error = ::m5::hal::v1::error::error_t::OK;
 };
 
+}  // namespace impl_software
 }  // anonymous namespace
 
-::m5::hal::v1::result_t<void> Bus::init(const BusConfig& config)
+::m5::hal::v1::result_t<void> Bus_software::init(const BusConfig_software& config)
 {
     _config = config;
 
     if (_config.pin_clk < 0) {
-        M5_LIB_LOGE("software::spi::Bus::init: CLK pin not set");
+        M5_LIB_LOGE("software::spi::Bus_software::init: CLK pin not set");
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
     auto clk = ::m5::hal::v1::M5_Hal.Gpio.tryGetPin(_config.pin_clk);
@@ -629,15 +629,15 @@ private:
     }
     _pin_clk = clk.value();
 
-    auto dc = resolveOptionalPin(_config.pin_dc, _pin_dc);
+    auto dc = impl_software::resolveOptionalPin(_config.pin_dc, _pin_dc);
     if (!dc.has_value()) {
         return m5::stl::make_unexpected(dc.error());
     }
-    auto mosi = resolveOptionalPin(_config.pin_mosi, _pin_mosi);
+    auto mosi = impl_software::resolveOptionalPin(_config.pin_mosi, _pin_mosi);
     if (!mosi.has_value()) {
         return m5::stl::make_unexpected(mosi.error());
     }
-    auto miso = resolveOptionalPin(_config.pin_miso, _pin_miso);
+    auto miso = impl_software::resolveOptionalPin(_config.pin_miso, _pin_miso);
     if (!miso.has_value()) {
         return m5::stl::make_unexpected(miso.error());
     }
@@ -658,10 +658,10 @@ private:
     return {};
 }
 
-::m5::hal::v1::result_t<size_t> Bus::transfer(::m5::hal::v1::bus::Accessor* owner,
-                                              const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg,
-                                              const ::m5::hal::v1::spi::TransferDesc& desc,
-                                              ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
+::m5::hal::v1::result_t<size_t> Bus_software::transfer(::m5::hal::v1::bus::IAccessor* owner,
+                                                       const ::m5::hal::v1::spi::MasterAccessConfig& cfg,
+                                                       const ::m5::hal::v1::spi::TransferDesc& desc,
+                                                       ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx)
 {
     (void)owner;
     // This variant bit-bangs a single-lane MOSI/MISO pair. Multi-lane
@@ -670,16 +670,16 @@ private:
     // as a transfer carries data in only ONE direction (the meta phase
     // is already sent sequentially — the DC demos rely on that); what
     // cannot be honored is half-duplex with BOTH tx and rx data, which
-    // full-duplex clocking would corrupt (S16 D10).
+    // full-duplex clocking would corrupt.
     {
         using ::m5::hal::v1::spi::spi_data_mode_t;
         const auto mode       = cfg.spi_data_mode;
-        const bool multi_lane = mode == spi_data_mode_t::spi_dual_output || mode == spi_data_mode_t::spi_dual_io ||
-                                mode == spi_data_mode_t::spi_quad_output || mode == spi_data_mode_t::spi_quad_io ||
-                                mode == spi_data_mode_t::spi_octal_output || mode == spi_data_mode_t::spi_octal_io;
-        const bool half_duplex = mode == spi_data_mode_t::spi_halfduplex ||
-                                 mode == spi_data_mode_t::spi_halfduplex_with_dc_pin ||
-                                 mode == spi_data_mode_t::spi_halfduplex_with_dc_bit;
+        const bool multi_lane = mode == spi_data_mode_t::dual_output || mode == spi_data_mode_t::dual_io ||
+                                mode == spi_data_mode_t::quad_output || mode == spi_data_mode_t::quad_io ||
+                                mode == spi_data_mode_t::octal_output || mode == spi_data_mode_t::octal_io;
+        const bool half_duplex = mode == spi_data_mode_t::halfduplex ||
+                                 mode == spi_data_mode_t::halfduplex_with_dc_pin ||
+                                 mode == spi_data_mode_t::halfduplex_with_dc_bit;
         if (multi_lane || (half_duplex && tx != nullptr && !tx->eof() && rx != nullptr)) {
             return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::NOT_IMPLEMENTED);
         }
@@ -687,7 +687,7 @@ private:
     if (!_pin_clk.isValid()) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
-    auto half_tick = halfPeriodTick(cfg);
+    auto half_tick = impl_software::halfPeriodTick(cfg);
     if (!half_tick.has_value()) {
         return m5::stl::make_unexpected(half_tick.error());
     }
@@ -695,15 +695,30 @@ private:
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
 
+    // Per-device D/C override: a non-negative accessor pin_dc beats the
+    // bus-level default. The override pin is resolved/configured once
+    // and cached (resolution walks the GPIOGroup; too slow per call).
+    if (cfg.pin_dc >= 0 && cfg.pin_dc != _acc_dc_num) {
+        auto acc_dc = ::m5::hal::v1::M5_Hal.Gpio.tryGetPin(cfg.pin_dc);
+        if (!acc_dc.has_value()) {
+            return m5::stl::make_unexpected(acc_dc.error());
+        }
+        _pin_dc_acc = acc_dc.value();
+        _pin_dc_acc.setMode(::m5::hal::v1::types::gpio_mode_t::Output);
+        _pin_dc_acc.writeHigh();
+        _acc_dc_num = cfg.pin_dc;
+    }
+    ::m5::hal::v1::gpio::Pin& dc_pin = cfg.pin_dc >= 0 ? _pin_dc_acc : _pin_dc;
+
     const bool has_phase_dc = desc.command_dc_level >= 0 || desc.address_dc_level >= 0 || desc.data_dc_level >= 0;
-    if (!has_phase_dc && _pin_dc.isValid() && desc.dc_level_valid) {
-        _pin_dc.write(desc.dc_level);
+    if (!has_phase_dc && dc_pin.isValid() && desc.dc_level_valid) {
+        dc_pin.write(desc.dc_level);
     }
 
     const bool has_mosi = _pin_mosi.isValid();
     const bool has_miso = _pin_miso.isValid();
 
-    TransferService transfer_service{_pin_clk, _pin_mosi, _pin_miso, _pin_dc};
+    impl_software::TransferService transfer_service{_pin_clk, _pin_mosi, _pin_miso, dc_pin};
     transfer_service.begin(cfg, desc, tx, rx, half_tick.value(), has_mosi, has_miso);
     while (transfer_service.active()) {
         auto result =
@@ -716,15 +731,15 @@ private:
     return transfer_service.transferred();
 }
 
-::m5::hal::v1::result_t<void> Bus::beginTransaction(::m5::hal::v1::bus::Accessor* owner,
-                                                    const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg)
+::m5::hal::v1::result_t<void> Bus_software::beginTransaction(::m5::hal::v1::bus::IAccessor* owner,
+                                                             const ::m5::hal::v1::spi::MasterAccessConfig& cfg)
 {
     (void)owner;
     if (!_pin_clk.isValid()) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
 
-    auto cs_result = resolveOptionalPin(cfg.pin_cs, _transaction_cs);
+    auto cs_result = impl_software::resolveOptionalPin(cfg.pin_cs, _transaction_cs);
     if (!cs_result.has_value()) {
         return m5::stl::make_unexpected(cs_result.error());
     }
@@ -737,8 +752,8 @@ private:
     return {};
 }
 
-::m5::hal::v1::result_t<void> Bus::endTransaction(::m5::hal::v1::bus::Accessor* owner,
-                                                  const ::m5::hal::v1::spi::SPIMasterAccessConfig& cfg)
+::m5::hal::v1::result_t<void> Bus_software::endTransaction(::m5::hal::v1::bus::IAccessor* owner,
+                                                           const ::m5::hal::v1::spi::MasterAccessConfig& cfg)
 {
     (void)owner;
     _pin_clk.write((cfg.spi_mode & 0x02) != 0);
@@ -749,6 +764,6 @@ private:
     return {};
 }
 
-}  // namespace m5::variants::frameworks::software::hal::v1::spi
+}  // namespace m5::hal::v1::spi
 
 #endif

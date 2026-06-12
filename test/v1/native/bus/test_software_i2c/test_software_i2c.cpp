@@ -3,7 +3,7 @@
 // `RecordingPort` (a minimal `gpio::IPort` that records caller events
 // in order) plus tests that confirm `software::Bus::init` and the
 // Source / Sink based transfer path. Protocol-level checks live in
-// the latter half of this file and run `I2CSlaveService` over a
+// the latter half of this file and run `SlaveService` over a
 // virtual open-drain bus.
 //
 // Observation hooks live at the `IPort` layer, not at the `Pin`
@@ -21,6 +21,17 @@
 #include <vector>
 
 namespace {
+
+// Field-assignment helper: the positional pin ctor is gone (SCL/SDA
+// share one integer type, so swapped arguments would compile).
+m5::hal::v1::i2c::BusConfig_software makeSoftwareBusConfig(m5::hal::v1::types::gpio_number_t scl,
+                                                           m5::hal::v1::types::gpio_number_t sda)
+{
+    m5::hal::v1::i2c::BusConfig_software cfg;
+    cfg.pin_scl = scl;
+    cfg.pin_sda = sda;
+    return cfg;
+}
 
 class RecordingPort : public m5::hal::v1::gpio::IPort {
 public:
@@ -191,7 +202,7 @@ TEST(SoftwareI2CMasterTiming, ConvertsFreqToNsecHalfPeriod)
 {
     using m5::variants::frameworks::software::hal::v1::i2c::detail::MasterTiming;
 
-    m5::hal::v1::i2c::I2CMasterAccessConfig cfg;
+    m5::hal::v1::i2c::MasterAccessConfig cfg;
 
     cfg.freq      = 100000;
     auto standard = MasterTiming::fromConfig(cfg);
@@ -213,7 +224,7 @@ TEST(SoftwareI2CMasterTiming, RejectsInvalidFreqAndOversizedTimeout)
 {
     using m5::variants::frameworks::software::hal::v1::i2c::detail::MasterTiming;
 
-    m5::hal::v1::i2c::I2CMasterAccessConfig cfg;
+    m5::hal::v1::i2c::MasterAccessConfig cfg;
 
     cfg.freq          = 0;
     auto invalid_freq = MasterTiming::fromConfig(cfg);
@@ -221,7 +232,7 @@ TEST(SoftwareI2CMasterTiming, RejectsInvalidFreqAndOversizedTimeout)
     EXPECT_EQ(invalid_freq.error(), m5::hal::v1::error::error_t::INVALID_ARGUMENT);
 
     cfg.freq             = 100000;
-    cfg.timeout_ms       = 3000;
+    cfg.wire_timeout_ms       = 3000;
     auto invalid_timeout = MasterTiming::fromConfig(cfg);
     ASSERT_FALSE(invalid_timeout.has_value());
     EXPECT_EQ(invalid_timeout.error(), m5::hal::v1::error::error_t::INVALID_ARGUMENT);
@@ -808,15 +819,15 @@ TEST(SoftwareI2CMasterTransaction, RunsAddressAndBufferSequences)
     EXPECT_EQ(rx[1], 0xFF);
 }
 
-TEST(SoftwareI2CBus, TransferRecordsPinEventsViaPrefix)
+TEST(SoftwareIBus, TransferRecordsPinEventsViaPrefix)
 {
     RecordingPort scl_port;
     RecordingPort sda_port;
     ScopedRecordingGPIO rec{scl_port, sda_port};
 
-    m5::hal::v1::i2c::I2CBusConfig bus_cfg{rec.scl(), rec.sda()};
+    auto bus_cfg = makeSoftwareBusConfig(rec.scl(), rec.sda());
 
-    m5::variants::frameworks::software::hal::v1::i2c::Bus bus;
+    m5::hal::v1::i2c::Bus_software bus;
     auto init_result = bus.init(bus_cfg);
     EXPECT_TRUE(init_result.has_value());
 
@@ -824,10 +835,10 @@ TEST(SoftwareI2CBus, TransferRecordsPinEventsViaPrefix)
     EXPECT_FALSE(scl_port.events().empty());
     EXPECT_FALSE(sda_port.events().empty());
 
-    m5::hal::v1::i2c::I2CMasterAccessConfig acc_cfg;
+    m5::hal::v1::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr   = 0x68;
     acc_cfg.freq       = 100000;
-    acc_cfg.timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = 100;
 
     // The prefix bytes go directly into the `TransferDesc` inline buffer.
     m5::hal::v1::i2c::TransferDesc desc;
@@ -841,7 +852,7 @@ TEST(SoftwareI2CBus, TransferRecordsPinEventsViaPrefix)
     // fixed-value RecordingPin) cannot acknowledge correctly. All this
     // skeleton asserts is that transfer drove SCL/SDA, i.e. the bit-bang
     // state machine actually ran. Protocol-level checks below use
-    // I2CSlaveService on VirtualOpenDrainBus.
+    // SlaveService on VirtualOpenDrainBus.
     //
     // `owner` is reserved for future lock semantics and accepts nullptr here.
     (void)bus.transfer(nullptr, acc_cfg, desc, nullptr, nullptr);
@@ -849,16 +860,16 @@ TEST(SoftwareI2CBus, TransferRecordsPinEventsViaPrefix)
     EXPECT_GT(sda_port.events().size(), baseline_sda);
 }
 
-TEST(SoftwareI2CBus, TransferRejectsInvalidFrequency)
+TEST(SoftwareIBus, TransferRejectsInvalidFrequency)
 {
     RecordingPort scl_port;
     RecordingPort sda_port;
     ScopedRecordingGPIO rec{scl_port, sda_port};
 
-    m5::variants::frameworks::software::hal::v1::i2c::Bus bus;
-    ASSERT_TRUE(bus.init(m5::hal::v1::i2c::I2CBusConfig{rec.scl(), rec.sda()}).has_value());
+    m5::hal::v1::i2c::Bus_software bus;
+    ASSERT_TRUE(bus.init(makeSoftwareBusConfig(rec.scl(), rec.sda())).has_value());
 
-    m5::hal::v1::i2c::I2CMasterAccessConfig acc_cfg;
+    m5::hal::v1::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr = 0x68;
     acc_cfg.freq     = 0;
 
@@ -867,22 +878,22 @@ TEST(SoftwareI2CBus, TransferRejectsInvalidFrequency)
     EXPECT_EQ(r.error(), m5::hal::v1::error::error_t::INVALID_ARGUMENT);
 }
 
-TEST(SoftwareI2CBus, TransferRecordsPinEventsViaSource)
+TEST(SoftwareIBus, TransferRecordsPinEventsViaSource)
 {
     RecordingPort scl_port;
     RecordingPort sda_port;
     ScopedRecordingGPIO rec{scl_port, sda_port};
 
-    m5::hal::v1::i2c::I2CBusConfig bus_cfg{rec.scl(), rec.sda()};
+    auto bus_cfg = makeSoftwareBusConfig(rec.scl(), rec.sda());
 
-    m5::variants::frameworks::software::hal::v1::i2c::Bus bus;
+    m5::hal::v1::i2c::Bus_software bus;
     auto init_result = bus.init(bus_cfg);
     EXPECT_TRUE(init_result.has_value());
 
-    m5::hal::v1::i2c::I2CMasterAccessConfig acc_cfg;
+    m5::hal::v1::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr   = 0x68;
     acc_cfg.freq       = 100000;
-    acc_cfg.timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = 100;
 
     // Push tx bytes through a MemorySource to exercise the Source path.
     const uint8_t tx_bytes[] = {0xBB, 0xCC};
@@ -902,25 +913,25 @@ TEST(SoftwareI2CBus, TransferRecordsPinEventsViaSource)
 // waveforms (an earlier implementation just returned success without
 // doing anything). This recording-pin test only confirms that
 // waveforms appear on the wire. ACK and read / write semantics are
-// pinned down later by the I2CSlaveService + VirtualOpenDrainBus tests.
-TEST(SoftwareI2CBus, ProbeProducesWireActivity)
+// pinned down later by the SlaveService + VirtualOpenDrainBus tests.
+TEST(SoftwareIBus, ProbeProducesWireActivity)
 {
     RecordingPort scl_port;
     RecordingPort sda_port;
     ScopedRecordingGPIO rec{scl_port, sda_port};
 
-    m5::hal::v1::i2c::I2CBusConfig bus_cfg{rec.scl(), rec.sda()};
+    auto bus_cfg = makeSoftwareBusConfig(rec.scl(), rec.sda());
 
-    m5::variants::frameworks::software::hal::v1::i2c::Bus bus;
+    m5::hal::v1::i2c::Bus_software bus;
     auto init_result = bus.init(bus_cfg);
     EXPECT_TRUE(init_result.has_value());
 
-    m5::hal::v1::i2c::I2CMasterAccessConfig acc_cfg;
+    m5::hal::v1::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr   = 0x42;
     acc_cfg.freq       = 100000;
-    acc_cfg.timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = 100;
 
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     const size_t baseline_scl = scl_port.events().size();
     const size_t baseline_sda = sda_port.events().size();
@@ -935,13 +946,13 @@ TEST(SoftwareI2CBus, ProbeProducesWireActivity)
     EXPECT_GT(sda_port.events().size(), baseline_sda);
 }
 
-TEST(SoftwareI2CBus, VirtualSlaveServiceAcksProbe)
+TEST(SoftwareIBus, VirtualSlaveServiceAcksProbe)
 {
     using namespace service_proto;
 
     VirtualOpenDrainBus lines;
     ServiceRunner runner;
-    I2CSlaveService slave{lines, 0x42};
+    SlaveService slave{lines, 0x42};
     runner.add(slave);
     lines.setRunner(&runner);
 
@@ -949,31 +960,31 @@ TEST(SoftwareI2CBus, VirtualSlaveServiceAcksProbe)
     VirtualI2CPort sda_port{lines, VirtualI2CPort::Line::SDA};
     ScopedVirtualI2CGPIO gpio{scl_port, sda_port};
 
-    m5::variants::frameworks::software::hal::v1::i2c::Bus bus;
-    ASSERT_TRUE(bus.init(m5::hal::v1::i2c::I2CBusConfig{gpio.scl(), gpio.sda()}).has_value());
+    m5::hal::v1::i2c::Bus_software bus;
+    ASSERT_TRUE(bus.init(makeSoftwareBusConfig(gpio.scl(), gpio.sda())).has_value());
 
-    m5::hal::v1::i2c::I2CMasterAccessConfig acc_cfg;
+    m5::hal::v1::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr   = 0x42;
     acc_cfg.freq       = 100000;
-    acc_cfg.timeout_ms = 100;
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    acc_cfg.wire_timeout_ms = 100;
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
     auto r = accessor.probe();
     EXPECT_TRUE(r.has_value());
 }
 
-TEST(I2CSlaveService, IdleBeforeInit)
+TEST(SlaveService, IdleBeforeInit)
 {
-    m5::hal::v1::i2c::I2CSlaveService slave;
+    m5::hal::v1::i2c::SlaveService slave;
     EXPECT_EQ(slave.service(m5::hal::v1::service::ServiceContext{0}), m5::hal::v1::service::ServiceResult::Idle);
 }
 
-TEST(I2CSlaveService, Rejects10BitAddressUntilImplemented)
+TEST(SlaveService, Rejects10BitAddressUntilImplemented)
 {
     using namespace service_proto;
 
     VirtualOpenDrainBus lines;
-    m5::hal::v1::i2c::I2CSlaveService slave;
-    m5::hal::v1::i2c::I2CSlaveConfig cfg;
+    m5::hal::v1::i2c::SlaveService slave;
+    m5::hal::v1::i2c::SlaveConfig cfg;
     cfg.address          = 0x120;
     cfg.address_is_10bit = true;
 
@@ -982,21 +993,21 @@ TEST(I2CSlaveService, Rejects10BitAddressUntilImplemented)
     EXPECT_EQ(r.error(), m5::hal::v1::error::error_t::INVALID_ARGUMENT);
 }
 
-TEST(I2CSlaveService, MaxAckedWriteBytesSurvivesInit)
+TEST(SlaveService, MaxAckedWriteBytesSurvivesInit)
 {
     // Configuration set before init() must survive it: resetProtocol()
-    // resets protocol state, not configuration (S16 D6).
+    // resets protocol state, not configuration.
     service_proto::VirtualOpenDrainBus lines;
-    m5::hal::v1::i2c::I2CSlaveService slave;
+    m5::hal::v1::i2c::SlaveService slave;
     slave.setMaxAckedWriteBytes(3);
 
-    m5::hal::v1::i2c::I2CSlaveConfig cfg;
+    m5::hal::v1::i2c::SlaveConfig cfg;
     cfg.address = 0x42;
     ASSERT_TRUE(slave.init(lines, cfg).has_value());
     EXPECT_EQ(slave.maxAckedWriteBytes(), 3u);
 }
 
-TEST(I2CSlaveDriverRegistration, RegistersAndRemovesDriverService)
+TEST(SlaveDriverRegistration, RegistersAndRemovesDriverService)
 {
     class CountingService : public m5::hal::v1::service::IService {
     public:
@@ -1007,12 +1018,12 @@ TEST(I2CSlaveDriverRegistration, RegistersAndRemovesDriverService)
         }
         size_t calls = 0;
     };
-    class StubSlaveDriver : public m5::hal::v1::i2c::I2CSlaveDriver {
+    class StubSlaveDriver : public m5::hal::v1::i2c::SlaveDriver {
     public:
         explicit StubSlaveDriver(m5::hal::v1::service::IService* svc) : svc{svc}
         {
         }
-        m5::hal::v1::result_t<void> init(const m5::hal::v1::i2c::I2CSlaveConfig&) override
+        m5::hal::v1::result_t<void> init(const m5::hal::v1::i2c::SlaveConfig&) override
         {
             return {};
         }
@@ -1032,7 +1043,7 @@ TEST(I2CSlaveDriverRegistration, RegistersAndRemovesDriverService)
     m5::hal::v1::service::ServiceRunner runner;
 
     {
-        m5::hal::v1::i2c::ScopedI2CSlaveServiceRegistration registration;
+        m5::hal::v1::i2c::ScopedSlaveServiceRegistration registration;
         auto r = registration.registerTo(runner, driver);
         ASSERT_TRUE(r.has_value());
         EXPECT_TRUE(registration.registered());
@@ -1046,7 +1057,7 @@ TEST(I2CSlaveDriverRegistration, RegistersAndRemovesDriverService)
     EXPECT_EQ(service.calls, size_t{1});
 }
 
-TEST(I2CSlaveDriverRegistration, RejectsNullOrDuplicateService)
+TEST(SlaveDriverRegistration, RejectsNullOrDuplicateService)
 {
     class IdleService : public m5::hal::v1::service::IService {
     public:
@@ -1055,12 +1066,12 @@ TEST(I2CSlaveDriverRegistration, RejectsNullOrDuplicateService)
             return m5::hal::v1::service::ServiceResult::Idle;
         }
     };
-    class StubSlaveDriver : public m5::hal::v1::i2c::I2CSlaveDriver {
+    class StubSlaveDriver : public m5::hal::v1::i2c::SlaveDriver {
     public:
         explicit StubSlaveDriver(m5::hal::v1::service::IService* svc) : svc{svc}
         {
         }
-        m5::hal::v1::result_t<void> init(const m5::hal::v1::i2c::I2CSlaveConfig&) override
+        m5::hal::v1::result_t<void> init(const m5::hal::v1::i2c::SlaveConfig&) override
         {
             return {};
         }
@@ -1079,7 +1090,7 @@ TEST(I2CSlaveDriverRegistration, RejectsNullOrDuplicateService)
     StubSlaveDriver null_driver{nullptr};
     StubSlaveDriver driver{&service};
     m5::hal::v1::service::ServiceRunner runner;
-    m5::hal::v1::i2c::ScopedI2CSlaveServiceRegistration registration;
+    m5::hal::v1::i2c::ScopedSlaveServiceRegistration registration;
 
     auto null_result = registration.registerTo(runner, null_driver);
     ASSERT_FALSE(null_result.has_value());
@@ -1093,13 +1104,13 @@ TEST(I2CSlaveDriverRegistration, RejectsNullOrDuplicateService)
     EXPECT_EQ(runner.size(), size_t{1});
 }
 
-TEST(SoftwareI2CBus, VirtualSlaveServiceReceivesWriteBytes)
+TEST(SoftwareIBus, VirtualSlaveServiceReceivesWriteBytes)
 {
     using namespace service_proto;
 
     VirtualOpenDrainBus lines;
     ServiceRunner runner;
-    I2CSlaveService slave{lines, 0x42};
+    SlaveService slave{lines, 0x42};
     runner.add(slave);
     lines.setRunner(&runner);
 
@@ -1107,13 +1118,13 @@ TEST(SoftwareI2CBus, VirtualSlaveServiceReceivesWriteBytes)
     VirtualI2CPort sda_port{lines, VirtualI2CPort::Line::SDA};
     ScopedVirtualI2CGPIO gpio{scl_port, sda_port};
 
-    m5::variants::frameworks::software::hal::v1::i2c::Bus bus;
-    ASSERT_TRUE(bus.init(m5::hal::v1::i2c::I2CBusConfig{gpio.scl(), gpio.sda()}).has_value());
+    m5::hal::v1::i2c::Bus_software bus;
+    ASSERT_TRUE(bus.init(makeSoftwareBusConfig(gpio.scl(), gpio.sda())).has_value());
 
-    m5::hal::v1::i2c::I2CMasterAccessConfig acc_cfg;
+    m5::hal::v1::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr   = 0x42;
     acc_cfg.freq       = 100000;
-    acc_cfg.timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = 100;
 
     const uint8_t tx_bytes[] = {0x12, 0x34};
     m5::hal::v1::data::MemorySource tx_src{m5::hal::v1::data::ConstDataSpan{tx_bytes, sizeof(tx_bytes)}};
@@ -1121,19 +1132,19 @@ TEST(SoftwareI2CBus, VirtualSlaveServiceReceivesWriteBytes)
     m5::hal::v1::i2c::TransferDesc desc{uint8_t{0xAB}};
     auto r = bus.transfer(nullptr, acc_cfg, desc, &tx_src, nullptr);
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(*r, size_t{2});  // data phase only (prefix not counted, S16 D4)
+    EXPECT_EQ(*r, size_t{2});  // data phase only (prefix not counted)
 
     const std::vector<uint8_t> expected{0xAB, 0x12, 0x34};
     EXPECT_EQ(slave.received(), expected);
 }
 
-TEST(SoftwareI2CBus, VirtualSlaveServiceSupportsWriteThenReadWithRestart)
+TEST(SoftwareIBus, VirtualSlaveServiceSupportsWriteThenReadWithRestart)
 {
     using namespace service_proto;
 
     VirtualOpenDrainBus lines;
     ServiceRunner runner;
-    I2CSlaveService slave{lines, 0x42, {0xDE, 0xAD}};
+    SlaveService slave{lines, 0x42, {0xDE, 0xAD}};
     runner.add(slave);
     lines.setRunner(&runner);
 
@@ -1141,13 +1152,13 @@ TEST(SoftwareI2CBus, VirtualSlaveServiceSupportsWriteThenReadWithRestart)
     VirtualI2CPort sda_port{lines, VirtualI2CPort::Line::SDA};
     ScopedVirtualI2CGPIO gpio{scl_port, sda_port};
 
-    m5::variants::frameworks::software::hal::v1::i2c::Bus bus;
-    ASSERT_TRUE(bus.init(m5::hal::v1::i2c::I2CBusConfig{gpio.scl(), gpio.sda()}).has_value());
+    m5::hal::v1::i2c::Bus_software bus;
+    ASSERT_TRUE(bus.init(makeSoftwareBusConfig(gpio.scl(), gpio.sda())).has_value());
 
-    m5::hal::v1::i2c::I2CMasterAccessConfig acc_cfg;
+    m5::hal::v1::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr    = 0x42;
     acc_cfg.freq        = 100000;
-    acc_cfg.timeout_ms  = 100;
+    acc_cfg.wire_timeout_ms  = 100;
     acc_cfg.use_restart = true;
 
     uint8_t rx_bytes[2] = {};
@@ -1156,7 +1167,7 @@ TEST(SoftwareI2CBus, VirtualSlaveServiceSupportsWriteThenReadWithRestart)
     m5::hal::v1::i2c::TransferDesc desc{uint8_t{0x10}};
     auto r = bus.transfer(nullptr, acc_cfg, desc, nullptr, &rx_sink);
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(*r, size_t{2});  // data phase only (prefix not counted, S16 D4)
+    EXPECT_EQ(*r, size_t{2});  // data phase only (prefix not counted)
 
     const std::vector<uint8_t> expected_written{0x10};
     EXPECT_EQ(slave.received(), expected_written);
@@ -1164,13 +1175,13 @@ TEST(SoftwareI2CBus, VirtualSlaveServiceSupportsWriteThenReadWithRestart)
     EXPECT_EQ(rx_bytes[1], 0xAD);
 }
 
-TEST(SoftwareI2CBus, VirtualSlaveServiceSupportsReadOnly)
+TEST(SoftwareIBus, VirtualSlaveServiceSupportsReadOnly)
 {
     using namespace service_proto;
 
     VirtualOpenDrainBus lines;
     ServiceRunner runner;
-    I2CSlaveService slave{lines, 0x42, {0xA5, 0x5A}};
+    SlaveService slave{lines, 0x42, {0xA5, 0x5A}};
     runner.add(slave);
     lines.setRunner(&runner);
 
@@ -1178,13 +1189,13 @@ TEST(SoftwareI2CBus, VirtualSlaveServiceSupportsReadOnly)
     VirtualI2CPort sda_port{lines, VirtualI2CPort::Line::SDA};
     ScopedVirtualI2CGPIO gpio{scl_port, sda_port};
 
-    m5::variants::frameworks::software::hal::v1::i2c::Bus bus;
-    ASSERT_TRUE(bus.init(m5::hal::v1::i2c::I2CBusConfig{gpio.scl(), gpio.sda()}).has_value());
+    m5::hal::v1::i2c::Bus_software bus;
+    ASSERT_TRUE(bus.init(makeSoftwareBusConfig(gpio.scl(), gpio.sda())).has_value());
 
-    m5::hal::v1::i2c::I2CMasterAccessConfig acc_cfg;
+    m5::hal::v1::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr   = 0x42;
     acc_cfg.freq       = 100000;
-    acc_cfg.timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = 100;
 
     uint8_t rx_bytes[2] = {};
     m5::hal::v1::data::MemorySink rx_sink{m5::hal::v1::data::DataSpan{rx_bytes, sizeof(rx_bytes)}};
@@ -1202,13 +1213,13 @@ TEST(SoftwareI2CBus, VirtualSlaveServiceSupportsReadOnly)
     EXPECT_EQ(slave.masterAcks(), expected_master_acks);
 }
 
-TEST(SoftwareI2CBus, VirtualSlaveServiceSupportsWriteThenReadWithoutRestart)
+TEST(SoftwareIBus, VirtualSlaveServiceSupportsWriteThenReadWithoutRestart)
 {
     using namespace service_proto;
 
     VirtualOpenDrainBus lines;
     ServiceRunner runner;
-    I2CSlaveService slave{lines, 0x42, {0xBE, 0xEF}};
+    SlaveService slave{lines, 0x42, {0xBE, 0xEF}};
     runner.add(slave);
     lines.setRunner(&runner);
 
@@ -1216,13 +1227,13 @@ TEST(SoftwareI2CBus, VirtualSlaveServiceSupportsWriteThenReadWithoutRestart)
     VirtualI2CPort sda_port{lines, VirtualI2CPort::Line::SDA};
     ScopedVirtualI2CGPIO gpio{scl_port, sda_port};
 
-    m5::variants::frameworks::software::hal::v1::i2c::Bus bus;
-    ASSERT_TRUE(bus.init(m5::hal::v1::i2c::I2CBusConfig{gpio.scl(), gpio.sda()}).has_value());
+    m5::hal::v1::i2c::Bus_software bus;
+    ASSERT_TRUE(bus.init(makeSoftwareBusConfig(gpio.scl(), gpio.sda())).has_value());
 
-    m5::hal::v1::i2c::I2CMasterAccessConfig acc_cfg;
+    m5::hal::v1::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr    = 0x42;
     acc_cfg.freq        = 100000;
-    acc_cfg.timeout_ms  = 100;
+    acc_cfg.wire_timeout_ms  = 100;
     acc_cfg.use_restart = false;
 
     uint8_t rx_bytes[2] = {};
@@ -1231,7 +1242,7 @@ TEST(SoftwareI2CBus, VirtualSlaveServiceSupportsWriteThenReadWithoutRestart)
     m5::hal::v1::i2c::TransferDesc desc{uint8_t{0x20}};
     auto r = bus.transfer(nullptr, acc_cfg, desc, nullptr, &rx_sink);
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(*r, size_t{2});  // data phase only (prefix not counted, S16 D4)
+    EXPECT_EQ(*r, size_t{2});  // data phase only (prefix not counted)
 
     const std::vector<uint8_t> expected_written{0x20};
     EXPECT_EQ(slave.received(), expected_written);
@@ -1239,13 +1250,13 @@ TEST(SoftwareI2CBus, VirtualSlaveServiceSupportsWriteThenReadWithoutRestart)
     EXPECT_EQ(rx_bytes[1], 0xEF);
 }
 
-TEST(SoftwareI2CBus, VirtualSlaveServiceNacksAddressMismatch)
+TEST(SoftwareIBus, VirtualSlaveServiceNacksAddressMismatch)
 {
     using namespace service_proto;
 
     VirtualOpenDrainBus lines;
     ServiceRunner runner;
-    I2CSlaveService slave{lines, 0x42};
+    SlaveService slave{lines, 0x42};
     runner.add(slave);
     lines.setRunner(&runner);
 
@@ -1253,14 +1264,14 @@ TEST(SoftwareI2CBus, VirtualSlaveServiceNacksAddressMismatch)
     VirtualI2CPort sda_port{lines, VirtualI2CPort::Line::SDA};
     ScopedVirtualI2CGPIO gpio{scl_port, sda_port};
 
-    m5::variants::frameworks::software::hal::v1::i2c::Bus bus;
-    ASSERT_TRUE(bus.init(m5::hal::v1::i2c::I2CBusConfig{gpio.scl(), gpio.sda()}).has_value());
+    m5::hal::v1::i2c::Bus_software bus;
+    ASSERT_TRUE(bus.init(makeSoftwareBusConfig(gpio.scl(), gpio.sda())).has_value());
 
-    m5::hal::v1::i2c::I2CMasterAccessConfig acc_cfg;
+    m5::hal::v1::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr   = 0x43;
     acc_cfg.freq       = 100000;
-    acc_cfg.timeout_ms = 100;
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    acc_cfg.wire_timeout_ms = 100;
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     auto r = accessor.probe();
     ASSERT_FALSE(r.has_value());
@@ -1268,7 +1279,7 @@ TEST(SoftwareI2CBus, VirtualSlaveServiceNacksAddressMismatch)
     EXPECT_TRUE(slave.received().empty());
 }
 
-TEST(SoftwareI2CBus, VirtualSlaveServicesShareBusByAddress)
+TEST(SoftwareIBus, VirtualSlaveServicesShareBusByAddress)
 {
     using namespace service_proto;
 
@@ -1276,8 +1287,8 @@ TEST(SoftwareI2CBus, VirtualSlaveServicesShareBusByAddress)
     ServiceRunner runner;
     VirtualOpenDrainSlaveLineDriver slave42_lines{lines, 0};
     VirtualOpenDrainSlaveLineDriver slave43_lines{lines, 1};
-    I2CSlaveService slave42{slave42_lines, 0x42};
-    I2CSlaveService slave43{slave43_lines, 0x43};
+    SlaveService slave42{slave42_lines, 0x42};
+    SlaveService slave43{slave43_lines, 0x43};
     runner.add(slave42);
     runner.add(slave43);
     lines.setRunner(&runner);
@@ -1286,13 +1297,13 @@ TEST(SoftwareI2CBus, VirtualSlaveServicesShareBusByAddress)
     VirtualI2CPort sda_port{lines, VirtualI2CPort::Line::SDA};
     ScopedVirtualI2CGPIO gpio{scl_port, sda_port};
 
-    m5::variants::frameworks::software::hal::v1::i2c::Bus bus;
-    ASSERT_TRUE(bus.init(m5::hal::v1::i2c::I2CBusConfig{gpio.scl(), gpio.sda()}).has_value());
+    m5::hal::v1::i2c::Bus_software bus;
+    ASSERT_TRUE(bus.init(makeSoftwareBusConfig(gpio.scl(), gpio.sda())).has_value());
 
-    m5::hal::v1::i2c::I2CMasterAccessConfig acc_cfg;
+    m5::hal::v1::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr   = 0x43;
     acc_cfg.freq       = 100000;
-    acc_cfg.timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = 100;
 
     const uint8_t tx_bytes[] = {0x33, 0x44};
     m5::hal::v1::data::MemorySource tx_src{m5::hal::v1::data::ConstDataSpan{tx_bytes, sizeof(tx_bytes)}};
@@ -1300,7 +1311,7 @@ TEST(SoftwareI2CBus, VirtualSlaveServicesShareBusByAddress)
     m5::hal::v1::i2c::TransferDesc desc{uint8_t{0x22}};
     auto r = bus.transfer(nullptr, acc_cfg, desc, &tx_src, nullptr);
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(*r, size_t{2});  // data phase only (prefix not counted, S16 D4)
+    EXPECT_EQ(*r, size_t{2});  // data phase only (prefix not counted)
 
     EXPECT_TRUE(slave42.received().empty());
     const std::vector<uint8_t> expected43{0x22, 0x33, 0x44};
@@ -1309,13 +1320,13 @@ TEST(SoftwareI2CBus, VirtualSlaveServicesShareBusByAddress)
     EXPECT_GE(slave43.stopCount(), size_t{1});
 }
 
-TEST(SoftwareI2CBus, VirtualSlaveServiceNacksWriteData)
+TEST(SoftwareIBus, VirtualSlaveServiceNacksWriteData)
 {
     using namespace service_proto;
 
     VirtualOpenDrainBus lines;
     ServiceRunner runner;
-    I2CSlaveService slave{lines, 0x42};
+    SlaveService slave{lines, 0x42};
     slave.setMaxAckedWriteBytes(1);
     runner.add(slave);
     lines.setRunner(&runner);
@@ -1324,13 +1335,13 @@ TEST(SoftwareI2CBus, VirtualSlaveServiceNacksWriteData)
     VirtualI2CPort sda_port{lines, VirtualI2CPort::Line::SDA};
     ScopedVirtualI2CGPIO gpio{scl_port, sda_port};
 
-    m5::variants::frameworks::software::hal::v1::i2c::Bus bus;
-    ASSERT_TRUE(bus.init(m5::hal::v1::i2c::I2CBusConfig{gpio.scl(), gpio.sda()}).has_value());
+    m5::hal::v1::i2c::Bus_software bus;
+    ASSERT_TRUE(bus.init(makeSoftwareBusConfig(gpio.scl(), gpio.sda())).has_value());
 
-    m5::hal::v1::i2c::I2CMasterAccessConfig acc_cfg;
+    m5::hal::v1::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr   = 0x42;
     acc_cfg.freq       = 100000;
-    acc_cfg.timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = 100;
 
     const uint8_t tx_bytes[] = {0x12, 0x34};
     m5::hal::v1::data::MemorySource tx_src{m5::hal::v1::data::ConstDataSpan{tx_bytes, sizeof(tx_bytes)}};
@@ -1345,13 +1356,13 @@ TEST(SoftwareI2CBus, VirtualSlaveServiceNacksWriteData)
     EXPECT_GE(slave.stopCount(), size_t{1});
 }
 
-TEST(SoftwareI2CBus, VirtualSlaveServiceObservesFinalReadNack)
+TEST(SoftwareIBus, VirtualSlaveServiceObservesFinalReadNack)
 {
     using namespace service_proto;
 
     VirtualOpenDrainBus lines;
     ServiceRunner runner;
-    I2CSlaveService slave{lines, 0x42, {0x11, 0x22}};
+    SlaveService slave{lines, 0x42, {0x11, 0x22}};
     runner.add(slave);
     lines.setRunner(&runner);
 
@@ -1359,13 +1370,13 @@ TEST(SoftwareI2CBus, VirtualSlaveServiceObservesFinalReadNack)
     VirtualI2CPort sda_port{lines, VirtualI2CPort::Line::SDA};
     ScopedVirtualI2CGPIO gpio{scl_port, sda_port};
 
-    m5::variants::frameworks::software::hal::v1::i2c::Bus bus;
-    ASSERT_TRUE(bus.init(m5::hal::v1::i2c::I2CBusConfig{gpio.scl(), gpio.sda()}).has_value());
+    m5::hal::v1::i2c::Bus_software bus;
+    ASSERT_TRUE(bus.init(makeSoftwareBusConfig(gpio.scl(), gpio.sda())).has_value());
 
-    m5::hal::v1::i2c::I2CMasterAccessConfig acc_cfg;
+    m5::hal::v1::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr   = 0x42;
     acc_cfg.freq       = 100000;
-    acc_cfg.timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = 100;
 
     uint8_t rx_bytes[2] = {};
     m5::hal::v1::data::MemorySink rx_sink{m5::hal::v1::data::DataSpan{rx_bytes, sizeof(rx_bytes)}};
@@ -1381,7 +1392,7 @@ TEST(SoftwareI2CBus, VirtualSlaveServiceObservesFinalReadNack)
     EXPECT_EQ(rx_bytes[1], 0x22);
 }
 
-TEST(SoftwareI2CBus, VirtualOpenDrainBusReportsTimeoutWhenSclHeldLow)
+TEST(SoftwareIBus, VirtualOpenDrainBusReportsTimeoutWhenSclHeldLow)
 {
     using namespace service_proto;
 
@@ -1392,21 +1403,21 @@ TEST(SoftwareI2CBus, VirtualOpenDrainBusReportsTimeoutWhenSclHeldLow)
     VirtualI2CPort sda_port{lines, VirtualI2CPort::Line::SDA};
     ScopedVirtualI2CGPIO gpio{scl_port, sda_port};
 
-    m5::variants::frameworks::software::hal::v1::i2c::Bus bus;
-    ASSERT_TRUE(bus.init(m5::hal::v1::i2c::I2CBusConfig{gpio.scl(), gpio.sda()}).has_value());
+    m5::hal::v1::i2c::Bus_software bus;
+    ASSERT_TRUE(bus.init(makeSoftwareBusConfig(gpio.scl(), gpio.sda())).has_value());
 
-    m5::hal::v1::i2c::I2CMasterAccessConfig acc_cfg;
+    m5::hal::v1::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr   = 0x42;
     acc_cfg.freq       = 100000;
-    acc_cfg.timeout_ms = 1;
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    acc_cfg.wire_timeout_ms = 1;
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     auto r = accessor.probe();
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), m5::hal::v1::error::error_t::TIMEOUT_ERROR);
 }
 
-TEST(SoftwareI2CBus, VirtualOpenDrainBusReportsBusErrorWhenSdaHeldLowAtStop)
+TEST(SoftwareIBus, VirtualOpenDrainBusReportsBusErrorWhenSdaHeldLowAtStop)
 {
     using namespace service_proto;
 
@@ -1417,14 +1428,14 @@ TEST(SoftwareI2CBus, VirtualOpenDrainBusReportsBusErrorWhenSdaHeldLowAtStop)
     VirtualI2CPort sda_port{lines, VirtualI2CPort::Line::SDA};
     ScopedVirtualI2CGPIO gpio{scl_port, sda_port};
 
-    m5::variants::frameworks::software::hal::v1::i2c::Bus bus;
-    ASSERT_TRUE(bus.init(m5::hal::v1::i2c::I2CBusConfig{gpio.scl(), gpio.sda()}).has_value());
+    m5::hal::v1::i2c::Bus_software bus;
+    ASSERT_TRUE(bus.init(makeSoftwareBusConfig(gpio.scl(), gpio.sda())).has_value());
 
-    m5::hal::v1::i2c::I2CMasterAccessConfig acc_cfg;
+    m5::hal::v1::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr   = 0x42;
     acc_cfg.freq       = 100000;
-    acc_cfg.timeout_ms = 100;
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    acc_cfg.wire_timeout_ms = 100;
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     auto r = accessor.probe();
     ASSERT_FALSE(r.has_value());
@@ -1439,19 +1450,19 @@ TEST(SoftwareI2CBus, VirtualOpenDrainBusReportsBusErrorWhenSdaHeldLowAtStop)
 
 namespace stage2 {
 
-// `StubBus` is a minimal `I2CBus`. `transfer` records the arguments
+// `StubBus` is a minimal `IBus`. `transfer` records the arguments
 // so tests can observe them, and writes one byte (`fake_rx_byte`)
 // into the rx sink for `readRegister`-style tests. The lock owner
 // is exposed through a getter so the test can observe lock / unlock
 // directly.
-class StubBus : public m5::hal::v1::i2c::I2CBus {
+class StubBus : public m5::hal::v1::i2c::IBus {
 public:
-    const m5::hal::v1::i2c::I2CBusConfig& getConfig(void) const override
+    const m5::hal::v1::i2c::IBusConfig& getConfig(void) const override
     {
         return _config;
     }
-    m5::hal::v1::result_t<size_t> transfer(m5::hal::v1::bus::Accessor*,
-                                           const m5::hal::v1::i2c::I2CMasterAccessConfig& cfg,
+    m5::hal::v1::result_t<size_t> transfer(m5::hal::v1::bus::IAccessor*,
+                                           const m5::hal::v1::i2c::MasterAccessConfig& cfg,
                                            const m5::hal::v1::i2c::TransferDesc& desc, m5::hal::v1::data::Source* tx,
                                            m5::hal::v1::data::Sink* rx) override
     {
@@ -1460,7 +1471,7 @@ public:
         last_desc       = desc;
         last_tx_was_set = (tx != nullptr);
         last_rx_was_set = (rx != nullptr);
-        size_t total    = 0;  // data phase only (S16 D4)
+        size_t total    = 0;  // data phase only
         if (tx) {
             // Drain the tx source and stash the bytes into the observation buffer.
             while (!tx->eof()) {
@@ -1488,12 +1499,12 @@ public:
         return total;
     }
 
-    const m5::hal::v1::bus::Accessor* lockOwner(void) const
+    const m5::hal::v1::bus::IAccessor* lockOwner(void) const
     {
         return _lock_owner;
     }
     size_t transfer_count = 0;
-    m5::hal::v1::i2c::I2CMasterAccessConfig last_cfg;
+    m5::hal::v1::i2c::MasterAccessConfig last_cfg;
     m5::hal::v1::i2c::TransferDesc last_desc;
     bool last_tx_was_set = false;
     bool last_rx_was_set = false;
@@ -1501,12 +1512,12 @@ public:
     uint8_t fake_rx_byte = 0;
 };
 
-m5::hal::v1::i2c::I2CMasterAccessConfig makeAcc(uint16_t addr)
+m5::hal::v1::i2c::MasterAccessConfig makeAcc(uint16_t addr)
 {
-    m5::hal::v1::i2c::I2CMasterAccessConfig acc;
+    m5::hal::v1::i2c::MasterAccessConfig acc;
     acc.i2c_addr   = addr;
     acc.freq       = 100000;
-    acc.timeout_ms = 100;
+    acc.wire_timeout_ms = 100;
     return acc;
 }
 
@@ -1514,7 +1525,7 @@ TEST(BusLock, LockSetsOwnerUnlockClears)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x10);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     EXPECT_EQ(bus.lockOwner(), nullptr);
     auto lk = bus.lock(&accessor);
@@ -1534,18 +1545,20 @@ TEST(BusLock, LockRejectsNullOwner)
     EXPECT_EQ(r.error(), m5::hal::v1::error::error_t::INVALID_ARGUMENT);
 }
 
-TEST(BusLock, SecondLockReturnsBusy)
+TEST(BusLock, SecondLockTimesOut)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x10);
-    m5::hal::v1::i2c::I2CMasterAccessor a1{bus, acc_cfg};
-    m5::hal::v1::i2c::I2CMasterAccessor a2{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor a1{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor a2{bus, acc_cfg};
 
     ASSERT_TRUE(bus.lock(&a1).has_value());
 
-    auto r = bus.lock(&a2);
+    // The default timeout now waits forever; pass a small finite budget
+    // so the contention check stays deterministic.
+    auto r = bus.lock(&a2, 10);
     EXPECT_FALSE(r.has_value());
-    EXPECT_EQ(r.error(), m5::hal::v1::error::error_t::BUSY);
+    EXPECT_EQ(r.error(), m5::hal::v1::error::error_t::TIMEOUT_ERROR);
     EXPECT_EQ(bus.lockOwner(), &a1);  // The owner is unchanged.
 
     (void)bus.unlock(&a1);
@@ -1555,8 +1568,8 @@ TEST(BusLock, UnlockByWrongOwnerFails)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x10);
-    m5::hal::v1::i2c::I2CMasterAccessor a1{bus, acc_cfg};
-    m5::hal::v1::i2c::I2CMasterAccessor a2{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor a1{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor a2{bus, acc_cfg};
 
     ASSERT_TRUE(bus.lock(&a1).has_value());
 
@@ -1572,7 +1585,7 @@ TEST(AccessorAccess, BeginEndManageBusLock)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x10);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     EXPECT_FALSE(accessor.inAccess());
     ASSERT_TRUE(accessor.beginAccess().has_value());
@@ -1588,7 +1601,7 @@ TEST(AccessorAccess, NestedBeginEndOnlyLocksOnce)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x10);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     ASSERT_TRUE(accessor.beginAccess().has_value());
     ASSERT_TRUE(accessor.beginAccess().has_value());  // Inner call (analogous to a sugar method).
@@ -1610,18 +1623,73 @@ TEST(AccessorAccess, EndAccessWithoutBeginFails)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x10);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     auto r = accessor.endAccess();
     EXPECT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), m5::hal::v1::error::error_t::INVALID_ARGUMENT);
 }
 
+// ---- Unbound construction + typed bind --------------------------------
+
+TEST(AccessorBind, UnboundThenBindRunsNormally)
+{
+    StubBus bus;
+    m5::hal::v1::i2c::MasterAccessor accessor{makeAcc(0x10)};  // unbound
+
+    EXPECT_FALSE(accessor.isBound());
+    ASSERT_TRUE(accessor.bind(bus).has_value());
+    EXPECT_TRUE(accessor.isBound());
+
+    ASSERT_TRUE(accessor.beginAccess(10).has_value());
+    EXPECT_EQ(bus.lockOwner(), &accessor);
+    ASSERT_TRUE(accessor.endAccess().has_value());
+    EXPECT_EQ(bus.lockOwner(), nullptr);
+}
+
+TEST(AccessorBind, RebindMovesToTheNewBus)
+{
+    StubBus bus_a;
+    StubBus bus_b;
+    m5::hal::v1::i2c::MasterAccessor accessor{makeAcc(0x10)};
+
+    ASSERT_TRUE(accessor.bind(bus_a).has_value());
+    ASSERT_TRUE(accessor.bind(bus_b).has_value());  // rebind outside a window is fine
+
+    ASSERT_TRUE(accessor.beginAccess(10).has_value());
+    EXPECT_EQ(bus_b.lockOwner(), &accessor);
+    EXPECT_EQ(bus_a.lockOwner(), nullptr);
+    (void)accessor.endAccess();
+}
+
+TEST(AccessorBind, BindIsRejectedWhileAWindowIsOpen)
+{
+    StubBus bus_a;
+    StubBus bus_b;
+    m5::hal::v1::i2c::MasterAccessor accessor{bus_a, makeAcc(0x10)};
+
+    ASSERT_TRUE(accessor.beginAccess(10).has_value());
+    auto r = accessor.bind(bus_b);
+    EXPECT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), m5::hal::v1::error::error_t::INVALID_ARGUMENT);
+    EXPECT_EQ(bus_a.lockOwner(), &accessor);  // still on the original bus
+    (void)accessor.endAccess();
+}
+
+// `EXPECT_DEATH` is only meaningful in debug builds (NDEBUG undefined),
+// which is what the native test env runs; release builds return
+// INVALID_ARGUMENT from the same gate instead.
+TEST(AccessorBindDeathTest, UnboundWindowOpenAssertsInDebug)
+{
+    m5::hal::v1::i2c::MasterAccessor accessor{makeAcc(0x10)};  // never bound
+    EXPECT_DEATH({ (void)accessor.beginAccess(10); }, "not bound to a bus");
+}
+
 TEST(ScopedAccess, AcquiresAndReleasesAtScopeExit)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x10);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     {
         m5::hal::v1::bus::ScopedAccess scope{accessor};
@@ -1637,15 +1705,16 @@ TEST(ScopedAccess, FailureLeavesBusUnlocked)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x10);
-    m5::hal::v1::i2c::I2CMasterAccessor blocker{bus, acc_cfg};
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor blocker{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     ASSERT_TRUE(bus.lock(&blocker).has_value());
 
     {
-        m5::hal::v1::bus::ScopedAccess scope{accessor};
+        // Finite budget: the default would wait forever on the blocker.
+        m5::hal::v1::bus::ScopedAccess scope{accessor, 10};
         EXPECT_TRUE(scope.has_error());
-        EXPECT_EQ(scope.error(), m5::hal::v1::error::error_t::BUSY);
+        EXPECT_EQ(scope.error(), m5::hal::v1::error::error_t::TIMEOUT_ERROR);
         EXPECT_FALSE(accessor.inAccess());
     }
     // The blocker's lock must not be unlocked accidentally by the failed scope's dtor.
@@ -1658,7 +1727,7 @@ TEST(ScopedLock, AcquiresAndReleasesAtScopeExit)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x10);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     {
         m5::hal::v1::bus::ScopedLock scope{bus, &accessor};
@@ -1668,19 +1737,20 @@ TEST(ScopedLock, AcquiresAndReleasesAtScopeExit)
     EXPECT_EQ(bus.lockOwner(), nullptr);
 }
 
-TEST(ScopedLock, ContendedAcquireSurfacesBusy)
+TEST(ScopedLock, ContendedAcquireSurfacesTimeout)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x10);
-    m5::hal::v1::i2c::I2CMasterAccessor a1{bus, acc_cfg};
-    m5::hal::v1::i2c::I2CMasterAccessor a2{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor a1{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor a2{bus, acc_cfg};
 
     ASSERT_TRUE(bus.lock(&a1).has_value());
 
     {
-        m5::hal::v1::bus::ScopedLock scope{bus, &a2};
+        // Finite budget: the default would wait forever on the holder.
+        m5::hal::v1::bus::ScopedLock scope{bus, &a2, 10};
         EXPECT_TRUE(scope.has_error());
-        EXPECT_EQ(scope.error(), m5::hal::v1::error::error_t::BUSY);
+        EXPECT_EQ(scope.error(), m5::hal::v1::error::error_t::TIMEOUT_ERROR);
     }
     EXPECT_EQ(bus.lockOwner(), &a1);
 
@@ -1691,7 +1761,7 @@ TEST(AccessorSugar, TransferLocksDuringCall)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x10);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     EXPECT_EQ(bus.lockOwner(), nullptr);
     auto r = accessor.transfer(m5::hal::v1::i2c::TransferDesc{}, m5::hal::v1::data::ConstDataSpan{},
@@ -1705,7 +1775,7 @@ TEST(AccessorSugar, TransferInsideScopedAccessOnlyLocksOnce)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x10);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     {
         m5::hal::v1::bus::ScopedAccess scope{accessor};
@@ -1800,7 +1870,7 @@ TEST(AccessorRegister, WriteRegisterSendsPrefixAndValue)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x10);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     // Recommended style: declare register addresses as typed
     // constants. `uint8_t` / `uint16_t` spell the wire width out.
@@ -1822,7 +1892,7 @@ TEST(AccessorRegister, ReadRegisterReturnsSinkContents)
     StubBus bus;
     bus.fake_rx_byte = 0x60;  // BME280 chip id
     auto acc_cfg     = makeAcc(0x76);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     static constexpr uint8_t REG_ID = 0xD0;
     auto r                          = accessor.readRegister(REG_ID);
@@ -1839,7 +1909,7 @@ TEST(AccessorRegister, ReadRegisterSpanFillsSink)
     StubBus bus;
     bus.fake_rx_byte = 0xAB;
     auto acc_cfg     = makeAcc(0x76);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     static constexpr uint8_t REG_DATA = 0xF7;
     uint8_t buf[4]                    = {0, 0, 0, 0};
@@ -1858,7 +1928,7 @@ TEST(AccessorRegister, LiteralReadRegisterUsesOneByteByDefault)
     // The default register_address_bytes value is 0, which falls back
     // to the historical 1-byte register address behavior.
     EXPECT_EQ(acc_cfg.register_address_bytes, 0);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     auto r = accessor.readRegister(0xD0);
     ASSERT_TRUE(r.has_value());
@@ -1873,7 +1943,7 @@ TEST(AccessorRegister, LiteralWriteRegisterUsesConfiguredTwoByteAddress)
     auto acc_cfg                       = makeAcc(0x50);
     acc_cfg.register_address_bytes     = 2;
     static constexpr uint8_t VAL_WRITE = 0xA5;
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     auto r = accessor.writeRegister(0x1234, VAL_WRITE);
     ASSERT_TRUE(r.has_value());
@@ -1888,7 +1958,7 @@ TEST(AccessorRegister, LiteralReadRegisterRejectsValueTooLargeForConfiguredWidth
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x76);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     auto r = accessor.readRegister(0x1234);
     ASSERT_FALSE(r.has_value());
@@ -1902,7 +1972,7 @@ TEST(AccessorRegister, WriteRegister16IsBigEndian)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x50);  // Imaginary EEPROM target at 0x50.
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     static constexpr uint16_t REG_PAGE = 0x1234;
     static constexpr uint8_t VAL       = 0xAB;
@@ -1921,7 +1991,7 @@ TEST(AccessorRegister, ReadRegister16IsBigEndian)
     StubBus bus;
     bus.fake_rx_byte = 0x5A;
     auto acc_cfg     = makeAcc(0x50);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     static constexpr uint16_t REG_PAGE = 0xABCD;
     auto r                             = accessor.readRegister(REG_PAGE);
@@ -1937,7 +2007,7 @@ TEST(AccessorRegister, ReadRegister16SpanFillsSink)
     StubBus bus;
     bus.fake_rx_byte = 0xEE;
     auto acc_cfg     = makeAcc(0x50);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     static constexpr uint16_t REG_PAGE = 0x0100;
     uint8_t buf[3]                     = {};
@@ -1955,7 +2025,7 @@ TEST(AccessorProbe, ProbeSendsEmptyTransfer)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x76);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     auto r = accessor.probe();
     EXPECT_TRUE(r.has_value());
@@ -1983,7 +2053,7 @@ TEST(AccessorRaw, WriteRawSendsTxBytes)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x10);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     const uint8_t payload[] = {0xDE, 0xAD, 0xBE, 0xEF};
     auto r                  = accessor.write(payload, sizeof(payload));
@@ -2002,7 +2072,7 @@ TEST(AccessorRaw, ReadRawFillsBuffer)
     StubBus bus;
     bus.fake_rx_byte = 0x5A;
     auto acc_cfg     = makeAcc(0x10);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     uint8_t buf[5] = {0, 0, 0, 0, 0};
     auto r         = accessor.read(buf, sizeof(buf));
@@ -2019,7 +2089,7 @@ TEST(AccessorRaw, WriteRegisterRawSendsPrefixAndValues)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x76);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     static constexpr uint8_t REG_DATA = 0xF7;
     const uint8_t payload[]           = {0x10, 0x20, 0x30};
@@ -2038,7 +2108,7 @@ TEST(AccessorRaw, ReadRegisterRawFillsBuffer)
     StubBus bus;
     bus.fake_rx_byte = 0xC3;
     auto acc_cfg     = makeAcc(0x76);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     static constexpr uint8_t REG_DATA = 0xF7;
     uint8_t buf[6]                    = {};
@@ -2056,7 +2126,7 @@ TEST(AccessorRaw, WriteRegister16RawIsBigEndian)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x50);  // Imaginary EEPROM target.
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     static constexpr uint16_t REG_PAGE = 0xABCD;
     const uint8_t payload[]            = {0x11, 0x22};
@@ -2075,7 +2145,7 @@ TEST(AccessorRaw, ReadRegister16RawIsBigEndian)
     StubBus bus;
     bus.fake_rx_byte = 0x77;
     auto acc_cfg     = makeAcc(0x50);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, acc_cfg};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     static constexpr uint16_t REG_PAGE = 0x0100;
     uint8_t buf[3]                     = {};
@@ -2101,7 +2171,7 @@ TEST(AccessorRaw, RawAndSpanOverloadsAreEquivalentForWriteRegister)
     StubBus bus_raw;
     {
         auto acc_cfg = makeAcc(0x10);
-        m5::hal::v1::i2c::I2CMasterAccessor accessor{bus_raw, acc_cfg};
+        m5::hal::v1::i2c::MasterAccessor accessor{bus_raw, acc_cfg};
         ASSERT_TRUE(accessor.writeRegister(REG, payload, sizeof(payload)).has_value());
     }
 
@@ -2109,7 +2179,7 @@ TEST(AccessorRaw, RawAndSpanOverloadsAreEquivalentForWriteRegister)
     StubBus bus_span;
     {
         auto acc_cfg = makeAcc(0x10);
-        m5::hal::v1::i2c::I2CMasterAccessor accessor{bus_span, acc_cfg};
+        m5::hal::v1::i2c::MasterAccessor accessor{bus_span, acc_cfg};
         ASSERT_TRUE(
             accessor.writeRegister(REG, m5::hal::v1::data::ConstDataSpan{payload, sizeof(payload)}).has_value());
     }
@@ -2122,7 +2192,7 @@ TEST(AccessorRaw, RawAndSpanOverloadsAreEquivalentForWriteRegister)
 }  // namespace spec_polish_a3
 
 // ---------------------------------------------------------------------------
-// `I2CBusConfig` exposes a single gpio_number_t path: `pin_scl` /
+// `IBusConfig` exposes a single gpio_number_t path: `pin_scl` /
 // `pin_sda` default to `-1`. Callers fill in gpio_number values via
 // the 2-argument ctor or field assignment, and `init()` resolves a
 // `Pin` from `m5::hal::v1::M5_Hal.Gpio.getPin(num)` through the
@@ -2138,42 +2208,41 @@ TEST(AccessorRaw, RawAndSpanOverloadsAreEquivalentForWriteRegister)
 
 namespace spec_polish_a1 {
 
-TEST(I2CBusConfig, DefaultCtorLeavesPinsInvalid)
+TEST(IBusConfig, DefaultCtorLeavesPinsInvalid)
 {
-    m5::hal::v1::i2c::I2CBusConfig cfg;
+    m5::hal::v1::i2c::BusConfig_software cfg;
     EXPECT_LT(cfg.pin_scl, 0);
     EXPECT_LT(cfg.pin_sda, 0);
 }
 
-TEST(I2CBusConfig, SoftwareVariantRejectsInvalidPins)
+TEST(IBusConfig, SoftwareVariantRejectsInvalidPins)
 {
-    m5::hal::v1::i2c::I2CBusConfig cfg;
+    m5::hal::v1::i2c::BusConfig_software cfg;
     // `pin_scl` / `pin_sda` keep their default value (-1).
 
-    m5::variants::frameworks::software::hal::v1::i2c::Bus bus;
+    m5::hal::v1::i2c::Bus_software bus;
     auto err = bus.init(cfg);
     ASSERT_FALSE(err.has_value());
     EXPECT_EQ(err.error(), m5::hal::v1::error::error_t::INVALID_ARGUMENT);
 }
 
-TEST(I2CBusConfig, CtorFromGpioNumbersStoresValuesAndResolvesViaGPIOGroup)
+TEST(IBusConfig, FieldAssignedGpioNumbersResolveViaGPIOGroup)
 {
-    // The 2-argument ctor stores the gpio_numbers into
-    // `pin_scl` / `pin_sda`. `init()` calls
-    // `m5::hal::v1::M5_Hal.Gpio.getPin(num)`, which resolves to a
-    // `stub::Port` Pin in the native build via `M5_Hal.Gpio` ->
-    // `stub::GPIO`.
-    m5::hal::v1::i2c::I2CBusConfig cfg{/*scl=*/21, /*sda=*/22};
+    // Field-assigned gpio_numbers land in `pin_scl` / `pin_sda`.
+    // `init()` calls `m5::hal::v1::M5_Hal.Gpio.getPin(num)`, which
+    // resolves to a `stub::Port` Pin in the native build via
+    // `M5_Hal.Gpio` -> `stub::GPIO`.
+    auto cfg = makeSoftwareBusConfig(/*scl=*/21, /*sda=*/22);
     EXPECT_EQ(cfg.pin_scl, 21);
     EXPECT_EQ(cfg.pin_sda, 22);
 
-    m5::variants::frameworks::software::hal::v1::i2c::Bus bus;
+    m5::hal::v1::i2c::Bus_software bus;
     auto err = bus.init(cfg);
     EXPECT_TRUE(err.has_value());
     (void)bus.release();
 }
 
-TEST(I2CBusConfig, SoftwareVariantAcceptsRecordingGPIOViaGPIOGroup)
+TEST(IBusConfig, SoftwareVariantAcceptsRecordingGPIOViaGPIOGroup)
 {
     // The expander-style path (driving SCL / SDA from a Port that
     // lives outside the variant) is reached by registering a
@@ -2185,9 +2254,9 @@ TEST(I2CBusConfig, SoftwareVariantAcceptsRecordingGPIOViaGPIOGroup)
     RecordingPort sda_port;
     ScopedRecordingGPIO rec{scl_port, sda_port};
 
-    m5::hal::v1::i2c::I2CBusConfig cfg{rec.scl(), rec.sda()};
+    auto cfg = makeSoftwareBusConfig(rec.scl(), rec.sda());
 
-    m5::variants::frameworks::software::hal::v1::i2c::Bus bus;
+    m5::hal::v1::i2c::Bus_software bus;
     auto err = bus.init(cfg);
     EXPECT_TRUE(err.has_value());
     (void)bus.release();
@@ -2196,7 +2265,7 @@ TEST(I2CBusConfig, SoftwareVariantAcceptsRecordingGPIOViaGPIOGroup)
 }  // namespace spec_polish_a1
 
 // ---------------------------------------------------------------------------
-// `setConfig` (replace an accessor's cfg) and `I2CBus::probe(addr)`
+// `setConfig` (replace an accessor's cfg) and `IBus::probe(addr)`
 // (the accessor-less probe sugar). Reuses `StubBus` from earlier.
 // ---------------------------------------------------------------------------
 
@@ -2209,7 +2278,7 @@ TEST(AccessorSetConfig, ReplacesConfigOutsideAccess)
 {
     StubBus bus;
     auto cfg1 = makeAcc(0x10);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, cfg1};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, cfg1};
 
     auto cfg2 = makeAcc(0x20);
     auto r    = accessor.setConfig(cfg2);
@@ -2225,7 +2294,7 @@ TEST(AccessorSetConfig, RejectsWhenInAccess)
 {
     StubBus bus;
     auto cfg1 = makeAcc(0x10);
-    m5::hal::v1::i2c::I2CMasterAccessor accessor{bus, cfg1};
+    m5::hal::v1::i2c::MasterAccessor accessor{bus, cfg1};
 
     auto ba = accessor.beginAccess();
     ASSERT_TRUE(ba.has_value());
@@ -2260,10 +2329,10 @@ TEST(BusProbe, UsesDefaultFreqAndShortTimeout)
     (void)bus.probe(0x42);
     // `Bus::probe(addr)`'s scan-oriented defaults: `freq = 100000` Hz,
     // `timeout = 50` ms. The short timeout is deliberately different
-    // from `I2CMasterAccessConfig`'s default of 1000 ms — scan loops
+    // from `MasterAccessConfig`'s default of 1000 ms — scan loops
     // shouldn't pay one second per NACK.
     EXPECT_EQ(bus.last_cfg.freq, 100000u);
-    EXPECT_EQ(bus.last_cfg.timeout_ms, 50u);
+    EXPECT_EQ(bus.last_cfg.wire_timeout_ms, 50u);
 }
 
 TEST(BusProbe, AcceptsCustomFreqAndTimeout)
@@ -2271,7 +2340,7 @@ TEST(BusProbe, AcceptsCustomFreqAndTimeout)
     StubBus bus;
     (void)bus.probe(0x42, 400000, 200);
     EXPECT_EQ(bus.last_cfg.freq, 400000u);
-    EXPECT_EQ(bus.last_cfg.timeout_ms, 200u);
+    EXPECT_EQ(bus.last_cfg.wire_timeout_ms, 200u);
 }
 
 TEST(BusProbe, ReleasesLockAfterCall)
@@ -2280,7 +2349,7 @@ TEST(BusProbe, ReleasesLockAfterCall)
     // accessor and walks `beginAccess` -> `transfer` -> `endAccess`.
     // By the time `probe` returns, `bus.lockOwner()` must be
     // `nullptr` (the sentinel's dtor has released the lock); if this
-    // breaks, every subsequent caller hits BUSY.
+    // breaks, every subsequent caller times out.
     StubBus bus;
     (void)bus.probe(0x42);
     EXPECT_EQ(bus.lockOwner(), nullptr);

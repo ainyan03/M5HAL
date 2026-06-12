@@ -9,7 +9,7 @@
 // Pin defaults match M5Stack Core (Basic / Gray / Fire) style wiring:
 //   SDA=21, SCL=22
 //
-// To force a backend, change ExampleI2CBus below. The default m5hal::i2c::Bus
+// To force a backend, change ExampleBus below. The default m5hal::i2c::Bus
 // is the first backend offered by the active build environment.
 // =============================================================================
 
@@ -32,17 +32,17 @@ static constexpr uint8_t REG_PROBE_R2 = 0x01;
 
 // m5hal::i2c::Bus resolves to the first backend the build offers
 // (framework scan order; see spec/design/variants.md). Uncomment a
-// variant::* alias below to force a specific backend instead.
-using ExampleI2CBus = m5hal::i2c::Bus;
-// using ExampleI2CBus = m5hal::i2c::variant::arduino::Bus;
-// using ExampleI2CBus = m5hal::i2c::variant::espidf::Bus;
-// using ExampleI2CBus = m5hal::i2c::variant::software::Bus;
+// suffixed variant type below to force a specific backend instead.
+using ExampleBus = m5hal::i2c::Bus;
+// using ExampleBus = m5hal::i2c::Bus_arduino;
+// using ExampleBus = m5hal::i2c::Bus_espidf;
+// using ExampleBus = m5hal::i2c::Bus_software;
 
-ExampleI2CBus i2c_bus;
+ExampleBus i2c_bus;
 
 // -------------------------------------------------------------------------
 
-static uint16_t scanFirst(m5hal::i2c::I2CBus& bus)
+static uint16_t scanFirst(m5hal::i2c::IBus& bus)
 {
     Serial.println("I2C scan:");
     uint16_t found = 0xFFFF;
@@ -59,7 +59,7 @@ static uint16_t scanFirst(m5hal::i2c::I2CBus& bus)
 
 // -------------------------------------------------------------------------
 
-static void demoReadRegister(m5hal::i2c::I2CMasterAccessor& dev)
+static void demoReadRegister(m5hal::i2c::MasterAccessor& dev)
 {
     auto v = dev.readRegister(0x00);  // literal sugar: 1-byte register address by default
     if (!v.has_value()) {
@@ -71,7 +71,7 @@ static void demoReadRegister(m5hal::i2c::I2CMasterAccessor& dev)
 
 // -------------------------------------------------------------------------
 
-static void demoBurstRead(m5hal::i2c::I2CMasterAccessor& dev)
+static void demoBurstRead(m5hal::i2c::MasterAccessor& dev)
 {
     uint8_t buf[4] = {};
     auto r         = dev.readRegister(REG_PROBE_R, buf, sizeof(buf));
@@ -84,9 +84,11 @@ static void demoBurstRead(m5hal::i2c::I2CMasterAccessor& dev)
 
 // -------------------------------------------------------------------------
 
-static void demoScopedAccess(m5hal::i2c::I2CMasterAccessor& dev)
+static void demoScopedAccess(m5hal::i2c::MasterAccessor& dev)
 {
-    m5hal::bus::ScopedAccess scope{dev};
+    // Pass an explicit lock budget when you can handle the timeout;
+    // omitting it means "wait forever" (handy, but be deliberate).
+    m5hal::bus::ScopedAccess scope{dev, 100};
     if (scope.has_error()) {
         Serial.printf("ScopedAccess failed: %d\n", (int)scope.error());
         return;
@@ -110,7 +112,10 @@ void setup()
     Serial.printf("pins: SDA=%d SCL=%d freq=%u\n", PIN_SDA, PIN_SCL,
                   static_cast<unsigned>(M5HAL_EXAMPLE_HOWTOUSEI2C_FREQ));
 
-    m5hal::i2c::BusConfig bus_cfg{&Wire, PIN_SCL, PIN_SDA};
+    m5hal::i2c::BusConfig bus_cfg;
+    bus_cfg.wire    = &Wire;
+    bus_cfg.pin_scl = PIN_SCL;
+    bus_cfg.pin_sda = PIN_SDA;
 
     if (auto r = i2c_bus.init(bus_cfg); !r) {
         Serial.printf("Bus init failed: %d\n", (int)r.error());
@@ -124,11 +129,11 @@ void setup()
     }
     Serial.printf("Using device at 0x%02X for demo.\n", addr);
 
-    m5hal::i2c::I2CMasterAccessConfig acc_cfg;
+    m5hal::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr   = addr;
     acc_cfg.freq       = M5HAL_EXAMPLE_HOWTOUSEI2C_FREQ;
-    acc_cfg.timeout_ms = 100;
-    m5hal::i2c::I2CMasterAccessor dev{i2c_bus, acc_cfg};
+    acc_cfg.wire_timeout_ms = 100;
+    m5hal::i2c::MasterAccessor dev{i2c_bus, acc_cfg};
 
     demoReadRegister(dev);
     demoBurstRead(dev);

@@ -2,10 +2,10 @@
 #ifndef M5_HAL_VARIANTS_FRAMEWORKS_ARDUINO_HAL_GPIO_GPIO_HPP
 #define M5_HAL_VARIANTS_FRAMEWORKS_ARDUINO_HAL_GPIO_GPIO_HPP
 
-// GPIO implementation for the arduino framework variant — wraps the
+// GPIO_arduino implementation for the arduino framework variant — wraps the
 // Arduino API (`pinMode` / `digitalWrite` / `digitalRead`). The
 // encoded value is the gpio_number itself: even on ESP32 boards, the
-// Arduino API addresses by gpio_number, so a single Port covers
+// Arduino API addresses by gpio_number, so a single Port_arduino covers
 // everything.
 // Authoritative spec: spec/design/gpio.md, spec/design/variants.md.
 
@@ -27,14 +27,14 @@
 
 #if defined(ARDUINO)
 
-namespace m5::variants::frameworks::arduino::hal::v1::gpio {
+namespace m5::hal::v1::gpio {
 
-class Port : public ::m5::hal::v1::gpio::IPort {
+class Port_arduino : public ::m5::hal::v1::gpio::IPort {
 public:
     // Concrete pin validity is delegated to the Arduino API; `kWidth` only caps the range.
     static constexpr uint8_t kWidth = NUM_DIGITAL_PINS;
 
-    constexpr Port() = default;
+    constexpr Port_arduino() = default;
 
 protected:
     void _writePinEncoded(uint32_t encoded_num, bool v) override
@@ -83,15 +83,15 @@ protected:
     }
 };
 
-// Minimal GPIO with a single built-in Port. constexpr singleton —
+// Minimal GPIO_arduino with a single built-in Port_arduino. constexpr singleton —
 // `getInstance()` returns a `static constexpr` placed in rodata, so
 // there is no guard variable. `_port` is stateless, which keeps the
 // `mutable` + rodata combination free of UB.
-class GPIO : public ::m5::hal::v1::gpio::IGPIO {
+class GPIO_arduino : public ::m5::hal::v1::gpio::IGPIO {
 public:
     ::m5::hal::v1::gpio::IPort* portForPin(::m5::hal::v1::types::gpio_local_pin_t pin_index) const override
     {
-        M5HAL_ASSERT(pin_index < static_cast<::m5::hal::v1::types::gpio_local_pin_t>(Port::kWidth),
+        M5HAL_ASSERT(pin_index < static_cast<::m5::hal::v1::types::gpio_local_pin_t>(Port_arduino::kWidth),
                      "pin_index out of range");
         return &_port;
     }
@@ -102,52 +102,52 @@ public:
     }
     uint16_t getPinCount() const override
     {
-        return Port::kWidth;
+        return Port_arduino::kWidth;
     }
     uint8_t getPortCount() const override
     {
         return 1;
     }
 
-    static const GPIO* getInstance()
+    static const GPIO_arduino* getInstance()
     {
-        static constexpr GPIO s_gpio_instance{};
+        static constexpr GPIO_arduino s_gpio_instance{};
 
         return &s_gpio_instance;
     }
 
 protected:
-    constexpr GPIO() = default;
+    constexpr GPIO_arduino() = default;
 
     // Singleton: copy / move deleted (also required to keep the type literal).
-    constexpr GPIO(const GPIO&)            = delete;
-    constexpr GPIO& operator=(const GPIO&) = delete;
-    constexpr GPIO(GPIO&&)                 = delete;
-    constexpr GPIO& operator=(GPIO&&)      = delete;
+    constexpr GPIO_arduino(const GPIO_arduino&)            = delete;
+    constexpr GPIO_arduino& operator=(const GPIO_arduino&) = delete;
+    constexpr GPIO_arduino(GPIO_arduino&&)                 = delete;
+    constexpr GPIO_arduino& operator=(GPIO_arduino&&)      = delete;
 
 private:
-    mutable Port _port{};
+    mutable Port_arduino _port{};
 };
 
-// MCU-internal GPIO (constexpr instance). Call directly when a test
+// MCU-internal GPIO_arduino (constexpr instance). Call directly when a test
 // (or similar) needs to talk to this specific implementation.
-inline const ::m5::hal::v1::gpio::IGPIO* getMCUGPIO()
+inline const ::m5::hal::v1::gpio::IGPIO* getMCUGPIO_arduino()
 {
-    return GPIO::getInstance();
+    return GPIO_arduino::getInstance();
 }
 
-// Flat-injection entry: the MCU-internal GPIO as an `IGPIO*` (the
+// Flat-injection entry: the MCU-internal GPIO_arduino as an `IGPIO*` (the
 // local pin space). `M5HALCore::ctor` uses this as the slot-0
 // bootstrap source.
-inline const ::m5::hal::v1::gpio::IGPIO* getGPIO()
+inline const ::m5::hal::v1::gpio::IGPIO* getGPIO_arduino()
 {
-    return getMCUGPIO();
+    return getMCUGPIO_arduino();
 }
 
 // `getGPIOGroup()` / `pin()` free functions are gone. Global lookups
 // go through `m5::hal::v1::M5_Hal.Gpio.getPin(num)`.
 
-}  // namespace m5::variants::frameworks::arduino::hal::v1::gpio
+}  // namespace m5::hal::v1::gpio
 
 #endif  // ARDUINO
 

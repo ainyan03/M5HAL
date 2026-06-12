@@ -153,7 +153,7 @@ protected:
 
 ### variant 注入の構図
 
-variant が `<variant_ns>::hal::v1::gpio::getGPIO()` の inline definition を提供し、 `_offer.hpp` の flat-injection 経由で利用者に提供される:
+variant が `m5::hal::v1::gpio` 直下に `getGPIO_<variant>()` の inline definition を提供し ([variants.md](variants.md) §offer 要件)、 勝者選択が無印の wrapper を生成する:
 
 - `m5::hal::v1::gpio::getGPIO()` — MCU 内蔵 GPIO (`const IGPIO*`) を返す (ローカル空間)。 `M5HALCore::ctor` が slot 0 bootstrap source として使用する seam
 
@@ -269,7 +269,7 @@ private:
 - runtime には read-only access のみ走る前提 → **lock を持たない**
 - 規約違反 (runtime register / 走査中 register) の動作は未定義
 
-## I2CBusConfig / SPIBusConfig との関係
+## IBusConfig / IBusConfig との関係
 
 `*BusConfig` の `pin_*` フィールドは `gpio_number_t` 単一 path (default = -1 invalid)。 variant の `init()` 内で:
 
@@ -285,7 +285,7 @@ private:
 constexpr m5::hal::v1::types::gpio_slot_t EXPANDER_SLOT = 1;   // slot 0 は MCU 予約
 m5::hal::v1::M5_Hal.Gpio.addGPIO(&pca9554_gpio, EXPANDER_SLOT);
 
-m5::hal::v1::i2c::I2CBusConfig bus_cfg{
+m5::hal::v1::i2c::IBusConfig bus_cfg{
     m5::hal::v1::types::makeGpioNumber(EXPANDER_SLOT, 0),   // expander local pin 0 = SCL
     m5::hal::v1::types::makeGpioNumber(EXPANDER_SLOT, 1)};  // expander local pin 1 = SDA
 i2c_bus.init(bus_cfg);   // software bit-bang variant が M5_Hal.Gpio.getPin で Pin 解決して driving
@@ -372,5 +372,5 @@ using m5::hal::v1::gpio::ScopedPinBackup;
 
 - [bus_accessor.md](bus_accessor.md) — Bus / Accessor 責務分離 (`*BusConfig::pin_*` で gpio_number_t 単一 path)
 - [variants.md](variants.md) — variant 機構 (各 variant が GPIO 具象を flat 注入)
-- [i2c.md](i2c.md) — `I2CBusConfig` の pin 指定例
+- [i2c.md](i2c.md) — `IBusConfig` の pin 指定例
 - [../reference/directory-layout.md](../reference/directory-layout.md)

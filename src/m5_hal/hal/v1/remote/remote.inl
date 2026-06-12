@@ -56,7 +56,7 @@ result_t<void> Server::recordCapability(types::bus_kind_t kind, uint8_t bus_id)
     return {};
 }
 
-result_t<void> Server::registerI2C(uint8_t bus_id, i2c::I2CMasterAccessor& acc)
+result_t<void> Server::registerI2C(uint8_t bus_id, i2c::MasterAccessor& acc)
 {
     auto r = _runner.registerI2C(bus_id, acc);
     if (!r.has_value()) {
@@ -65,7 +65,7 @@ result_t<void> Server::registerI2C(uint8_t bus_id, i2c::I2CMasterAccessor& acc)
     return recordCapability(types::bus_kind_t::I2C, bus_id);
 }
 
-result_t<void> Server::registerSPI(uint8_t bus_id, spi::SPIMasterAccessor& acc)
+result_t<void> Server::registerSPI(uint8_t bus_id, spi::MasterAccessor& acc)
 {
     auto r = _runner.registerSPI(bus_id, acc);
     if (!r.has_value()) {
@@ -74,7 +74,7 @@ result_t<void> Server::registerSPI(uint8_t bus_id, spi::SPIMasterAccessor& acc)
     return recordCapability(types::bus_kind_t::SPI, bus_id);
 }
 
-result_t<void> Server::registerUART(uint8_t bus_id, uart::UARTAccessor& acc)
+result_t<void> Server::registerUART(uint8_t bus_id, uart::Accessor& acc)
 {
     auto r = _runner.registerUART(bus_id, acc);
     if (!r.has_value()) {
@@ -83,7 +83,7 @@ result_t<void> Server::registerUART(uint8_t bus_id, uart::UARTAccessor& acc)
     return recordCapability(types::bus_kind_t::UART, bus_id);
 }
 
-result_t<void> Server::registerI2S(uint8_t bus_id, i2s::I2STxAccessor& acc)
+result_t<void> Server::registerI2S(uint8_t bus_id, i2s::TxAccessor& acc)
 {
     auto r = _runner.registerI2S(bus_id, acc);
     if (!r.has_value()) {
@@ -134,17 +134,11 @@ error_t Server::prescan(data::ConstDataSpan script, size_t& offset) const
                 // layout (shared with encodeConfig).
                 switch (static_cast<types::bus_kind_t>(payload.data[0])) {
                     case types::bus_kind_t::I2C:
-                        exceeded =
-                            detail::u32FieldExceeds(cfg, bytecode::kI2CConfigTimeoutOffset, _config.max_bus_timeout_ms);
-                        break;
-                    case types::bus_kind_t::SPI:
-                        exceeded =
-                            detail::u32FieldExceeds(cfg, bytecode::kSPIConfigTimeoutOffset, _config.max_bus_timeout_ms);
+                        exceeded = detail::u32FieldExceeds(cfg, bytecode::kI2CConfigWireTimeoutOffset,
+                                                           _config.max_bus_timeout_ms);
                         break;
                     case types::bus_kind_t::UART:
-                        exceeded = detail::u32FieldExceeds(cfg, bytecode::kUARTConfigTimeoutOffset,
-                                                           _config.max_bus_timeout_ms) ||
-                                   detail::u32FieldExceeds(cfg, bytecode::kUARTConfigFirstByteTimeoutOffset,
+                        exceeded = detail::u32FieldExceeds(cfg, bytecode::kUARTConfigFirstByteTimeoutOffset,
                                                            _config.max_bus_timeout_ms) ||
                                    detail::u32FieldExceeds(cfg, bytecode::kUARTConfigInterByteTimeoutOffset,
                                                            _config.max_bus_timeout_ms) ||
@@ -152,11 +146,11 @@ error_t Server::prescan(data::ConstDataSpan script, size_t& offset) const
                                                            _config.max_bus_timeout_ms);
                         break;
                     case types::bus_kind_t::I2S:
-                        exceeded = detail::u32FieldExceeds(cfg, bytecode::kI2SConfigTimeoutOffset,
-                                                           _config.max_bus_timeout_ms) ||
-                                   detail::u32FieldExceeds(cfg, bytecode::kI2SConfigWriteTimeoutOffset,
+                        exceeded = detail::u32FieldExceeds(cfg, bytecode::kI2SConfigWriteTimeoutOffset,
                                                            _config.max_bus_timeout_ms);
                         break;
+                    // SPI carries no wire-time field anymore (its former
+                    // timeout_ms was lock-only); nothing to bound.
                     default:
                         break;
                 }
@@ -168,7 +162,7 @@ error_t Server::prescan(data::ConstDataSpan script, size_t& offset) const
         } else if (opcode == static_cast<uint8_t>(bytecode::OpCode::bus_transfer)) {
             // payload: [kind:1][bus_id:1][store_id:1][rx_len:LenVar]...
             // (mirrors BytecodeRunner::opBusTransfer). Cap the up-front rx
-            // allocation a wire message can request (S16 D8).
+            // allocation a wire message can request.
             if (payload.size > 3) {
                 const auto rx_len = bytecode::decodeLenVar(data::ConstDataSpan{payload.data + 3, payload.size - 3});
                 if (rx_len.valid && rx_len.consumed != 0 && rx_len.value > _config.max_transfer_rx) {
@@ -693,7 +687,7 @@ result_t<void> RemoteSession::awaitReply(AwaitKind kind, uint8_t seq)
         const uint8_t kind4 = type & kTypeKindMask;
         const data::ConstDataSpan body{msg + 2, msg_size - 2};
         if (kind4 == static_cast<uint8_t>(MessageType::error)) {
-            // Record ANY error message regardless of its seq (S16 D3):
+            // Record ANY error message regardless of its seq:
             // the server clears its pending NORESP error once the frame
             // is sent, so an error whose delivery crosses a host-side
             // timeout carries the seq of the timed-out exchange — a
@@ -712,7 +706,7 @@ result_t<void> RemoteSession::awaitReply(AwaitKind kind, uint8_t seq)
             // reaches the registered gpio event handler (lossy: ignore
             // run errors). runEvent keeps the request state intact —
             // an event arriving here must not clobber the response the
-            // caller is about to read (S16 D8).
+            // caller is about to read.
             (void)_runner.runEvent(body);
             continue;
         }
@@ -861,14 +855,14 @@ result_t<size_t> RemoteSession::poll(size_t max_frames)
                 _event_handler(_event_ctx, msg[1], body);
             }
             // runEvent: an idle-poll event must not clobber the stored
-            // data / report state of the previous request (S16 D8).
+            // data / report state of the previous request.
             (void)_runner.runEvent(body);
             ++events;
             continue;
         }
         if (kind4 == static_cast<uint8_t>(MessageType::error)) {
             // An error frame that crossed a host-side timeout can land in
-            // an idle poll; record it like awaitReply does (S16 D3) — it
+            // an idle poll; record it like awaitReply does — it
             // is not counted as an event.
             if (body.size >= 1) {
                 _last_remote_error = mapRemoteError(static_cast<int8_t>(body.data[0]));
@@ -882,7 +876,7 @@ result_t<size_t> RemoteSession::poll(size_t max_frames)
 
 // ---- RemoteI2CBus -------------------------------------------------------------
 
-result_t<void> RemoteI2CBus::init(const i2c::I2CBusConfig& config)
+result_t<void> RemoteI2CBus::init(const i2c::IBusConfig& config)
 {
     _config = config;
     return {};
@@ -982,14 +976,14 @@ result_t<size_t> proxyTransfer(RemoteSession* session, uint8_t remote_bus_id, co
         }
         rx_got = stored.size;
     }
-    // Data phase only, like every local backend (S16 D4): the prefix is
+    // Data phase only, like every local backend: the prefix is
     // not counted.
     return tx_len + rx_got;
 }
 
 }  // namespace detail
 
-result_t<size_t> RemoteI2CBus::transfer(bus::Accessor* owner, const i2c::I2CMasterAccessConfig& cfg,
+result_t<size_t> RemoteI2CBus::transfer(bus::IAccessor* owner, const i2c::MasterAccessConfig& cfg,
                                         const i2c::TransferDesc& desc, data::Source* tx, data::Sink* rx)
 {
     (void)owner;
@@ -998,13 +992,13 @@ result_t<size_t> RemoteI2CBus::transfer(bus::Accessor* owner, const i2c::I2CMast
 
 // ---- RemoteSPIBus -------------------------------------------------------------
 
-result_t<void> RemoteSPIBus::init(const spi::SPIBusConfig& config)
+result_t<void> RemoteSPIBus::init(const spi::IBusConfig& config)
 {
     _config = config;
     return {};
 }
 
-result_t<size_t> RemoteSPIBus::transfer(bus::Accessor* owner, const spi::SPIMasterAccessConfig& cfg,
+result_t<size_t> RemoteSPIBus::transfer(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg,
                                         const spi::TransferDesc& desc, data::Source* tx, data::Sink* rx)
 {
     (void)owner;
@@ -1013,7 +1007,7 @@ result_t<size_t> RemoteSPIBus::transfer(bus::Accessor* owner, const spi::SPIMast
 
 // ---- RemoteUARTBus ------------------------------------------------------------
 
-result_t<void> RemoteUARTBus::init(const uart::UARTBusConfig& config)
+result_t<void> RemoteUARTBus::init(const uart::IBusConfig& config)
 {
     _config = config;
     return {};
@@ -1036,7 +1030,7 @@ result_t<size_t> RemoteUARTBus::runScript(data::ConstDataSpan script, uint32_t r
     return size_t{0};
 }
 
-result_t<size_t> RemoteUARTBus::write(bus::Accessor* owner, const uart::UARTAccessConfig& cfg, data::Source* tx,
+result_t<size_t> RemoteUARTBus::write(bus::IAccessor* owner, const uart::AccessConfig& cfg, data::Source* tx,
                                       size_t len)
 {
     (void)owner;
@@ -1093,8 +1087,7 @@ result_t<size_t> RemoteUARTBus::write(bus::Accessor* owner, const uart::UARTAcce
     return tx_len;
 }
 
-result_t<size_t> RemoteUARTBus::read(bus::Accessor* owner, const uart::UARTAccessConfig& cfg, data::Sink* rx,
-                                     size_t len)
+result_t<size_t> RemoteUARTBus::read(bus::IAccessor* owner, const uart::AccessConfig& cfg, data::Sink* rx, size_t len)
 {
     (void)owner;
     if (_session == nullptr || rx == nullptr) {
@@ -1150,7 +1143,7 @@ result_t<size_t> RemoteUARTBus::read(bus::Accessor* owner, const uart::UARTAcces
     return stored.size;  // remote short reads come through as-is
 }
 
-result_t<size_t> RemoteUARTBus::readableBytes(bus::Accessor* owner, const uart::UARTAccessConfig& cfg)
+result_t<size_t> RemoteUARTBus::readableBytes(bus::IAccessor* owner, const uart::AccessConfig& cfg)
 {
     (void)owner;
     (void)cfg;
@@ -1205,7 +1198,7 @@ RemoteI2SBus::~RemoteI2SBus()
     }
 }
 
-result_t<void> RemoteI2SBus::init(const i2s::I2SBusConfig& config)
+result_t<void> RemoteI2SBus::init(const i2s::IBusConfig& config)
 {
     _config = config;
     return {};
@@ -1261,12 +1254,12 @@ result_t<void> RemoteI2SBus::syncStatus()
     return {};
 }
 
-result_t<void> RemoteI2SBus::syncConfig(const i2s::I2SAccessConfig& cfg)
+result_t<void> RemoteI2SBus::syncConfig(const i2s::AccessConfig& cfg)
 {
     // Send the device a non-blocking write timeout: credit, not the server
     // poll, does the waiting (spec §I2S proxy).
-    i2s::I2SAccessConfig wire_cfg = cfg;
-    wire_cfg.write_timeout_ms     = 0;
+    i2s::AccessConfig wire_cfg = cfg;
+    wire_cfg.write_timeout_ms  = 0;
 
     uint8_t script_buf[64];
     data::MemorySink sink{data::DataSpan{script_buf, sizeof(script_buf)}};
@@ -1297,8 +1290,7 @@ result_t<void> RemoteI2SBus::syncConfig(const i2s::I2SAccessConfig& cfg)
     return {};
 }
 
-result_t<size_t> RemoteI2SBus::write(bus::Accessor* owner, const i2s::I2SAccessConfig& cfg, data::Source* tx,
-                                     size_t len)
+result_t<size_t> RemoteI2SBus::write(bus::IAccessor* owner, const i2s::AccessConfig& cfg, data::Source* tx, size_t len)
 {
     (void)owner;
     if (_session == nullptr) {
@@ -1308,7 +1300,7 @@ result_t<size_t> RemoteI2SBus::write(bus::Accessor* owner, const i2s::I2SAccessC
     // Apply a changed (or first) AccessConfig and re-sync the credit baseline.
     const bool cfg_changed = !_configured || cfg.sample_rate_hz != _applied_cfg.sample_rate_hz ||
                              cfg.bits_per_sample != _applied_cfg.bits_per_sample ||
-                             cfg.channels != _applied_cfg.channels || cfg.timeout_ms != _applied_cfg.timeout_ms ||
+                             cfg.channels != _applied_cfg.channels ||
                              cfg.write_timeout_ms != _applied_cfg.write_timeout_ms;
     if (cfg_changed) {
         auto s = syncConfig(cfg);
@@ -1326,7 +1318,7 @@ result_t<size_t> RemoteI2SBus::write(bus::Accessor* owner, const i2s::I2SAccessC
 #endif
 
     // A null `tx` stages nothing: return 0 like the local espidf
-    // implementation (same I2SBus::write contract).
+    // implementation (same IBus::write contract).
     while (done < len && tx != nullptr && !tx->eof()) {
         uint32_t cr = credit();
         {
@@ -1433,7 +1425,7 @@ result_t<size_t> RemoteI2SBus::write(bus::Accessor* owner, const i2s::I2SAccessC
     return done;
 }
 
-result_t<size_t> RemoteI2SBus::writableBytes(bus::Accessor* owner, const i2s::I2SAccessConfig& cfg)
+result_t<size_t> RemoteI2SBus::writableBytes(bus::IAccessor* owner, const i2s::AccessConfig& cfg)
 {
     (void)owner;
     (void)cfg;

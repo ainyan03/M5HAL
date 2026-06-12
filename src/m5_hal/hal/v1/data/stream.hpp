@@ -67,6 +67,55 @@ struct StreamWriter {
 };
 
 /*!
+  @brief Read from `reader` until a delimiter byte is stored.
+
+  Fills `dst` one byte at a time until `delim` is stored, `dst` is
+  full, or the reader's own timeout policy expires (a zero-byte read).
+  Line-oriented protocols (NMEA sentences, AT command responses, ...)
+  are the target: the loop, the bound, and the termination test live
+  here once instead of in every sketch.
+
+  Contract:
+  - The return value is the number of bytes stored. **The delimiter is
+    included** when it arrived, so completion is decided from the data
+    alone: `n > 0 && dst.data[n - 1] == delim` = a complete line,
+    anything else = a partial read (timeout or a full `dst`). This is
+    deliberately unlike Arduino's `readBytesUntil`, which strips the
+    delimiter and leaves complete and cut-off lines indistinguishable.
+  - A timeout is NOT an error: the partial bytes are stored and their
+    count is returned (possibly 0). Timeout pacing follows the
+    reader's policy (for UART accessors: first-byte / inter-byte
+    timeouts from the access config).
+  - A hard reader error is returned as that error; bytes stored before
+    the failure are in `dst` but the caller should not trust them.
+
+  Works on any `StreamReader`; `uart::RxAccessor::readUntil` wraps this
+  in a single RX channel-lock window.
+ */
+inline m5::hal::v1::result_t<size_t> readUntil(StreamReader& reader, uint8_t delim, DataSpan dst)
+{
+    if (dst.data == nullptr || dst.size == 0) {
+        return m5::stl::make_unexpected(m5::hal::v1::error::error_t::INVALID_ARGUMENT);
+    }
+    size_t total = 0;
+    while (total < dst.size) {
+        uint8_t b = 0;
+        auto r    = reader.read(DataSpan{&b, 1});
+        if (!r.has_value()) {
+            return m5::stl::make_unexpected(r.error());
+        }
+        if (r.value() == 0) {
+            break;  // the reader's timeout expired: a partial read is normal
+        }
+        dst.data[total++] = b;
+        if (b == delim) {
+            break;
+        }
+    }
+    return total;
+}
+
+/*!
   @brief Adapter that exposes a `StreamReader` as a `Source`.
 
   The caller supplies a non-owning scratch buffer; peeked-but-not-yet-
@@ -299,9 +348,9 @@ public:
         if (wrote.value() != N) {
             // A short write's dominant cause is the writer's own write
             // timeout — classify it as TIMEOUT_ERROR (retryable), symmetric
-            // with the read side, instead of a fatal-looking IO_ERROR
-            // (S16 D10). NOTE: bytes may sit half-flushed on the wire; the
-            // caller decides whether to resync/retransmit.
+            // with the read side, instead of a fatal-looking IO_ERROR.
+            // NOTE: bytes may sit half-flushed on the wire; the caller
+            // decides whether to resync/retransmit.
             return m5::stl::make_unexpected(m5::hal::v1::error::error_t::TIMEOUT_ERROR);
         }
         return {};

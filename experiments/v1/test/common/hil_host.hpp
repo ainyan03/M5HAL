@@ -60,9 +60,9 @@ inline uint32_t baudEnv(uint32_t fallback = 115200)
 }
 
 // A timing profile generous enough to cover the echo round-trip latency.
-inline uart::UARTAccessConfig ioConfig(uint32_t baud)
+inline uart::AccessConfig ioConfig(uint32_t baud)
 {
-    uart::UARTAccessConfig cfg;
+    uart::AccessConfig cfg;
     cfg.baud_rate             = baud;
     cfg.first_byte_timeout_ms = 300;
     cfg.inter_byte_timeout_ms = 50;
@@ -72,7 +72,7 @@ inline uart::UARTAccessConfig ioConfig(uint32_t baud)
 
 // Accumulate exactly `len` bytes (the peer may deliver them in chunks). Returns
 // the count actually read (== len on success).
-inline size_t readExact(uart::UARTRxAccessor& dev, uint8_t* dst, size_t len, int max_reads)
+inline size_t readExact(uart::RxAccessor& dev, uint8_t* dst, size_t len, int max_reads)
 {
     size_t got = 0;
     for (int i = 0; i < max_reads && got < len; ++i) {
@@ -90,7 +90,7 @@ inline size_t readExact(uart::UARTRxAccessor& dev, uint8_t* dst, size_t len, int
 
 // Read and discard everything pending until the line is idle for one timeout.
 // Clears boot-ROM noise / stale bytes before a clean exchange.
-inline void drain(uart::UARTRxAccessor& dev)
+inline void drain(uart::RxAccessor& dev)
 {
     uint8_t scratch[256];
     for (int i = 0; i < 64; ++i) {
@@ -118,13 +118,13 @@ inline bool openSynced(uart::Bus& bus, const char* port, uint32_t baud)
         (void)::ioctl(fd, TIOCMBIC, &bits);
     }
 
-    uart::UARTAccessConfig sync_cfg;
+    uart::AccessConfig sync_cfg;
     sync_cfg.baud_rate             = baud;
     sync_cfg.first_byte_timeout_ms = 150;
     sync_cfg.inter_byte_timeout_ms = 30;
     sync_cfg.write_timeout_ms      = 300;
-    uart::UARTTxAccessor tx{bus, sync_cfg};
-    uart::UARTRxAccessor rx_dev{bus, sync_cfg};
+    uart::TxAccessor tx{bus, sync_cfg};
+    uart::RxAccessor rx_dev{bus, sync_cfg};
 
     static const uint8_t marker[] = {0xA5, 0x5A, 0xC3, 0x3C};
     for (int attempt = 0; attempt < 24; ++attempt) {

@@ -11,41 +11,34 @@
 
 #if defined(ARDUINO)
 
-namespace m5::variants::frameworks::arduino::hal::v1::i2c {
+namespace m5::hal::v1::i2c {
 
-using namespace ::m5::hal::v1;  // resolve unqualified interface::/types::/bus:: refs
-
-struct BusConfig : public ::m5::hal::v1::i2c::I2CBusConfig {
+struct BusConfig_arduino : public ::m5::hal::v1::i2c::IBusConfig {
     ::TwoWire* wire = nullptr;
 
-    constexpr BusConfig(void) : ::m5::hal::v1::i2c::I2CBusConfig{}
-    {
-    }
-    constexpr BusConfig(::TwoWire* wire_, ::m5::hal::v1::types::gpio_number_t scl,
-                        ::m5::hal::v1::types::gpio_number_t sda)
-        : ::m5::hal::v1::i2c::I2CBusConfig{scl, sda}, wire{wire_}
+    constexpr BusConfig_arduino(void) : ::m5::hal::v1::i2c::IBusConfig{}
     {
     }
 };
 
 // I2C bus that delegates to an explicitly provided Arduino TwoWire instance.
-// `init(BusConfig)` calls begin/end on that instance; `attach(TwoWire&)` leaves
+// `init(BusConfig_arduino)` calls begin/end on that instance; `attach(TwoWire&)` leaves
 // lifecycle ownership to the caller.
-class Bus : public ::m5::hal::v1::i2c::I2CBus {
+class Bus_arduino : public ::m5::hal::v1::i2c::IBus {
 public:
-    ~Bus() override
+    ~Bus_arduino() override
     {
         release();
     }
 
-    // Typed init: takes this variant's BusConfig (S17 E1). Passing the
-    // abstract I2CBusConfig (or a sibling variant's config) is a
+    // Typed init: takes this variant's BusConfig_arduino. Passing the
+    // abstract IBusConfig (or a sibling variant's config) is a
     // compile error instead of a silent bad downcast.
-    ::m5::hal::v1::result_t<void> init(const BusConfig& config);
+    ::m5::hal::v1::result_t<void> init(const BusConfig_arduino& config);
     ::m5::hal::v1::result_t<void> release(void) override;
 
-    ::m5::hal::v1::result_t<size_t> transfer(::m5::hal::v1::bus::Accessor* owner,
-                                             const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg,
+    ::m5::hal::v1::result_t<size_t> transfer(::m5::hal::v1::bus::IAccessor* owner,
+                                             const ::m5::hal::v1::i2c::MasterAccessConfig& cfg,
                                              const ::m5::hal::v1::i2c::TransferDesc& desc,
                                              ::m5::hal::v1::data::Source* tx, ::m5::hal::v1::data::Sink* rx) override;
 
@@ -62,7 +55,7 @@ private:
     uint32_t _last_timeout_ms = 0xFFFFFFFFu;  // sentinel: no setTimeOut call yet
 };
 
-}  // namespace m5::variants::frameworks::arduino::hal::v1::i2c
+}  // namespace m5::hal::v1::i2c
 
 #endif
 

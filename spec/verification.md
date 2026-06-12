@@ -14,16 +14,16 @@ M5HAL v1 開発で使う検証コマンドとその運用詳細を示す。
 | クロスチェック v1 | v1 公開 entry と主要 API surface の native + ESP32/S3/C3/C6 Arduino/ESP-IDF build fence | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v1/check.ini.cli pio run -e v1_check_native -e v1_check_esp32_arduino -e v1_check_esp32_espidf -e v1_check_esp32_espidf4 -e v1_check_esp32_espidf6 -e v1_check_esp32s3_arduino -e v1_check_esp32s3_espidf -e v1_check_esp32s3_espidf6 -e v1_check_esp32c3_arduino -e v1_check_esp32c3_espidf -e v1_check_esp32c6_espidf` |
 | v1 inline flip fence | `m5::hal::*` が v1 に resolve される構成の確認 | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v1/check.ini.cli pio run -e v1_check_native_inline` |
 | v0/v1 共存 fence (device) | 同一 TU で両エントリを include し、 include ガードの世代分離と platform checker の macro 名前空間分離 (v0 = 無印 / v1 = `M5HAL_V1_`) を device build で保証 (native 側は `test_coexist_include`) | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v0v1/check.ini.cli pio run -e v0v1_check_esp32_arduino -e v0v1_check_esp32s3_arduino -e v0v1_check_esp32_espidf` |
-| examples build | `examples/v1/HowToUse/I2C` / `SPI` / `UART` / `UARTEcho` の ESP32 / ESP32-S3 ビルド + `Bytecode` (Core BASIC 前提、ESP32 のみ) | `pio run -e HowToUse_I2C_esp32 -e HowToUse_I2C_esp32s3 -e HowToUse_SPI_esp32 -e HowToUse_SPI_esp32s3 -e HowToUse_UART_esp32 -e HowToUse_UART_esp32s3 -e HowToUse_UARTEcho_esp32 -e HowToUse_UARTEcho_esp32s3 -e HowToUse_Bytecode_esp32` |
+| examples build | `examples/v1/HowToUse/I2C` / `SPI` / `UART` / `UARTEcho` / `I2SAudio` の ESP32 / ESP32-S3 ビルド + `Bytecode` (Core BASIC 前提、ESP32 のみ) | `pio run -e HowToUse_I2C_esp32 -e HowToUse_I2C_esp32s3 -e HowToUse_SPI_esp32 -e HowToUse_SPI_esp32s3 -e HowToUse_UART_esp32 -e HowToUse_UART_esp32s3 -e HowToUse_UARTEcho_esp32 -e HowToUse_UARTEcho_esp32s3 -e HowToUse_I2SAudio_esp32 -e HowToUse_I2SAudio_esp32s3 -e HowToUse_Bytecode_esp32` |
 | remote harness build | リモートバス統合ハーネス `experiments/v1/RemoteMenu` (device 4 構成 + PC 側 CLI メニュー)。arduino framework のソケット層 fence と WiFi ゼロコスト対照を兼ねる | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v1/experiments_advanced.ini.cli pio run -e v1_exp_remote_arduino -e v1_exp_remote_idf5 -e v1_exp_remote_host -e v1_exp_remote_tcp_arduino -e v1_exp_remote_tcp_idf5` |
 | I2C variant 実機切替 | BoardMenu で Arduino / Software / ESP-IDF I2C backend を切り替えて scan / register read | `pio run -e v1_exp_menu_arduino -t upload` |
-| software SPI logic analyzer | software SPI の SCLK/MOSI/CS/DC wire activity smoke test | `pio run -e v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino` |
-| software SPI 5MHz / NDEBUG | software SPI の高周波設定と `M5HAL_ASSERT` 無効化の比較 | `pio run -e v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino_5mhz -e v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino_5mhz_ndebug` |
-| software SPI wire self-test | ESP32 実機で低速 software SPI の command/address/dummy/data、bit order、mode edge semantic を GPIO capture で判定 | `pio test -e v1_test_esp32_arduino_software_spi_wire` |
-| espidf SPI wire self-test | 同じ wire 契約を ESP-IDF hardware spi_master backend で判定 (capture rig は共通 `test/v1/embedded/bus/spi_wire_capture.hpp`) | `pio test -e v1_test_esp32_arduino_espidf_spi_wire` |
+| software SPI logic analyzer | software SPI の SCLK/MOSI/CS/DC wire activity smoke test | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v1/experiments_advanced.ini.cli pio run -e v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino` |
+| software SPI 5MHz / NDEBUG | software SPI の高周波設定と `M5HAL_ASSERT` 無効化の比較 | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v1/experiments_advanced.ini.cli pio run -e v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino_5mhz -e v1_experiment_SoftwareSPILogicAnalyzer_esp32_arduino_5mhz_ndebug` |
+| software SPI wire self-test | ESP32 実機で低速 software SPI の command/address/dummy/data、bit order、mode edge semantic を GPIO capture で判定 | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v1/test.ini.cli pio test -e v1_test_esp32_arduino_software_spi_wire` |
+| espidf SPI wire self-test | 同じ wire 契約を ESP-IDF hardware spi_master backend で判定 (capture rig は共通 `test/v1/embedded/bus/spi_wire_capture.hpp`) | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v1/test.ini.cli pio test -e v1_test_esp32_arduino_espidf_spi_wire` |
 | ESP-IDF I2C smoke | BoardMenu の純 ESP-IDF env で ESP-IDF I2C backend を選び bus init → scan → register read | `pio run -e v1_exp_menu_idf5 -t upload` |
 | ESP-IDF SPI build check | ESP-IDF framework variant の SPI master backend が public v1 header から見えることを確認 (wire semantic は上記 espidf SPI wire self-test で実機判定) | `pio run -e v1_check_esp32_espidf` |
-| software I2C hot path | bit-bang I2C の timer / virtual GPIO / write buffer state machine の切り分け | `pio run -e v1_experiment_I2CHotPathBenchmark_esp32_arduino` |
+| software I2C hot path | bit-bang I2C の timer / virtual GPIO / write buffer state machine の切り分け | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v1/experiments_advanced.ini.cli pio run -e v1_experiment_I2CHotPathBenchmark_esp32_arduino` |
 | M5UU 破壊検出 | M5UnitUnified との互換性確認 | 下記参照 |
 | clang-format | コードフォーマット検証 | 下記参照 |
 
@@ -90,7 +90,7 @@ command/address/dummy/data phase の意味を低速 capture で確認する。
 
 `I2CHotPathBenchmark` は外部 I2C slave を必要とせず、 software I2C の hot path を分解して測るための sketch。 `fastTick loop` は timer 取得コスト、 `virtual line ops` は line driver の仮想呼び出しと read/write の上限、 `write buffer forced due` / `write buffer timed` は byte 列送信 state machine、 `read buffer forced due` / `read buffer timed` は byte 列受信 state machine の内部上限を見る。
 
-software I2C の protocol-level native test は `test/v1/native/bus/test_software_i2c/` にある。 当初の `MockI2CSlave` 案は、現在は `I2CSlaveService` と `VirtualOpenDrainBus` の組み合わせとして実装済み。 probe ACK、write、read-only、write-then-read、address NACK、data NACK、clock stretch timeout、STOP 時 SDA stuck-low、read 最終 byte の master NACK 観測を固定している。
+software I2C の protocol-level native test は `test/v1/native/bus/test_software_i2c/` にある。 当初の `MockSlave` 案は、現在は `SlaveService` と `VirtualOpenDrainBus` の組み合わせとして実装済み。 probe ACK、write、read-only、write-then-read、address NACK、data NACK、clock stretch timeout、STOP 時 SDA stuck-low、read 最終 byte の master NACK 観測を固定している。
 
 この sketch の `est kHz` は synthetic line driver 上の内部推定であり、 wire 上の実測周波数ではない。 実機の SCL/SDA は pull-up 抵抗、配線長、接続 device 数、bus capacitance、ロジアナ閾値の影響を受ける。 特に 400kHz を超える software I2C 検証では、SCL/SDA の pull-up が弱いと rise time が支配的になり、 code hot path より低い周波数で頭打ちになる。
 
