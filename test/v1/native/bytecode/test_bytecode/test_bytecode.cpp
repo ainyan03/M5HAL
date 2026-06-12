@@ -77,7 +77,7 @@ m5::stl::expected<size_t, error_t> drainAndFeed(data::Source* tx, data::Sink* rx
 
 class CaptureI2CBus : public i2c::I2CBus {
 public:
-    m5::stl::expected<void, error_t> init(const bus::BusConfig&) override
+    m5::stl::expected<void, error_t> init(const i2c::I2CBusConfig&)
     {
         return {};
     }
@@ -106,7 +106,7 @@ public:
 
 class CaptureSPIBus : public spi::SPIBus {
 public:
-    m5::stl::expected<void, error_t> init(const bus::BusConfig&) override
+    m5::stl::expected<void, error_t> init(const spi::SPIBusConfig&)
     {
         return {};
     }
@@ -160,12 +160,9 @@ public:
 // reports a programmable writableBytes.
 class StubI2SBus : public i2s::I2SBus {
 public:
-    m5::stl::expected<void, error_t> init(const bus::BusConfig& config) override
+    m5::stl::expected<void, error_t> init(const i2s::I2SBusConfig& config)
     {
-        if (config.getBusKind() != types::bus_kind_t::I2S) {
-            return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
-        }
-        _config = static_cast<const i2s::I2SBusConfig&>(config);
+        _config = config;
         return {};
     }
     m5::stl::expected<size_t, error_t> write(bus::Accessor*, const i2s::I2SAccessConfig& cfg, data::Source* tx,

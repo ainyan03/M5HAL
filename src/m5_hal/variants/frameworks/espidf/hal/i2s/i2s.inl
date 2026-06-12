@@ -93,16 +93,13 @@ bool Bus::onSentCallback(::i2s_chan_handle_t /*handle*/, ::i2s_event_data_t* eve
 // ---------------------------------------------------------------------------
 // init
 // ---------------------------------------------------------------------------
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const ::m5::hal::v1::bus::BusConfig& config)
+m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig& config)
 {
-    if (config.getBusKind() != ::m5::hal::v1::types::bus_kind_t::I2S) {
-        return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
-    }
     // Re-init: tear down any existing channel first — clearing the handle
     // without `i2s_del_channel` would leak the old channel with its DMA
     // still running.
     destroyChannel();
-    _config          = static_cast<const ::m5::hal::v1::i2s::I2SBusConfig&>(config);
+    _config          = config;
     _configured      = false;
     _channel_enabled = false;
     _dma_in_flight.store(0, std::memory_order_relaxed);

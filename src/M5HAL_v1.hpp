@@ -17,6 +17,7 @@ M5HAL_INLINE_V1 namespace v1
 }  // namespace hal
 }  // namespace m5
 
+#include "./m5_hal/variants/ids.hpp"
 #include "./m5_hal/variants/platforms/_checker.hpp"
 #include "./m5_hal/variants/frameworks/_checker.hpp"
 #include "./m5_hal/hal/v1/i2c/i2c.hpp"
@@ -45,7 +46,7 @@ M5HAL_INLINE_V1 namespace v1
 
 #define M5HAL_STATIC_MACRO_PATH_HEADER M5HAL_STATIC_MACRO_CONCAT(M5HAL_V1_TARGET_PLATFORM_PATH, hal.hpp)
 
-#if M5HAL_V1_TARGET_PLATFORM_NUMBER != 0
+#if M5HAL_V1_TARGET_PLATFORM_VARIANT_ID != M5HAL_V1_VARIANT_ID_NONE
 #include M5HAL_STATIC_MACRO_PATH_HEADER
 #endif
 
@@ -93,7 +94,7 @@ M5HAL_INLINE_V1 namespace v1
 
 // 1. platform _offer.hpp scan
 #define M5HAL_STATIC_MACRO_PATH_OFFER M5HAL_STATIC_MACRO_CONCAT(M5HAL_V1_TARGET_PLATFORM_PATH, _offer.hpp)
-#if M5HAL_V1_TARGET_PLATFORM_NUMBER != 0
+#if M5HAL_V1_TARGET_PLATFORM_VARIANT_ID != M5HAL_V1_VARIANT_ID_NONE
 #define M5HAL_VARIANT_PLATFORM_ 1
 #include M5HAL_STATIC_MACRO_PATH_OFFER
 #include "./m5_hal/_macro/offer_all.inl"
@@ -130,6 +131,26 @@ M5HAL_INLINE_V1 namespace v1
 // 6. stub fallback _offer.hpp scan (always last)
 #include "./m5_hal/variants/frameworks/stub/_offer.hpp"
 #include "./m5_hal/_macro/offer_all.inl"
+
+// Selected-variant markers: the scan passes above burned the winner's id
+// into M5HAL_V1_SELECTED_VARIANT_<KIND> for every offered kind. Default
+// the unoffered kinds to NONE so `#if M5HAL_V1_SELECTED_VARIANT_<KIND>
+// == ...` comparisons are always well-formed.
+#ifndef M5HAL_V1_SELECTED_VARIANT_GPIO
+#define M5HAL_V1_SELECTED_VARIANT_GPIO M5HAL_V1_VARIANT_ID_NONE
+#endif
+#ifndef M5HAL_V1_SELECTED_VARIANT_I2C
+#define M5HAL_V1_SELECTED_VARIANT_I2C M5HAL_V1_VARIANT_ID_NONE
+#endif
+#ifndef M5HAL_V1_SELECTED_VARIANT_SPI
+#define M5HAL_V1_SELECTED_VARIANT_SPI M5HAL_V1_VARIANT_ID_NONE
+#endif
+#ifndef M5HAL_V1_SELECTED_VARIANT_I2S
+#define M5HAL_V1_SELECTED_VARIANT_I2S M5HAL_V1_VARIANT_ID_NONE
+#endif
+#ifndef M5HAL_V1_SELECTED_VARIANT_UART
+#define M5HAL_V1_SELECTED_VARIANT_UART M5HAL_V1_VARIANT_ID_NONE
+#endif
 
 // ----- M5HALCore (singleton HAL object layer) -----
 //

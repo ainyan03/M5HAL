@@ -51,17 +51,13 @@ namespace {
     return ::m5::hal::v1::error::error_t::OK;
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const ::m5::hal::v1::bus::BusConfig& config)
+m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig& config)
 {
-    if (config.getBusKind() != ::m5::hal::v1::types::bus_kind_t::I2C) {
-        return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
-    }
-    const auto& i2c_config = static_cast<const BusConfig&>(config);
-    _config                = i2c_config;
+    _config = config;
     if (_wire) {
         (void)release();
     }
-    auto* wire = i2c_config.wire;
+    auto* wire = config.wire;
     if (wire == nullptr) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }

@@ -66,13 +66,9 @@ bool isValidAddress(const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg)
     return ::m5::hal::v1::error::error_t::OK;
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const ::m5::hal::v1::bus::BusConfig& config)
+m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig& config)
 {
-    if (config.getBusKind() != ::m5::hal::v1::types::bus_kind_t::I2C) {
-        return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
-    }
-    const auto& i2c_config = static_cast<const BusConfig&>(config);
-    _config                = i2c_config;
+    _config = config;
     if (_config.pin_scl < 0 || _config.pin_sda < 0) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
@@ -81,7 +77,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const ::m5::hal
     }
 
     ::i2c_master_bus_config_t bus_config    = {};
-    bus_config.i2c_port                     = i2c_config.i2c_port;
+    bus_config.i2c_port                     = config.i2c_port;
     bus_config.scl_io_num                   = static_cast<::gpio_num_t>(_config.pin_scl);
     bus_config.sda_io_num                   = static_cast<::gpio_num_t>(_config.pin_sda);
     bus_config.clk_source                   = I2C_CLK_SRC_DEFAULT;

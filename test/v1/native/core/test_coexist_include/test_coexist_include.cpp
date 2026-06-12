@@ -19,12 +19,13 @@
 #include <gtest/gtest.h>
 
 // The platform checkers keep generation-separated macro namespaces:
-// v0 owns the unprefixed names, v1 owns the M5HAL_V1_-prefixed ones.
-// On native both must resolve to "unknown" independently.
+// v0 owns the unprefixed names, v1 reports through the variant-id
+// registry (S18). On native both must resolve to "unknown" / NONE
+// independently.
 static_assert(M5HAL_TARGET_PLATFORM_NUMBER == M5HAL_PLATFORM_NUMBER_UNKNOWN,
               "v0 platform number clobbered");
-static_assert(M5HAL_V1_TARGET_PLATFORM_NUMBER == M5HAL_V1_PLATFORM_NUMBER_UNKNOWN,
-              "v1 platform number missing or clobbered");
+static_assert(M5HAL_V1_TARGET_PLATFORM_VARIANT_ID == M5HAL_V1_VARIANT_ID_NONE,
+              "v1 platform variant id missing or clobbered");
 
 TEST(CoexistInclude, BothGenerationsVisibleInOneTU)
 {

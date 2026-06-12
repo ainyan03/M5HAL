@@ -15,6 +15,16 @@
 #define M5HAL_FRAMEWORK_HAS_ARDUINO 0
 #endif
 
+// The arduino variant is implemented against the arduino-esp32 core only
+// (TwoWire::begin(sda, scl), SPIClass::transferBytes, ...), and no other
+// variant covers a non-ESP32 Arduino core either (software depends on
+// <thread>). Fail loudly here instead of letting the build die deep
+// inside a variant header. Remove this gate when a non-ESP32 Arduino
+// core gains a supported variant set. See spec/design/variants.md.
+#if defined(ARDUINO) && !defined(ESP_PLATFORM)
+#error "M5HAL currently supports the arduino-esp32 core only; this Arduino core is not yet supported."
+#endif
+
 // ESP-IDF detection. ESP_PLATFORM means the ESP-IDF API surface is
 // available, including Arduino-on-IDF and ESP-IDF projects that add
 // Arduino as a component. When multiple framework variants offer the same

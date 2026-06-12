@@ -167,16 +167,12 @@ bool Bus::baudToSpeed(uint32_t baud, uint32_t& out_speed)
     return true;
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const ::m5::hal::v1::bus::BusConfig& config)
+m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig& config)
 {
-    if (config.getBusKind() != ::m5::hal::v1::types::bus_kind_t::UART) {
-        return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
-    }
     (void)release();
-    const auto& uart_config = static_cast<const BusConfig&>(config);
-    _config                 = uart_config;
-    _device_path            = uart_config.device_path;  // termios open is lazy (first write/read)
-    _tx_coalesce            = uart_config.tx_coalesce_bytes;
+    _config      = config;
+    _device_path = config.device_path;  // termios open is lazy (first write/read)
+    _tx_coalesce = config.tx_coalesce_bytes;
     return {};
 }
 

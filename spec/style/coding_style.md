@@ -49,7 +49,7 @@ using namespace ::m5::hal::v1;  // resolve unqualified types::/bus:: refs
 | ローカル変数・引数 | lower_snake_case | `delay_cycle`, `cb_obj` |
 | 定数 (constexpr) | 用途に応じる (`kCamelCase` または `UPPER_SNAKE_CASE`) | `kDefaultTimeoutMs` |
 | enum class 値 | **基本** UpperCamelCase。 **例外として** エラーコード等 C 互換 / POSIX 慣習を意識する定数群は UPPER_SNAKE_CASE 許容 | `BusKind::I2C`, `GpioMode::Output` / 許容例: `error_t::OK`, `error_t::I2C_NO_ACK` |
-| 機能・設定マクロ | `M5HAL_` プレフィックス (アンダースコアなし) + UPPER_SNAKE_CASE。 世代間で値が異なり得るものは `M5HAL_V1_` で世代分離 | `M5HAL_V1_TARGET_PLATFORM_NUMBER`, `M5HAL_ASSERT` |
+| 機能・設定マクロ | `M5HAL_` プレフィックス (アンダースコアなし) + UPPER_SNAKE_CASE。 世代間で値が異なり得るものは `M5HAL_V1_` で世代分離 | `M5HAL_V1_TARGET_PLATFORM_VARIANT_ID`, `M5HAL_ASSERT` |
 | ヘッダガード | `M5_HAL_<PATH>_HPP` (`M5_HAL_` = アンダースコアあり、 パスベース) | `M5_HAL_TYPES_HPP`, `M5_HAL_GPIO_GROUP_HPP_` |
 
 ### 先頭アンダースコア方式の制約
@@ -140,7 +140,7 @@ RAII 型:
 
 M5HAL のマクロは用途で 2 系統に分かれる (実態に基づく規約):
 
-- **機能・設定マクロは `M5HAL_` プレフィックス** (アンダースコアなし) + UPPER_SNAKE_CASE — 機能フラグ・外部定義の上書き・assert 等。 例: `M5HAL_FRAMEWORK_HAS_*`, `M5HAL_V1_PLATFORM_NUMBER_*`, `M5HAL_VARIANT_CURRENT_*`, `M5HAL_ASSERT`。 世代間で値が異なり得るものは `M5HAL_V1_` で世代分離する (無印は凍結 v0 が所有。 [../design/v0_v1_coexistence.md](../design/v0_v1_coexistence.md) §制約)
+- **機能・設定マクロは `M5HAL_` プレフィックス** (アンダースコアなし) + UPPER_SNAKE_CASE — 機能フラグ・外部定義の上書き・assert 等。 例: `M5HAL_FRAMEWORK_HAS_*`, `M5HAL_V1_VARIANT_ID_*`, `M5HAL_VARIANT_CURRENT_*`, `M5HAL_ASSERT`。 世代間で値が異なり得るものは `M5HAL_V1_` で世代分離する (無印は凍結 v0 が所有。 [../design/v0_v1_coexistence.md](../design/v0_v1_coexistence.md) §制約)
 - **ヘッダガードは `M5_HAL_<PATH>_HPP` プレフィックス** (`M5_HAL_` = アンダースコアあり、 ファイルパスベース) — 機能マクロの `M5HAL_` と区別する。 例: `M5_HAL_TYPES_HPP`, `M5_HAL_GPIO_GROUP_HPP_`, `M5_HAL_ASSERT_HPP`
 - 内部用途のマクロは末尾アンダースコアを付けて区別する (例: `M5HAL_VARIANT_CURRENT_*_`)
 

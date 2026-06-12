@@ -5,9 +5,7 @@
 // variant scanning, and offer_all.inl consumes + undefs the
 // M5HAL_VARIANT_CURRENT_*_ macros below on each pass.
 //
-// clang-format off / on guards protect the BASE_PATH_ value: bare path
-// tokens (../variants/frameworks/posix) would otherwise be reformatted
-// as a chain of C++ division operators, breaking the macro.
+// clang-format off / on keeps the aligned #define table as-is.
 //
 // This variant offers UART only (host serial via termios). It is active
 // solely on a POSIX host build; see frameworks/_checker.hpp
@@ -15,6 +13,7 @@
 
 #define M5HAL_VARIANT_CURRENT_ALIAS_   posix
 #define M5HAL_VARIANT_CURRENT_BASE_NS_ variants::frameworks::posix
+#define M5HAL_VARIANT_CURRENT_ID_      M5HAL_V1_VARIANT_ID_FRAMEWORK_POSIX
 
 #define M5HAL_VARIANT_CURRENT_HAS_HAL_UART_ 1
 // clang-format on

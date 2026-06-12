@@ -2,11 +2,11 @@
 // Capability self-declaration for the Espressif ESP32 (1st gen) platform variant.
 //
 // This file intentionally has NO include guard and NO #pragma once.
-// See frameworks/arduino/_offer.hpp for the rationale (including the
-// clang-format off rationale for the BASE_PATH_ value).
+// See frameworks/arduino/_offer.hpp for the rationale.
 
 #define M5HAL_VARIANT_CURRENT_ALIAS_   esp32
 #define M5HAL_VARIANT_CURRENT_BASE_NS_ variants::platforms::espressif::esp32
+#define M5HAL_VARIANT_CURRENT_ID_      M5HAL_V1_VARIANT_ID_PLATFORM_ESP32
 
 // Concrete Port / GPIO have been shipped under
 // platforms::espressif::esp32::hal::v1::gpio, so the capability is

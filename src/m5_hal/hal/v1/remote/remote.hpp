@@ -659,8 +659,9 @@ struct RemoteI2CBus : public i2c::I2CBus {
     {
     }
 
-    /*! @brief Local bookkeeping only — the physical bus is configured server-side. */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> init(const bus::BusConfig& config) override;
+    /*! @brief Local bookkeeping only — the physical bus is configured server-side.
+        Takes the abstract kind config: the proxy adds no fields (S17 E1). */
+    m5::stl::expected<void, m5::hal::v1::error::error_t> init(const i2c::I2CBusConfig& config);
     m5::stl::expected<void, m5::hal::v1::error::error_t> release(void) override
     {
         return {};
@@ -692,8 +693,9 @@ struct RemoteSPIBus : public spi::SPIBus {
     {
     }
 
-    /*! @brief Local bookkeeping only — the physical bus is configured server-side. */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> init(const bus::BusConfig& config) override;
+    /*! @brief Local bookkeeping only — the physical bus is configured server-side.
+        Takes the abstract kind config: the proxy adds no fields (S17 E1). */
+    m5::stl::expected<void, m5::hal::v1::error::error_t> init(const spi::SPIBusConfig& config);
     m5::stl::expected<void, m5::hal::v1::error::error_t> release(void) override
     {
         return {};
@@ -731,8 +733,9 @@ struct RemoteUARTBus : public uart::UARTBus {
     {
     }
 
-    /*! @brief Local bookkeeping only — the physical bus is configured server-side. */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> init(const bus::BusConfig& config) override;
+    /*! @brief Local bookkeeping only — the physical bus is configured server-side.
+        Takes the abstract kind config: the proxy adds no fields (S17 E1). */
+    m5::stl::expected<void, m5::hal::v1::error::error_t> init(const uart::UARTBusConfig& config);
     m5::stl::expected<void, m5::hal::v1::error::error_t> release(void) override
     {
         return {};
@@ -788,8 +791,9 @@ struct RemoteI2SBus : public i2s::I2SBus {
     RemoteI2SBus(RemoteI2SBus&&)                 = delete;
     RemoteI2SBus& operator=(RemoteI2SBus&&)      = delete;
 
-    /*! @brief Local bookkeeping only — the physical bus is configured server-side. */
-    m5::stl::expected<void, m5::hal::v1::error::error_t> init(const bus::BusConfig& config) override;
+    /*! @brief Local bookkeeping only — the physical bus is configured server-side.
+        Takes the abstract kind config: the proxy adds no fields (S17 E1). */
+    m5::stl::expected<void, m5::hal::v1::error::error_t> init(const i2s::I2SBusConfig& config);
     m5::stl::expected<void, m5::hal::v1::error::error_t> release(void) override
     {
         return {};

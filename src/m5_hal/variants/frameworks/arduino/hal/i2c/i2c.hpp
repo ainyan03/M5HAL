@@ -37,7 +37,10 @@ public:
         release();
     }
 
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> init(const ::m5::hal::v1::bus::BusConfig& config) override;
+    // Typed init: takes this variant's BusConfig (S17 E1). Passing the
+    // abstract I2CBusConfig (or a sibling variant's config) is a
+    // compile error instead of a silent bad downcast.
+    m5::stl::expected<void, ::m5::hal::v1::error::error_t> init(const BusConfig& config);
     m5::stl::expected<void, ::m5::hal::v1::error::error_t> release(void) override;
 
     m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> transfer(

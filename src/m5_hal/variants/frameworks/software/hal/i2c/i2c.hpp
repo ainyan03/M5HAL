@@ -971,9 +971,17 @@ private:
 
 }  // namespace detail
 
+// This variant needs no fields beyond the abstract kind config; the alias
+// keeps the `m5hal::i2c::BusConfig` spelling available in every build
+// (every variant publishes `Bus` + `BusConfig`, S17 E2).
+using BusConfig = ::m5::hal::v1::i2c::I2CBusConfig;
+
 class Bus : public ::m5::hal::v1::i2c::I2CBus {
 public:
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> init(const ::m5::hal::v1::bus::BusConfig& config) override;
+    // Typed init (S17 E1). BusConfig is an alias of the abstract
+    // I2CBusConfig here; the signature still names the alias so every
+    // variant reads the same.
+    m5::stl::expected<void, ::m5::hal::v1::error::error_t> init(const BusConfig& config);
     // The bit-bang variant owns no resource beyond the high-Z state
     // of the pins it grabbed in `init`, so `release` is a no-op that
     // returns OK.

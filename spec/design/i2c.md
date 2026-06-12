@@ -28,11 +28,13 @@ struct I2CMasterAccessConfig : public bus::AccessConfig {
 
 `register_address_bytes` は `readRegister(0x00)` のような signed literal sugar だけが参照する。 `0` と `1` は default の 1-byte register address として扱い、 `2` を明示した場合だけ 2-byte register address を big-endian で組み立てる。 それ以外の値は API 契約外で、debug build では assert、 release build では `INVALID_ARGUMENT` を返す。 `uint8_t` / `uint16_t` の型付き register 定数を渡した場合は型の幅が優先され、この field は参照されない。
 
-Framework 依存の native handle / port は共通 `I2CBusConfig` には置かない。 各 variant は必要に応じて共通 config を継承した `variant::<name>::BusConfig` を公開する:
+Framework 依存の native handle / port は共通 `I2CBusConfig` には置かない。 各 variant は共通 config を継承 (または alias) した `variant::<name>::BusConfig` を**必ず公開**し、 `init` は **その型を直接受ける非 virtual メンバ** (`init(const BusConfig&)`) として宣言する (基底 `bus::Bus` に virtual `init` は無い。 variant 固有情報が必須な操作を kind 汎用にはできないため。 [variants.md](variants.md) §offer 要件):
 
 - Arduino variant: `TwoWire* wire` を明示する。`init(BusConfig)` はその `TwoWire` に `begin` / `end` を行い、`attach(TwoWire&)` は caller-owned lifecycle として扱う。
 - ESP-IDF variant: ESP-IDF driver 世代に応じた `i2c_port` を持つ。pin / buffer など共通にできる値は基底 `I2CBusConfig` 側に残す。
-- software variant: native handle を持たないため、共通 `I2CBusConfig` をそのまま使う。
+- software variant: native handle を持たないため、`using BusConfig = I2CBusConfig;` の alias を公開して共通 config をそのまま受ける。
+
+抽象 `I2CBusConfig` を拡張フィールド持ち variant (Arduino 等) の `init` に渡す誤用、 および別 variant の config を渡す誤用は、 **どちらもコンパイルエラー**になる (派生参照に基底オブジェクトは束縛できない)。 拡張なし variant への variant config 渡しは upcast として正しく通る。
 
 ## I2CBus (Bus 抽象基底)
 

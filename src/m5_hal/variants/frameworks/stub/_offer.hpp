@@ -2,8 +2,7 @@
 // Capability self-declaration for the stub framework variant.
 //
 // This file intentionally has NO include guard and NO #pragma once.
-// See frameworks/arduino/_offer.hpp for the rationale (including the
-// clang-format off rationale for the BASE_PATH_ value).
+// See frameworks/arduino/_offer.hpp for the rationale.
 //
 // The stub variant is the unconditional fallback used when no other
 // variant provides a given HAL. It declares HAS_HAL_*_ for every HAL
@@ -11,6 +10,7 @@
 
 #define M5HAL_VARIANT_CURRENT_ALIAS_   stub
 #define M5HAL_VARIANT_CURRENT_BASE_NS_ variants::frameworks::stub
+#define M5HAL_VARIANT_CURRENT_ID_      M5HAL_V1_VARIANT_ID_FRAMEWORK_STUB
 
 #define M5HAL_VARIANT_CURRENT_HAS_HAL_GPIO_ 1
 // I2C / SPI / UART are not yet declared because their abstract bases

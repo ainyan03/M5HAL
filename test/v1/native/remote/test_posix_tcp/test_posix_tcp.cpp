@@ -174,7 +174,7 @@ struct StubI2CBus : public i2c::I2CBus {
     uint16_t last_addr    = 0;
     error::error_t result = error::error_t::OK;
 
-    m5::stl::expected<void, error::error_t> init(const bus::BusConfig&) override
+    m5::stl::expected<void, error::error_t> init(const i2c::I2CBusConfig&)
     {
         return {};
     }

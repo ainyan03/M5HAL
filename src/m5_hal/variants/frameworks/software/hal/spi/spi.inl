@@ -580,13 +580,9 @@ private:
 
 }  // anonymous namespace
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const ::m5::hal::v1::bus::BusConfig& config)
+m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig& config)
 {
-    if (config.getBusKind() != ::m5::hal::v1::types::bus_kind_t::SPI) {
-        M5_LIB_LOGE("software::spi::Bus::init: not an SPI config");
-        return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
-    }
-    _config = static_cast<const ::m5::hal::v1::spi::SPIBusConfig&>(config);
+    _config = config;
 
     if (_config.pin_clk < 0) {
         M5_LIB_LOGE("software::spi::Bus::init: CLK pin not set");

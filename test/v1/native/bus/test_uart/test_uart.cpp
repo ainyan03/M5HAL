@@ -7,12 +7,11 @@ namespace {
 
 class RecordingUARTBus : public m5::hal::v1::uart::UARTBus {
 public:
-    m5::stl::expected<void, m5::hal::v1::error::error_t> init(const m5::hal::v1::bus::BusConfig& config) override
+    // Typed init (S17 E1): the fake adds no fields, so it takes the
+    // abstract kind config.
+    m5::stl::expected<void, m5::hal::v1::error::error_t> init(const m5::hal::v1::uart::UARTBusConfig& config)
     {
-        if (config.getBusKind() != m5::hal::v1::types::bus_kind_t::UART) {
-            return m5::stl::make_unexpected(m5::hal::v1::error::error_t::INVALID_ARGUMENT);
-        }
-        _config = static_cast<const m5::hal::v1::uart::UARTBusConfig&>(config);
+        _config = config;
         return {};
     }
 

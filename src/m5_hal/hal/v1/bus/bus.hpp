@@ -157,21 +157,19 @@ public:
         return getConfig().getBusKind();
     }
 
-    /*!
-      @brief Initialize the bus.
+    // Bus initialization is intentionally NOT part of this abstract
+    // interface. Initialization inherently needs variant-specific data
+    // (a TwoWire*, a port number, a device path, ...), so a kind-generic
+    // `init` cannot exist; each concrete bus declares its own
+    // non-virtual `init(const <Variant>BusConfig&)` taking exactly the
+    // config type it can act on (variants without extra fields take the
+    // abstract kind config). The former base virtual only enabled
+    // passing a sibling config, which the mandatory downcast turned
+    // into UB (S17 E1). Return type matches the other public APIs
+    // (`lock` / `unlock` / `transfer` / ...), so callers use
+    // `if (auto r = bus.init(cfg); !r) ...` uniformly.
 
-      Return type matches the other public APIs (`lock` / `unlock` /
-      `beginAccess` / `endAccess` / `transfer` / register sugar /
-      `probe`), so callers use `if (auto r = bus.init(cfg); !r) ...`
-      uniformly. Internal code can still use `error::isError` /
-      `error::isOk` on a raw error_t.
-     */
-    virtual m5::stl::expected<void, error::error_t> init(const BusConfig& config)
-    {
-        (void)config;
-        return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
-    }
-    /*! @brief Release any resources acquired by `init`. */
+    /*! @brief Release any resources acquired by the concrete bus's `init`. */
     virtual m5::stl::expected<void, error::error_t> release(void)
     {
         return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);

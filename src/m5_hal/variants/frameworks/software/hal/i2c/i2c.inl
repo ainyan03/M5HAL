@@ -194,13 +194,9 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> sendStopWithService(::m5:
 
 }  // anonymous namespace
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const ::m5::hal::v1::bus::BusConfig& config)
+m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig& config)
 {
-    if (config.getBusKind() != ::m5::hal::v1::types::bus_kind_t::I2C) {
-        M5_LIB_LOGE("software::i2c::Bus::init: not an I2C config");
-        return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
-    }
-    _config = static_cast<const ::m5::hal::v1::i2c::I2CBusConfig&>(config);
+    _config = config;
 
     // BusConfig uses the single gpio_number_t path. Resolve through
     // `M5HALCore::Gpio` (the singleton GPIOGroup) with the CHECKED

@@ -14,6 +14,11 @@ namespace m5::variants::frameworks::espidf::hal::v1::i2s {
 
 using namespace ::m5::hal::v1;  // resolve unqualified types/bus:: refs
 
+// This variant needs no fields beyond the abstract kind config; the alias
+// keeps the `m5hal::i2s::BusConfig` spelling available in every build
+// (every variant publishes `Bus` + `BusConfig`, S17 E2).
+using BusConfig = ::m5::hal::v1::i2s::I2SBusConfig;
+
 // ESP-IDF gen5 (driver/i2s_std.h) concrete I2S TX bus.
 // The channel is created lazily on the first write. On each call the
 // AccessConfig is compared to the previous one; if it changed the channel
@@ -27,7 +32,10 @@ public:
         (void)release();
     }
 
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> init(const ::m5::hal::v1::bus::BusConfig& config) override;
+    // Typed init (S17 E1). BusConfig is an alias of the abstract
+    // I2SBusConfig here; the signature still names the alias so every
+    // variant reads the same.
+    m5::stl::expected<void, ::m5::hal::v1::error::error_t> init(const BusConfig& config);
     m5::stl::expected<void, ::m5::hal::v1::error::error_t> release(void) override;
 
     m5::stl::expected<size_t, ::m5::hal::v1::error::error_t> write(::m5::hal::v1::bus::Accessor* owner,

@@ -25,12 +25,11 @@ public:
         size_t rx_len = 0;
     };
 
-    m5::stl::expected<void, error::error_t> init(const bus::BusConfig& config) override
+    // Typed init (S17 E1): the fake adds no fields, so it takes the
+    // abstract kind config.
+    m5::stl::expected<void, error::error_t> init(const spi::SPIBusConfig& config)
     {
-        if (config.getBusKind() != m5::hal::v1::types::bus_kind_t::SPI) {
-            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
-        _config = static_cast<const spi::SPIBusConfig&>(config);
+        _config = config;
         return {};
     }
 

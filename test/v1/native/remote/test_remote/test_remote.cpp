@@ -111,12 +111,9 @@ struct StubI2CBus : public i2c::I2CBus {
     uint8_t rx_pattern    = 0xA0;         // rx byte i = rx_pattern + i
     error_t result        = error_t::OK;  // forced outcome
 
-    m5::stl::expected<void, error_t> init(const bus::BusConfig& config) override
+    m5::stl::expected<void, error_t> init(const i2c::I2CBusConfig& config)
     {
-        if (config.getBusKind() != types::bus_kind_t::I2C) {
-            return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
-        }
-        _config = static_cast<const i2c::I2CBusConfig&>(config);
+        _config = config;
         return {};
     }
 
@@ -469,12 +466,9 @@ struct StubSPIBus : public spi::SPIBus {
     std::vector<uint8_t> last_tx;
     uint8_t rx_pattern = 0xB0;
 
-    m5::stl::expected<void, error_t> init(const bus::BusConfig& config) override
+    m5::stl::expected<void, error_t> init(const spi::SPIBusConfig& config)
     {
-        if (config.getBusKind() != types::bus_kind_t::SPI) {
-            return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
-        }
-        _config = static_cast<const spi::SPIBusConfig&>(config);
+        _config = config;
         return {};
     }
     m5::stl::expected<size_t, error_t> transfer(bus::Accessor*, const spi::SPIMasterAccessConfig& cfg,
@@ -516,12 +510,9 @@ struct StubUARTBus : public uart_::UARTBus {
     std::vector<uint8_t> rx_data;  // bytes "already received" remotely
     uart_::UARTAccessConfig last_cfg{};
 
-    m5::stl::expected<void, error_t> init(const bus::BusConfig& config) override
+    m5::stl::expected<void, error_t> init(const uart_::UARTBusConfig& config)
     {
-        if (config.getBusKind() != types::bus_kind_t::UART) {
-            return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
-        }
-        _config = static_cast<const uart_::UARTBusConfig&>(config);
+        _config = config;
         return {};
     }
     m5::stl::expected<size_t, error_t> write(bus::Accessor*, const uart_::UARTAccessConfig& cfg, data::Source* tx,
@@ -1187,12 +1178,9 @@ struct StubI2SBus : public i2s::I2SBus {
         return capacity - in_buffer;
     }
 
-    m5::stl::expected<void, error_t> init(const bus::BusConfig& config) override
+    m5::stl::expected<void, error_t> init(const i2s::I2SBusConfig& config)
     {
-        if (config.getBusKind() != types::bus_kind_t::I2S) {
-            return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
-        }
-        _config = static_cast<const i2s::I2SBusConfig&>(config);
+        _config = config;
         return {};
     }
     m5::stl::expected<size_t, error_t> write(bus::Accessor*, const i2s::I2SAccessConfig& cfg, data::Source* tx,

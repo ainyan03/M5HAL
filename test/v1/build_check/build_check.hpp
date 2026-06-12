@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace m5hal_build_check::v1 {
 namespace detail {
@@ -30,12 +31,11 @@ namespace uart  = ::m5::hal::v1::uart;
 
 class DummyI2CBus : public i2c::I2CBus {
 public:
-    ::m5::stl::expected<void, error::error_t> init(const bus::BusConfig& config) override
+    // Typed init (S17 E1): the fake adds no fields, so it takes the
+    // abstract kind config.
+    ::m5::stl::expected<void, error::error_t> init(const i2c::I2CBusConfig& config)
     {
-        if (config.getBusKind() != types::bus_kind_t::I2C) {
-            return ::m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
-        _config = static_cast<const i2c::I2CBusConfig&>(config);
+        _config = config;
         return {};
     }
 
@@ -85,12 +85,9 @@ public:
 
 class DummySPIBus : public spi::SPIBus {
 public:
-    ::m5::stl::expected<void, error::error_t> init(const bus::BusConfig& config) override
+    ::m5::stl::expected<void, error::error_t> init(const spi::SPIBusConfig& config)
     {
-        if (config.getBusKind() != types::bus_kind_t::SPI) {
-            return ::m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
-        _config = static_cast<const spi::SPIBusConfig&>(config);
+        _config = config;
         return {};
     }
 
@@ -157,12 +154,9 @@ public:
 
 class DummyUARTBus : public uart::UARTBus {
 public:
-    ::m5::stl::expected<void, error::error_t> init(const bus::BusConfig& config) override
+    ::m5::stl::expected<void, error::error_t> init(const uart::UARTBusConfig& config)
     {
-        if (config.getBusKind() != types::bus_kind_t::UART) {
-            return ::m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
-        _config = static_cast<const uart::UARTBusConfig&>(config);
+        _config = config;
         return {};
     }
 
@@ -233,6 +227,37 @@ inline void useResult(const T& value)
 }
 
 }  // namespace detail
+
+// ---- Selected-variant markers (S17 E3) -----------------------------------
+// Fences for the scan-order assumptions, demonstrating both diagnosis
+// idioms: the integer marker (usable in #if AND static_assert) and the
+// entity-identity check (flat injection is a using-directive, so the flat
+// name and the variant alias denote the same type).
+static_assert(M5HAL_V1_SELECTED_VARIANT_I2C != M5HAL_V1_VARIANT_ID_NONE, "some variant must provide I2C");
+#if defined(ARDUINO)
+static_assert(M5HAL_V1_SELECTED_VARIANT_I2C == M5HAL_V1_VARIANT_ID_FRAMEWORK_ARDUINO,
+              "scan order: arduino wins the I2C flat injection when present");
+static_assert(std::is_same<::m5::hal::v1::i2c::Bus, ::m5::hal::v1::i2c::variant::arduino::Bus>::value,
+              "the flat name and the variant alias must be the same entity");
+#elif defined(ESP_PLATFORM) && M5HAL_ESPIDF_I2C_HAS_MASTER
+static_assert(M5HAL_V1_SELECTED_VARIANT_I2C == M5HAL_V1_VARIANT_ID_FRAMEWORK_ESPIDF,
+              "scan order: espidf wins the I2C flat injection on a plain IDF build");
+static_assert(std::is_same<::m5::hal::v1::i2c::Bus, ::m5::hal::v1::i2c::variant::espidf::Bus>::value,
+              "the flat name and the variant alias must be the same entity");
+#elif !defined(ESP_PLATFORM)
+static_assert(M5HAL_V1_SELECTED_VARIANT_I2C == M5HAL_V1_VARIANT_ID_FRAMEWORK_SOFTWARE,
+              "scan order: software provides I2C on a plain host build");
+static_assert(std::is_same<::m5::hal::v1::i2c::Bus, ::m5::hal::v1::i2c::variant::software::Bus>::value,
+              "the flat name and the variant alias must be the same entity");
+#endif
+#if defined(ESP_PLATFORM)
+static_assert(M5HAL_V1_SELECTED_VARIANT_GPIO == M5HAL_V1_VARIANT_ID_PLATFORM_ESP32,
+              "scan order: the platform variant wins GPIO on the ESP32 family");
+// Detection and selection share one id registry (S18), so the cross
+// comparison is direct: the detected platform's variant wins GPIO.
+static_assert(M5HAL_V1_SELECTED_VARIANT_GPIO == M5HAL_V1_TARGET_PLATFORM_VARIANT_ID,
+              "the detected platform's variant should win GPIO on ESP32");
+#endif
 
 inline void compileCommonApiSurface(void)
 {

@@ -44,13 +44,9 @@ bool isValidAddress(const ::m5::hal::v1::i2c::I2CMasterAccessConfig& cfg)
 
 }  // namespace
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const ::m5::hal::v1::bus::BusConfig& config)
+m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig& config)
 {
-    if (config.getBusKind() != ::m5::hal::v1::types::bus_kind_t::I2C) {
-        return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
-    }
-    const auto& i2c_config = static_cast<const BusConfig&>(config);
-    if (i2c_config.pin_scl < 0 || i2c_config.pin_sda < 0) {
+    if (config.pin_scl < 0 || config.pin_sda < 0) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
     // Release the previous driver while `_port` still names the OLD port;
@@ -59,8 +55,8 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const ::m5::hal
     if (_installed) {
         (void)release();
     }
-    _config = i2c_config;
-    _port   = i2c_config.i2c_port;
+    _config = config;
+    _port   = config.i2c_port;
 
     ::i2c_config_t conf   = {};
     conf.mode             = I2C_MODE_MASTER;

@@ -857,12 +857,9 @@ m5::stl::expected<size_t, error_t> RemoteSession::poll(size_t max_frames)
 
 // ---- RemoteI2CBus -------------------------------------------------------------
 
-m5::stl::expected<void, error_t> RemoteI2CBus::init(const bus::BusConfig& config)
+m5::stl::expected<void, error_t> RemoteI2CBus::init(const i2c::I2CBusConfig& config)
 {
-    if (config.getBusKind() != types::bus_kind_t::I2C) {
-        return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
-    }
-    _config = static_cast<const i2c::I2CBusConfig&>(config);
+    _config = config;
     return {};
 }
 
@@ -963,12 +960,9 @@ m5::stl::expected<size_t, error_t> RemoteI2CBus::transfer(bus::Accessor* owner, 
 
 // ---- RemoteSPIBus -------------------------------------------------------------
 
-m5::stl::expected<void, error_t> RemoteSPIBus::init(const bus::BusConfig& config)
+m5::stl::expected<void, error_t> RemoteSPIBus::init(const spi::SPIBusConfig& config)
 {
-    if (config.getBusKind() != types::bus_kind_t::SPI) {
-        return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
-    }
-    _config = static_cast<const spi::SPIBusConfig&>(config);
+    _config = config;
     return {};
 }
 
@@ -1061,12 +1055,9 @@ m5::stl::expected<size_t, error_t> RemoteSPIBus::transfer(bus::Accessor* owner, 
 
 // ---- RemoteUARTBus ------------------------------------------------------------
 
-m5::stl::expected<void, error_t> RemoteUARTBus::init(const bus::BusConfig& config)
+m5::stl::expected<void, error_t> RemoteUARTBus::init(const uart::UARTBusConfig& config)
 {
-    if (config.getBusKind() != types::bus_kind_t::UART) {
-        return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
-    }
-    _config = static_cast<const uart::UARTBusConfig&>(config);
+    _config = config;
     return {};
 }
 
@@ -1256,12 +1247,9 @@ RemoteI2SBus::~RemoteI2SBus()
     }
 }
 
-m5::stl::expected<void, error_t> RemoteI2SBus::init(const bus::BusConfig& config)
+m5::stl::expected<void, error_t> RemoteI2SBus::init(const i2s::I2SBusConfig& config)
 {
-    if (config.getBusKind() != types::bus_kind_t::I2S) {
-        return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
-    }
-    _config = static_cast<const i2s::I2SBusConfig&>(config);
+    _config = config;
     return {};
 }
 

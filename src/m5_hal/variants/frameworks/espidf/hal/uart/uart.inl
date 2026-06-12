@@ -83,13 +83,9 @@ bool sameConfig(const ::m5::hal::v1::uart::UARTAccessConfig& lhs, const ::m5::ha
 
 }  // namespace
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const ::m5::hal::v1::bus::BusConfig& config)
+m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig& config)
 {
-    if (config.getBusKind() != ::m5::hal::v1::types::bus_kind_t::UART) {
-        return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
-    }
-    const auto& uart_config = static_cast<const BusConfig&>(config);
-    const auto new_port     = resolvePort(uart_config.port_num);
+    const auto new_port = resolvePort(config.port_num);
     if (new_port < UART_NUM_0 || new_port >= UART_NUM_MAX) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
@@ -99,7 +95,7 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const ::m5::hal
     if (_installed) {
         (void)release();
     }
-    _config = uart_config;
+    _config = config;
     _port   = new_port;
 
     const int rx_size = static_cast<int>(_config.rx_buffer_size == 0 ? 256 : _config.rx_buffer_size);

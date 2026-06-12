@@ -25,13 +25,17 @@ SPI は I2C と同じく `Bus` / `Accessor` / `TransferDesc` / `Source` / `Sink`
 ## BusConfig の役割
 
 共通 `SPIBusConfig` は pin など HAL 共通の情報だけを持つ。Framework 依存の
-native handle / host は各 variant 固有の `BusConfig` に置く。
+native handle / host は各 variant 固有の `BusConfig` に置く。各 variant は
+`BusConfig` を必ず公開し、`init` はその型を直接受ける非 virtual メンバとして
+宣言する (基底 `bus::Bus` に virtual `init` は無い。[variants.md](variants.md)
+§offer 要件と [i2c.md](i2c.md) §BusConfig の誤用防止の説明を参照)。
 
 - Arduino variant: `SPIClass* spi` を明示する。`init(BusConfig)` はその
   `SPIClass` に `begin` / `end` を行い、`attach(SPIClass&)` は caller-owned
   lifecycle として扱う。
 - ESP-IDF variant: `spi_host_device_t host` を持つ。既定値は `SPI2_HOST`。
-- software variant: native handle を持たないため、共通 `SPIBusConfig` をそのまま使う。
+- software variant: native handle を持たないため、`using BusConfig = SPIBusConfig;`
+  の alias を公開して共通 config をそのまま受ける。
 
 これにより、Arduino / ESP-IDF / software のどれを選んでも「共通configは共通情報、
 variant configはnative実体」という同じ読み方になる。

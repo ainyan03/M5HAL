@@ -13,9 +13,17 @@ namespace m5::variants::frameworks::software::hal::v1::spi {
 
 using namespace ::m5::hal::v1;
 
+// This variant needs no fields beyond the abstract kind config; the alias
+// keeps the `m5hal::spi::BusConfig` spelling available in every build
+// (every variant publishes `Bus` + `BusConfig`, S17 E2).
+using BusConfig = ::m5::hal::v1::spi::SPIBusConfig;
+
 class Bus : public ::m5::hal::v1::spi::SPIBus {
 public:
-    m5::stl::expected<void, ::m5::hal::v1::error::error_t> init(const ::m5::hal::v1::bus::BusConfig& config) override;
+    // Typed init (S17 E1). BusConfig is an alias of the abstract
+    // SPIBusConfig here; the signature still names the alias so every
+    // variant reads the same.
+    m5::stl::expected<void, ::m5::hal::v1::error::error_t> init(const BusConfig& config);
     m5::stl::expected<void, ::m5::hal::v1::error::error_t> release(void) override
     {
         return {};

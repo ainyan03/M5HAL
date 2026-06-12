@@ -152,17 +152,13 @@ m5::stl::expected<void, ::m5::hal::v1::error::error_t> transferChunk(::SPIClass&
     return ::m5::hal::v1::error::error_t::OK;
 }
 
-m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const ::m5::hal::v1::bus::BusConfig& config)
+m5::stl::expected<void, ::m5::hal::v1::error::error_t> Bus::init(const BusConfig& config)
 {
-    if (config.getBusKind() != ::m5::hal::v1::types::bus_kind_t::SPI) {
-        return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
-    }
-    const auto& spi_config = static_cast<const BusConfig&>(config);
-    _config                = spi_config;
+    _config = config;
     if (_spi) {
         (void)release();
     }
-    auto* spi = spi_config.spi;
+    auto* spi = config.spi;
     if (spi == nullptr) {
         return m5::stl::make_unexpected(::m5::hal::v1::error::error_t::INVALID_ARGUMENT);
     }
