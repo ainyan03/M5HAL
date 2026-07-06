@@ -1,0 +1,79 @@
+# Official ESP-IDF component build check.
+#
+# Builds M5HAL as an ESP-IDF component (test/idf_component_build) with the
+# official `espressif/idf` toolchain across the full chip family — crucially
+# including esp32-h2 and esp32-p4, which the PlatformIO `espressif32` platform
+# cannot build (it ships no h2/p4 board files). Official ESP-IDF supports every
+# chip M5HAL targets (see idf_component.yml `targets:`), so this is the
+# authoritative verification lane. The build-check-pio workflow covers the fast
+# public compile fences across selected Arduino / ESP-IDF generations; this
+# workflow covers official component integration for all supported chip targets.
+#
+# Coverage: the 10 official chips on TWO framework generations (release-v5.5 =
+# current stable baseline, release-v6.0 = newest), plus the two preview-status
+# SoCs (esp32h21, esp32h4) on v6.0 via `idf.py --preview`. esp32h4 REQUIRES v6.0
+# (its esp_driver_i2c/spi are header-only in v5.5 — compiles, then link-fails);
+# esp32h21 builds from v5.5 but rides the v6.0 preview lane for one toolchain.
+#
+# This workflow is intentionally shared by upstream and forks. It uses
+# GitHub-hosted ubuntu-latest plus Espressif's official container image, so it
+# does not require m5stack self-hosted runners.
+#
+# Modeled on the LovyanGFX / M5GFX / M5Unified `IDFBuild.yml` pattern, using the
+# official image directly as the job container (no manual esp-idf clone). The
+# tiny consumer project (test/idf_component_build) registers M5HAL + the sibling
+# M5Utility checkout as components (IDF_COMPONENT_MANAGER=0 -> hermetic, no
+# network deps) and compiles the shared v2 API surface (test/v2/build_check),
+# which references PinBackup / ScopedPinBackup.
+name: build-check-idf
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  idf-build:
+    name: idf ${{ matrix.idf }} ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    container: espressif/idf:${{ matrix.idf }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The 10 official chips on two framework generations (stable v5.5 + newest
+        # v6.0). A dynamic matrix driven by Espressif's idf_versions.js (as in
+        # upstream LovyanGFX) is a possible follow-up.
+        idf: ['release-v5.5', 'release-v6.0']
+        target: [esp32, esp32s2, esp32s3, esp32c2, esp32c3, esp32c5, esp32c6, esp32c61, esp32h2, esp32p4]
+        include:
+          # Preview-status SoCs need `idf.py --preview`. esp32h4 REQUIRES v6.0;
+          # esp32h21 rides the same v6.0 preview lane.
+          - idf: 'release-v6.0'
+            target: esp32h21
+            preview: '--preview'
+          - idf: 'release-v6.0'
+            target: esp32h4
+            preview: '--preview'
+    steps:
+      - name: Checkout M5HAL
+        uses: actions/checkout@v6
+        with:
+          path: M5HAL
+
+      - name: Checkout M5Utility (sibling component)
+        uses: actions/checkout@v6
+        with:
+          repository: m5stack/M5Utility
+          ref: develop
+          path: M5Utility
+
+      - name: Build M5HAL component for ${{ matrix.target }}
+        shell: bash
+        env:
+          # Resolve deps only from the local EXTRA_COMPONENT_DIRS checkouts.
+          IDF_COMPONENT_MANAGER: "0"
+        run: |
+          . "$IDF_PATH/export.sh"
+          cd M5HAL/test/idf_component_build
+          # matrix.preview is '--preview' for preview SoCs, empty otherwise.
+          idf.py ${{ matrix.preview }} set-target ${{ matrix.target }} build

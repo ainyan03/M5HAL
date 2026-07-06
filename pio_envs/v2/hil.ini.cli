@@ -1,0 +1,111 @@
+; =============================================================================
+; M5HAL — v2 HIL (hardware-in-the-loop) envs: host POSIX UART <-> ESP32 echo
+;
+; HIL tests live in experiments/v2/test/<name>/{device,host}/ and run via `pio run`
+; (NOT `pio test`, whose discovery is locked to test_dir). The host driver is a
+; gtest binary built with `pio run` and then executed directly.
+;
+; This is a *.ini.cli file: it is NOT auto-loaded (extra_configs only globs
+; *.ini). Load it for a run by pointing M5HAL_PIO_EXTRA_CONFIG at it (no copy):
+;   export M5HAL_PIO_EXTRA_CONFIG=pio_envs/v2/hil.ini.cli
+; The runner experiments/v2/test/hil-run.sh sets this for you.
+;
+; Setup (M5Stack Core BASIC, classic ESP32): the echo firmware drives UART0
+; (GPIO1=TX / GPIO3=RX = the USB bridge) via M5HAL UART, echo-only, no logging.
+; No extra wiring: the existing USB cable is the echo channel.
+;
+; Manual run:
+;   export M5HAL_PIO_EXTRA_CONFIG=pio_envs/v2/hil.ini.cli
+;   pio run -e v2_hil_uart_echo_device_esp32 -t upload                 # flash device
+;   pio run -e v2_hil_uart_echo_host                                   # build host
+;   M5HAL_POSIX_UART_PORT=/dev/cu.usbserial-XXXX \
+;     .pio/build/v2_hil_uart_echo_host/program
+;   (M5HAL_POSIX_UART_BAUD optional, default 115200. For a high-baud run also
+;    flash with PLATFORMIO_BUILD_FLAGS="-DM5HAL_HIL_ECHO_BAUD=<baud>".)
+; Or one-shot: experiments/v2/test/hil-run.sh uart_echo [port] [baud]
+; =============================================================================
+
+[env:v2_hil_uart_echo_device_esp32]
+extends = common_esp32dev, common_arduino
+build_src_filter = +<*> +<../experiments/v2/test/uart_echo/device/uart_echo.cpp>
+build_flags =
+    ${common_esp32.build_flags}
+    -DCORE_DEBUG_LEVEL=0
+
+[env:v2_hil_uart_echo_host]
+extends = common_native, test_fw
+build_src_filter = +<*> +<../experiments/v2/test/uart_echo/host/uart_echo.cpp>
+
+; -----------------------------------------------------------------------------
+; I2C slave (D8 stretch backend) — 2-board HIL: a CoreS3SE (ESP32-S3) slave
+; driven through the public M5HAL API (SlaveBus_espidf + SlaveStreamAccessor)
+; against a Core2 verification master. Unlike uart_echo there is NO POSIX host:
+; the master is a second board (a companion bench firmware kept in the project's
+; private experiments tree, ROLE_MASTER), and acceptance is read from the
+; master's serial (BAD=0 across the WTR/SPLIT/WTEST x {100,400,800} kHz matrix).
+; This env builds the device only, so check_hil()'s compile fence covers it
+; without the master tree.
+;
+; The device exercises the LL clock-stretch backend, selected on the S3
+; (SOC_I2C_SLAVE_CAN_GET_STRETCH_CAUSE). framework=espidf (IDF5): the LL path
+; needs the stretch-cause caps + i2c_ll_* helpers that the Arduino platform
+; (espressif32@6.12.0 = IDF 4.4) does not ship. Wiring + flash steps live in the
+; source: experiments/v2/test/i2c_slave/device/i2c_slave.cpp.
+[env:v2_hil_i2c_slave_device_esp32s3]
+extends = common_esp32s3dev_espidf5, common_espidf
+build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/device/i2c_slave.cpp>
+; This env needs a 1 kHz FreeRTOS tick (CONFIG_FREERTOS_HZ=1000). The accessor's
+; polling waits are delayMs(1) = one tick; at the IDF-default 100 Hz that is 10 ms,
+; which dominated the slave's per-transaction response latency and let an
+; occasional readback overrun the master's tolerance (INVALID_STATE). 1 ms ticks
+; make the polling ~10x finer and the HIL matrix clean. Set via the project-root
+; sdkconfig.defaults (this platform pin does not honor PlatformIO custom_sdkconfig).
+
+; STREAM echo variant of the same 2-board HIL: drives SlaveBus_espidf through a
+; bare SlaveStreamAccessor (no register map) so the master can write up to 1 KB and
+; read the same bytes back verbatim. This is the on-hardware test of the espidf TX
+; streaming path (TX ring + TX_EMPTY underrun stretch), the read-direction
+; counterpart to the RX ring. Same wiring / sdkconfig (1 kHz tick) as the register
+; device; pair with the ROLE_MASTER -DECHO_MODE bench firmware. Source header has the
+; echo contract: experiments/v2/test/i2c_slave/device/i2c_echo.cpp.
+[env:v2_hil_i2c_slave_echo_device_esp32s3]
+extends = common_esp32s3dev_espidf5, common_espidf
+build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/device/i2c_echo.cpp>
+
+; M5HAL-MASTER half of the echo HIL pair: an ESP32 (Core2) driving the espidf master
+; backend through MasterAccessor::transfer(Source*, Sink*) against the M5HAL stream
+; slave above -- "both ends on the Source/Sink design". framework=espidf to match the
+; slave (espidf master gen5 driver). It sweeps N (to 1 KB) x SCL {100,400,800} kHz
+; internally and logs OK/BAD per round. Source header has the contract + wiring:
+; experiments/v2/test/i2c_slave/master/i2c_echo_master.cpp.
+[env:v2_hil_i2c_echo_master_esp32]
+extends = common_esp32dev_espidf5, common_espidf
+build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_echo_master.cpp>
+
+; SOFTWARE (bit-banged) variant of the M5HAL echo master: same firmware with
+; -DECHO_MASTER_SOFTWARE, which drives Bus_software (M5_Hal.Gpio bit-bang, no HW FIFO)
+; instead of Bus_espidf. Diagnostic for the 32-byte write-side "息継ぎ" -- if it
+; vanishes here, the gap was the HW master's TX-FIFO refill, not the slave.
+[env:v2_hil_i2c_echo_master_sw_esp32]
+extends = common_esp32dev_espidf5, common_espidf
+build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_echo_master.cpp>
+build_flags = -DECHO_MASTER_SOFTWARE
+
+; SPI slave echo: ESP-IDF spi_slave driver on a CoreS3 (ESP32-S3).
+; Echo contract: receive N bytes (one CS assertion), then send them back on
+; the next CS assertion. Port B + Port C straight wiring to a Core2 master.
+; Source: experiments/v2/test/spi_slave/device/spi_echo.cpp.
+[env:v2_hil_spi_slave_echo_esp32s3]
+extends = common_esp32s3dev_espidf5, common_espidf
+build_src_filter = +<*> +<../experiments/v2/test/spi_slave/device/spi_echo.cpp>
+
+; GPIO channel identification for Saleae Logic analyzer mapping.
+; Core2 pulses each GROVE pin with a unique count (1..7 pulses per pin).
+; CoreS3 sets all GROVE pins to input (Hi-Z) so Core2 drives them cleanly.
+[env:v2_hil_gpio_ident_core2]
+extends = common_esp32dev_espidf5, common_espidf
+build_src_filter = +<*> +<../experiments/v2/test/gpio_ident/core2/gpio_ident_core2.cpp>
+
+[env:v2_hil_gpio_ident_cores3]
+extends = common_esp32s3dev_espidf5, common_espidf
+build_src_filter = +<*> +<../experiments/v2/test/gpio_ident/cores3/gpio_ident_cores3.cpp>

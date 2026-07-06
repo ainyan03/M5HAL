@@ -1,0 +1,14 @@
+# Defaults applied to every chip target of the official component build check.
+#
+# Enable the ESP-IDF v2 I2C slave driver so the classic-ESP32 (non-LL) backend
+# path of SlaveBus_espidf is actually compiled here. On IDF v5.4/v5.5
+# M5HAL_ESPIDF_I2C_HAS_SLAVE_V2 is gated on CONFIG_I2C_ENABLE_SLAVE_DRIVER_VERSION_2
+# (sdkconfig, not header presence), so without this the classic-ESP32 v2 slave
+# bodies in slave.inl are #if'd out and a v2-only compile break slips through
+# every lane except the private app's QEMU build. Stretch-cause SoCs (s2/s3/
+# c3/... — every chip except classic esp32) use the LL path and ignore this;
+# only classic esp32 compiles the v2 path because of it. On IDF v6.0+ this
+# Kconfig option no longer exists (v2 is the
+# only slave driver) and is silently ignored here; espidf_version.hpp detects
+# v2 by IDF version instead, so the v6 lanes exercise the same path without it.
+CONFIG_I2C_ENABLE_SLAVE_DRIVER_VERSION_2=y

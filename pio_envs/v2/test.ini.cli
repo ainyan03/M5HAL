@@ -1,0 +1,64 @@
+; =============================================================================
+; M5HAL — v2 embedded tests
+;
+; `test/v2/native/` は host 上で完結する gtest。
+; `test/v2/embedded/` は実機・実配線を使い、テストコード自身が PASS/FAIL を
+; 判定する PlatformIO Unity test。
+;
+; 使い方:
+;   pio test -e v2_test_esp32_arduino_software_spi_wire
+;   pio test -e v2_test_esp32_arduino_software_spi_wire_jumper
+;   pio test -e v2_test_esp32s3_arduino_software_spi_wire
+;   pio test -e v2_test_esp32_arduino_espidf_spi_wire
+; =============================================================================
+
+[env:v2_test_esp32_arduino_software_spi_wire]
+extends = common_esp32dev, common_arduino
+test_framework = unity
+test_filter = v2/embedded/bus/test_software_spi_wire
+test_build_src = true
+build_flags =
+    ${common_esp32.build_flags}
+    -DM5HAL_TEST_SOFTWARE_SPI_FREQ=2000
+
+[env:v2_test_esp32_arduino_software_spi_wire_jumper]
+extends = env:v2_test_esp32_arduino_software_spi_wire
+build_flags =
+    ${common_esp32.build_flags}
+    -DM5HAL_TEST_SOFTWARE_SPI_FREQ=2000
+    -DM5HAL_TEST_SOFTWARE_SPI_CAPTURE_CLK=32
+    -DM5HAL_TEST_SOFTWARE_SPI_CAPTURE_MOSI=33
+    -DM5HAL_TEST_SOFTWARE_SPI_CAPTURE_DC=25
+    -DM5HAL_TEST_SOFTWARE_SPI_CAPTURE_CS=26
+
+; espidf (hardware spi_master) variant, exercised from an Arduino-on-IDF
+; build via the variant alias — the Arduino layer supplies the capture rig.
+[env:v2_test_esp32_arduino_espidf_spi_wire]
+extends = common_esp32dev, common_arduino
+test_framework = unity
+test_filter = v2/embedded/bus/test_espidf_spi_wire
+test_build_src = true
+build_flags =
+    ${common_esp32.build_flags}
+    -DM5HAL_TEST_ESPIDF_SPI_FREQ=2000
+
+; CoreS3SE: free GPIOs confirmed by the board owner (G0/6/7/13). The
+; earlier placeholder pins drove G11/G12, which are CoreS3's internal
+; I2C bus (PMIC / expander / amp) — unsafe to bit-bang. CS takes G0 (a
+; strapping pin) since CS idles high, matching G0's boot-default level.
+[env:v2_test_esp32s3_arduino_software_spi_wire]
+extends = common_esp32s3dev, common_arduino
+test_framework = unity
+test_filter = v2/embedded/bus/test_software_spi_wire
+test_build_src = true
+build_flags =
+    ${common_esp32.build_flags}
+    ; CoreS3SE's PC link is USB-Serial-JTAG; route Arduino Serial (the Unity
+    ; test output) to it, otherwise Serial defaults to UART0 (not wired to USB).
+    -DARDUINO_USB_MODE=1
+    -DARDUINO_USB_CDC_ON_BOOT=1
+    -DM5HAL_TEST_SOFTWARE_SPI_FREQ=2000
+    -DM5HAL_TEST_SOFTWARE_SPI_PIN_CLK=13
+    -DM5HAL_TEST_SOFTWARE_SPI_PIN_MOSI=7
+    -DM5HAL_TEST_SOFTWARE_SPI_PIN_DC=6
+    -DM5HAL_TEST_SOFTWARE_SPI_PIN_CS=0

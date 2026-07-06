@@ -2,28 +2,56 @@ description: Hardware Abstraction Layer (HAL) for M5Stack products.
 url: https://github.com/m5stack/M5HAL
 issues: https://github.com/m5stack/M5HAL/issues
 license: MIT
-version: "0.1.2"
+version: "1.0.0-dev"
 
 dependencies:
-  idf: ">=5.0"
+  idf: ">=4.4"
   m5stack/M5Utility:
     git: https://github.com/m5stack/M5Utility.git
-    version: main
+    # Pin a released tag instead of `main` so component builds are
+    # reproducible (library.json requires >=0.1.0 for the same reason).
+    # Resolution is verified consumer-side by test/idf_consumer_build.
+    # NOTE: at tag 0.1.0 M5Utility's manifest still restricts `targets:`,
+    # so consumers on chips absent from that list (e.g. esp32c5) fail to
+    # resolve even though M5HAL declares them; fixed upstream-side by
+    # removing the restriction (pending merge/release), then advance this
+    # pin and add those chips to the consumer check.
+    version: "0.1.0"
 
 targets:
   - esp32
+  - esp32s2
   - esp32s3
+  - esp32c2
   - esp32c3
+  - esp32c5
   - esp32c6
-  - esp32p4
+  - esp32c61
   - esp32h2
+  - esp32p4
+  # Preview-status SoCs (ESP-IDF idf.py --preview). esp32h21 builds from v5.5;
+  # esp32h4 needs ESP-IDF v6.0+ (its esp_driver_i2c/spi are header-only in v5.5,
+  # so a v5.5 build compiles but link-fails). Listed so registry consumers on
+  # these chips can resolve M5HAL; pair esp32h4 with IDF >= 6.0.
+  - esp32h21
+  - esp32h4
 
+# Ship the library plus its user documentation (src + headers + CMakeLists +
+# README + LICENSE + spec/) in the published ESP-IDF component. spec/ stays in
+# so registry users can read the design docs offline. examples/ is excluded
+# here because an IDF component never builds or consumes them; the PlatformIO
+# package (library.json) intentionally KEEPS examples/ since Arduino /
+# PlatformIO users do. Rationale:
+# spec/reference/directory-layout.md (published-package excludes).
 files:
   exclude:
     - "docs/**"
     - "examples/**"
+    - "experiments/**"
     - "test/**"
+    - "pio_envs/**"
     - ".github/**"
     - "boards/**"
+    - "platformio.ini"
     - "library.json"
     - "library.properties"

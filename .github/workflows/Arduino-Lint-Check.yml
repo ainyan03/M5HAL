@@ -17,7 +17,9 @@ concurrency:
 jobs:
   lint:
     name: Lint Check
-    runs-on: ubuntu-latest
+    # m5stack org uses its self-hosted runners; forks (no self-hosted runner)
+    # fall back to the free GitHub-hosted runner. Same action either way.
+    runs-on: ${{ github.repository_owner == 'm5stack' && fromJSON('["self-hosted", "Linux", "X64"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: arduino/arduino-lint-action@v2

@@ -1,0 +1,6 @@
+# Depend on the M5HAL working tree by path; the component manager then
+# resolves M5HAL's own dependencies (M5Utility from its upstream git URL)
+# exactly as a real consumer's build would.
+dependencies:
+  M5HAL:
+    path: "../../.."

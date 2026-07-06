@@ -13,7 +13,7 @@
     "dependencies": {
         "m5stack/M5Utility": ">=0.1.0"
     },
-    "version": "0.1.2",
+    "version": "1.0.0-dev",
     "frameworks": [
         "arduino",
         "espidf"
@@ -21,6 +21,25 @@
     "platforms": [
         "espressif32"
     ],
+    "build": {
+        "comment": "M5HAL requires C++17. These flags apply to M5HAL's OWN sources only (PlatformIO scopes library.json build to a per-library environment; they do NOT reach the consumer's translation unit — a consumer that includes <M5HAL_v2.hpp> must still set -std=gnu++17 itself, and gets a clear #error from the header if it forgets). Their job is to keep a downstream build that forgot -std from ALSO drowning in errors out of M5HAL's own .cpp files. espressif32@6.x / Arduino core 2.x defaults to gnu++11.",
+        "unflags": [
+            "-std=gnu++11"
+        ],
+        "flags": [
+            "-std=gnu++17"
+        ]
+    },
     "headers": "M5HAL.hpp",
-    "license": "MIT"
+    "license": "MIT",
+    "export": {
+        "exclude": [
+            "experiments",
+            "test",
+            "pio_envs",
+            ".github",
+            "platformio.ini",
+            "idf_component.yml"
+        ]
+    }
 }

@@ -1,0 +1,560 @@
+// SPDX-License-Identifier: MIT
+
+#ifndef M5_HAL_BUS_HPP_
+#define M5_HAL_BUS_HPP_
+
+#include "../assert.hpp"
+#include "../error.hpp"
+#include "../runtime/runtime.hpp"
+#include "../types.hpp"
+
+#include <M5Utility.hpp>
+
+#include <memory>
+#include <utility>
+
+/*!
+  @namespace m5::hal::v2::bus
+  @brief IBus / IAccessor abstractions shared by every kind (I2C, SPI, ...).
+ */
+namespace m5::hal::v2::bus {
+
+struct IBus;
+struct IAccessConfig;
+struct IAccessor;
+
+//-------------------------------------------------------------------------
+/*!
+  @brief Abstract base for per-bus initialization configuration.
+
+  Carries a kind tag (`bus_kind`) as a plain field, set by the derived
+  constructor and forwarded to this base constructor. `getBusKind()` is
+  non-virtual so the type has no vtable. The field is intentionally
+  non-const because variant implementations copy-assign through a
+  `_config = static_cast<const FooBusConfig&>(config);` pattern; the
+  value is fixed at construction by the derived ctor (the sole entry
+  point) by convention.
+ */
+struct IBusConfig {
+    types::bus_kind_t bus_kind;  ///< Kind tag (`I2C`, `SPI`, ...). Set by the derived ctor.
+    types::bus_kind_t getBusKind(void) const
+    {
+        return bus_kind;
+    }
+
+protected:
+    explicit constexpr IBusConfig(types::bus_kind_t k) : bus_kind{k}
+    {
+    }
+};
+
+//-------------------------------------------------------------------------
+/*!
+  @brief Marker base for per-call transfer metadata.
+
+  Each bus kind defines its own derivation (`i2c::ITransferDesc`,
+  `spi::ITransferDesc`, etc.) carrying prefix bytes and per-transfer
+  flags. This base has no virtual hook and no `getBusKind` — it exists
+  only as a typed anchor.
+ */
+struct ITransferDesc {};
+
+//-------------------------------------------------------------------------
+/*!
+  @brief Cumulative byte counts for one bus transaction.
+
+  `tx` counts bytes consumed from caller-provided Source/write buffers.
+  `rx` counts bytes committed into caller-provided Sink/read buffers.
+  Descriptor-generated wire bytes (I2C prefix, SPI command/address/dummy,
+  implicit dummy TX, etc.) are intentionally excluded.
+ */
+struct TransferTotals {
+    size_t tx = 0;
+    size_t rx = 0;
+
+    void clear(void)
+    {
+        tx = 0;
+        rx = 0;
+    }
+
+    void add(const TransferTotals& other)
+    {
+        tx += other.tx;
+        rx += other.rx;
+    }
+};
+
+//-------------------------------------------------------------------------
+/*!
+  @brief Abstract base for accessor-side (per-target) configuration.
+
+  The kind-tag convention matches `IBusConfig`: a non-virtual getter
+  returns a field that the derived ctor forwards to this base ctor.
+ */
+struct IAccessConfig {
+    types::bus_kind_t bus_kind;
+    types::bus_kind_t getBusKind(void) const
+    {
+        return bus_kind;
+    }
+
+protected:
+    explicit constexpr IAccessConfig(types::bus_kind_t k) : bus_kind{k}
+    {
+    }
+};
+
+//-------------------------------------------------------------------------
+/*!
+  @brief Abstract base for a per-target accessor.
+
+  An `IAccessor` is the owner identity for an access window, holds a
+  pointer to its `IBus`, and exposes lifecycle hooks. Actual I/O is
+  defined by kind-specific derivations (`i2c::MasterAccessor`,
+  `spi::MasterAccessor`, ...).
+
+  An accessor may be constructed UNBOUND (no bus yet) and bound later
+  through the derivation's kind-typed `bind()` — the
+  "global driver object, begin(bus) in setup()" pattern. Unbound use
+  is a contract violation gated at the access-window entry points
+  (`beginAccess` and the kind-specific window openers): debug builds
+  assert, release builds return `INVALID_ARGUMENT`. Hot-path calls
+  below the gate (transfer and the sugars, which all pass through a
+  gate first) skip the check by design.
+
+  `getConfig()` returns a const reference to the (derived) `IAccessConfig`.
+  It is named symmetrically with `IBus::getConfig() -> const IBusConfig&`.
+  Derived classes may narrow the return type covariantly (e.g.
+  `const MasterAccessConfig&`); the abstract base returns
+  `const IAccessConfig&`.
+
+  `getBusKind()` delegates to `getConfig()` (single source of truth).
+  Routing the lookup through `IAccessConfig` leaves room for a future
+  asymmetric setup where the bus and the accessor speak different kinds
+  (for example, an I2C protocol accessor running on top of an SPI bus).
+ */
+struct IAccessor {
+    virtual ~IAccessor(void)                           = default;
+    virtual const IAccessConfig& getConfig(void) const = 0;
+    types::bus_kind_t getBusKind(void) const;
+
+    IAccessor(IBus& bus);
+    /*!
+      @brief Co-owning construction: the accessor shares ownership of the bus.
+
+      The canonical "borrow from M5_Hal" path: `M5_Hal.<kind>.acquire(cfg)`
+      hands back a `shared_ptr<IBus>`, and constructing an accessor from it
+      keeps the bus alive for as long as the accessor lives. This makes the
+      borrow safe even when the caller does not separately retain the
+      `shared_ptr` (e.g. `Accessor dev{acquire(cfg).value(), cfg}` — the
+      temporary would otherwise drop and dangle the bus).
+
+      The hot path still goes through the raw `_bus`; `_owner` only pins the
+      lifetime. The `IBus&` overload above is the escape for callers that own
+      the bus themselves (direct construction), leaving `_owner` empty.
+     */
+    explicit IAccessor(std::shared_ptr<IBus> owner);
+    /*! @brief Whether a bus is currently bound. */
+    bool isBound(void) const;
+    /*!
+      @brief Return the bound bus.
+
+      Calling this on an unbound accessor is a contract violation
+      (ungated null dereference); check `isBound()` when in doubt.
+     */
+    IBus& getBus(void) const;
+    const IBusConfig& getBusConfig(void) const;
+
+    /*!
+      @brief Open an access window on the underlying bus.
+
+      Internally calls `_bus.lock(this, timeout_ms)` (with a paired
+      `_bus.unlock(this)` from `endAccess`). The depth counter
+      `_access_depth` collapses nested calls (e.g. an outer
+      `ScopedAccess` plus an inner sugar method) into a single lock.
+
+      @param timeout_ms Bus-lock acquisition timeout, in milliseconds;
+                       0 = immediate try-lock, `types::TIMEOUT_FOREVER`
+                       (the default) = wait until acquired (semantics:
+                       `IBus::lock`). Prefer an explicit budget you can
+                       handle on expiry; the infinite default is the
+                       sugar for call sites where handling a timeout is
+                       more trouble than it is worth.
+      @return Empty success, or `TIMEOUT_ERROR` when the bus stayed
+              held by another owner for the whole (finite) timeout.
+     */
+    m5::hal::v2::result_t<void> beginAccess(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+    /*!
+      @brief Close one nesting level of the access window; release the
+             bus lock on the outermost call.
+     */
+    m5::hal::v2::result_t<void> endAccess(void);
+    /*! @brief Return whether the accessor currently holds an access window. */
+    bool inAccess(void) const;
+
+protected:
+    // Unbound construction is protected: only a derivation that also
+    // offers the kind-typed bind() may expose it.
+    IAccessor(void) = default;
+    /*!
+      @brief Bind (or rebind) the bus. Backs the derivation's typed bind().
+
+      Must not be called while an access window is open — the open
+      window holds the previous bus's lock. Derivations enforce that
+      (`bind` returns `INVALID_ARGUMENT`) before delegating here.
+
+      `bind` takes the bus by reference, so the accessor borrows it without
+      owning it: any prior co-ownership (`_owner`, from a shared_ptr ctor) is
+      dropped here. This keeps the invariant "`_owner` is empty, or owns the
+      bus `_bus` points to" — otherwise rebinding would leak the old bus and
+      leave `_owner` pointing at a different bus than `_bus`.
+     */
+    void _bindBus(IBus& bus);
+
+    IBus* _bus             = nullptr;
+    uint32_t _access_depth = 0;
+    // Empty unless the accessor co-owns its bus (constructed from a
+    // shared_ptr). Pins the bus lifetime; `_bus` aliases `_owner.get()`.
+    std::shared_ptr<IBus> _owner{};
+};
+
+//-------------------------------------------------------------------------
+/*!
+  @brief Abstract base for a communication bus.
+
+  Instances are obtained via `hal.<KIND>.acquire(cfg)` on a `Hal` facade
+  (e.g. `M5_Hal.I2C.acquire(cfg)`) — see the per-kind headers' file docs
+  for the entry-point story.
+
+  `getBusKind()` delegates to `IBusConfig` (single source of truth).
+  Only one virtual call (`getConfig()`) is needed; derived classes do
+  not override `getBusKind()` because the kind is already forwarded
+  into `IBusConfig` by their constructor.
+ */
+struct IBus {
+public:
+    virtual ~IBus()                                 = default;
+    virtual const IBusConfig& getConfig(void) const = 0;
+    types::bus_kind_t getBusKind(void) const;
+
+    // IBus initialization is intentionally NOT part of this abstract
+    // interface. Initialization inherently needs variant-specific data
+    // (a TwoWire*, a port number, a device path, ...), so a kind-generic
+    // `init` cannot exist; each concrete bus declares its own
+    // non-virtual `init(const <Variant>IBusConfig&)` taking exactly the
+    // config type it can act on (variants without extra fields take the
+    // abstract kind config). The former base virtual only enabled
+    // passing a sibling config, which the mandatory downcast turned
+    // into UB. Return type matches the other public APIs
+    // (`lock` / `unlock` / `transfer` / ...), so callers use
+    // `if (auto r = bus.init(cfg); !r) ...` uniformly.
+
+    /*! @brief Release any resources acquired by the concrete bus's `init`. */
+    virtual result_t<void> release(void);
+
+    /*!
+      @brief Acquire mutual exclusion on the bus for an owner.
+
+      Backed by the always-embedded `runtime::Mutex`: the call
+      WAITS for the current holder up to `timeout_ms` and fails with
+      `TIMEOUT_ERROR` when the mutex could not be taken; `timeout_ms`
+      of 0 is an immediate try-lock and `types::TIMEOUT_FOREVER` (the
+      default) blocks until acquired. Non-recursive — `IBus::lock` is
+      invoked at most once per access window (nesting is absorbed by
+      the depth counter in `IAccessor::beginAccess`), and a re-lock from
+      the holding task (same owner or another accessor) also waits
+      until the timeout and fails — with TIMEOUT_FOREVER that is a
+      deadlock (fail-loud: the task watchdog fires). Task context only;
+      never call from an ISR. Timeout granularity follows the
+      runtime variant (one FreeRTOS tick — 10 ms by default — on the
+      embedded targets).
+
+      `owner` must be a valid `IAccessor*`; `nullptr` returns
+      `INVALID_ARGUMENT`. The `_lock_owner` bookkeeping happens with
+      the mutex held on both lock and unlock.
+
+      @param owner       Locking accessor; required.
+      @param timeout_ms  Acquisition timeout in milliseconds; 0 tries
+                         once and returns immediately,
+                         `types::TIMEOUT_FOREVER` waits indefinitely.
+      @retval TIMEOUT_ERROR     The bus was still held after timeout_ms.
+      @retval INVALID_ARGUMENT  `owner` is null.
+     */
+    virtual result_t<void> lock(IAccessor* owner, uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+
+    /*!
+      @brief Release the bus lock.
+
+      `owner` must match the accessor that took the lock; a mismatch or
+      an unlock without a preceding lock returns `INVALID_ARGUMENT`
+      without touching the mutex. Must be called from the task that
+      locked (a FreeRTOS mutex requirement).
+     */
+    virtual result_t<void> unlock(IAccessor* owner);
+
+    // Backend query API (ADR 034 phase 3). These describe HOW the bus is
+    // currently driven, so a holder can react to a hot-swap (e.g. a
+    // hardware->software downgrade when a controller is reassigned). They
+    // are non-pure with safe defaults: any bus that has not opted into the
+    // phase-3 backend model answers "software / no controller / unknown
+    // ceiling / never swapped", which never misleads a caller into assuming
+    // hardware guarantees. The runtime facade forwards these to its live
+    // backend so the answers track swaps.
+
+    /*!
+      @brief Whether this bus is driven by hardware or software right now.
+
+      Defaults to `Software` (the safe answer: an un-migrated bus never
+      claims hardware it does not have).
+     */
+    virtual types::backend_kind_t backendKind(void) const;
+
+    /*!
+      @brief Identifier of the hardware controller backing this bus, or -1.
+
+      -1 = no dedicated controller (software backend, or a kind that does
+      not participate in HW allocation). For hardware backends this is the
+      peripheral index (e.g. an I2C port number).
+     */
+    virtual int8_t controllerId(void) const;
+
+    /*!
+      @brief Upper frequency the current backend can sustain, in Hz; 0 = unknown.
+
+      Lets a holder notice a capability drop after a downgrade to software
+      (ADR 034: declare the ceiling rather than silently slow down).
+     */
+    virtual uint32_t maxFrequency(void) const;
+
+    /*!
+      @brief Monotonic counter bumped on every backend swap (poll baseline).
+
+      A holder that cached `backendKind()` / `maxFrequency()` detects a
+      change by comparing this against a previously read value -- no
+      callback needed. Stays 0 for buses that never swap.
+     */
+    virtual uint32_t backendGeneration(void) const;
+
+protected:
+    runtime::Mutex _mutex;             // always embedded; backs lock()/unlock()
+    IAccessor* _lock_owner = nullptr;  // nullptr = not currently locked
+};
+
+//-------------------------------------------------------------------------
+/*!
+  @brief RAII helper that wraps an accessor's `beginAccess` / `endAccess`.
+
+  Templated on the accessor type so the accessor's OWN `beginAccess` is called
+  by static dispatch. For UART / I2S split accessors that is the TX-only or
+  RX-only `beginAccess`, NOT the base `IAccessor::beginAccess` (which is
+  non-virtual and would otherwise be sliced to the combined-channel lock,
+  blocking the opposite channel and risking self-deadlock) (D2/F2). Use CTAD:
+  `ScopedAccess guard{tx_accessor};` deduces the accessor type. Master /
+  single-channel accessors deduce to themselves and behave exactly as before.
+
+  Nested with sugar methods that also call `beginAccess`, the depth
+  counter folds the layers naturally. Both move and copy are deleted
+  because the scope is not meant to outlive its lexical block. A
+  lock-acquisition failure is observed via `has_error()` / `error()`.
+
+  Polarity: success = `scope.ok()` (== `!scope.has_error()`). There is
+  deliberately no `operator bool` - "truthy scope = acquired" and
+  "truthy = has error" are both plausible readings, so the check must
+  spell the polarity out; `ok()` makes the positive check explicit.
+  `error()` is `OK` exactly when `has_error()` is false. The same
+  applies to `ScopedLock` below.
+ */
+template <class Accessor>
+class ScopedAccess {
+public:
+    explicit ScopedAccess(Accessor& accessor, uint32_t timeout_ms = types::TIMEOUT_FOREVER) : _accessor{&accessor}
+    {
+        auto r = _accessor->beginAccess(timeout_ms);
+        if (!r.has_value()) {
+            _error    = r.error();
+            _accessor = nullptr;  // dtor will not call endAccess
+        }
+    }
+    ~ScopedAccess()
+    {
+        if (_accessor != nullptr) {
+            (void)_accessor->endAccess();
+        }
+    }
+    ScopedAccess(const ScopedAccess&)            = delete;
+    ScopedAccess& operator=(const ScopedAccess&) = delete;
+    ScopedAccess(ScopedAccess&&)                 = delete;
+    ScopedAccess& operator=(ScopedAccess&&)      = delete;
+
+    bool has_error(void) const
+    {
+        return _accessor == nullptr;
+    }
+    /*! @brief Success view: `true` when the scope acquired (== `!has_error()`). */
+    bool ok(void) const
+    {
+        return !has_error();
+    }
+    m5::hal::v2::error::error_t error(void) const
+    {
+        return _error;
+    }
+
+private:
+    Accessor* _accessor                = nullptr;
+    m5::hal::v2::error::error_t _error = m5::hal::v2::error::error_t::OK;
+};
+
+/*!
+  @brief RAII helper that wraps `IBus::lock` / `IBus::unlock`.
+
+  For low-level callers who want to make several
+  `bus.transfer(&accessor, ...)` calls atomic. Move and copy are
+  deleted; failure is observed via `has_error()` / `error()`.
+ */
+class ScopedLock {
+public:
+    ScopedLock(IBus& bus, IAccessor* owner, uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+    ~ScopedLock();
+    ScopedLock(const ScopedLock&)            = delete;
+    ScopedLock& operator=(const ScopedLock&) = delete;
+    ScopedLock(ScopedLock&&)                 = delete;
+    ScopedLock& operator=(ScopedLock&&)      = delete;
+
+    bool has_error(void) const;
+    /*! @brief Success view: `true` when the scope acquired (== `!has_error()`). */
+    bool ok(void) const;
+    m5::hal::v2::error::error_t error(void) const;
+
+private:
+    IBus* _bus                         = nullptr;
+    IAccessor* _owner                  = nullptr;
+    m5::hal::v2::error::error_t _error = m5::hal::v2::error::error_t::OK;
+};
+
+/*!
+  @brief Non-owning bus reference registry (slot -> bus).
+
+  This is NOT the entry point for obtaining a bus — that is
+  `hal.<KIND>.acquire(cfg)`. `BusGroup` is a utility for upper layers
+  (board-support packages) that want to publish slot-numbered wiring.
+
+  The HAL neither creates nor owns buses — the user does (the v2
+  ownership model). What a board-support layer still needs is a place
+  to PUBLISH its wiring: "slot 1 is the SD bus, slot 2 is the LCD bus".
+  A `BusGroup` is that place, one per kind on `M5_Hal` (`M5_Hal.SPI`,
+  ...), with the same shape as `GPIOGroup::addGPIO`:
+
+  @code
+  static m5::hal::v2::spi::Bus spi_bus;             // user-owned
+  M5_Hal.SPI.addBus(&spi_bus, 1);                   // publish
+  auto* bus = M5_Hal.SPI.getBus(1);                 // look up (nullptr = empty)
+  @endcode
+
+  - **Aliasing is natural**: registering the SAME pointer in several
+    slots expresses "slot 1 (SD) and slot 2 (LCD) are one physical
+    bus". The registry stores references, not instances, so nothing
+    special is needed.
+  - **Slot meanings belong to the upper layer** (a board-support
+    package names its slots with constants); the HAL only provides the
+    table.
+  - **Lifetime rule**: registered buses should have static storage
+    duration; call `removeBus` before destroying or `release()`-ing a
+    registered bus. The registry never deletes.
+  - Registration is a startup-time operation; afterwards the table is
+    treated as read-only (no locking), like `GPIOGroup`.
+ */
+template <typename BusT>
+class BusGroup {
+public:
+    /*! @brief Fixed slot count (a few pointers per kind). */
+    static constexpr size_t kSlotCount = 8;
+
+    constexpr BusGroup() noexcept = default;
+
+    BusGroup(const BusGroup&)            = delete;
+    BusGroup& operator=(const BusGroup&) = delete;
+    BusGroup(BusGroup&&)                 = delete;
+    BusGroup& operator=(BusGroup&&)      = delete;
+
+    /*!
+      @brief Publish `bus` at `slot`.
+
+      Rejected (`INVALID_ARGUMENT`) when `bus == nullptr`,
+      `slot >= kSlotCount`, or the slot is already in use. The same
+      bus MAY occupy several slots (aliasing).
+     */
+    [[nodiscard]] result_t<void> addBus(BusT* bus, size_t slot)
+    {
+        if (bus == nullptr || slot >= kSlotCount || _slots[slot] != nullptr) {
+            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+        }
+        _slots[slot] = bus;
+        return {};
+    }
+
+    /*!
+      @brief Withdraw the registration at `slot`.
+
+      Rejected when `slot >= kSlotCount` or the slot is empty. Only the
+      table entry is cleared — the bus object is untouched.
+     */
+    [[nodiscard]] result_t<void> removeBus(size_t slot)
+    {
+        if (slot >= kSlotCount || _slots[slot] == nullptr) {
+            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+        }
+        _slots[slot] = nullptr;
+        return {};
+    }
+
+    /*! @brief Bus registered at `slot`, or `nullptr` (empty / out of range). */
+    BusT* getBus(size_t slot) const
+    {
+        return slot < kSlotCount ? _slots[slot] : nullptr;
+    }
+
+    bool hasBus(size_t slot) const
+    {
+        return getBus(slot) != nullptr;
+    }
+
+private:
+    BusT* _slots[kSlotCount] = {};
+};
+
+/*!
+  @brief Run `body` bracketed by `begin` / `end` with the shared
+         release-error policy.
+
+  The policy every accessor sugar method follows: a `begin` failure
+  returns immediately (nothing to release), the `body` error wins over
+  an `end` error, but a clean body must not hide a broken release —
+  depth-counter corruption would otherwise go unnoticed. `end` always
+  runs once `begin` succeeded, even when the body failed.
+
+  All three callables return a `result_t`; the body's result type is
+  the call's result type.
+ */
+template <typename BeginFn, typename BodyFn, typename EndFn>
+auto guarded(BeginFn&& begin, BodyFn&& body, EndFn&& end) -> decltype(body())
+{
+    auto b = begin();
+    if (!b.has_value()) {
+        return m5::stl::make_unexpected(b.error());
+    }
+    auto result = body();
+    auto e      = end();
+    if (!result.has_value()) {
+        return result;
+    }
+    if (!e.has_value()) {
+        return m5::stl::make_unexpected(e.error());
+    }
+    return result;
+}
+
+}  // namespace m5::hal::v2::bus
+
+#endif

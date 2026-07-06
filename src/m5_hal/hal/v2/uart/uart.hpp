@@ -1,0 +1,736 @@
+// SPDX-License-Identifier: MIT
+#ifndef M5_HAL_UART_UART_HPP_
+#define M5_HAL_UART_UART_HPP_
+
+#include "../bus/bus.hpp"
+#include "../bus/hal_backend.hpp"
+#include "../bus/managed_facade.hpp"
+#include "../bus/registry.hpp"
+#include "../data.hpp"
+#include "../data/stream.hpp"
+#include "../types.hpp"
+
+#include <stddef.h>
+#include <stdint.h>
+#include <memory>
+#include <new>
+#include <type_traits>
+
+/*!
+  @namespace m5::hal::v2::uart
+  @brief UART bus, TX/RX accessors, and stream-style byte I/O.
+
+  ## Getting a bus (entry point)
+
+  Buses are obtained from a `Hal` facade instance — `M5_Hal` (the local
+  device) or a user-constructed remote `Hal` — never by naming a concrete
+  backend type yourself. Remote instances are connected via
+  `Hal::connect(endpoint)`; see m5_hal.hpp.
+
+  @code
+  m5hal::uart::BusConfig cfg{m5hal::uart::Tx{17}, m5hal::uart::Rx{16}};
+  auto bus = m5hal::M5_Hal.UART.acquire(cfg);  // result_t<shared_ptr<IBus>>
+  if (!bus) {
+      // handle bus.error()
+  }
+  @endcode
+
+  Note: `uart::BusConfig` is an alias supplied by the active build
+  variant — this abstract header defines only the `IBusConfig` base and
+  the pin tags. Include the v2 entry header (`<M5HAL_v2.hpp>`) and the
+  alias resolves to the variant's concrete config type. The
+  pin-tag construction above is for MCU variants; the POSIX variant
+  identifies a bus by `device_path` instead and deliberately has no pin
+  constructor (see the IBusConfig doc below). Acquiring the same wiring
+  twice returns the same instance (identity acquire; see
+  spec/design/bus_accessor.md). Direct construction
+  (`uart::Bus bus; bus.init(cfg);`) remains the advanced path.
+ */
+namespace m5::hal::v2::uart {
+
+enum class Parity : uint8_t {
+    None = 0,
+    Even = 1,
+    Odd  = 2,
+};
+using parity_t = Parity;
+
+enum class Channel : uint8_t {
+    None = 0,
+    Tx   = 1u << 0,
+    Rx   = 1u << 1,
+    TxRx = (1u << 0) | (1u << 1),
+};
+using channel_t = Channel;
+
+constexpr Channel operator|(Channel lhs, Channel rhs)
+{
+    return static_cast<Channel>(static_cast<uint8_t>(lhs) | static_cast<uint8_t>(rhs));
+}
+
+constexpr Channel operator&(Channel lhs, Channel rhs)
+{
+    return static_cast<Channel>(static_cast<uint8_t>(lhs) & static_cast<uint8_t>(rhs));
+}
+
+constexpr bool hasChannel(Channel value, Channel bit)
+{
+    return (static_cast<uint8_t>(value) & static_cast<uint8_t>(bit)) == static_cast<uint8_t>(bit);
+}
+
+/*!
+  @brief Strong-typed TX pin for one-line bus-config construction.
+
+  Wraps a global `gpio_number_t` so the constructor argument carries
+  its role in the type. The constructor is `explicit` on purpose: a
+  plain integer never converts into a tag, so an untagged positional
+  call like `BusConfig{17, 16}` stays a compile error.
+ */
+struct Tx {
+    constexpr explicit Tx(types::gpio_number_t pin) : value{pin}
+    {
+    }
+    types::gpio_number_t value;
+};
+
+/*! @brief Strong-typed RX pin. See @ref Tx. */
+struct Rx {
+    constexpr explicit Rx(types::gpio_number_t pin) : value{pin}
+    {
+    }
+    types::gpio_number_t value;
+};
+
+/*!
+  @brief Bus-level UART configuration.
+
+  Pin fields take global `gpio_number_t` numbers; -1 = the line is not
+  used (RTS/CTS default to unused). Buffer sizes are in bytes and are
+  handed to the backend driver; 0 keeps the backend's default behavior
+  (e.g. ESP-IDF installs no TX ring buffer, so writes block until the
+  bytes are queued).
+
+  One-line construction passes the strong-typed pin tags — either order
+  lands on the right field:
+  @code
+  uart::BusConfig cfg{uart::Tx{17}, uart::Rx{16}};
+  @endcode
+  RTS / CTS and the buffer sizes stay at their defaults and are set by
+  field assignment when needed.
+
+  This tag one-liner is for the MCU variants (`BusConfig_espidf` /
+  `BusConfig_arduino`, which inherit it). The POSIX host variant
+  (`BusConfig_posix`) deliberately omits the pin ctor — its endpoint selector
+  is a `device_path` (which serial device to open), not pins, so it is built
+  by field assignment (`cfg.device_path = "/dev/ttyUSB0";`) to avoid a pin
+  one-liner that looks complete while leaving `device_path` unset. Note that
+  `device_path` is a backend endpoint selector, NOT the shared-registry bus
+  identity (which is the TX/RX pin pair — see `identityFromConfig` below);
+  path-keyed acquire through the shared registry is not supported (D4). `uart::BusConfig` resolves to
+  the active build's variant, so the pin one-liner above compiles on an MCU
+  build but not on a native/POSIX build (see spec/design/uart.md §pin).
+ */
+struct IBusConfig : public bus::IBusConfig {
+    types::gpio_number_t pin_tx  = -1;
+    types::gpio_number_t pin_rx  = -1;
+    types::gpio_number_t pin_rts = -1;
+    types::gpio_number_t pin_cts = -1;
+    size_t rx_buffer_size        = 256;
+    size_t tx_buffer_size        = 0;
+
+    constexpr IBusConfig(void) : bus::IBusConfig{types::bus_kind_t::UART}
+    {
+    }
+
+    /*! @brief One-line pin construction (tag order is free). */
+    constexpr IBusConfig(Tx tx, Rx rx) : bus::IBusConfig{types::bus_kind_t::UART}, pin_tx{tx.value}, pin_rx{rx.value}
+    {
+    }
+    constexpr IBusConfig(Rx rx, Tx tx) : IBusConfig{tx, rx}
+    {
+    }
+};
+
+/*!
+  @brief Pin + intent acquire request for the unified BusView surface.
+
+  UART currently uses static backend selection through `acquire(BusConfig)`;
+  the logical acquire overload exists on `BusView` for API parity with I2C/SPI
+  and reports `NOT_IMPLEMENTED` until UART grows a controller-allocation policy.
+ */
+struct LogicalBusConfig {
+    types::gpio_number_t pin_tx = -1;
+    types::gpio_number_t pin_rx = -1;
+    types::AllocationIntent intent{};
+
+    constexpr LogicalBusConfig(void) = default;
+    constexpr LogicalBusConfig(Tx tx, Rx rx, types::AllocationIntent in = {})
+        : pin_tx{tx.value}, pin_rx{rx.value}, intent{in}
+    {
+    }
+    constexpr LogicalBusConfig(Rx rx, Tx tx, types::AllocationIntent in = {}) : LogicalBusConfig{tx, rx, in}
+    {
+    }
+};
+
+/*!
+  @brief Accessor-level UART configuration. All timeouts are in
+         milliseconds.
+
+  Reads wait `first_byte_timeout_ms` for the first byte and
+  `inter_byte_timeout_ms` between subsequent bytes; expiry is a normal
+  short read, not an error. `write_timeout_ms` bounds the write/drain
+  wait (the backends differ in what "drained" means — the contract
+  table is in spec/design/uart.md). Channel-lock acquisition is NOT a
+  config concern: it is a per-call argument of `beginAccess` on the TX
+  or RX channel accessor (default: wait forever).
+ */
+struct AccessConfig : public bus::IAccessConfig {
+    uint32_t baud_rate             = 115200;
+    uint32_t first_byte_timeout_ms = 100;
+    uint32_t inter_byte_timeout_ms = 20;
+    uint32_t write_timeout_ms      = 1000;
+    uint8_t data_bits              = 8;
+    uint8_t stop_bits              = 1;
+    parity_t parity                = parity_t::None;
+    bool invert                    = false;
+
+    constexpr AccessConfig(void) : bus::IAccessConfig{types::bus_kind_t::UART}
+    {
+    }
+};
+
+struct IBus;
+
+/*!
+  @brief TX-side accessor; locks only the TX channel.
+
+  TX and RX are independent channel locks, so one owner can write
+  while another reads. `beginAccess` / `endAccess` (TX channel) nest
+  through a depth counter (like `Accessor::beginAccess`), and the write
+  sugars open the window themselves when needed.
+
+  A UART transaction is a TX channel exclusion scope plus byte-count
+  aggregation; it has no physical CS or bus-occupancy side effect. Accessors
+  must not be shared between threads. The transaction depth is only for
+  same-owner reentry, while sharing the Bus through separate accessors is
+  supported. `setConfig` fails with `INVALID_STATE` while an access window is
+  open.
+ */
+struct TxAccessor : public bus::IAccessor, public data::StreamWriter {
+    TxAccessor(IBus& bus, const AccessConfig& access_config);
+    /*! @brief Co-owning construction from a borrowed bus (`M5_Hal.UART.acquire(cfg)`). */
+    TxAccessor(std::shared_ptr<IBus> bus, const AccessConfig& access_config);
+
+    /*! @name Unbound construction + typed bind (gate: `beginAccess` on TX channel). @{ */
+    TxAccessor(void) = default;
+    explicit TxAccessor(const AccessConfig& access_config) : _access_config{access_config}
+    {
+    }
+    /*! @brief Bind (or rebind) to a UART bus; rejected while the TX window is open. */
+    result_t<void> bind(IBus& bus);
+    /*! @} */
+
+    const AccessConfig& getConfig(void) const override
+    {
+        return _access_config;
+    }
+    IBus& getBus(void) const;
+
+    result_t<void> setConfig(const AccessConfig& cfg);
+    result_t<void> beginAccess(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+    result_t<void> endAccess(void);
+    bool inAccess(void) const
+    {
+        return _tx_access_depth > 0;
+    }
+
+    result_t<void> beginTransaction(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+    result_t<bus::TransferTotals> endTransaction(void);
+    bool inTransaction(void) const
+    {
+        return _tx_txn_depth > 0;
+    }
+
+    result_t<size_t> write(data::ConstDataSpan src_bytes) override;
+    result_t<size_t> write(data::Source& src, size_t len);
+    result_t<size_t> write(const uint8_t* src, size_t len);
+
+protected:
+    AccessConfig _access_config;
+
+private:
+    uint32_t _tx_access_depth = 0;
+    uint32_t _tx_txn_depth    = 0;
+    bus::TransferTotals _tx_txn_totals;
+};
+
+/*!
+  @brief RX-side accessor; locks only the RX channel.
+
+  The mirror of `TxAccessor`: independent channel lock, depth
+  counter via `beginAccess` / `endAccess` (RX channel), and `setConfig`
+  fails with `INVALID_STATE` while an access window is open.
+
+  A UART transaction is an RX channel exclusion scope plus byte-count
+  aggregation; it has no physical CS or bus-occupancy side effect. Accessors
+  must not be shared between threads. The transaction depth is only for
+  same-owner reentry, while sharing the Bus through separate accessors is
+  supported.
+ */
+struct RxAccessor : public bus::IAccessor, public data::StreamReader {
+    RxAccessor(IBus& bus, const AccessConfig& access_config);
+    /*! @brief Co-owning construction from a borrowed bus (`M5_Hal.UART.acquire(cfg)`). */
+    RxAccessor(std::shared_ptr<IBus> bus, const AccessConfig& access_config);
+
+    /*! @name Unbound construction + typed bind (gate: `beginAccess` on RX channel). @{ */
+    RxAccessor(void) = default;
+    explicit RxAccessor(const AccessConfig& access_config) : _access_config{access_config}
+    {
+    }
+    /*! @brief Bind (or rebind) to a UART bus; rejected while the RX window is open. */
+    result_t<void> bind(IBus& bus);
+    /*! @} */
+
+    const AccessConfig& getConfig(void) const override
+    {
+        return _access_config;
+    }
+    IBus& getBus(void) const;
+
+    result_t<void> setConfig(const AccessConfig& cfg);
+    result_t<void> beginAccess(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+    result_t<void> endAccess(void);
+    bool inAccess(void) const
+    {
+        return _rx_access_depth > 0;
+    }
+
+    result_t<void> beginTransaction(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+    result_t<bus::TransferTotals> endTransaction(void);
+    bool inTransaction(void) const
+    {
+        return _rx_txn_depth > 0;
+    }
+
+    result_t<size_t> read(data::DataSpan dst_bytes) override;
+    result_t<size_t> read(data::Sink& dst, size_t len);
+    result_t<size_t> read(uint8_t* dst, size_t len);
+
+    /*!
+      @brief Read until `delim` is stored (line-oriented sugar).
+
+      `data::readUntil` run inside ONE RX channel-lock window, so a
+      line costs one lock acquisition instead of one per byte. The
+      return value is the byte count with **the delimiter included**;
+      `n > 0 && dst[n - 1] == delim` decides completion, a short
+      count is a timeout-bounded partial read (not an error). See
+      `data::readUntil` for the full contract.
+     */
+    result_t<size_t> readUntil(uint8_t delim, uint8_t* dst, size_t max_len);
+
+    result_t<size_t> readableBytes(void) override;
+
+protected:
+    AccessConfig _access_config;
+
+private:
+    uint32_t _rx_access_depth = 0;
+    uint32_t _rx_txn_depth    = 0;
+    bus::TransferTotals _rx_txn_totals;
+};
+
+/*!
+  @brief Convenience facade bundling one TX and one RX accessor.
+
+  `beginAccess` opens both channels in TX -> RX order, spending the
+  remaining timeout budget on the second lock (an infinite budget stays
+  infinite); if the RX lock fails, the already-acquired TX lock is
+  rolled back. The split accessors are the primary API — the facade
+  keeps simple command-response code short.
+ */
+struct Accessor {
+    Accessor(IBus& bus, const AccessConfig& access_config);
+    /*!
+      @brief Co-owning construction from a borrowed bus. Both channels share
+      ownership of the bus (`M5_Hal.UART.acquire(cfg)`).
+     */
+    Accessor(std::shared_ptr<IBus> bus, const AccessConfig& access_config);
+
+    /*! @name Unbound construction + typed bind (delegates to both channels). @{ */
+    Accessor(void) = default;
+    explicit Accessor(const AccessConfig& access_config) : _tx{access_config}, _rx{access_config}
+    {
+    }
+    /*! @brief Bind (or rebind) both channel accessors; rejected while either window is open. */
+    result_t<void> bind(IBus& bus);
+    /*! @} */
+
+    const AccessConfig& getConfig(void) const
+    {
+        return _tx.getConfig();
+    }
+    IBus& getBus(void) const;
+
+    TxAccessor& tx(void)
+    {
+        return _tx;
+    }
+    const TxAccessor& tx(void) const
+    {
+        return _tx;
+    }
+    RxAccessor& rx(void)
+    {
+        return _rx;
+    }
+    const RxAccessor& rx(void) const
+    {
+        return _rx;
+    }
+
+    result_t<void> setConfig(const AccessConfig& cfg);
+    result_t<void> beginAccess(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+    result_t<void> endAccess(void);
+    bool inAccess(void) const
+    {
+        return _tx.inAccess() || _rx.inAccess();
+    }
+
+    result_t<size_t> write(data::ConstDataSpan src_bytes);
+    result_t<size_t> write(data::Source& src, size_t len);
+    result_t<size_t> write(const uint8_t* src, size_t len);
+
+    result_t<size_t> read(data::DataSpan dst_bytes);
+    result_t<size_t> read(data::Sink& dst, size_t len);
+    result_t<size_t> read(uint8_t* dst, size_t len);
+
+    result_t<bus::TransferTotals> transfer(data::Source& src, size_t tx_len, data::Sink& dst, size_t rx_len);
+    result_t<bus::TransferTotals> transfer(data::ConstDataSpan src_bytes, data::DataSpan dst_bytes);
+
+    /*! @brief Line-oriented sugar; forwards to the RX accessor's `readUntil`. */
+    result_t<size_t> readUntil(uint8_t delim, uint8_t* dst, size_t max_len);
+
+    result_t<size_t> readableBytes(void);
+
+protected:
+    TxAccessor _tx;
+    RxAccessor _rx;
+};
+
+struct IBus : public bus::IBus {
+    const IBusConfig& getConfig(void) const override
+    {
+        return _config;
+    }
+
+    virtual result_t<size_t> write(bus::IAccessor* owner, const AccessConfig& cfg, data::Source* src, size_t len);
+    virtual result_t<size_t> read(bus::IAccessor* owner, const AccessConfig& cfg, data::Sink* dst, size_t len);
+    /*!
+      @brief Transfer bytes in both independent UART directions.
+
+      The contract is direction-independent concurrent progress: TX consumes
+      up to `tx_len` bytes while RX produces up to `rx_len` bytes. The default
+      implementation approximates this for local backends by running `write`
+      first and then `read`; a backend with true full-duplex DMA may override
+      it. If either step fails, the error is returned immediately, and bytes
+      from the earlier step may already have moved.
+     */
+    virtual result_t<bus::TransferTotals> transfer(bus::IAccessor* owner, const AccessConfig& cfg, data::Source* src,
+                                                   size_t tx_len, data::Sink* dst, size_t rx_len);
+    virtual result_t<size_t> readableBytes(bus::IAccessor* owner, const AccessConfig& cfg);
+
+    result_t<void> lock(bus::IAccessor* owner, uint32_t timeout_ms = types::TIMEOUT_FOREVER) override;
+    result_t<void> unlock(bus::IAccessor* owner) override;
+    virtual result_t<void> lockChannel(bus::IAccessor* owner, Channel ch, uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+    virtual result_t<void> unlockChannel(bus::IAccessor* owner, Channel ch);
+
+protected:
+    IBusConfig _config;
+    // UART splits the bus lock into independent TX / RX channels, so it
+    // carries one runtime::Mutex per channel (the composite txrx lock
+    // takes both, TX first); the base Bus mutex stays unused here. Lock
+    // semantics per channel match Bus::lock: wait up to timeout_ms,
+    // TIMEOUT_ERROR on expiry, non-recursive, task context only.
+    runtime::Mutex _tx_mutex;
+    runtime::Mutex _rx_mutex;
+    bus::IAccessor* _tx_lock_owner = nullptr;
+    bus::IAccessor* _rx_lock_owner = nullptr;
+};
+
+//-------------------------------------------------------------------------
+// bind() is defined below the concrete IBus: at the accessors' point of
+// declaration the kind IBus is still an incomplete type, so the
+// derived-to-base conversion _bindBus needs is not visible yet.
+inline result_t<void> TxAccessor::bind(IBus& bus)
+{
+    if (inAccess()) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    _bindBus(bus);
+    return {};
+}
+inline result_t<void> RxAccessor::bind(IBus& bus)
+{
+    if (inAccess()) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    _bindBus(bus);
+    return {};
+}
+inline result_t<void> Accessor::bind(IBus& bus)
+{
+    if (inAccess()) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    (void)_tx.bind(bus);
+    (void)_rx.bind(bus);
+    return {};
+}
+
+/*!
+  @brief Maps a variant BusConfig_<variant> to its backend Bus_<variant>.
+
+  Undefined primary on purpose: passing a config type without a
+  specialization to Bus::init is a compile error. Each variant header
+  specializes this next to its Bus_<variant>.
+ */
+template <class CfgT>
+struct BackendFor;
+
+struct Bus;  // the facade, defined just below
+
+/*!
+  @brief Per-kind Traits for the shared `bus::FacadeCore` and BusView.
+
+  UART's `Bus` shares the phase-1/2 spine (backend ownership + `init` +
+  `release` + the query mirror). Its plain `BusView` uses the same traits for
+  typed acquire identity: concrete kind `IBus`, the bus-level config base, the
+  variant selector (`FacadeCore`), the public `BusType`, kind tag, and the 2-pin
+  (TX/RX) identity projection. UART has no phase-3 intent / hot-swap surface,
+  so the master-only Traits members are intentionally absent.
+  `Bus` is forward-declared at namespace scope so `BusType` names the public
+  `uart::Bus`, not a nested type.
+ */
+struct BusTraits {
+    using IBus             = uart::IBus;
+    using IBusConfig       = uart::IBusConfig;
+    using LogicalBusConfig = uart::LogicalBusConfig;
+    using BusType          = Bus;
+    template <class CfgT>
+    using BackendFor = uart::BackendFor<CfgT>;
+
+    static constexpr types::bus_kind_t KIND = types::bus_kind_t::UART;
+
+    // UART bus identity is the TX/RX pin pair ONLY (D4/F3,F4). Backend-specific
+    // selectors -- ESP-IDF `port_num`, POSIX `device_path` -- are NOT part of the
+    // identity, so two acquires with the same pins share one bus even if they
+    // name a different controller/device (first config wins). This is by design:
+    // UART is a pins-keyed static view that does not (yet) participate in the
+    // managed controller allocator. Selecting a specific UART controller, or a
+    // POSIX device by path, is therefore out of scope for this shared pins-only
+    // acquire path -- use distinct pins, or a future dedicated API. (Validating
+    // backend-specific fields on a registry hit is a possible future safety net;
+    // see S23/D4.)
+    static bus::IdentityKey identityFromConfig(const IBusConfig& cfg)
+    {
+        return bus::IdentityKey::fromPins({cfg.pin_tx, cfg.pin_rx});
+    }
+    static bus::IdentityKey identityFromLogical(const LogicalBusConfig& req)
+    {
+        return bus::IdentityKey::fromPins({req.pin_tx, req.pin_rx});
+    }
+    static bool configCompatible(const IBusConfig& current, const IBusConfig& requested)
+    {
+        return current.pin_tx == requested.pin_tx && current.pin_rx == requested.pin_rx &&
+               current.pin_rts == requested.pin_rts && current.pin_cts == requested.pin_cts &&
+               current.rx_buffer_size == requested.rx_buffer_size && current.tx_buffer_size == requested.tx_buffer_size;
+    }
+};
+
+/*!
+  @brief Runtime facade for a UART bus (the unsuffixed uart::Bus).
+
+  All of the backend spine -- the `unique_ptr`-held backend, `init`, `release`,
+  and the lock-free backend-query mirror -- lives in
+  `bus::FacadeCore<BusTraits>`. This derived type adds only the UART data-path
+  forwards (write / read / readableBytes). The TX / RX channel locks
+  (lock / unlock / lockChannel / unlockChannel and the two channel mutexes) are
+  INHERITED from uart::IBus and stay on THIS facade -- the accessors contend on
+  the facade's channel mutexes, the backend's stay dormant. So the 2-mutex
+  channel model needs no special handling here: only the data path is delegated.
+  Mirrors the i2c::Bus design (ADR 034) without the phase-3 intent / hot-swap
+  extensions.
+ */
+struct Bus : public bus::FacadeCore<BusTraits> {
+    result_t<size_t> write(bus::IAccessor* owner, const AccessConfig& cfg, data::Source* src, size_t len) override
+    {
+        return forwardBackend([&](IBus& b) { return b.write(owner, cfg, src, len); });
+    }
+
+    result_t<size_t> read(bus::IAccessor* owner, const AccessConfig& cfg, data::Sink* dst, size_t len) override
+    {
+        return forwardBackend([&](IBus& b) { return b.read(owner, cfg, dst, len); });
+    }
+
+    result_t<bus::TransferTotals> transfer(bus::IAccessor* owner, const AccessConfig& cfg, data::Source* src,
+                                           size_t tx_len, data::Sink* dst, size_t rx_len) override
+    {
+        return forwardBackend([&](IBus& b) { return b.transfer(owner, cfg, src, tx_len, dst, rx_len); });
+    }
+
+    result_t<size_t> readableBytes(bus::IAccessor* owner, const AccessConfig& cfg) override
+    {
+        return forwardBackend([&](IBus& b) { return b.readableBytes(owner, cfg); });
+    }
+};
+
+/*!
+  @brief Typed UART view delegating registry access to the HAL backend.
+
+  ADR 034 phase 2 parity with i2c::BusView: UART buses are interned by the HAL
+  backend's registry keyed by physical wiring (the TX / RX pins).
+  acquire(cfg) returns the bus for those pins, creating it (the facade + the
+  backend selected by cfg's type) on the first call and sharing it on later
+  calls for the same wiring. Identity is (TX, RX); both are required (a
+  TX-only or RX-only port is not registry-acquirable -- construct it
+  directly). The public view uses the static-backend policy: `commitBuses()`
+  exists and is a no-op, while logical acquire reports `NOT_IMPLEMENTED` until
+  UART grows a controller-allocation policy.
+ */
+class BusView {
+public:
+    BusView() : _backend{nullptr}
+    {
+    }
+    explicit BusView(bus::IHalBackend* backend) : _backend{backend}
+    {
+    }
+    BusView(const BusView&)            = delete;
+    BusView& operator=(const BusView&) = delete;
+
+    void setBackend(bus::IHalBackend* backend)
+    {
+        _backend = backend;
+    }
+
+    template <class CfgT>
+    result_t<std::shared_ptr<IBus>> acquire(const CfgT& cfg)
+    {
+        static_assert(std::is_base_of<IBusConfig, CfgT>::value,
+                      "BusView::acquire expects a BusConfig of this bus kind");
+        if (_backend == nullptr) {
+            return m5::stl::make_unexpected(error::error_t::NOT_CONNECTED);
+        }
+        bus::IdentityKey id = BusTraits::identityFromConfig(cfg);
+        if (!id.valid()) {
+            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+        }
+        {
+            auto r = _backend->acquireBusTyped(types::bus_kind_t::UART, id, cfg);
+            if (r.has_value()) {
+                return std::static_pointer_cast<IBus>(r.value());
+            }
+            if (r.error() != error::error_t::NOT_IMPLEMENTED) {
+                return m5::stl::make_unexpected(r.error());
+            }
+        }
+        if (auto existing = _backend->busRegistry().findByIdentity(types::bus_kind_t::UART, id)) {
+            if (!BusTraits::configCompatible(static_cast<const IBusConfig&>(existing->getConfig()), cfg)) {
+                return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+            }
+        }
+        auto acquired = _backend->busRegistry().acquireOrFind(
+            types::bus_kind_t::UART, id, [&cfg]() -> result_t<std::shared_ptr<bus::IBus>> {
+                std::shared_ptr<Bus> facade{new (std::nothrow) Bus()};
+                if (!facade) {
+                    return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+                }
+                auto r = facade->init(cfg);
+                if (!r.has_value()) {
+                    return m5::stl::make_unexpected(r.error());
+                }
+                return std::shared_ptr<bus::IBus>{facade};
+            });
+        if (!acquired.has_value()) {
+            return m5::stl::make_unexpected(acquired.error());
+        }
+        return std::static_pointer_cast<IBus>(acquired.value());
+    }
+
+    result_t<std::shared_ptr<IBus>> acquire(const LogicalBusConfig& req)
+    {
+        if (_backend == nullptr) {
+            return m5::stl::make_unexpected(error::error_t::NOT_CONNECTED);
+        }
+        bus::IdentityKey id = BusTraits::identityFromLogical(req);
+        if (!id.valid()) {
+            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+        }
+        if (!req.intent.valid()) {
+            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+        }
+        bus::AllocationRequest ar{types::bus_kind_t::UART, id, req.intent, &req};
+        auto acquired = _backend->acquireBusLogical(types::bus_kind_t::UART, id, ar);
+        if (!acquired.has_value()) {
+            return m5::stl::make_unexpected(acquired.error());
+        }
+        return std::static_pointer_cast<IBus>(acquired.value());
+    }
+
+    result_t<void> commitBuses(uint32_t timeout_ms = types::TIMEOUT_FOREVER)
+    {
+        if (_backend == nullptr) {
+            return m5::stl::make_unexpected(error::error_t::NOT_CONNECTED);
+        }
+        return _backend->commitBuses(types::bus_kind_t::UART, timeout_ms);
+    }
+
+    /*!
+      @brief Explicitly release a bus acquired via acquire().
+
+      Clears the registry slot for the bus so capacity is reclaimed
+      immediately. For a remote backend this also sends BusRelease to
+      the peer. Pass the `shared_ptr<IBus>` returned by acquire().
+      Returns `INVALID_ARGUMENT` if the bus is null, its config pins
+      are invalid, or no matching slot is found in the registry.
+     */
+    result_t<void> release(const std::shared_ptr<IBus>& bus)
+    {
+        if (_backend == nullptr || !bus) {
+            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+        }
+        bus::IdentityKey id = BusTraits::identityFromConfig(bus->getConfig());
+        if (!id.valid()) {
+            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+        }
+        return _backend->releaseBus(types::bus_kind_t::UART, id);
+    }
+
+    uint8_t hardwareInUse(void) const
+    {
+        return 0;
+    }
+
+    LogicalBusConfig createBusConfig(Tx tx, Rx rx, types::AllocationIntent intent = {}) const
+    {
+        return {tx, rx, intent};
+    }
+    LogicalBusConfig createBusConfig(Rx rx, Tx tx, types::AllocationIntent intent = {}) const
+    {
+        return {tx, rx, intent};
+    }
+
+private:
+    bus::IHalBackend* _backend;
+};
+
+/*!
+  @brief Non-owning UART bus group; retained for the slot-based publish/lookup
+         table and the bus::BusGroup tests.
+ */
+using BusGroup = bus::BusGroup<IBus>;
+
+}  // namespace m5::hal::v2::uart
+
+#endif
