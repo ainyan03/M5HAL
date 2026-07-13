@@ -9,6 +9,7 @@
 #define M5HAL_I2C_MASTER_MAX_CLOCK_HZ 1200000u
 
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 #include <M5HAL_v2.hpp>
 
 #include <cstdint>
@@ -66,5 +67,6 @@ TEST(MasterClockLimit, ZeroFrequencyIsUnchanged)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

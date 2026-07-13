@@ -13,6 +13,10 @@ namespace m5::hal::v2::spi {
 
 result_t<void> Bus_remote::init(const BusConfig_remote& config)
 {
+    bus::BusLifecycle::Operation operation{*_lifecycle};
+    if (!operation) {
+        return m5::stl::make_unexpected(operation.error());
+    }
     (void)config;
     if (_session == nullptr) {
         return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
@@ -22,6 +26,10 @@ result_t<void> Bus_remote::init(const BusConfig_remote& config)
 
 result_t<void> Bus_remote::beginTransaction(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg)
 {
+    bus::BusLifecycle::Operation operation{*_lifecycle};
+    if (!operation) {
+        return m5::stl::make_unexpected(operation.error());
+    }
     (void)owner;
     if (_session == nullptr) {
         return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
@@ -41,30 +49,43 @@ result_t<void> Bus_remote::beginTransaction(bus::IAccessor* owner, const spi::Ma
     if (!r.has_value()) {
         return m5::stl::make_unexpected(r.error());
     }
-    auto req = _session->request({script_buf, script.written()});
+    remote::RemoteSessionHandle::Lease lease{*_session};
+    if (!lease) {
+        return m5::stl::make_unexpected(lease.error());
+    }
+    auto& session = lease.session();
+    auto req      = session.request({script_buf, script.written()});
     if (!req.has_value()) {
+        _config_cache.invalidate();
         return m5::stl::make_unexpected(req.error());
     }
     bytecode::BytecodeRunner runner{memory::defaultAllocator()};
     runner.setReceiveOnly(true);
-    auto resp = _session->lastResponse();
+    auto resp = session.lastResponse();
     auto run  = runner.run(resp);
     if (!run.has_value()) {
+        _config_cache.invalidate();
         return m5::stl::make_unexpected(run.error());
     }
     if (!runner.statusReported()) {
+        _config_cache.invalidate();
         return m5::stl::make_unexpected(error::error_t::PROTOCOL_ERROR);
     }
     if (error::isError(runner.reportedStatus())) {
+        _config_cache.invalidate();
         return m5::stl::make_unexpected(runner.reportedStatus());
     }
     _in_transaction = true;
-    _config_cache.rememberSent(_session, cfg_bytes);
+    _config_cache.rememberSent(&session, cfg_bytes);
     return {};
 }
 
 result_t<void> Bus_remote::endTransaction(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg)
 {
+    bus::BusLifecycle::Operation operation{*_lifecycle};
+    if (!operation) {
+        return m5::stl::make_unexpected(operation.error());
+    }
     (void)owner;
     (void)cfg;
     if (_session == nullptr || !_in_transaction) {
@@ -82,22 +103,32 @@ result_t<void> Bus_remote::endTransaction(bus::IAccessor* owner, const spi::Mast
         _in_transaction = false;
         return m5::stl::make_unexpected(r.error());
     }
-    auto req        = _session->request({script_buf, script.written()});
+    remote::RemoteSessionHandle::Lease lease{*_session};
+    if (!lease) {
+        _in_transaction = false;
+        return m5::stl::make_unexpected(lease.error());
+    }
+    auto& session   = lease.session();
+    auto req        = session.request({script_buf, script.written()});
     _in_transaction = false;
     if (!req.has_value()) {
+        _config_cache.invalidate();
         return m5::stl::make_unexpected(req.error());
     }
     bytecode::BytecodeRunner runner{memory::defaultAllocator()};
     runner.setReceiveOnly(true);
-    auto resp = _session->lastResponse();
+    auto resp = session.lastResponse();
     auto run  = runner.run(resp);
     if (!run.has_value()) {
+        _config_cache.invalidate();
         return m5::stl::make_unexpected(run.error());
     }
     if (!runner.statusReported()) {
+        _config_cache.invalidate();
         return m5::stl::make_unexpected(error::error_t::PROTOCOL_ERROR);
     }
     if (error::isError(runner.reportedStatus())) {
+        _config_cache.invalidate();
         return m5::stl::make_unexpected(runner.reportedStatus());
     }
     return {};
@@ -107,6 +138,10 @@ result_t<void> Bus_remote::transfer(bus::IAccessor* owner, const spi::MasterAcce
                                     const spi::TransferDesc& desc, data::Source* src, size_t tx_len, data::Sink* dst,
                                     size_t rx_len)
 {
+    bus::BusLifecycle::Operation operation{*_lifecycle};
+    if (!operation) {
+        return m5::stl::make_unexpected(operation.error());
+    }
     (void)owner;
     if (_session == nullptr) {
         return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
@@ -131,6 +166,10 @@ result_t<void> Bus_remote::transfer(bus::IAccessor* owner, const spi::MasterAcce
 
 result_t<bus::TransferTotals> Bus_remote::waitTransfer(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg)
 {
+    bus::BusLifecycle::Operation operation{*_lifecycle};
+    if (!operation) {
+        return m5::stl::make_unexpected(operation.error());
+    }
     (void)owner;
     (void)cfg;
     auto totals  = _last_totals;
@@ -140,6 +179,10 @@ result_t<bus::TransferTotals> Bus_remote::waitTransfer(bus::IAccessor* owner, co
 
 bool Bus_remote::transferBusy(bus::IAccessor* owner)
 {
+    bus::BusLifecycle::Operation operation{*_lifecycle, 0};
+    if (!operation) {
+        return false;
+    }
     (void)owner;
     return false;
 }

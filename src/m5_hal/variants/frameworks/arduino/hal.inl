@@ -5,3 +5,4 @@
 #include "hal/i2c/i2c.inl"
 #include "hal/spi/spi.inl"
 #include "hal/uart/uart.inl"
+#include "hal/runtime/atomic_libcalls.inl"

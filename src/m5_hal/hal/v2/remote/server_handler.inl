@@ -20,9 +20,18 @@ result_t<void> RemoteServerHandler::handler(void* ctx, frame::Kind kind, uint8_t
 
     switch (kind) {
         case frame::Kind::Control:
+            // Reset is fire-and-forget per spec/design/remote.md §Control:
+            // "host API は応答を待たない" — the host never reads this Response
+            // or otherwise observes whether a restart actually happened, so a
+            // platform that cannot restart itself writing this same success
+            // Response and simply not restarting is within contract (already
+            // the case for posix hosts, which have never called esp_restart
+            // here either; RP2040/SAMD51 now share that same behavior).
             enc.writeFrame(frame::Kind::Response, seq, {});
-#if (defined(M5HAL_FRAMEWORK_HAS_ESPIDF) && M5HAL_FRAMEWORK_HAS_ESPIDF) || \
-    (defined(M5HAL_FRAMEWORK_HAS_ARDUINO) && M5HAL_FRAMEWORK_HAS_ARDUINO)
+#if defined(ESP_PLATFORM)
+            // ESPIDF and arduino-esp32 both resolve to ESP_PLATFORM here;
+            // other Arduino cores (RP2040 / SAMD51) have no FreeRTOS/esp_restart
+            // and fall through to the plain `return {}` below, same as posix.
             vTaskDelay(pdMS_TO_TICKS(50));
             M5HAL_DIAG("restart requested seq=%u", static_cast<unsigned>(seq));
             esp_restart();
@@ -45,7 +54,10 @@ result_t<void> RemoteServerHandler::handler(void* ctx, frame::Kind kind, uint8_t
             h->clearGpioMonitorMasks();
             h->clearGpioSnapshot();
 
-            uint8_t hello_body[6];
+            // HelloResp: [proto_ver][flags][n]([bus_kind][bus_id])*n [gpio_port][gpio_pin:u16]?
+            // (spec/design/remote.md §hello). n mirrors the server's statically
+            // registered bus capabilities; the host decodes with decodeHelloCaps.
+            uint8_t hello_body[3 + Capabilities::kMaxEntries * 2 + 3];
             uint8_t flags = h->hello_flags;
             if (h->pool != nullptr) {
                 flags |= 0x02u;
@@ -53,16 +65,27 @@ result_t<void> RemoteServerHandler::handler(void* ctx, frame::Kind kind, uint8_t
             if (h->gpio != nullptr) {
                 flags |= 0x01u;
             }
-            hello_body[0]    = kProtocolVersion;
-            hello_body[1]    = flags;
-            hello_body[2]    = 0;
+            hello_body[0] = kProtocolVersion;
+            hello_body[1] = flags;
+
+            size_t cap_count = h->server != nullptr ? h->server->capabilityCount() : 0;
+            if (cap_count > Capabilities::kMaxEntries) {
+                cap_count = Capabilities::kMaxEntries;
+            }
+            hello_body[2]    = static_cast<uint8_t>(cap_count);
             size_t hello_len = 3;
+            for (size_t i = 0; i < cap_count; ++i) {
+                const Capabilities::BusEntry& entry = h->server->capabilityAt(i);
+                hello_body[hello_len]               = static_cast<uint8_t>(entry.kind);
+                hello_body[hello_len + 1]           = entry.bus_id;
+                hello_len += 2;
+            }
             if (h->gpio != nullptr) {
-                hello_body[3]    = h->gpio->getPortCount();
-                uint16_t pin_cnt = h->gpio->getPinCount();
-                hello_body[4]    = static_cast<uint8_t>(pin_cnt & 0xFFu);
-                hello_body[5]    = static_cast<uint8_t>((pin_cnt >> 8) & 0xFFu);
-                hello_len        = 6;
+                uint16_t pin_cnt          = h->gpio->getPinCount();
+                hello_body[hello_len]     = h->gpio->getPortCount();
+                hello_body[hello_len + 1] = static_cast<uint8_t>(pin_cnt & 0xFFu);
+                hello_body[hello_len + 2] = static_cast<uint8_t>((pin_cnt >> 8) & 0xFFu);
+                hello_len += 3;
             }
             enc.writeFrame(frame::Kind::HelloResp, seq, {hello_body, hello_len});
             return {};

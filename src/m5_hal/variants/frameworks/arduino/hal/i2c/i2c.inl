@@ -37,6 +37,17 @@ error::error_t mapWireEndTransmission(uint8_t code)
     }
 }
 
+// The ESP8266 core's TwoWire has no end() — the peripheral cannot be
+// deinitialized there and release() leaves it configured (begin() re-inits).
+void wireEnd(::TwoWire& wire)
+{
+#if !defined(ARDUINO_ARCH_ESP8266)
+    wire.end();
+#else
+    (void)wire;
+#endif
+}
+
 }  // namespace impl_arduino
 }  // namespace
 
@@ -63,15 +74,26 @@ result_t<void> Bus_arduino::init(const BusConfig_arduino& config)
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
 
+#if defined(ESP_PLATFORM) || defined(ARDUINO_ARCH_ESP8266)
+    // TwoWire::begin(sda, scl) is an Espressif extension (arduino-esp32 and
+    // the ESP8266 core both have the int-pin overload); no other supported
+    // Arduino core (see _checker.hpp) has a matching overload —
+    // TwoWire::begin(uint8_t) means "start as I2C slave at this address" on
+    // the portable Arduino Wire API, not pin selection.
     if (_config.pin_sda >= 0 && _config.pin_scl >= 0) {
         wire->begin(static_cast<int>(_config.pin_sda), static_cast<int>(_config.pin_scl));
     } else {
         wire->begin();
     }
+#else
+    // Portable cores fix SDA/SCL per Wire instance (board variant file);
+    // a configured pin pair cannot be honored here and is ignored.
+    wire->begin();
+#endif
 
     auto err = attach(*wire);
     if (error::isError(err)) {
-        wire->end();
+        impl_arduino::wireEnd(*wire);
         return m5::stl::make_unexpected(err);
     }
     _owns_wire = true;
@@ -81,7 +103,7 @@ result_t<void> Bus_arduino::init(const BusConfig_arduino& config)
 result_t<void> Bus_arduino::release(void)
 {
     if (_wire && _owns_wire) {
-        _wire->end();
+        impl_arduino::wireEnd(*_wire);
     }
     _wire            = nullptr;
     _owns_wire       = false;
@@ -125,12 +147,16 @@ result_t<void> Bus_arduino::transfer(bus::IAccessor* owner, const i2c::MasterAcc
         _wire->setClock(freq);
         _last_freq = freq;
     }
+#if defined(ESP_PLATFORM)
     // arduino-esp32 TwoWire::setTimeOut() takes milliseconds, same unit as
-    // cfg.wire_timeout_ms.
+    // cfg.wire_timeout_ms. Not part of the portable Arduino Wire API — no
+    // other supported core (see _checker.hpp) has an equivalent, so
+    // wire_timeout_ms is a no-op there.
     if (cfg.wire_timeout_ms != _last_timeout_ms) {
         _wire->setTimeOut(static_cast<uint32_t>(cfg.wire_timeout_ms));
         _last_timeout_ms = cfg.wire_timeout_ms;
     }
+#endif
 
     // Pass `desc.prefix` into the legacy code path (header.data /
     // header.size) as a local `ConstDataSpan`. `desc` lives as a

@@ -2,6 +2,7 @@
 // Smoke test for the native build environment: verifies that
 // PlatformIO + googletest are wired up before the rest of the v2 suite.
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 #include <M5HAL_v2.hpp>
 
 namespace {
@@ -15,12 +16,12 @@ public:
     m5::hal::v2::service::ServicePoll serviceImpl(const m5::hal::v2::service::ServiceContext& ctx) override
     {
         ++count;
-        last_now_tick = ctx.now_tick;
+        last_elapsed = ctx.elapsed;
         return _result;
     }
 
-    int count                                       = 0;
-    m5::hal::v2::service::tick_nsec_t last_now_tick = 0;
+    int count                                      = 0;
+    m5::hal::v2::service::fast_tick_t last_elapsed = 0;
 
 private:
     m5::hal::v2::service::ServiceResult _result;
@@ -91,20 +92,20 @@ TEST(ServiceRunner, RunsRegisteredServicesInOrder)
     EXPECT_FALSE(runner.add(idle));
     EXPECT_EQ(runner.size(), size_t{2});
 
-    EXPECT_TRUE(runner.runOnce(1234));
+    EXPECT_TRUE(runner.runOnce(m5::hal::v2::service::ServiceContext{1234, 0}));
     EXPECT_EQ(idle.count, 1);
     EXPECT_EQ(progress.count, 1);
-    EXPECT_EQ(idle.last_now_tick, 1234u);
-    EXPECT_EQ(progress.last_now_tick, 1234u);
+    EXPECT_EQ(idle.last_elapsed, 1234u);
+    EXPECT_EQ(progress.last_elapsed, 1234u);
 
     EXPECT_TRUE(runner.remove(idle));
     EXPECT_FALSE(runner.remove(idle));
     EXPECT_EQ(runner.size(), size_t{1});
 
-    EXPECT_TRUE(runner.runOnce(5678));
+    EXPECT_TRUE(runner.runOnce(m5::hal::v2::service::ServiceContext{4444, 0}));
     EXPECT_EQ(idle.count, 1);
     EXPECT_EQ(progress.count, 2);
-    EXPECT_EQ(progress.last_now_tick, 5678u);
+    EXPECT_EQ(progress.last_elapsed, 4444u);
 }
 
 TEST(ServiceTiming, WrapAwareElapsedAndReached)
@@ -150,7 +151,7 @@ TEST(M5HALCore, OwnsGlobalServiceRunner)
 
     CountingService service{ServiceResult::Progress};
     EXPECT_TRUE(runner.add(service));
-    EXPECT_TRUE(m5::hal::v2::getM5_Hal().Services.runOnce(1000));
+    EXPECT_TRUE(m5::hal::v2::getM5_Hal().Services.runOnce(m5::hal::v2::service::ServiceContext{1000, 0}));
     EXPECT_EQ(service.count, 1);
 
     EXPECT_TRUE(runner.remove(service));
@@ -162,5 +163,6 @@ TEST(M5HALCore, OwnsGlobalServiceRunner)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

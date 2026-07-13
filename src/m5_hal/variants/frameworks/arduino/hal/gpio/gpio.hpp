@@ -56,11 +56,30 @@ protected:
 
         uint8_t arduino_mode;
         if (value & bits::output) {
+            // Open-drain output constant name/availability varies by core:
+            // arduino-esp32 spells it OUTPUT_OPEN_DRAIN, arduino-pico
+            // OUTPUT_OPENDRAIN (no underscore); cores with neither have no
+            // dedicated open-drain output mode and fall back to plain
+            // OUTPUT (push-pull), same degradation as the missing
+            // OUTPUT+pull combination noted above.
+#if defined(OUTPUT_OPEN_DRAIN)
             arduino_mode = (value & bits::open_drain) ? OUTPUT_OPEN_DRAIN : OUTPUT;
+#elif defined(OUTPUT_OPENDRAIN)
+            arduino_mode = (value & bits::open_drain) ? OUTPUT_OPENDRAIN : OUTPUT;
+#else
+            arduino_mode = OUTPUT;
+#endif
         } else if (value & bits::pull_up) {
             arduino_mode = INPUT_PULLUP;
         } else if (value & bits::pull_down) {
+#if defined(ARDUINO_ARCH_ESP8266)
+            // ESP8266 has no generic pulldown; only GPIO16 has one, with its
+            // own mode constant. Other pins fall back to plain INPUT, the
+            // same degradation policy as the missing modes above.
+            arduino_mode = (encoded_num == 16) ? INPUT_PULLDOWN_16 : INPUT;
+#else
             arduino_mode = INPUT_PULLDOWN;
+#endif
         } else {
             arduino_mode = INPUT;
         }

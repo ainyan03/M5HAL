@@ -151,6 +151,7 @@ M5HAL_INLINE_V2 namespace v2
 
     Hal::~Hal()
     {
+        setBackendAll(nullptr);
         Gpio.clearWatchers();
         if (_connection != nullptr && _connection->service() != nullptr) {
             (void)Services.remove(*_connection->service());
@@ -161,6 +162,12 @@ M5HAL_INLINE_V2 namespace v2
         }
         delete _connection;
         _connection = nullptr;
+        // Avoid recursive destruction through RemoteGpioOwner::next after a
+        // long-running process has reconnected many times.
+        while (_retired_remote_gpios != nullptr) {
+            auto next             = std::move(_retired_remote_gpios->next);
+            _retired_remote_gpios = std::move(next);
+        }
     }
 
     remote::RemoteSession* Hal::session(void)
@@ -205,9 +212,17 @@ M5HAL_INLINE_V2 namespace v2
             if (_connection != nullptr && _connection->service() != nullptr) {
                 (void)Services.remove(*_connection->service());
             }
-            delete _connection;
+            auto* old_connection = _connection;
+            if (old_connection != nullptr) {
+                auto old_handle = old_connection->sessionHandle();
+                if (old_handle) {
+                    old_handle->close();
+                }
+                retireRemoteGPIO();
+            }
             _connection = nullptr;
             setBackendAll(local);
+            delete old_connection;
             if (!Gpio.hasGPIO(0)) {
                 (void)Gpio.addGPIO(gpio::getGPIO(), 0);
             }

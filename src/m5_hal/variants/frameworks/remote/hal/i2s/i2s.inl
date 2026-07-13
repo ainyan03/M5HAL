@@ -10,6 +10,10 @@ namespace m5::hal::v2::i2s {
 
 result_t<void> Bus_remote::init(const BusConfig_remote& config)
 {
+    bus::BusLifecycle::Operation operation{*_lifecycle};
+    if (!operation) {
+        return m5::stl::make_unexpected(operation.error());
+    }
     (void)config;
     if (_session == nullptr) {
         return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
@@ -19,8 +23,18 @@ result_t<void> Bus_remote::init(const BusConfig_remote& config)
 
 result_t<size_t> Bus_remote::write(bus::IAccessor* owner, const i2s::AccessConfig& cfg, data::Source* src, size_t len)
 {
+    bus::BusLifecycle::Operation operation{*_lifecycle};
+    if (!operation) {
+        return m5::stl::make_unexpected(operation.error());
+    }
     (void)owner;
-    if (_session == nullptr || src == nullptr || len == 0) {
+    if (_session == nullptr) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    if (len != 0 && src == nullptr) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+    if (len == 0) {
         return static_cast<size_t>(0);
     }
 
@@ -36,6 +50,10 @@ result_t<size_t> Bus_remote::write(bus::IAccessor* owner, const i2s::AccessConfi
 
 result_t<size_t> Bus_remote::writableBytes(bus::IAccessor* owner, const i2s::AccessConfig& cfg)
 {
+    bus::BusLifecycle::Operation operation{*_lifecycle};
+    if (!operation) {
+        return m5::stl::make_unexpected(operation.error());
+    }
     (void)owner;
     (void)cfg;
     return static_cast<size_t>(0);
@@ -43,8 +61,18 @@ result_t<size_t> Bus_remote::writableBytes(bus::IAccessor* owner, const i2s::Acc
 
 result_t<size_t> Bus_remote::read(bus::IAccessor* owner, const i2s::AccessConfig& cfg, data::Sink* dst, size_t len)
 {
+    bus::BusLifecycle::Operation operation{*_lifecycle};
+    if (!operation) {
+        return m5::stl::make_unexpected(operation.error());
+    }
     (void)owner;
-    if (_session == nullptr || dst == nullptr || len == 0) {
+    if (_session == nullptr) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    if (len != 0 && dst == nullptr) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+    if (len == 0) {
         return static_cast<size_t>(0);
     }
 
@@ -61,6 +89,10 @@ result_t<size_t> Bus_remote::read(bus::IAccessor* owner, const i2s::AccessConfig
 result_t<bus::TransferTotals> Bus_remote::transfer(bus::IAccessor* owner, const i2s::AccessConfig& cfg,
                                                    data::Source* src, size_t tx_len, data::Sink* dst, size_t rx_len)
 {
+    bus::BusLifecycle::Operation operation{*_lifecycle};
+    if (!operation) {
+        return m5::stl::make_unexpected(operation.error());
+    }
     (void)owner;
     if (_session == nullptr) {
         return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
@@ -84,6 +116,10 @@ result_t<bus::TransferTotals> Bus_remote::transfer(bus::IAccessor* owner, const 
 
 result_t<size_t> Bus_remote::readableBytes(bus::IAccessor* owner, const i2s::AccessConfig& cfg)
 {
+    bus::BusLifecycle::Operation operation{*_lifecycle};
+    if (!operation) {
+        return m5::stl::make_unexpected(operation.error());
+    }
     (void)owner;
     (void)cfg;
     return static_cast<size_t>(0);

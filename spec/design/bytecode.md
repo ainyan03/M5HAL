@@ -126,8 +126,8 @@ BytecodeRunner::run       ←frame─  BytecodeRunner::writeResponse
 
 ## 互換性と版管理
 
-- 本フォーマット (M5HAL bytecode v1) は**実験段階**であり、公開リリースノートで凍結を宣言するまでは非互換変更があり得る
-- 凍結後の拡張は原則として**新 opcode の追加**で行う (size 前置 + critical フラグにより旧 runner とも共存できる)。命令レイアウト自体の非互換変更が必要になった場合は **v2 として別フォーマット名**を与える
+- 本フォーマット (M5HAL bytecode v1) の段は **`experimental`** ([../stability.md](../stability.md))。`stable` を宣言するまでは非互換変更があり得る
+- `stable` 宣言後の拡張は原則として**新 opcode の追加**で行う (size 前置 + critical フラグにより旧 runner とも共存できる)。命令レイアウト自体の非互換変更が必要になった場合は **v2 として別フォーマット名**を与える
 - 予約 opcode の値は将来の版でも再利用しない。`ReportError` は code を **i8** で運ぶ。範囲・freeze 契約は [errors.md](errors.md) §エラー対処 hint 表 を参照。
 - `ReportError` / `ReportComplete` の payload は**前方互換的に拡張され得る** (例: 下層ドライバのネイティブエラーコード等の診断 detail を末尾に追加)。受信側は既知の prefix のみ読み、余剰バイトは無視すること (命令 size が境界を自己記述するため安全にスキップできる)
 

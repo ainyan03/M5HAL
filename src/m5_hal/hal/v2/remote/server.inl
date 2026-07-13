@@ -125,7 +125,7 @@ result_t<void> Server::gpioAllowlistThunk(void* ctx, const uint8_t* pins, size_t
     return static_cast<Server*>(ctx)->handleGpioAllowlist(pins, count);
 }
 
-// TODO(Phase3): build AllowlistGPIO + GPIOGroup from pin list and call
+// TODO: build AllowlistGPIO + GPIOGroup from pin list and call
 // setGPIOGroup(). Currently a stub.
 result_t<void> Server::handleGpioAllowlist(const uint8_t* pins, size_t count)
 {
@@ -426,9 +426,9 @@ remote_error_t Server::prescan(data::ConstDataSpan script, size_t& offset) const
     // policy checks live here (delay budget, bus timeouts); malformed
     // scripts fall through so the runner reports them with its own,
     // more precise error and offset.
-    size_t at               = 0;
-    uint64_t delay_total    = 0;
-    bool stream_tx_must_end = false;
+    size_t at            = 0;
+    uint64_t delay_total = 0;
+    bool stream_must_end = false;
     while (at < script.size) {
         const auto lv = bytecode::decodeLenVar(data::ConstDataSpan{script.data + at, script.size - at});
         if (lv.consumed == 0 || !lv.valid || lv.value == 0) {
@@ -443,8 +443,8 @@ remote_error_t Server::prescan(data::ConstDataSpan script, size_t& offset) const
         const data::ConstDataSpan payload{script.data + at + 1, lv.value - 1};
         at += lv.value;
 
-        if (stream_tx_must_end) {
-            M5HAL_DIAG("script rejected offset=%zu reason=stream-tx-not-terminal", instr_at);
+        if (stream_must_end) {
+            M5HAL_DIAG("script rejected offset=%zu reason=stream-not-terminal", instr_at);
             offset = instr_at;
             return remote_error_t::INVALID_ARGUMENT;
         }
@@ -500,20 +500,30 @@ remote_error_t Server::prescan(data::ConstDataSpan script, size_t& offset) const
         } else if (opcode == static_cast<uint8_t>(bytecode::OpCode::BusTransfer)) {
             // payload: [kind:1][bus_id:1][store_id:1][rx_len:LenVar]...
             // (mirrors BytecodeRunner::opBusTransfer). Cap the up-front rx
-            // allocation a wire message can request.
+            // allocation a wire message can request. When the data is stored
+            // for the response, also cap it to the response frame capacity
+            // before any non-idempotent bus read can run.
             if (payload.size > 3) {
-                const auto rx_len = bytecode::decodeLenVar(data::ConstDataSpan{payload.data + 3, payload.size - 3});
-                if (rx_len.valid && rx_len.consumed != 0 && rx_len.value > _config.max_transfer_rx) {
+                const bool stores_rx = payload.data[2] != bytecode::kDiscardStoreId;
+                const auto rx_len    = bytecode::decodeLenVar(data::ConstDataSpan{payload.data + 3, payload.size - 3});
+                const auto limit =
+                    (stores_rx && _config.max_transfer_rx > kMaxTransferRx) ? kMaxTransferRx : _config.max_transfer_rx;
+                if (rx_len.valid && rx_len.consumed != 0 && rx_len.value > limit) {
                     M5HAL_DIAG("script rejected offset=%zu reason=transfer-rx-limit rx_len=%u limit=%u", instr_at,
-                               static_cast<unsigned>(rx_len.value), static_cast<unsigned>(_config.max_transfer_rx));
+                               static_cast<unsigned>(rx_len.value), static_cast<unsigned>(limit));
                     offset = instr_at;
                     return remote_error_t::INVALID_ARGUMENT;
                 }
             }
         } else if (opcode == static_cast<uint8_t>(bytecode::OpCode::BusStreamTransfer)) {
             // payload: [kind:1][bus_id:1][stream_id:1][meta_size:1][tx_len:4LE][rx_len:4LE][meta]
-            if (payload.size >= 8 && detail::getU32LE(payload.data + 4) > 0) {
-                stream_tx_must_end = true;
+            // Any stream transfer that defers the response (tx or rx
+            // pending) must be the script's last instruction: the deferred
+            // Response carries only Report*, so response slots stored by a
+            // later instruction would be silently dropped.
+            if ((payload.size >= 8 && detail::getU32LE(payload.data + 4) > 0) ||
+                (payload.size >= 12 && detail::getU32LE(payload.data + 8) > 0)) {
+                stream_must_end = true;
             }
         }
     }

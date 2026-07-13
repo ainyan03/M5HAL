@@ -74,8 +74,9 @@ struct IHalBackend {
 
       Both LocalBackend and a future RemoteBackend provide a registry: local for
       real buses, remote for proxy interning. The difference is in what the
-      BusView's make-lambda creates (local facade vs remote proxy), which is an
-      S27 concern and does not affect this interface.
+      BusView's make-lambda creates (local facade vs remote proxy), which is a
+      concern of the make-lambda's construction site and does not affect this
+      interface.
      */
     BusRegistry& busRegistry(void)
     {
@@ -152,11 +153,23 @@ struct IHalBackend {
       reclaiming the capacity immediately. RemoteBackend overrides this to
       also send a BusRelease bytecode to the peer before clearing the slot.
 
-      Returns `INVALID_ARGUMENT` if no matching live slot is found.
+      Returns `INVALID_ARGUMENT` if the exact live instance is not registered,
+      and `BUSY` while another owner/accessor exists or the identity is already
+      releasing. Success consumes the caller's reference at the BusView layer.
      */
-    virtual result_t<void> releaseBus(types::bus_kind_t kind, const IdentityKey& id)
+    virtual result_t<void> releaseBus(types::bus_kind_t kind, const IdentityKey& id,
+                                      const std::shared_ptr<IBus>& expected)
     {
-        return _registry.release(kind, id);
+        auto ticket = _registry.beginRelease(kind, id, expected);
+        if (!ticket.has_value()) {
+            return m5::stl::make_unexpected(ticket.error());
+        }
+        auto committed = _registry.commitRelease(ticket.value());
+        if (!committed.has_value()) {
+            (void)_registry.cancelRelease(ticket.value());
+            return m5::stl::make_unexpected(committed.error());
+        }
+        return {};
     }
 
     /*!
@@ -167,6 +180,38 @@ struct IHalBackend {
     {
         (void)kind;
         return 0;
+    }
+
+    /*!
+      @brief Claim a hardware controller for a caller OUTSIDE the intent
+             resolver (e.g. a standalone slave with no `IManagedBus`).
+      @param kind Bus kind the controller belongs to.
+      @param intent Resolution request; a default-constructed intent is Auto.
+      @return The claimed controller index, or an error (see
+              `AllocationCore::claimController`).
+
+      Default: `NOT_IMPLEMENTED` (a kind with no `AllocationCore`, or a
+      backend with no local allocation at all -- e.g. `RemoteBackend`, where
+      claiming a controller on a remote peer for local slave use is
+      meaningless). `LocalBackend` forwards to the kind's `AllocationCore`.
+     */
+    virtual result_t<int8_t> claimController(types::bus_kind_t kind, const types::AllocationIntent& intent)
+    {
+        (void)kind;
+        (void)intent;
+        return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
+    }
+
+    /*!
+      @brief Return a controller claimed via `claimController`.
+      @param kind Bus kind the controller belongs to.
+      @param controller Controller index returned by `claimController`.
+     */
+    virtual result_t<void> releaseClaimedController(types::bus_kind_t kind, int8_t controller)
+    {
+        (void)kind;
+        (void)controller;
+        return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
     }
 
     virtual ~IHalBackend() = default;

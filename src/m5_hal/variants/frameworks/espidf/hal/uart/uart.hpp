@@ -47,18 +47,32 @@ public:
         return _port;
     }
 
+    /*! @brief Reconfiguration-skip count (diagnostic only); see spec/design/uart.md §state mutex. */
+    uint32_t reconfigSkips();
+
 protected:
     result_t<size_t> rawWrite(const uint8_t* data, size_t len, uint32_t timeout_ms) override;
     result_t<size_t> rawRead(uint8_t* buf, size_t len, uint32_t timeout_ms) override;
     result_t<size_t> rawReadableBytes() override;
 
 private:
-    result_t<void> applyConfig(const uart::AccessConfig& cfg);
+    // Reconfiguration quiescence gate (spec/design/uart.md): `owner`/`entered`
+    // identify the calling accessor and the channel it already holds so a
+    // config change different from `_applied_cfg` can be gated through
+    // `uart::IBus::tryAcquireOppositeChannel`. The first apply on a fresh
+    // bus (`!_configured`) skips the gate.
+    result_t<void> applyConfig(bus::IAccessor* owner, Channel entered, const uart::AccessConfig& cfg);
+    // Actual ESP-IDF apply; assumes `_state_mutex` is already held.
+    result_t<void> applyConfigLocked(const uart::AccessConfig& cfg);
 
     ::uart_port_t _port = UART_NUM_0;
     bool _installed     = false;
     bool _configured    = false;
     uart::AccessConfig _applied_cfg;
+    // Leaf mutex (see uart::IBus class comment) guarding
+    // _installed/_configured/_applied_cfg against concurrent TX/RX access.
+    runtime::Mutex _state_mutex;
+    uint32_t _reconfig_skips = 0;  // skipped reconfigures (opposite channel busy); read via reconfigSkips()
 };
 
 // Facade backend selection: uart::Bus::init(BusConfig_espidf) -> Bus_espidf.

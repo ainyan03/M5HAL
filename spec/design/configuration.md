@@ -11,10 +11,12 @@ M5HAL の挙動をビルド時に変えるユーザー設定ノブの一覧。
 |---|---|---|---|---|
 | `M5HAL_CONFIG_POSIX_UART` | `1` | `0`/`1` | `1`=POSIX host で termios serial を既定 UART provider として自動提供。 `0`=抑止 (host で UART kind を未提供へ戻す)。 **UART kind のみ** に作用し、 posix variant の runtime kind は影響を受けない ([runtime.md](runtime.md)) | `variants/frameworks/posix/_offer.hpp` |
 | `M5HAL_CONFIG_REMOTE` | `0` | `0`/`1` | `1` のとき remote variant を framework winner scan に参加させる (`M5HAL_FRAMEWORK_HAS_REMOTE`) | `variants/frameworks/_checker.hpp` |
-| `M5HAL_CONFIG_IDF_I2C_LEGACY` | `0` | `0`/`1` | ESP-IDF の I2C backend 選択。 `0`=新 bus-device driver (gen5)、 `1`=legacy command-link driver (gen4)。 legacy driver を既に使うプロジェクトは `1` で混在リンク abort を回避 | `variants/frameworks/espidf/detail/espidf_version.hpp` |
+| `M5HAL_CONFIG_IDF_I2C_LEGACY` | `0` | `0`/`1` | ESP-IDF の I2C backend 選択。 `0`=新 bus-device driver (gen5)、 `1`=legacy command-link driver (gen4)。 legacy driver を既に使うプロジェクトは `1` で混在リンク abort を回避。legacy選択時はLP_I2Cをcontroller poolへ公開しない ([i2c.md](i2c.md) §ESP-IDF LP_I2C) | `variants/frameworks/espidf/detail/espidf_version.hpp` |
 | `M5HAL_CONFIG_ERROR_STRINGS` | `1` | `0`/`1` | `1`=`error::toString` がコード名の文字列テーブルを持つ。 `0`=テーブルを落とす (`toString` は常に `""`)。 容量が厳しいビルド向け ([errors.md](errors.md)) | `hal/v2/error.hpp` |
 | `M5HAL_CONFIG_MEMORY_TEMP_BLOCK_SIZE` | `256` | `>=4` かつ 4 の倍数 | 一時メモリプールの 1 block サイズ (byte) | `src/m5_hal_config.hpp` |
 | `M5HAL_CONFIG_MEMORY_TEMP_BLOCK_COUNT` | `32` | `1`〜`32` | 一時メモリプールの block 数 (bitmap が `uint32_t` 1 個のため上限 32) | `src/m5_hal_config.hpp` |
+| `M5HAL_CONFIG_SERVICE_AUTORUN_CORE` | `TASK_CORE_ANY` (-1) | core id / `-1` (ANY) / `-2` (OPPOSITE) / `-3` (SAME) | auto-run タスクの core 配置 (`runtime::Task::start` の `core` 引数へ渡る)。 既定 = スケジューラ任せ — 相対 tick 契約 (コアドメインガード + gap-drop) がコア移動を安全にしており、 dual-core 実測でも SAME pin に退行しない ([service.md](service.md))。 runner を consumer と同一クロックドメインへ固定したい場合 (例: `ASSUME_PINNED` 併用) は core id か `-3` (SAME) を指定する。 単コア・host build には影響しない | `hal/v2/service/service.hpp` |
+| `M5HAL_CONFIG_SERVICE_ASSUME_PINNED` | `0` | `0`/`1` | `1`=経過測定のコアドメインガード (パス毎の core-id 読み + 比較、数 cycles) を compile-time に外す。 **有効化してよい条件 = 「各 runner を default-clock 駆動する全タスクが同一 core で走る」または単コアビルド** (「全タスクがどこかに pin されている」だけでは不十分 — 別 core に pin された 2 駆動者が同一ドメイン扱いになる)。 既定 `0` (正しさ側、ガードは実測でスループットに現れない — [service.md](service.md)) | `hal/v2/service/service.hpp` |
 | `M5HAL_CONFIG_SOFTWARE_I2C_YIELD_PROBE_SPINS` | `64` | `>=1` | software I2C 同期ランナーの通常 idle パスの調整。 yield 前の busy probe 回数。 *上級* | `variants/frameworks/software/hal/i2c/i2c.inl` |
 | `M5HAL_CONFIG_DIAG` | `0` | `0`/`1` | `1`=`M5HAL_DIAG` イベントトレース有効。 `0`=呼び出しサイトは引数非評価の no-op | `hal/v2/diag.hpp` |
 

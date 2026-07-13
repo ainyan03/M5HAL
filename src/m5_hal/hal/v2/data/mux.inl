@@ -61,10 +61,10 @@ memory::Allocator* MuxFrameEncoder::allocator() const
     return _alloc;
 }
 
-size_t MuxFrameEncoder::pump()
+m5::hal::v2::result_t<size_t> MuxFrameEncoder::pump()
 {
     if (_alloc == nullptr) {
-        return 0;
+        return size_t{0};
     }
     // Drain attached sources until credit, allocation, or data runs out.
     // The outer loop keeps per-stream fairness round-robin (one frame per
@@ -77,6 +77,17 @@ size_t MuxFrameEncoder::pump()
         for (uint8_t i = 0; i < kMaxStreams; ++i) {
             auto* src = _streams[i].source;
             if (src == nullptr || src->eof()) {
+                continue;
+            }
+            // Skip open-but-idle sources before spending credit checks or a
+            // Temp block on them: pre-peek is safe (peek is idempotent and
+            // borrows only until buildDataFrame's own peek replaces it), and
+            // it stops a per-pump allocate/free churn on every idle stream.
+            auto peeked = src->peek(1);
+            if (!peeked.has_value()) {
+                return m5::stl::make_unexpected(peeked.error());
+            }
+            if (peeked->size == 0) {
                 continue;
             }
             if (_credit_gated && _remote_credit == 0) {
@@ -92,12 +103,16 @@ size_t MuxFrameEncoder::pump()
             if (block == nullptr) {
                 return frames;
             }
-            size_t frame_size = frame::buildDataFrame(block, i, *src);
-            if (frame_size == 0) {
+            auto frame_size = frame::buildDataFrame(block, i, *src);
+            if (!frame_size.has_value()) {
+                _alloc->deallocate(block);
+                return m5::stl::make_unexpected(frame_size.error());
+            }
+            if (frame_size.value() == 0) {
                 _alloc->deallocate(block);
                 continue;
             }
-            if (!_output.addBlock(block, frame_size)) {
+            if (!_output.addBlock(block, frame_size.value())) {
                 _alloc->deallocate(block);
                 return frames;
             }
@@ -184,6 +199,12 @@ void MuxFrameDecoder::setFrameHandler(frame_handler_t fn, void* ctx)
     _handler_ctx = ctx;
 }
 
+void MuxFrameDecoder::setStaleDataObserver(stale_data_fn fn, void* ctx)
+{
+    _stale_data_fn  = fn;
+    _stale_data_ctx = ctx;
+}
+
 Source* MuxFrameDecoder::createStream(uint8_t stream_id, uint8_t* buf, size_t buf_size)
 {
     if (stream_id >= kMaxStreams) {
@@ -243,15 +264,20 @@ void MuxFrameDecoder::destroyStream(uint8_t stream_id)
     if (!s.active) {
         return;
     }
+    s.blocks.releaseAll();
+    // Unbind (not just reset) the ring BEFORE freeing its backing buffer:
+    // reset() keeps the buffer bound, so a Source/Sink view held across
+    // destroyStream() would still look open and could lend out freed
+    // memory. Unbound views report eof()/closed() and lend nothing.
+    s.ring.setBuf(nullptr, 0);
     if (s.owned_buf != nullptr && _alloc != nullptr) {
         _alloc->deallocate(s.owned_buf);
     }
-    s.blocks.releaseAll();
-    s.ring.reset();
-    s.direct_sink = nullptr;
-    s.owned_buf   = nullptr;
-    s.block_mode  = false;
-    s.active      = false;
+    s.direct_sink    = nullptr;
+    s.owned_buf      = nullptr;
+    s.block_mode     = false;
+    s.active         = false;
+    s.partial_offset = 0;
 }
 
 bool MuxFrameDecoder::setSink(uint8_t stream_id, Sink& sink)
@@ -266,13 +292,17 @@ bool MuxFrameDecoder::setSink(uint8_t stream_id, Sink& sink)
     }
     s.direct_sink = &sink;
     s.active      = true;
+    // A new destination invalidates any in-progress resume point for the
+    // previous one.
+    s.partial_offset = 0;
     return true;
 }
 
 void MuxFrameDecoder::clearSink(uint8_t stream_id)
 {
     if (stream_id < kMaxStreams) {
-        _streams[stream_id].direct_sink = nullptr;
+        _streams[stream_id].direct_sink    = nullptr;
+        _streams[stream_id].partial_offset = 0;
     }
 }
 
@@ -315,7 +345,7 @@ size_t MuxFrameDecoder::blockStreamReleasedTotal() const
     return total;
 }
 
-size_t MuxFrameDecoder::pump(Source& wire_in)
+m5::hal::v2::result_t<size_t> MuxFrameDecoder::pump(Source& wire_in)
 {
     size_t count = 0;
     for (size_t iter = 0; iter < kPumpMaxFramesPerCall; ++iter) {
@@ -324,18 +354,29 @@ size_t MuxFrameDecoder::pump(Source& wire_in)
         bool pending = _pending_len != 0;
 
         if (pending) {
-            if (!fillPendingFrame(wire_in)) {
+            auto filled = fillPendingFrame(wire_in);
+            if (!filled.has_value()) {
+                return m5::stl::make_unexpected(filled.error());
+            }
+            if (!filled.value()) {
                 break;
             }
             result = frame::decode({_pending_frame, _pending_len}, view);
         } else {
             auto peeked = wire_in.peek(frame::kMaxFrameSize);
-            if (!peeked.has_value() || peeked.value().size == 0) {
+            if (!peeked.has_value()) {
+                return m5::stl::make_unexpected(peeked.error());
+            }
+            if (peeked.value().size == 0) {
                 break;
             }
             result = frame::decode(peeked.value(), view);
             if (result.status == frame::DecodeStatus::NeedMore) {
-                if (!beginPendingFrame(wire_in, peeked.value())) {
+                auto begun = beginPendingFrame(wire_in, peeked.value());
+                if (!begun.has_value()) {
+                    return m5::stl::make_unexpected(begun.error());
+                }
+                if (!begun.value()) {
                     break;
                 }
                 continue;
@@ -350,7 +391,10 @@ size_t MuxFrameDecoder::pump(Source& wire_in)
                 if (pending) {
                     consumePendingFrame(result.consumed);
                 } else {
-                    (void)wire_in.advance(result.consumed);
+                    auto advanced = wire_in.advance(result.consumed);
+                    if (!advanced.has_value()) {
+                        return m5::stl::make_unexpected(advanced.error());
+                    }
                 }
                 continue;
             case frame::DecodeStatus::InvalidPrefix:
@@ -359,7 +403,10 @@ size_t MuxFrameDecoder::pump(Source& wire_in)
                 if (pending) {
                     consumePendingFrame(result.consumed);
                 } else {
-                    (void)wire_in.advance(result.consumed);
+                    auto advanced = wire_in.advance(result.consumed);
+                    if (!advanced.has_value()) {
+                        return m5::stl::make_unexpected(advanced.error());
+                    }
                 }
                 continue;
             case frame::DecodeStatus::Ok:
@@ -377,14 +424,17 @@ size_t MuxFrameDecoder::pump(Source& wire_in)
         if (pending) {
             consumePendingFrame(result.consumed);
         } else {
-            (void)wire_in.advance(result.consumed);
+            auto advanced = wire_in.advance(result.consumed);
+            if (!advanced.has_value()) {
+                return m5::stl::make_unexpected(advanced.error());
+            }
         }
         ++count;
     }
     return count;
 }
 
-bool MuxFrameDecoder::beginPendingFrame(Source& wire_in, ConstDataSpan bytes)
+m5::hal::v2::result_t<bool> MuxFrameDecoder::beginPendingFrame(Source& wire_in, ConstDataSpan bytes)
 {
     if (bytes.data == nullptr || bytes.size == 0 || bytes.size > sizeof(_pending_frame)) {
         return false;
@@ -393,19 +443,22 @@ bool MuxFrameDecoder::beginPendingFrame(Source& wire_in, ConstDataSpan bytes)
     auto advanced = wire_in.advance(bytes.size);
     if (!advanced.has_value()) {
         clearPendingFrame();
-        return false;
+        return m5::stl::make_unexpected(advanced.error());
     }
     _pending_len = bytes.size;
     updatePendingFrameNeed();
     return true;
 }
 
-bool MuxFrameDecoder::fillPendingFrame(Source& wire_in)
+m5::hal::v2::result_t<bool> MuxFrameDecoder::fillPendingFrame(Source& wire_in)
 {
     updatePendingFrameNeed();
     while (_pending_len < _pending_need) {
         auto peeked = wire_in.peek(_pending_need - _pending_len);
-        if (!peeked.has_value() || peeked.value().size == 0) {
+        if (!peeked.has_value()) {
+            return m5::stl::make_unexpected(peeked.error());
+        }
+        if (peeked.value().size == 0) {
             return false;
         }
         size_t n = peeked.value().size;
@@ -416,7 +469,7 @@ bool MuxFrameDecoder::fillPendingFrame(Source& wire_in)
         auto advanced = wire_in.advance(n);
         if (!advanced.has_value()) {
             clearPendingFrame();
-            return false;
+            return m5::stl::make_unexpected(advanced.error());
         }
         _pending_len += n;
         updatePendingFrameNeed();
@@ -479,7 +532,25 @@ MuxFrameDecoder::~MuxFrameDecoder()
 
 bool MuxFrameDecoder::deliverData(uint8_t stream_id, ConstDataSpan payload)
 {
-    if (stream_id >= kMaxStreams || !_streams[stream_id].active || payload.size == 0) {
+    if (stream_id >= kMaxStreams) {
+        return true;
+    }
+    if (!_streams[stream_id].active) {
+        // A Data frame with nowhere to go: `active` is only set by
+        // setSink()/createStream()/createBlockStream(), so this is the
+        // normal case for a stream_id that was attached without a Sink
+        // (e.g. a tx-only transfer) or never attached at all. It is also
+        // what a quarantined tx-only/no-sink stream_id looks like on this
+        // path, since quarantineStream() detaches without ever having set a
+        // Sink for it. Report it so RemoteSession can treat it as evidence
+        // the peer is still producing for that id and keep its insurance
+        // timer alive instead of expiring on a fixed deadline.
+        if (payload.size > 0 && _stale_data_fn != nullptr) {
+            _stale_data_fn(_stale_data_ctx, stream_id);
+        }
+        return true;
+    }
+    if (payload.size == 0) {
         return true;
     }
     auto& s = _streams[stream_id];
@@ -488,12 +559,31 @@ bool MuxFrameDecoder::deliverData(uint8_t stream_id, ConstDataSpan payload)
     }
     Sink* dst = s.direct_sink != nullptr ? s.direct_sink : (s.ring.capacity() > 0 ? &s.ring.sink() : nullptr);
     if (dst == nullptr) {
+        // Reachable only for a stream whose direct Sink was later removed by
+        // clearSink() (setSink() always installs one and `active` stays set):
+        // this is what a quarantined rx-bearing stream_id looks like, so it
+        // must feed the same staleness evidence as the !active branch above
+        // or the insurance timer would expire under an alive producer.
+        if (_stale_data_fn != nullptr) {
+            _stale_data_fn(_stale_data_ctx, stream_id);
+        }
         return true;
     }
-    size_t offset = 0;
+    // Resume from wherever the previous attempt at *this same* frame left
+    // off. pump() only advances past a Data frame once this function
+    // returns true, so a call that returns false here is retried on the
+    // next pump() with the identical payload bytes (same stream_id, same
+    // content) — restarting from offset 0 would recommit the already-
+    // delivered prefix and duplicate it on the sink. An all-or-nothing
+    // pre-check (require free() >= payload.size before committing
+    // anything) was considered instead but rejected: a payload larger
+    // than the ring's total capacity would then never be deliverable,
+    // permanently stalling that stream.
+    size_t offset = s.partial_offset < payload.size ? s.partial_offset : 0;
     while (offset < payload.size) {
         auto rsv = dst->reserve(payload.size - offset);
         if (!rsv.has_value() || rsv.value().size == 0) {
+            s.partial_offset = offset;
             return false;
         }
         size_t n = rsv.value().size;
@@ -503,10 +593,19 @@ bool MuxFrameDecoder::deliverData(uint8_t stream_id, ConstDataSpan payload)
         ::memcpy(rsv.value().data, payload.data + offset, n);
         auto c = dst->commit(n);
         if (!c.has_value()) {
+            // A failing commit() may still have accepted a prefix (a
+            // StreamSink direct sink whose transport short-writes). Count
+            // that prefix as delivered, or the retry would recommit it.
+            size_t accepted = dst->partialCommitAccepted();
+            if (accepted > n) {
+                accepted = n;
+            }
+            s.partial_offset = offset + accepted;
             return false;
         }
         offset += n;
     }
+    s.partial_offset = 0;
     return true;
 }
 

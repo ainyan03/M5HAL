@@ -78,6 +78,18 @@ public:
         return _has_gpio ? _gpio_group : nullptr;
     }
 
+    /*! @brief Number of statically registered bus capabilities (for HelloResp). */
+    size_t capabilityCount() const
+    {
+        return _cap_count;
+    }
+
+    /*! @brief The i-th registered bus capability (0 <= i < capabilityCount()). */
+    const Capabilities::BusEntry& capabilityAt(size_t i) const
+    {
+        return _caps[i];
+    }
+
     using bus_create_app_fn_t = m5::hal::v2::result_t<void> (*)(void* ctx, bool create, types::bus_kind_t kind,
                                                                 uint8_t bus_id, data::ConstDataSpan pin_config);
 

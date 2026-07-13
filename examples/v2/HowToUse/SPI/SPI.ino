@@ -53,8 +53,8 @@ constexpr int LCD_WIDTH   = 320;
 constexpr int LCD_HEIGHT  = 240;
 #endif
 
-// Borrowed handle, assigned in setup().
-// For borrow model details, see HowToUse/I2C and README.
+// Shared owner, assigned in setup().
+// For ownership model details, see HowToUse/I2C and README.
 std::shared_ptr<m5hal::spi::IBus> spi_bus;
 
 static void printError(const char* label, m5hal::error::error_t error)
@@ -226,10 +226,11 @@ void setup()
     acc_cfg.spi_read_dummy_cycle              = 8;
     acc_cfg.spi_write_dummy_cycle             = 0;  // (default; shown for clarity)
 
-    m5hal::spi::MasterAccessor dev{spi_bus, acc_cfg};  // co-owns the borrowed bus
+    m5hal::spi::MasterAccessor dev{spi_bus, acc_cfg};  // co-owns the acquired bus
 
     Serial.printf("backend: %s\n",
-                  spi_bus->backendKind() == m5hal::types::backend_kind_t::Hardware ? "espidf (Hardware)" : "arduino (Software)");
+                  spi_bus->backendKind() == m5hal::types::backend_kind_t::Hardware ? "Hardware (dedicated SPI controller)"
+                                                                                    : "Software (bit-bang)");
 
     demoPlainWrite(dev);
     demoCommandData(dev);

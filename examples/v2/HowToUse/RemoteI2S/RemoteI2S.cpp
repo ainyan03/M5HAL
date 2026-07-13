@@ -23,7 +23,7 @@
 //
 // The device side does not need a dedicated RemoteI2S sketch. Flash the
 // generic RemoteServerTCP or RemoteServer firmware; this host program powers
-// the Core2 V2.1 speaker amplifier via remote I2C before acquiring remote I2S.
+// the Core2 V1.1 speaker amplifier via remote I2C before acquiring remote I2S.
 //
 // This example is POSIX-only (macOS / Linux). It is not an Arduino sketch.
 // =============================================================================
@@ -138,37 +138,38 @@ void initCore2V11Amplifier(m5hal::Hal& hal)
         return;
     }
 
-    m5hal::i2c::MasterAccessConfig acc_cfg;
-    acc_cfg.i2c_addr = AXP2101_ADDR;
-    acc_cfg.freq     = 400000;
-    m5hal::i2c::MasterAccessor axp{bus.value(), acc_cfg};
-
     bool ok   = true;
     uint8_t v = 0;
-    auto w94  = axp.writeRegister(0x94, 0x1C);
-    if (!w94.has_value()) {
-        warnResult("AXP2101 reg 0x94 write", w94.error());
-        ok = false;
-    }
-    auto r90 = axp.readRegister(0x90, &v, 1);
-    if (!r90.has_value()) {
-        warnResult("AXP2101 reg 0x90 read", r90.error());
-        ok = false;
-    }
-    auto w90 = axp.writeRegister(0x90, static_cast<uint8_t>(v | 0x04));
-    if (!w90.has_value()) {
-        warnResult("AXP2101 reg 0x90 write", w90.error());
-        ok = false;
+    {
+        m5hal::i2c::MasterAccessConfig acc_cfg;
+        acc_cfg.i2c_addr = AXP2101_ADDR;
+        acc_cfg.freq     = 400000;
+        m5hal::i2c::MasterAccessor axp{bus.value(), acc_cfg};
+
+        auto w94 = axp.writeRegister(0x94, 0x1C);
+        if (!w94.has_value()) {
+            warnResult("AXP2101 reg 0x94 write", w94.error());
+            ok = false;
+        }
+        auto r90 = axp.readRegister(0x90, &v, 1);
+        if (!r90.has_value()) {
+            warnResult("AXP2101 reg 0x90 read", r90.error());
+            ok = false;
+        }
+        auto w90 = axp.writeRegister(0x90, static_cast<uint8_t>(v | 0x04));
+        if (!w90.has_value()) {
+            warnResult("AXP2101 reg 0x90 write", w90.error());
+            ok = false;
+        }
     }
     if (ok) {
-        ::printf("Core2 V2.1 amplifier power enabled (AXP2101 ALDO3)\n");
+        ::printf("Core2 V1.1 amplifier power enabled (AXP2101 ALDO3)\n");
     }
 
     auto rel = hal.I2C.release(bus.value());
     if (!rel.has_value()) {
         warnResult("I2C release after amplifier init", rel.error());
     }
-    bus.value().reset();
 }
 
 int streamTone(const std::shared_ptr<m5hal::i2s::IBus>& bus, uint32_t seconds, uint32_t tone_hz, uint32_t rate,
@@ -319,7 +320,7 @@ int main(int argc, char** argv)
     uint32_t tone_hz   = DEFAULT_TONE_HZ;
     uint32_t rate      = DEFAULT_RATE;
     uint32_t channels  = DEFAULT_CHANNELS;
-    uint32_t bclk      = 12;  // Core2 V2.1 speaker path (NS4168)
+    uint32_t bclk      = 12;  // Core2 V1.1 speaker path (NS4168)
     uint32_t ws        = 0;
     uint32_t dout      = 2;
     uint32_t chunk_kib = static_cast<uint32_t>(DEFAULT_CHUNK_BYTES / 1024);
@@ -370,8 +371,6 @@ int main(int argc, char** argv)
     if (!rel.has_value()) {
         warnResult("I2S release", rel.error());
     }
-    i2s_bus.value().reset();
-
     return rc;
 }
 

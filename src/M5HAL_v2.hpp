@@ -138,8 +138,9 @@ M5HAL_INLINE_V2 namespace v2
 
 // === variant scan and winner alias generation ===
 //
-// Scan order: platform -> arduino framework -> espidf framework -> posix
-// framework -> software framework -> stub fallback.
+// Scan order: platform -> freertos framework -> arduino framework ->
+// espidf framework -> posix framework -> remote framework -> software
+// framework -> stub fallback.
 // Each pass includes the variant's _offer.hpp followed by
 // offer_all.inl, which on the first hit per kind binds the winner's
 // suffixed types (`Bus_<variant>` etc., defined directly in

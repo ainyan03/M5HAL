@@ -4,8 +4,11 @@
 
 #include "../../../../../hal/v2/gpio/port.hpp"
 #include "../../../../../hal/v2/m5_hal.hpp"
+#include "../../../../../hal/v2/service/completion_gate.hpp"
 #include "../../../../../hal/v2/service/service.hpp"
 #include "../../../../../hal/v2/spi/spi.hpp"
+
+#include <atomic>
 
 // SPI bit-bang implementation. The bus stores CLK/MOSI/MISO/DC pins resolved
 // from IBusConfig via M5_Hal.Gpio. Per-device CS is resolved from
@@ -53,10 +56,9 @@ private:
     gpio::Pin _transaction_cs{};
     void* _transfer_service         = nullptr;
     bus::IAccessor* _transfer_owner = nullptr;
-    bool _transfer_active           = false;
-    bool _transfer_registered       = false;
-    bool _transfer_done             = true;
-    error::error_t _transfer_error  = error::error_t::OK;
+    std::atomic<bool> _transfer_registered{false};
+    service::CompletionGate _transfer_gate;
+    error::error_t _transfer_error = error::error_t::OK;
     bus::TransferTotals _transfer_totals{};
 };
 
@@ -66,7 +68,7 @@ struct BackendFor<BusConfig_software> {
     using type = Bus_software;
 };
 
-// Phase-3 software backend factory: builds a bit-bang Bus_software from a
+// software backend factory: builds a bit-bang Bus_software from a
 // LogicalBusConfig's pins. M5HALCore wires this into spi::BusView (the logical
 // acquire path). The software variant is always present, so this is the
 // universal software fallback used when a bus is not (or not yet) on hardware.

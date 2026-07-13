@@ -11,6 +11,7 @@
 // subclassed.
 
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 #include <M5HAL_v2.hpp>
 
 #include "i2c_virtual_bus.hpp"
@@ -21,6 +22,25 @@
 #include <memory>
 #include <type_traits>
 #include <vector>
+
+// tsan's instrumentation slowdown (plus a fully loaded host during a parallel
+// full-CI run) can push a long virtual-wire transfer past a 100 ms wire
+// timeout even though nothing is wedged (observed on the 200-byte
+// continuation read). Give the success-path wire timeout the same kind of
+// tsan headroom the per-test watchdog takes (gtest_watchdog.hpp, 30 s ->
+// 120 s). Timeout-EXPECTING tests scale with it harmlessly: the timeout
+// still fires, just later, and nothing asserts on the elapsed time.
+#if defined(__SANITIZE_THREAD__)
+#define M5HAL_TEST_WIRE_TIMEOUT_MS 1000
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define M5HAL_TEST_WIRE_TIMEOUT_MS 1000
+#else
+#define M5HAL_TEST_WIRE_TIMEOUT_MS 100
+#endif
+#else
+#define M5HAL_TEST_WIRE_TIMEOUT_MS 100
+#endif
 
 namespace {
 
@@ -287,22 +307,22 @@ TEST(SoftwareI2CMasterStartCondition, AdvancesByNsecTicks)
     StartConditionService start;
     start.begin(lines, timing, 1000);
 
-    EXPECT_EQ(start.service(m5::hal::v2::service::ServiceContext{1000}), m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(start.service(1000), m5::hal::v2::service::ServiceResult::Progress);
     ASSERT_EQ(lines.events.size(), size_t{1});
     EXPECT_EQ(lines.events[0].kind, FakeMasterLineDriver::EventKind::SCL);
     EXPECT_TRUE(lines.events[0].high);
     EXPECT_EQ(start.dueTick(), 1100u);
 
-    EXPECT_EQ(start.service(m5::hal::v2::service::ServiceContext{1099}), m5::hal::v2::service::ServiceResult::Idle);
+    EXPECT_EQ(start.service(1099), m5::hal::v2::service::ServiceResult::Idle);
     EXPECT_EQ(lines.events.size(), size_t{1});
 
-    EXPECT_EQ(start.service(m5::hal::v2::service::ServiceContext{1100}), m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(start.service(1100), m5::hal::v2::service::ServiceResult::Progress);
     ASSERT_EQ(lines.events.size(), size_t{2});
     EXPECT_EQ(lines.events[1].kind, FakeMasterLineDriver::EventKind::SDA);
     EXPECT_FALSE(lines.events[1].high);
     EXPECT_EQ(start.dueTick(), 1200u);
 
-    EXPECT_EQ(start.service(m5::hal::v2::service::ServiceContext{1200}), m5::hal::v2::service::ServiceResult::Done);
+    EXPECT_EQ(start.service(1200), m5::hal::v2::service::ServiceResult::Done);
     ASSERT_EQ(lines.events.size(), size_t{3});
     EXPECT_EQ(lines.events[2].kind, FakeMasterLineDriver::EventKind::SCL);
     EXPECT_FALSE(lines.events[2].high);
@@ -322,17 +342,17 @@ TEST(SoftwareI2CMasterStartCondition, WaitsForClockStretchRelease)
     StartConditionService start;
     start.begin(lines, timing, 2000);
 
-    EXPECT_EQ(start.service(m5::hal::v2::service::ServiceContext{2000}), m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(start.service(2000), m5::hal::v2::service::ServiceResult::Progress);
     EXPECT_EQ(start.state(), StartConditionService::State::WaitClockHigh);
     ASSERT_EQ(lines.events.size(), size_t{1});
     EXPECT_EQ(lines.events.back().kind, FakeMasterLineDriver::EventKind::SCL);
     EXPECT_TRUE(lines.events.back().high);
 
-    EXPECT_EQ(start.service(m5::hal::v2::service::ServiceContext{2500}), m5::hal::v2::service::ServiceResult::Idle);
+    EXPECT_EQ(start.service(2500), m5::hal::v2::service::ServiceResult::Idle);
     EXPECT_EQ(lines.events.size(), size_t{1});
 
     lines.scl_read_high = true;
-    EXPECT_EQ(start.service(m5::hal::v2::service::ServiceContext{2600}), m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(start.service(2600), m5::hal::v2::service::ServiceResult::Progress);
     EXPECT_EQ(start.state(), StartConditionService::State::PullSdaLow);
     EXPECT_EQ(start.dueTick(), 2700u);
 }
@@ -350,11 +370,11 @@ TEST(SoftwareI2CMasterStartCondition, ReportsTimeoutWhenSclStaysLow)
     StartConditionService start;
     start.begin(lines, timing, 3000);
 
-    EXPECT_EQ(start.service(m5::hal::v2::service::ServiceContext{3000}), m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(start.service(3000), m5::hal::v2::service::ServiceResult::Progress);
     EXPECT_EQ(start.state(), StartConditionService::State::WaitClockHigh);
 
-    EXPECT_EQ(start.service(m5::hal::v2::service::ServiceContext{3029}), m5::hal::v2::service::ServiceResult::Idle);
-    EXPECT_EQ(start.service(m5::hal::v2::service::ServiceContext{3030}), m5::hal::v2::service::ServiceResult::Error);
+    EXPECT_EQ(start.service(3029), m5::hal::v2::service::ServiceResult::Idle);
+    EXPECT_EQ(start.service(3030), m5::hal::v2::service::ServiceResult::Error);
     EXPECT_EQ(start.state(), StartConditionService::State::Timeout);
     EXPECT_EQ(start.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
     EXPECT_FALSE(start.done());
@@ -372,14 +392,14 @@ TEST(SoftwareI2CMasterWriteByte, SendsBitsMsbFirstAndSamplesAck)
     WriteByteService writer;
     writer.begin(lines, timing, 0xA5, 1000);
 
-    EXPECT_EQ(writer.service(m5::hal::v2::service::ServiceContext{999}), m5::hal::v2::service::ServiceResult::Idle);
+    EXPECT_EQ(writer.service(999), m5::hal::v2::service::ServiceResult::Idle);
     ASSERT_EQ(lines.events.size(), size_t{1});
     EXPECT_EQ(lines.events[0].kind, FakeMasterLineDriver::EventKind::SDA);
     EXPECT_TRUE(lines.events[0].high);
 
     m5::hal::v2::service::ServiceResult result = m5::hal::v2::service::ServiceResult::Idle;
     for (size_t i = 0; i < 32 && result != m5::hal::v2::service::ServiceResult::Done; ++i) {
-        result = writer.service(m5::hal::v2::service::ServiceContext{writer.dueTick()});
+        result = writer.service(writer.dueTick());
     }
 
     EXPECT_EQ(result, m5::hal::v2::service::ServiceResult::Done);
@@ -430,13 +450,11 @@ TEST(SoftwareI2CMasterWriteByte, KeepsClockPhaseWhenServiceRunsLate)
     writer.begin(lines, timing, 0x80, 1000);
 
     EXPECT_EQ(writer.dueTick(), 1010u);
-    EXPECT_EQ(writer.service(m5::hal::v2::service::ServiceContext{1013}),
-              m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(writer.service(1013), m5::hal::v2::service::ServiceResult::Progress);
     EXPECT_EQ(writer.state(), WriteByteService::State::LowerClock);
     EXPECT_EQ(writer.dueTick(), 1020u);
 
-    EXPECT_EQ(writer.service(m5::hal::v2::service::ServiceContext{1024}),
-              m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(writer.service(1024), m5::hal::v2::service::ServiceResult::Progress);
     EXPECT_EQ(writer.state(), WriteByteService::State::RaiseClock);
     EXPECT_EQ(writer.dueTick(), 1030u);
 }
@@ -452,8 +470,7 @@ TEST(SoftwareI2CMasterWriteByte, ResyncsClockPhaseWhenServiceRunsTooLate)
     WriteByteService writer;
     writer.begin(lines, timing, 0x80, 1000);
 
-    EXPECT_EQ(writer.service(m5::hal::v2::service::ServiceContext{1055}),
-              m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(writer.service(1055), m5::hal::v2::service::ServiceResult::Progress);
     EXPECT_EQ(writer.state(), WriteByteService::State::LowerClock);
     EXPECT_EQ(writer.dueTick(), 1065u);
 }
@@ -472,7 +489,7 @@ TEST(SoftwareI2CMasterWriteByte, ReportsNackAfterReturningClockLow)
 
     m5::hal::v2::service::ServiceResult result = m5::hal::v2::service::ServiceResult::Idle;
     for (size_t i = 0; i < 32 && result != m5::hal::v2::service::ServiceResult::Error; ++i) {
-        result = writer.service(m5::hal::v2::service::ServiceContext{writer.dueTick()});
+        result = writer.service(writer.dueTick());
     }
 
     EXPECT_EQ(result, m5::hal::v2::service::ServiceResult::Error);
@@ -499,20 +516,18 @@ TEST(SoftwareI2CMasterWriteByte, WaitsForClockStretchRelease)
     WriteByteService writer;
     writer.begin(lines, timing, 0x80, 1000);
 
-    EXPECT_EQ(writer.service(m5::hal::v2::service::ServiceContext{1000}), m5::hal::v2::service::ServiceResult::Idle);
-    EXPECT_EQ(writer.service(m5::hal::v2::service::ServiceContext{1010}),
-              m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(writer.service(1000), m5::hal::v2::service::ServiceResult::Idle);
+    EXPECT_EQ(writer.service(1010), m5::hal::v2::service::ServiceResult::Progress);
     EXPECT_EQ(writer.state(), WriteByteService::State::WaitClockHigh);
     ASSERT_EQ(lines.events.size(), size_t{2});
     EXPECT_EQ(lines.events.back().kind, FakeMasterLineDriver::EventKind::SCL);
     EXPECT_TRUE(lines.events.back().high);
 
-    EXPECT_EQ(writer.service(m5::hal::v2::service::ServiceContext{1050}), m5::hal::v2::service::ServiceResult::Idle);
+    EXPECT_EQ(writer.service(1050), m5::hal::v2::service::ServiceResult::Idle);
     EXPECT_EQ(lines.events.size(), size_t{2});
 
     lines.scl_read_high = true;
-    EXPECT_EQ(writer.service(m5::hal::v2::service::ServiceContext{1060}),
-              m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(writer.service(1060), m5::hal::v2::service::ServiceResult::Progress);
     EXPECT_EQ(writer.state(), WriteByteService::State::LowerClock);
     EXPECT_EQ(writer.dueTick(), 1070u);
 }
@@ -530,13 +545,12 @@ TEST(SoftwareI2CMasterWriteByte, ReportsTimeoutWhenClockStretchDoesNotRelease)
     WriteByteService writer;
     writer.begin(lines, timing, 0x80, 2000);
 
-    EXPECT_EQ(writer.service(m5::hal::v2::service::ServiceContext{2000}), m5::hal::v2::service::ServiceResult::Idle);
-    EXPECT_EQ(writer.service(m5::hal::v2::service::ServiceContext{2010}),
-              m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(writer.service(2000), m5::hal::v2::service::ServiceResult::Idle);
+    EXPECT_EQ(writer.service(2010), m5::hal::v2::service::ServiceResult::Progress);
     EXPECT_EQ(writer.state(), WriteByteService::State::WaitClockHigh);
 
-    EXPECT_EQ(writer.service(m5::hal::v2::service::ServiceContext{2039}), m5::hal::v2::service::ServiceResult::Idle);
-    EXPECT_EQ(writer.service(m5::hal::v2::service::ServiceContext{2040}), m5::hal::v2::service::ServiceResult::Error);
+    EXPECT_EQ(writer.service(2039), m5::hal::v2::service::ServiceResult::Idle);
+    EXPECT_EQ(writer.service(2040), m5::hal::v2::service::ServiceResult::Error);
     EXPECT_EQ(writer.state(), WriteByteService::State::Timeout);
     EXPECT_EQ(writer.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
     EXPECT_FALSE(writer.done());
@@ -554,10 +568,10 @@ TEST(SoftwareI2CMasterStopCondition, ReleasesSdaWhileSclHigh)
     StopConditionService stop;
     stop.begin(lines, timing, 1000);
 
-    EXPECT_EQ(stop.service(m5::hal::v2::service::ServiceContext{1000}), m5::hal::v2::service::ServiceResult::Progress);
-    EXPECT_EQ(stop.service(m5::hal::v2::service::ServiceContext{1010}), m5::hal::v2::service::ServiceResult::Progress);
-    EXPECT_EQ(stop.service(m5::hal::v2::service::ServiceContext{1020}), m5::hal::v2::service::ServiceResult::Progress);
-    EXPECT_EQ(stop.service(m5::hal::v2::service::ServiceContext{1030}), m5::hal::v2::service::ServiceResult::Done);
+    EXPECT_EQ(stop.service(1000), m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(stop.service(1010), m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(stop.service(1020), m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(stop.service(1030), m5::hal::v2::service::ServiceResult::Done);
 
     ASSERT_EQ(lines.events.size(), size_t{3});
     EXPECT_EQ(lines.events[0].kind, FakeMasterLineDriver::EventKind::SDA);
@@ -583,7 +597,7 @@ TEST(SoftwareI2CMasterStopCondition, ReportsBusErrorWhenSdaStaysLow)
 
     m5::hal::v2::service::ServiceResult result = m5::hal::v2::service::ServiceResult::Idle;
     for (size_t i = 0; i < 8 && result != m5::hal::v2::service::ServiceResult::Error; ++i) {
-        result = stop.service(m5::hal::v2::service::ServiceContext{stop.dueTick()});
+        result = stop.service(stop.dueTick());
     }
 
     EXPECT_EQ(result, m5::hal::v2::service::ServiceResult::Error);
@@ -604,12 +618,12 @@ TEST(SoftwareI2CMasterStopCondition, ReportsTimeoutWhenSclStaysLow)
     StopConditionService stop;
     stop.begin(lines, timing, 3000);
 
-    EXPECT_EQ(stop.service(m5::hal::v2::service::ServiceContext{3000}), m5::hal::v2::service::ServiceResult::Progress);
-    EXPECT_EQ(stop.service(m5::hal::v2::service::ServiceContext{3010}), m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(stop.service(3000), m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(stop.service(3010), m5::hal::v2::service::ServiceResult::Progress);
     EXPECT_EQ(stop.state(), StopConditionService::State::WaitClockHigh);
 
-    EXPECT_EQ(stop.service(m5::hal::v2::service::ServiceContext{3039}), m5::hal::v2::service::ServiceResult::Idle);
-    EXPECT_EQ(stop.service(m5::hal::v2::service::ServiceContext{3040}), m5::hal::v2::service::ServiceResult::Error);
+    EXPECT_EQ(stop.service(3039), m5::hal::v2::service::ServiceResult::Idle);
+    EXPECT_EQ(stop.service(3040), m5::hal::v2::service::ServiceResult::Error);
     EXPECT_EQ(stop.state(), StopConditionService::State::Timeout);
     EXPECT_EQ(stop.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
 }
@@ -632,7 +646,7 @@ TEST(SoftwareI2CMasterReadByte, SamplesBitsMsbFirstAndSendsAck)
         if (reader.state() == ReadByteService::State::SampleBit && sampled_bits < sizeof(bits)) {
             lines.sda_read_high = bits[sampled_bits++];
         }
-        result = reader.service(m5::hal::v2::service::ServiceContext{reader.dueTick()});
+        result = reader.service(reader.dueTick());
     }
 
     EXPECT_EQ(result, m5::hal::v2::service::ServiceResult::Done);
@@ -665,7 +679,7 @@ TEST(SoftwareI2CMasterReadByte, SendsNackAfterFinalByte)
 
     m5::hal::v2::service::ServiceResult result = m5::hal::v2::service::ServiceResult::Idle;
     for (size_t i = 0; i < 64 && result != m5::hal::v2::service::ServiceResult::Done; ++i) {
-        result = reader.service(m5::hal::v2::service::ServiceContext{reader.dueTick()});
+        result = reader.service(reader.dueTick());
     }
 
     EXPECT_EQ(result, m5::hal::v2::service::ServiceResult::Done);
@@ -691,18 +705,15 @@ TEST(SoftwareI2CMasterReadByte, KeepsClockPhaseWhenServiceRunsLate)
     reader.begin(lines, timing, true, 1000);
 
     EXPECT_EQ(reader.dueTick(), 1000u);
-    EXPECT_EQ(reader.service(m5::hal::v2::service::ServiceContext{1003}),
-              m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(reader.service(1003), m5::hal::v2::service::ServiceResult::Progress);
     EXPECT_EQ(reader.state(), ReadByteService::State::RaiseClock);
     EXPECT_EQ(reader.dueTick(), 1013u);
 
-    EXPECT_EQ(reader.service(m5::hal::v2::service::ServiceContext{1016}),
-              m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(reader.service(1016), m5::hal::v2::service::ServiceResult::Progress);
     EXPECT_EQ(reader.state(), ReadByteService::State::SampleBit);
     EXPECT_EQ(reader.dueTick(), 1023u);
 
-    EXPECT_EQ(reader.service(m5::hal::v2::service::ServiceContext{1028}),
-              m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(reader.service(1028), m5::hal::v2::service::ServiceResult::Progress);
     EXPECT_EQ(reader.state(), ReadByteService::State::RaiseClock);
     EXPECT_EQ(reader.dueTick(), 1033u);
 }
@@ -718,13 +729,11 @@ TEST(SoftwareI2CMasterReadByte, ResyncsClockPhaseWhenServiceRunsTooLate)
     ReadByteService reader;
     reader.begin(lines, timing, true, 1000);
 
-    EXPECT_EQ(reader.service(m5::hal::v2::service::ServiceContext{1000}),
-              m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(reader.service(1000), m5::hal::v2::service::ServiceResult::Progress);
     EXPECT_EQ(reader.state(), ReadByteService::State::RaiseClock);
     EXPECT_EQ(reader.dueTick(), 1010u);
 
-    EXPECT_EQ(reader.service(m5::hal::v2::service::ServiceContext{1055}),
-              m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(reader.service(1055), m5::hal::v2::service::ServiceResult::Progress);
     EXPECT_EQ(reader.state(), ReadByteService::State::SampleBit);
     EXPECT_EQ(reader.dueTick(), 1065u);
 }
@@ -742,13 +751,11 @@ TEST(SoftwareI2CMasterReadByte, ReportsTimeoutWhenClockStretchDoesNotRelease)
     ReadByteService reader;
     reader.begin(lines, timing, true, 3000);
 
-    EXPECT_EQ(reader.service(m5::hal::v2::service::ServiceContext{3000}),
-              m5::hal::v2::service::ServiceResult::Progress);
-    EXPECT_EQ(reader.service(m5::hal::v2::service::ServiceContext{3010}),
-              m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(reader.service(3000), m5::hal::v2::service::ServiceResult::Progress);
+    EXPECT_EQ(reader.service(3010), m5::hal::v2::service::ServiceResult::Progress);
     EXPECT_EQ(reader.state(), ReadByteService::State::WaitClockHigh);
-    EXPECT_EQ(reader.service(m5::hal::v2::service::ServiceContext{3039}), m5::hal::v2::service::ServiceResult::Idle);
-    EXPECT_EQ(reader.service(m5::hal::v2::service::ServiceContext{3040}), m5::hal::v2::service::ServiceResult::Error);
+    EXPECT_EQ(reader.service(3039), m5::hal::v2::service::ServiceResult::Idle);
+    EXPECT_EQ(reader.service(3040), m5::hal::v2::service::ServiceResult::Error);
     EXPECT_EQ(reader.state(), ReadByteService::State::Timeout);
     EXPECT_EQ(reader.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
 }
@@ -768,7 +775,7 @@ TEST(SoftwareI2CMasterTransaction, RunsStartWriteReadAndStopPrimitives)
     auto run_until_done = [&](uint32_t now_tick) {
         m5::hal::v2::service::ServiceResult result = m5::hal::v2::service::ServiceResult::Idle;
         for (size_t i = 0; i < 64 && result != m5::hal::v2::service::ServiceResult::Done; ++i) {
-            result = transaction.service(m5::hal::v2::service::ServiceContext{now_tick});
+            result = transaction.service(now_tick);
             now_tick += 10;
         }
         return result;
@@ -786,7 +793,7 @@ TEST(SoftwareI2CMasterTransaction, RunsStartWriteReadAndStopPrimitives)
     m5::hal::v2::service::ServiceResult result = m5::hal::v2::service::ServiceResult::Idle;
     for (uint32_t now_tick = 3000; now_tick < 4000 && result != m5::hal::v2::service::ServiceResult::Done;
          now_tick += 10) {
-        result = transaction.service(m5::hal::v2::service::ServiceContext{now_tick});
+        result = transaction.service(now_tick);
     }
     EXPECT_EQ(result, m5::hal::v2::service::ServiceResult::Done);
     EXPECT_EQ(transaction.byte(), 0xFF);
@@ -811,7 +818,7 @@ TEST(SoftwareI2CMasterTransaction, PropagatesPrimitiveErrors)
 
     m5::hal::v2::service::ServiceResult result = m5::hal::v2::service::ServiceResult::Idle;
     for (size_t i = 0; i < 64 && result != m5::hal::v2::service::ServiceResult::Error; ++i) {
-        result = transaction.service(m5::hal::v2::service::ServiceContext{1000 + static_cast<uint32_t>(i * 10)});
+        result = transaction.service(1000 + static_cast<uint32_t>(i * 10));
     }
 
     EXPECT_EQ(result, m5::hal::v2::service::ServiceResult::Error);
@@ -831,7 +838,7 @@ TEST(SoftwareI2CMasterTransaction, RunsAddressAndBufferSequences)
     auto run_until_done = [](MasterTransactionService& transaction, uint32_t now_tick) {
         m5::hal::v2::service::ServiceResult result = m5::hal::v2::service::ServiceResult::Idle;
         for (size_t i = 0; i < 128 && result != m5::hal::v2::service::ServiceResult::Done; ++i) {
-            result = transaction.service(m5::hal::v2::service::ServiceContext{now_tick});
+            result = transaction.service(now_tick);
             now_tick += 10;
         }
         return result;
@@ -876,7 +883,7 @@ TEST(SoftwareIBus, TransferRecordsPinEventsViaPrefix)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x68;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
 
     // The prefix bytes go directly into the `TransferDesc` inline buffer.
     m5::hal::v2::i2c::TransferDesc desc;
@@ -931,7 +938,7 @@ TEST(SoftwareIBus, TransferRecordsPinEventsViaSource)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x68;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
 
     // Push tx bytes through a MemorySource to exercise the Source path.
     const uint8_t tx_bytes[] = {0xBB, 0xCC};
@@ -967,7 +974,7 @@ TEST(SoftwareIBus, ProbeProducesWireActivity)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
 
     m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
 
@@ -1004,7 +1011,7 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareAcksProbe)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
     m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
     auto r = accessor.probe();
     EXPECT_TRUE(r.has_value());
@@ -1033,7 +1040,7 @@ TEST(SoftwareIBus, AccessorTransferRunsInServiceRunnerUntilEndTransaction)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
     m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     const uint8_t tx[] = {0x10, 0x11, 0x12, 0x13};
@@ -1044,12 +1051,10 @@ TEST(SoftwareIBus, AccessorTransferRunsInServiceRunnerUntilEndTransaction)
     EXPECT_TRUE(accessor.transferBusy());
     EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), 1u);
 
-    auto now = m5::hal::v2::service::fastTick();
     for (size_t i = 0; i < 400 && m5::hal::v2::M5_Hal.Services.size() != 0; ++i) {
-        auto tick = static_cast<m5::hal::v2::service::fast_tick_t>(
-            now + static_cast<m5::hal::v2::service::fast_tick_t>((i + 1) * 1000));
-        lines.setNowTick(tick);
-        (void)m5::hal::v2::M5_Hal.Services.runOnce(tick);
+        lines.advance(1000);
+        (void)m5::hal::v2::M5_Hal.Services.runOnce(
+            m5::hal::v2::service::ServiceContext{1000, m5::hal::v2::service::fastTick()});
     }
     EXPECT_FALSE(accessor.transferBusy());
     EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), 0u);
@@ -1085,7 +1090,7 @@ TEST(SoftwareIBus, AccessorTransferFailsWhenServiceRunnerIsFull)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
     m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     const uint8_t tx[] = {0x10, 0x11, 0x12, 0x13};
@@ -1096,10 +1101,11 @@ TEST(SoftwareIBus, AccessorTransferFailsWhenServiceRunnerIsFull)
     EXPECT_EQ(started.error(), m5::hal::v2::error::error_t::OUT_OF_RESOURCE);
     EXPECT_FALSE(accessor.transferBusy());
 
-    auto totals = accessor.endTransaction();
-    ASSERT_TRUE(totals.has_value());
-    EXPECT_EQ(totals->tx, size_t{0});
-    EXPECT_EQ(totals->rx, size_t{0});
+    // The failed segment poisons the transaction (unified latch contract,
+    // spec/design/i2c.md §transaction 中のエラー).
+    auto ended = accessor.endTransaction();
+    ASSERT_FALSE(ended.has_value());
+    EXPECT_EQ(ended.error(), m5::hal::v2::error::error_t::OUT_OF_RESOURCE);
     EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), m5::hal::v2::service::ServiceRunner::kMaxServices);
     (void)fillers;
 }
@@ -1127,7 +1133,7 @@ TEST(SoftwareIBus, NextAccessorTransferDrainsPreviousBeforeStarting)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
     m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     const uint8_t first[]  = {0x20, 0x21};
@@ -1160,7 +1166,7 @@ TEST(SlaveBusSoftware, IdleBeforeInit)
 {
     m5::hal::v2::i2c::SlaveBus_software slave;
     auto& svc = static_cast<m5::hal::v2::service::IService&>(slave);
-    EXPECT_EQ(m5::hal::v2::service::ServiceRunner::run(svc, m5::hal::v2::service::ServiceContext{0}),
+    EXPECT_EQ(m5::hal::v2::service::ServiceRunner::run(svc, m5::hal::v2::service::ServiceContext{0, 0}),
               m5::hal::v2::service::ServiceResult::Idle);
 }
 
@@ -1258,12 +1264,12 @@ TEST(SlaveBusSoftwareRegistration, RegistersAndRemovesBusService)
         ASSERT_TRUE(r.has_value());
         EXPECT_TRUE(registration.registered());
         EXPECT_EQ(runner.size(), size_t{1});
-        EXPECT_TRUE(runner.runOnce(0));
+        EXPECT_TRUE(runner.runOnce(m5::hal::v2::service::ServiceContext{0, 0}));
         EXPECT_EQ(service.calls, size_t{1});
     }
 
     EXPECT_EQ(runner.size(), size_t{0});
-    EXPECT_FALSE(runner.runOnce(0));
+    EXPECT_FALSE(runner.runOnce(m5::hal::v2::service::ServiceContext{0, 0}));
     EXPECT_EQ(service.calls, size_t{1});
 }
 
@@ -1358,7 +1364,7 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareReceivesWriteBytes)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
 
     const uint8_t tx_bytes[] = {0x12, 0x34};
     m5::hal::v2::data::MemorySource tx_src{m5::hal::v2::data::ConstDataSpan{tx_bytes, sizeof(tx_bytes)}};
@@ -1394,7 +1400,7 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareSupportsWriteThenReadWithRestart)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
     acc_cfg.use_restart     = true;
 
     uint8_t rx_bytes[2] = {};
@@ -1433,7 +1439,7 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareSupportsReadOnly)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
 
     uint8_t rx_bytes[2] = {};
     m5::hal::v2::data::MemorySink rx_sink{m5::hal::v2::data::DataSpan{rx_bytes, sizeof(rx_bytes)}};
@@ -1473,7 +1479,7 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareSupportsWriteThenReadWithoutRestart)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
     acc_cfg.use_restart     = false;
 
     uint8_t rx_bytes[2] = {};
@@ -1510,7 +1516,7 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareNacksAddressMismatch)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x43;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
     m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     auto r = accessor.probe();
@@ -1543,7 +1549,7 @@ TEST(SoftwareIBus, VirtualSlaveBusesShareBusByAddress)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x43;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
 
     const uint8_t tx_bytes[] = {0x33, 0x44};
     m5::hal::v2::data::MemorySource tx_src{m5::hal::v2::data::ConstDataSpan{tx_bytes, sizeof(tx_bytes)}};
@@ -1581,7 +1587,7 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareNacksWriteData)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
 
     const uint8_t tx_bytes[] = {0x12, 0x34};
     m5::hal::v2::data::MemorySource tx_src{m5::hal::v2::data::ConstDataSpan{tx_bytes, sizeof(tx_bytes)}};
@@ -1618,7 +1624,7 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareObservesFinalReadNack)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
 
     uint8_t rx_bytes[2] = {};
     m5::hal::v2::data::MemorySink rx_sink{m5::hal::v2::data::DataSpan{rx_bytes, sizeof(rx_bytes)}};
@@ -1654,7 +1660,7 @@ TEST(SlaveStreamAccessorWindow, CompletedMasterTransferOpensReadableWindow)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
 
     const uint8_t tx_bytes[] = {0x12, 0x34};
     m5::hal::v2::data::MemorySource tx_src{m5::hal::v2::data::ConstDataSpan{tx_bytes, sizeof(tx_bytes)}};
@@ -1693,7 +1699,7 @@ TEST(SlaveStreamAccessorWindow, ConsecutiveMasterTransfersOpenSeparateWindows)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
 
     ASSERT_TRUE(bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x10}}, nullptr, 0, nullptr, 0)
                     .has_value());
@@ -1740,7 +1746,7 @@ TEST(SlaveStreamAccessorWindow, TxQueuedInWindowExpiresAtStop)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
 
     uint8_t rx_first[2] = {};
     m5::hal::v2::data::MemorySink first_sink{m5::hal::v2::data::DataSpan{rx_first, sizeof(rx_first)}};
@@ -1777,7 +1783,7 @@ TEST(SlaveStreamAccessorWindow, UnderrunReturnsConfiguredFillByte)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
 
     uint8_t rx[2] = {};
     m5::hal::v2::data::MemorySink rx_sink{m5::hal::v2::data::DataSpan{rx, sizeof(rx)}};
@@ -1809,7 +1815,7 @@ TEST(SlaveStreamAccessorWindow, WriteThenReadIsHandledInsideOneWindow)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
     acc_cfg.use_restart     = true;
 
     uint8_t rx[2] = {};
@@ -2120,7 +2126,7 @@ TEST(SoftwareI2CMasterSourceSink, WriteSourceSendsBytes)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
     m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     const uint8_t tx_bytes[] = {0x12, 0x34};
@@ -2155,7 +2161,7 @@ TEST(SoftwareI2CMasterSourceSink, ReadSinkReceivesBytes)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
     m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     uint8_t rx_buf[2] = {};
@@ -2188,7 +2194,7 @@ TEST(SoftwareI2CMasterSourceSink, WriteRegisterTypedSourceSendsPrefix)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
     m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     static constexpr uint8_t REG = 0xF4;
@@ -2223,7 +2229,7 @@ TEST(SoftwareI2CMasterSourceSink, WriteRegisterLiteralSourceSendsPrefix)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
     m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     const uint8_t payload[] = {0xCC, 0xDD};
@@ -2260,7 +2266,7 @@ TEST(SoftwareI2CMasterSourceSink, ReadRegisterTypedSinkReceivesData)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
     acc_cfg.use_restart     = true;
     m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
 
@@ -2301,7 +2307,7 @@ TEST(SoftwareI2CMasterSourceSink, ReadRegisterLiteralSinkReceivesData)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
     acc_cfg.use_restart     = true;
     m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
 
@@ -2339,7 +2345,7 @@ TEST(SoftwareI2CMasterSourceSink, WriteCapsBytesAtLen)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
     m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     // Source has 8 bytes; the len cap must limit the wire to exactly 4.
@@ -2377,7 +2383,7 @@ TEST(SoftwareI2CMasterSourceSink, ReadCapsBytesAtLen)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
     m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     // Sink has 8-byte backing; the len cap must stop the master after 4 bytes.
@@ -2399,6 +2405,81 @@ TEST(SoftwareI2CMasterSourceSink, ReadCapsBytesAtLen)
     EXPECT_EQ(rx_buf[5], 0x00);
     EXPECT_EQ(rx_buf[6], 0x00);
     EXPECT_EQ(rx_buf[7], 0x00);
+}
+
+TEST(SoftwareI2CMasterSourceSink, ReadWithShortReserveSinkReceivesAllBytesAcrossChunks)
+{
+    // Regression for a two-part chunking bug in TransferState::beginReadChunk:
+    // (1) it used to overwrite `_rx_remaining` with the (possibly short)
+    // reserved span size, so the "more to read" loop in advanceAfterDone
+    // could never trigger; (2) `last_nack` was hardcoded true, so the
+    // master NACKed at the end of every chunk, not just the final one.
+    // A MemorySink always reserves the full remainder contiguously and
+    // never exercises either bug. A RingFIFO sink does: reserve() only
+    // returns the contiguous run up to its backing buffer's physical end,
+    // which is shorter than the request whenever the write cursor sits
+    // mid-buffer -- exactly the "short reserve" Sink shape called out in
+    // the task spec.
+    using namespace service_proto;
+
+    VirtualOpenDrainBus lines;
+    ServiceRunner runner;
+    SlaveEndpoint slave{lines, 0x42};
+    const std::vector<uint8_t> tx_bytes{0x10, 0x11, 0x12, 0x13, 0x14, 0x15};
+    SlaveTransactionResponder responder{slave, tx_bytes};
+    runner.add(slave.service());
+    runner.add(responder);
+    lines.setRunner(&runner);
+
+    VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
+    VirtualI2CPort sda_port{lines, VirtualI2CPort::Line::SDA};
+    ScopedVirtualI2CGPIO gpio{scl_port, sda_port};
+
+    m5::hal::v2::i2c::Bus_software bus;
+    ASSERT_TRUE(bus.init(makeSoftwareBusConfig(gpio.scl(), gpio.sda())).has_value());
+
+    m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
+    acc_cfg.i2c_addr        = 0x42;
+    acc_cfg.freq            = 100000;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
+    m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
+
+    // 8-byte backing buffer for a RingFIFO sink. Pre-position the write
+    // cursor (`head`) at offset 5 by committing and then fully draining 5
+    // bytes, so the buffer holds no data but its *physical* layout has
+    // only 3 contiguous bytes left before wrapping to the start.
+    uint8_t ring_buf[8] = {};
+    m5::hal::v2::data::RingFIFO ring{ring_buf, sizeof(ring_buf)};
+    {
+        auto primed = ring.sink().reserve(5);
+        ASSERT_TRUE(primed.has_value());
+        ASSERT_EQ(primed.value().size, size_t{5});
+        ASSERT_TRUE(ring.sink().commit(5).has_value());
+        ASSERT_TRUE(ring.source().advance(5).has_value());
+    }
+    ASSERT_EQ(ring.buffered(), size_t{0});
+    ASSERT_EQ(ring.free(), size_t{8});
+
+    // Request 6 bytes: the first reserve() call can only return the 3
+    // contiguous bytes remaining before the ring wraps (a "short
+    // reserve"), forcing TransferState into a second chunk.
+    auto r = accessor.read(ring.sink(), tx_bytes.size());
+    ASSERT_TRUE(r.has_value()) << "err=" << m5::hal::v2::error::toString(r.error());
+    EXPECT_EQ(*r, tx_bytes.size());
+
+    // Drain the ring and confirm every requested byte arrived, in order,
+    // across the (necessarily two) chunks.
+    std::vector<uint8_t> received;
+    for (;;) {
+        auto peeked = ring.source().peek(64);
+        ASSERT_TRUE(peeked.has_value());
+        if (peeked.value().size == 0) {
+            break;
+        }
+        received.insert(received.end(), peeked.value().data, peeked.value().data + peeked.value().size);
+        ASSERT_TRUE(ring.source().advance(peeked.value().size).has_value());
+    }
+    EXPECT_EQ(received, tx_bytes);
 }
 
 // ===========================================================================
@@ -2444,6 +2525,17 @@ struct ReadCounter {
     uint8_t next = 0;
 };
 
+struct ComposeCallCounter {
+    size_t calls = 0;
+};
+
+uint8_t regMapOnReadCountCalls(uint8_t reg, void* ctx)
+{
+    auto* c = static_cast<ComposeCallCounter*>(ctx);
+    ++c->calls;
+    return reg;
+}
+
 uint8_t regMapOnReadCounter(uint8_t reg, void* ctx)
 {
     (void)reg;
@@ -2479,6 +2571,9 @@ public:
             _composed         = false;
             _pointer_ingested = false;
             _ended            = false;
+            _tx_have          = 0;
+            _tx_sent          = 0;
+            _resp_off         = 0;
         }
 
         uint8_t buffer[64] = {};
@@ -2505,12 +2600,8 @@ public:
             }
             const size_t seen = _pointer_ingested ? 1 : 0;  // a pure read sees 0
             if (seen >= _min_rx_before_compose) {
-                uint8_t tx[64] = {};
-                _regmap.composeReply(m5::hal::v2::data::DataSpan{tx, sizeof(tx)});
-                auto write = acc.write(m5::hal::v2::data::ConstDataSpan{tx, sizeof(tx)});
-                if (write.has_value()) {
-                    _composed = true;
-                }
+                pumpReply(acc);
+                _composed = true;
             }
             // Apply data bytes that arrived alongside the pointer, AFTER compose.
             if (_composed && n > off) {
@@ -2520,7 +2611,6 @@ public:
             // Post-compose: every further byte is write data; apply incrementally.
             _regmap.ingest(m5::hal::v2::data::ConstDataSpan{buffer, n});
         }
-
         auto complete = acc.transactionComplete();
         if (complete.has_value() && complete.value()) {
             (void)acc.endTransaction();
@@ -2531,10 +2621,42 @@ public:
             }
             return m5::hal::v2::service::ServiceResult::Done;
         }
+        if (_composed) {
+            // Keep the reply streaming past the first chunk (mirrors serve()'s
+            // pump): the ring frees as the master clocks bytes out; the next
+            // chunk is composed from the advancing offset (8-bit wrap).
+            // Ordered AFTER the completion check, like serve(): pumping a
+            // just-completed transaction would see the queue the STOP freed
+            // and compose extra chunks that no one will read.
+            pumpReply(acc);
+        }
         return m5::hal::v2::service::ServiceResult::Progress;
     }
 
 private:
+    // Compose-and-push loop shared by the first reply and its continuation:
+    // compose a chunk only once the previous one was fully accepted, retry the
+    // unaccepted tail verbatim (never re-compose -> onRead fires once per
+    // streamed byte), stand down while the ring is full.
+    void pumpReply(m5::hal::v2::i2c::SlaveStreamAccessor& acc)
+    {
+        for (;;) {
+            if (_tx_sent == _tx_have) {
+                _tx_have = _regmap.composeReply(m5::hal::v2::data::DataSpan{_tx, sizeof(_tx)}, _resp_off);
+                _tx_sent = 0;
+                _resp_off += _tx_have;
+            }
+            auto write = acc.write(m5::hal::v2::data::ConstDataSpan{_tx + _tx_sent, _tx_have - _tx_sent});
+            if (!write.has_value()) {
+                return;
+            }
+            _tx_sent += write.value();
+            if (_tx_sent < _tx_have) {
+                return;  // ring full for now; retry on a later tick
+            }
+        }
+    }
+
     m5::hal::v2::i2c::SlaveRegMapAccessor& _regmap;
     size_t _min_rx_before_compose = 0;
     bool _repeat                  = false;
@@ -2542,6 +2664,10 @@ private:
     bool _composed                = false;
     bool _pointer_ingested        = false;
     bool _ended                   = false;
+    uint8_t _tx[64]               = {};
+    size_t _tx_have               = 0;
+    size_t _tx_sent               = 0;
+    size_t _resp_off              = 0;
 };
 
 }  // namespace
@@ -2639,6 +2765,40 @@ TEST(SlaveRegMapAccessorLogic, ReadWindowWrapsAtEightBits)
     EXPECT_EQ(tx[1], 0xFF);
     EXPECT_EQ(tx[2], 0x00);
     EXPECT_EQ(tx[3], 0x01);
+}
+
+TEST(SlaveRegMapAccessorLogic, ComposeReplyOffsetContinuesWindowWithoutMovingPointer)
+{
+    uint8_t reg_file[256];
+    for (int i = 0; i < 256; ++i) {
+        reg_file[i] = static_cast<uint8_t>(i);
+    }
+    m5::hal::v2::i2c::SlaveBus_software bus;
+    m5::hal::v2::i2c::SlaveRegMapAccessor rm{bus, m5::hal::v2::data::DataSpan{reg_file, sizeof(reg_file)}};
+
+    const uint8_t ptr_frame[] = {0xF0};
+    rm.beginExchange();
+    rm.ingest(m5::hal::v2::data::ConstDataSpan{ptr_frame, sizeof(ptr_frame)});
+
+    // Chunked continuation: offset picks up exactly where the previous chunk
+    // ended, wrapping at 8 bits (0xF0 + 16 -> 0x00).
+    uint8_t a[8] = {}, b[8] = {}, c[8] = {};
+    EXPECT_EQ(rm.composeReply(m5::hal::v2::data::DataSpan{a, sizeof(a)}), size_t{8});
+    EXPECT_EQ(rm.composeReply(m5::hal::v2::data::DataSpan{b, sizeof(b)}, 8), size_t{8});
+    EXPECT_EQ(rm.composeReply(m5::hal::v2::data::DataSpan{c, sizeof(c)}, 16), size_t{8});
+    EXPECT_EQ(a[0], 0xF0);
+    EXPECT_EQ(a[7], 0xF7);
+    EXPECT_EQ(b[0], 0xF8);
+    EXPECT_EQ(b[7], 0xFF);
+    EXPECT_EQ(c[0], 0x00);  // continuation wrapped past 0xFF
+    EXPECT_EQ(c[7], 0x07);
+
+    // Offset composes never advance the pointer: a fresh offset-0 compose
+    // re-serves the same base (repeat-read semantics).
+    EXPECT_EQ(rm.pointer(), 0xF0);
+    uint8_t again[2] = {};
+    rm.composeReply(m5::hal::v2::data::DataSpan{again, sizeof(again)});
+    EXPECT_EQ(again[0], 0xF0);
 }
 
 TEST(SlaveRegMapAccessorLogic, GetSetRegisterTouchBackingStore)
@@ -2743,7 +2903,7 @@ TEST(SlaveRegMapAccessorWire, WriteThenReadReturnsRegisterWindow)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
     acc_cfg.use_restart     = true;
 
     uint8_t rx[4] = {};
@@ -2789,7 +2949,7 @@ TEST(SlaveRegMapAccessorWire, SplitWriteThenSeparateReadUsesPersistedPointer)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
 
     // Transaction 1: write the register pointer only, STOP.
     const uint8_t ptr_byte[] = {0x40};
@@ -2834,7 +2994,7 @@ TEST(SlaveRegMapAccessorWire, MultiByteWriteStoresIntoRegisterFile)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
 
     // Write [0x50, 0xDE, 0xAD, 0xBE]: pointer 0x50, then three data bytes.
     const uint8_t payload[] = {0xDE, 0xAD, 0xBE};
@@ -2928,7 +3088,7 @@ TEST(SlaveRegMapAccessorWire, OnReadSuppliesLiveValuesOverTheWire)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
     acc_cfg.use_restart     = true;
 
     // onRead ignores the register and returns an incrementing counter, so the
@@ -2979,7 +3139,7 @@ TEST(SlaveRegMapAccessorWire, SameTransactionWriteThenReadSeesPreWriteValue)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
     acc_cfg.use_restart     = true;
 
     // Write [0x10, 0xAA] then repeated-START read 1 byte.
@@ -2993,6 +3153,147 @@ TEST(SlaveRegMapAccessorWire, SameTransactionWriteThenReadSeesPreWriteValue)
 
     EXPECT_EQ(rx[0], 0x10);           // pre-write reg_file[0x10], composed before the store
     EXPECT_EQ(reg_file[0x10], 0xAA);  // the data byte still lands in the backing store
+}
+
+TEST(SlaveRegMapAccessorWire, LongReadStreamsBeyondOneReplyChunk)
+{
+    using namespace service_proto;
+
+    VirtualOpenDrainBus lines;
+    ServiceRunner runner;
+    SlaveEndpoint slave{lines, 0x42};
+
+    uint8_t reg_file[256];
+    for (int i = 0; i < 256; ++i) {
+        reg_file[i] = static_cast<uint8_t>(i);
+    }
+    m5::hal::v2::i2c::SlaveRegMapAccessor regmap{slave.bus(), m5::hal::v2::data::DataSpan{reg_file, sizeof(reg_file)}};
+    RegMapTickResponder responder{regmap, /*min_rx_before_compose=*/1};
+
+    runner.add(slave.service());
+    runner.add(responder);
+    lines.setRunner(&runner);
+
+    VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
+    VirtualI2CPort sda_port{lines, VirtualI2CPort::Line::SDA};
+    ScopedVirtualI2CGPIO gpio{scl_port, sda_port};
+
+    m5::hal::v2::i2c::Bus_software bus;
+    ASSERT_TRUE(bus.init(makeSoftwareBusConfig(gpio.scl(), gpio.sda())).has_value());
+
+    m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
+    acc_cfg.i2c_addr        = 0x42;
+    acc_cfg.freq            = 100000;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
+    acc_cfg.use_restart     = true;
+
+    // 96 bytes in ONE transaction: past the 64-byte compose chunk, so the
+    // responder must stream a continuation chunk while the master keeps
+    // clocking (the reply-pump streaming fix; previously a read was capped at one window).
+    uint8_t rx[96] = {};
+    m5::hal::v2::data::MemorySink rx_sink{m5::hal::v2::data::DataSpan{rx, sizeof(rx)}};
+    ASSERT_TRUE(
+        bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x00}}, nullptr, 0, &rx_sink, SIZE_MAX)
+            .has_value());
+
+    for (int i = 0; i < 96; ++i) {
+        ASSERT_EQ(rx[i], static_cast<uint8_t>(i)) << "at offset " << i;
+    }
+}
+
+TEST(SlaveRegMapAccessorWire, OneByteReadComposeReadAheadIsBounded)
+{
+    using namespace service_proto;
+
+    VirtualOpenDrainBus lines;
+    ServiceRunner runner;
+    SlaveEndpoint slave{lines, 0x42};
+
+    uint8_t reg_file[256];
+    for (int i = 0; i < 256; ++i) {
+        reg_file[i] = static_cast<uint8_t>(i);
+    }
+    m5::hal::v2::i2c::SlaveRegMapAccessor regmap{slave.bus(), m5::hal::v2::data::DataSpan{reg_file, sizeof(reg_file)}};
+    ComposeCallCounter counter;
+    regmap.setOnRead(&regMapOnReadCountCalls, &counter);
+    RegMapTickResponder responder{regmap, /*min_rx_before_compose=*/1};
+
+    runner.add(slave.service());
+    runner.add(responder);
+    lines.setRunner(&runner);
+
+    VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
+    VirtualI2CPort sda_port{lines, VirtualI2CPort::Line::SDA};
+    ScopedVirtualI2CGPIO gpio{scl_port, sda_port};
+
+    m5::hal::v2::i2c::Bus_software bus;
+    ASSERT_TRUE(bus.init(makeSoftwareBusConfig(gpio.scl(), gpio.sda())).has_value());
+
+    m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
+    acc_cfg.i2c_addr        = 0x42;
+    acc_cfg.freq            = 100000;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
+    acc_cfg.use_restart     = true;
+
+    // Documented read-ahead bound: onRead fires ahead of the wire, but by no
+    // more than the TX queue depth plus one staged chunk -- two 64-byte chunks
+    // here. A 1-byte read must compose at least the first window and at most
+    // two of them (regression pin for the public contract's caveat).
+    uint8_t rx[1] = {};
+    m5::hal::v2::data::MemorySink rx_sink{m5::hal::v2::data::DataSpan{rx, sizeof(rx)}};
+    ASSERT_TRUE(
+        bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x20}}, nullptr, 0, &rx_sink, SIZE_MAX)
+            .has_value());
+
+    EXPECT_EQ(rx[0], 0x20);
+    EXPECT_GE(counter.calls, size_t{64});
+    EXPECT_LE(counter.calls, size_t{128});
+}
+
+TEST(SlaveRegMapAccessorWire, LongReadContinuationWrapsPastRegisterFileEnd)
+{
+    using namespace service_proto;
+
+    VirtualOpenDrainBus lines;
+    ServiceRunner runner;
+    SlaveEndpoint slave{lines, 0x42};
+
+    uint8_t reg_file[256];
+    for (int i = 0; i < 256; ++i) {
+        reg_file[i] = static_cast<uint8_t>(i);
+    }
+    m5::hal::v2::i2c::SlaveRegMapAccessor regmap{slave.bus(), m5::hal::v2::data::DataSpan{reg_file, sizeof(reg_file)}};
+    RegMapTickResponder responder{regmap, /*min_rx_before_compose=*/1};
+
+    runner.add(slave.service());
+    runner.add(responder);
+    lines.setRunner(&runner);
+
+    VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
+    VirtualI2CPort sda_port{lines, VirtualI2CPort::Line::SDA};
+    ScopedVirtualI2CGPIO gpio{scl_port, sda_port};
+
+    m5::hal::v2::i2c::Bus_software bus;
+    ASSERT_TRUE(bus.init(makeSoftwareBusConfig(gpio.scl(), gpio.sda())).has_value());
+
+    m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
+    acc_cfg.i2c_addr        = 0x42;
+    acc_cfg.freq            = 100000;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
+    acc_cfg.use_restart     = true;
+
+    // 200 bytes from 0xC0: crosses several continuation chunks AND the 8-bit
+    // register-address wrap (0xC0..0xFF then 0x00..0x87) -- the classic
+    // auto-increment regmap behavior, unbounded by the chunk size.
+    uint8_t rx[200] = {};
+    m5::hal::v2::data::MemorySink rx_sink{m5::hal::v2::data::DataSpan{rx, sizeof(rx)}};
+    ASSERT_TRUE(
+        bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0xC0}}, nullptr, 0, &rx_sink, SIZE_MAX)
+            .has_value());
+
+    for (int i = 0; i < 200; ++i) {
+        ASSERT_EQ(rx[i], static_cast<uint8_t>(0xC0 + i)) << "at offset " << i;
+    }
 }
 
 TEST(SoftwareIBus, VirtualOpenDrainBusReportsTimeoutWhenSclHeldLow)
@@ -3037,7 +3338,7 @@ TEST(SoftwareIBus, VirtualOpenDrainBusReportsBusErrorWhenSdaHeldLowAtStop)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
     m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     auto r = accessor.probe();
@@ -3141,7 +3442,7 @@ m5::hal::v2::i2c::MasterAccessConfig makeAcc(uint16_t addr)
     m5::hal::v2::i2c::MasterAccessConfig acc;
     acc.i2c_addr        = addr;
     acc.freq            = 100000;
-    acc.wire_timeout_ms = 100;
+    acc.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
     return acc;
 }
 
@@ -4118,7 +4419,7 @@ TEST(BusProbe, ReleasesLockAfterCall)
 }  // namespace spec_polish_a2
 
 // ---------------------------------------------------------------------------
-// S20: tag-pin constructors. One-line construction with strong-typed
+// Tag-pin constructors. One-line construction with strong-typed
 // pin tags (`Scl` / `Sda`) — either argument order lands on the right
 // field, an untagged positional call stays a compile error, and the
 // variant configs expose the constructors through ctor inheritance.
@@ -4235,6 +4536,52 @@ public:
     }
 };
 
+// A master that goes inactive mid-transaction: the scripted bytes arrive but the
+// STOP never does (transactionComplete stays false), modeling a master that died
+// or aborted with no visible STOP. The tx side is bounded like a real backend's
+// tx ring, so the reply pump cannot register endless fake progress. This is the
+// case a finite serve(timeout) must escape from instead of waiting forever.
+class StalledSlaveBus : public ScriptedSlaveBus {
+public:
+    size_t tx_capacity = 64;
+
+    m5::hal::v2::result_t<size_t> write(m5::hal::v2::bus::IAccessor*, m5::hal::v2::data::ConstDataSpan src) override
+    {
+        const size_t room = tx_capacity > tx_capture.size() ? tx_capacity - tx_capture.size() : 0;
+        const size_t n    = std::min(room, src.size);
+        const auto* p     = static_cast<const uint8_t*>(src.data);
+        tx_capture.insert(tx_capture.end(), p, p + n);
+        return n;
+    }
+    m5::hal::v2::result_t<bool> transactionComplete(m5::hal::v2::bus::IAccessor*) override
+    {
+        return false;
+    }
+};
+
+// A master that pauses mid-transaction and resumes later: the scripted bytes
+// become visible only after `reveal_after_ms`. Exercises the escape-drain
+// deadline boundary -- a serve() that escaped during the pause must still be
+// draining (fresh second deadline) when the bytes finally arrive.
+class LateTailSlaveBus : public ScriptedSlaveBus {
+public:
+    uint32_t reveal_after_ms = 0;
+    uint32_t t0              = m5::hal::v2::runtime::millis();
+
+    bool revealed() const
+    {
+        return m5::hal::v2::runtime::millis() - t0 >= reveal_after_ms;
+    }
+    m5::hal::v2::result_t<size_t> readableBytes(m5::hal::v2::bus::IAccessor* o) override
+    {
+        return revealed() ? ScriptedSlaveBus::readableBytes(o) : m5::hal::v2::result_t<size_t>{size_t{0}};
+    }
+    m5::hal::v2::result_t<size_t> read(m5::hal::v2::bus::IAccessor* o, m5::hal::v2::data::DataSpan dst) override
+    {
+        return revealed() ? ScriptedSlaveBus::read(o, dst) : m5::hal::v2::result_t<size_t>{size_t{0}};
+    }
+};
+
 TEST(SlaveStreamServe, WriteTransactionFillsSink)
 {
     ScriptedSlaveBus bus;
@@ -4326,6 +4673,49 @@ TEST(SlaveStreamServe, ClosedSinkEscapesUnderForeverTimeout)
     EXPECT_EQ(bus.rx_pos, size_t{50});  // the rest drained to discard (bus released)
 }
 
+TEST(SlaveStreamServe, MasterInactiveMidTransactionEscapesWithFiniteTimeout)
+{
+    // The master wrote 3 bytes, then went silent without a STOP. The Sink has
+    // room (no local stall), yet no progress is possible -- a finite timeout
+    // must abandon the transaction instead of waiting for a STOP that will
+    // never come. (Pre-fix the escape drain still waited on
+    // transactionComplete() forever even after the deadline expired.)
+    StalledSlaveBus bus;
+    bus.rx_script = {0x31, 0x32, 0x33};
+    m5::hal::v2::i2c::SlaveStreamAccessor acc{bus};
+
+    uint8_t rx[8] = {};
+    m5::hal::v2::data::MemorySink sink{m5::hal::v2::data::DataSpan{rx, sizeof(rx)}};
+    auto n = acc.serve(nullptr, &sink, 20);  // finite no-progress deadline
+    ASSERT_FALSE(n.has_value());
+    EXPECT_EQ(n.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+    // The bytes that did arrive were delivered before the abandon.
+    EXPECT_EQ(sink.written(), size_t{3});
+    EXPECT_EQ(rx[0], 0x31);
+    EXPECT_EQ(rx[2], 0x33);
+}
+
+TEST(SlaveStreamServe, EscapeDrainGetsAFreshSecondDeadline)
+{
+    // The master pauses long enough to trip the first no-progress deadline (so
+    // serve() escapes), then finishes its write INSIDE the second deadline
+    // window. The escape drain must survive to the STOP -- entering escape
+    // grants one more full deadline -- instead of abandoning almost immediately
+    // on the stale pre-escape timer (the boundary a stale timer breaks).
+    LateTailSlaveBus bus;
+    bus.rx_script.assign(10, 0x5A);
+    bus.reveal_after_ms = 70;  // past the 1st deadline (50 ms), inside the 2nd (100 ms)
+    m5::hal::v2::i2c::SlaveStreamAccessor acc{bus};
+
+    uint8_t rx[16] = {};
+    m5::hal::v2::data::MemorySink sink{m5::hal::v2::data::DataSpan{rx, sizeof(rx)}};
+    auto n = acc.serve(nullptr, &sink, 50);
+    ASSERT_FALSE(n.has_value());
+    EXPECT_EQ(n.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);  // it DID escape...
+    EXPECT_EQ(bus.rx_pos, size_t{10});                                 // ...but drained the late tail to the STOP
+    EXPECT_EQ(sink.written(), size_t{0});                              // the tail went to discard, not the Sink
+}
+
 TEST(SlaveRegMapServe, RegisterWriteUpdatesFileAndFiresOnWrite)
 {
     ScriptedSlaveBus bus;
@@ -4403,10 +4793,109 @@ TEST(SlaveRegMapServe, LongWriteBeyondReplyWindowFillsRegisterFile)
     }
 }
 
+TEST(SlaveRegMapServe, MasterInactiveMidTransactionEscapesWithFiniteTimeout)
+{
+    // Pointer + one data byte arrive, then the master goes silent without a
+    // STOP. serve(finite) must abandon the exchange and return TIMEOUT_ERROR
+    // (pre-fix the timeout only bounded the transaction start, diverging from
+    // the documented contract, and this hung forever). The bytes ingested
+    // before the stall stay applied, like a real register device cut off
+    // mid-write.
+    StalledSlaveBus bus;
+    bus.rx_script         = {0x10, 0xAA};
+    uint8_t reg_file[256] = {};
+    m5::hal::v2::i2c::SlaveRegMapAccessor rm{bus, m5::hal::v2::data::DataSpan{reg_file, sizeof(reg_file)}};
+
+    auto r = rm.serve(20);  // finite no-progress deadline
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+    EXPECT_EQ(reg_file[0x10], 0xAA);
+}
+
+// A backend that reports a bound ISR regmap fast path (SlaveRegMapAccessor::
+// serve() then takes its fast-path branch) and confirms activity on every
+// waitForActivity() call, each of which sleeps past a short finite deadline.
+// transactionComplete() only flips true once `complete_after_activity` such
+// calls have happened.
+class FastPathActiveSlaveBus : public m5::hal::v2::i2c::ISlaveBus {
+public:
+    int activity_calls          = 0;
+    int complete_after_activity = 4;
+
+    m5::hal::v2::result_t<void> init(const m5::hal::v2::i2c::SlaveBusConfig&) override
+    {
+        return {};
+    }
+    m5::hal::v2::result_t<void> beginTransaction(m5::hal::v2::bus::IAccessor*, uint32_t) override
+    {
+        return {};
+    }
+    m5::hal::v2::result_t<void> endTransaction(m5::hal::v2::bus::IAccessor*) override
+    {
+        return {};
+    }
+    m5::hal::v2::result_t<size_t> read(m5::hal::v2::bus::IAccessor*, m5::hal::v2::data::DataSpan) override
+    {
+        return size_t{0};
+    }
+    m5::hal::v2::result_t<size_t> write(m5::hal::v2::bus::IAccessor*, m5::hal::v2::data::ConstDataSpan) override
+    {
+        return size_t{0};
+    }
+    m5::hal::v2::result_t<size_t> readableBytes(m5::hal::v2::bus::IAccessor*) override
+    {
+        return size_t{0};
+    }
+    m5::hal::v2::result_t<bool> transactionComplete(m5::hal::v2::bus::IAccessor*) override
+    {
+        return activity_calls >= complete_after_activity;
+    }
+    m5::hal::v2::service::IService* service() override
+    {
+        return nullptr;
+    }
+    m5::hal::v2::result_t<bool> waitForActivity(m5::hal::v2::bus::IAccessor*, uint32_t) override
+    {
+        ++activity_calls;
+        // Real elapsed time across all calls exceeds the finite deadline used
+        // below well before complete_after_activity calls accumulate, so a
+        // deadline that does NOT refresh on confirmed activity (the F1 bug)
+        // would time out first.
+        m5::hal::v2::runtime::delayMs(8);
+        return true;
+    }
+    bool bindIsrRegMap(m5::hal::v2::i2c::IsrRegMapBinding* binding) override
+    {
+        (void)binding;
+        return true;
+    }
+    void unbindIsrRegMap(m5::hal::v2::i2c::IsrRegMapBinding*) override
+    {
+    }
+};
+
+// F1 regression: SlaveRegMapAccessor::serve()'s ISR fast-path branch must
+// treat timeout_ms as a NO-PROGRESS stall deadline (refreshed by every
+// CONFIRMED waitForActivity() wake), not a wall-clock total -- see the
+// fast-path branch's doc comment. Each waitForActivity() call here sleeps
+// 8ms and confirms activity; with a 20ms deadline that never refreshes, this
+// would return TIMEOUT_ERROR well before the 4th call. With the no-progress
+// fix it must complete OK once transactionComplete() flips true.
+TEST(SlaveRegMapServe, FastPathNoProgressDeadlineRefreshesOnConfirmedActivity)
+{
+    FastPathActiveSlaveBus bus;
+    uint8_t reg_file[16] = {};
+    m5::hal::v2::i2c::SlaveRegMapAccessor rm{bus, m5::hal::v2::data::DataSpan{reg_file, sizeof(reg_file)}};
+
+    auto r = rm.serve(20);  // finite deadline, shorter than the total real elapsed time
+    ASSERT_TRUE(r.has_value()) << "err=" << m5::hal::v2::error::toString(r.error());
+    EXPECT_GE(bus.activity_calls, 4);
+}
+
 }  // namespace serve_scripted
 
 // ===========================================================================
-// i2c::Bus runtime facade (ADR 034 phase 1)
+// i2c::Bus runtime facade
 //
 // `i2c::Bus` is now a runtime facade that owns the lock + accessor binding and
 // delegates transfer to a backend (`Bus_<variant>`) created by `init()` via the
@@ -4439,7 +4928,7 @@ TEST(I2cBusFacade, DelegatesAccessorTransferToBackend)
     m5::hal::v2::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = 0x42;
     acc_cfg.freq            = 100000;
-    acc_cfg.wire_timeout_ms = 100;
+    acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
 
     // Accessor binds to the FACADE; the transaction locks the facade and
     // transfer delegates to the backend.
@@ -4517,5 +5006,6 @@ TEST(I2cBusFacade, ReleaseIsIdempotent)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

@@ -4,6 +4,20 @@
 
 I2C slave の Bus / Accessor / 設定型 / 給仕モデルの仕様。 master 体系は [i2c.md](i2c.md)、 共通基底は [bus_accessor.md](bus_accessor.md) を参照。
 
+## 目次
+
+- [API 概要](#api-概要)
+- [backend の構築とコントローラの占有](#backend-の構築とコントローラの占有)
+- [serve() の polarity と timeout](#serve-の-polarity-と-timeout)
+- [トランザクション窓モデル](#トランザクション窓モデル)
+- [アクセサの選択 (Stream vs RegMap)](#アクセサの選択-stream-vs-regmap)
+- [応答ポリシーの詳細](#応答ポリシーの詳細)
+- [ISR regmap fast path (`bindIsrRegMap`)](#isr-regmap-fast-path-bindisrregmap)
+- [backend 実装](#backend-実装)
+- [関連](#関連)
+
+## API 概要
+
 I2C slave は基本機能として master 体系と相似の型で提供する:
 `ISlaveBus` (抽象基底) / `SlaveBus_<variant>` (具象 backend) / `SlaveBusConfig` /
 `SlaveStreamAccessor` (基底のストリームアクセサ)。 応答ポリシーは後述のとおり
@@ -41,6 +55,7 @@ struct SlaveBusConfig : public bus::IBusConfig {
     TxUnderrun tx_underrun       = TxUnderrun::fill;
     uint8_t tx_fill_byte         = 0xFF;
     uint32_t stretch_timeout_ms  = 100;    // tx_underrun=stretch の応答待ち上限 (超過で fill へ)
+    int8_t controller            = -1;     // 占有するハードウェアコントローラ (§コントローラの占有)
 };
 
 class SlaveStreamAccessor /* : StreamReader, StreamWriter */ {
@@ -104,12 +119,53 @@ class SlaveRegMapAccessor {  // SlaveStreamAccessor を内部に合成するア�
 }
 ```
 
+## backend の構築とコントローラの占有
+
 **backend の構築**: 実機 (ESP32-S3 系) は `SlaveBus_espidf bus; bus.init(cfg);` で済む
 (`cfg` は `SlaveBusConfig`)。 software / native backend (`SlaveBus_software`) は SCL/SDA を
 駆動する `SlaveLineDriver` を渡す `init(SlaveLineDriver&, cfg)` を使う (`init(cfg)` 単独呼びは
 `INVALID_ARGUMENT`)。 software backend を native の ServiceRunner tick から進めるモデルでは
 `ScopedSlaveServiceRegistration{runner, bus}` で service を runner に登録する (`serve()` の
 ブロッキング poll が使えない単一スレッド向け、後述の取引ステップ API と組む)。
+
+**コントローラの占有 (`SlaveBusConfig::controller`)**: 実機の I2C ハードウェアコントローラは
+master 体系と同じ有限プールを共有する物理資源であり、 台帳を経ずに固定ポートへ直書きすると
+同じポートを使う master バスのレジスタを破壊しうる。 `SlaveBusConfig::controller` はどの
+コントローラを占有するかを指定する欄で、 正しい値は `bus::BusView::claimController(intent)`
+(既定 = Auto、 最小空きコントローラ) で取得する:
+
+```cpp
+auto claim = M5_Hal.I2C.claimController();  // 既定 = Auto
+if (!claim.has_value()) { /* 全コントローラ使用中、または不適格 */ }
+cfg.controller = claim.value();
+auto init = slave_bus.init(cfg);
+if (!init.has_value()) {
+    // init に失敗した slave は港を掴んでいない — claim だけ返却する
+    M5_Hal.I2C.releaseClaimedController(claim.value());
+}
+// 使い終わったら「先に slave を止め、止まってから」claim を返却する。
+// 逆順 (claim を先に返す) は、slave がまだ ISR とレジスタを掴んでいる間に
+// master 側の再配置が同じ港を確保・再設定できてしまう
+if (slave_bus.release().has_value()) {
+    M5_Hal.I2C.releaseClaimedController(claim.value());
+}
+```
+
+占有した区画は master 側の `commitBuses()` (バス再配置) を生き延び、 自動割当も明示指名
+(`requireController`/`preferController`) もこの区画を master へ渡さない。 逆に master が
+先に同じコントローラを保持している場合、 `claimController` は `OUT_OF_RESOURCE` を返す
+(明示指名で不適格なコントローラを指した場合は `INVALID_ARGUMENT`)。
+
+`controller = -1` (既定値) は「backend の既定ポートを直接使う」を意味し、 **プールの台帳に
+一切載らない** (自己責任 — 同じポートを使う master バスとの衝突を検出できない)。 単体テストや
+HIL ベンチなど、 プールを経由しない生成経路との互換のために残した既定であり、 実運用では
+`claimController` 経由での取得を推奨する。
+
+低電力ドメインのコントローラ (LP_I2C) は指定できない — clock-stretch / ISR ベースの slave
+機構は HP コントローラ専用で、 LP 区画を指した `controller` は `init()` が `INVALID_ARGUMENT`
+で拒否する。
+
+## serve() の polarity と timeout
 
 **`serve(src, dst, timeout)` の polarity と nullptr** (`src`/`dst` は master API と同じ「この
 accessor が送る / 受ける」向き。 slave 視点ではなく master 動作を主語に読むと迷わない):
@@ -123,9 +179,11 @@ accessor が送る / 受ける」向き。 slave 視点ではなく master 動�
 
 | 設定 | 対象 | 期限時の挙動 |
 |---|---|---|
-| `serve(…, timeout_ms)` | 取引開始待ち + 取引中の無進展 (stall)。**wall-clock 総時間ではない** | `TIMEOUT_ERROR`。取引中 stall なら残り write を discard して master を完走させる |
+| `serve(…, timeout_ms)` | 取引開始待ち + 取引中の無進展 (stall)。**wall-clock 総時間ではない** | `TIMEOUT_ERROR`。取引中 stall なら残り write を discard して master を完走させる (discard 中も master が無活動のままなら deadline もう 1 回分で取引ごと放棄 — 有限 timeout は必ず返る) |
 | `SlaveBusConfig::timeout_ms` | 低レベル `read()` が現窓の RX byte を待つ予算 | 0 byte の短読み (通常 error ではない) |
 | `SlaveBusConfig::stretch_timeout_ms` | `tx_underrun=stretch` で窓未オープン / 応答未投入の read を stretch 保持する上限 | `tx_fill_byte` 送出へ fallback |
+
+## トランザクション窓モデル
 
 **トランザクション窓モデル**: 1 窓 = master の 1 `transfer()` (write-then-read を
 repeated start で繋いだ全体、STOP まで)。 「トランザクション = データの寿命スコープ」:
@@ -141,14 +199,22 @@ repeated start で繋いだ全体、STOP まで)。 「トランザクション 
 - 窓未オープンで master に読まれたら **`tx_underrun` policy**: `fill` = `tx_fill_byte`
   を送出 / `stretch` = SCL stretch で slave の `write` を待ち、 `stretch_timeout_ms`
   超過で fill にフォールバック。 stretch は backend / SoC の capability に依存する
-  (software backend は両対応。 ESP32 無印の HW slave は stretch 非対応)
+  (software backend は両対応。 ESP32 無印の HW slave は stretch 非対応で
+  `TxUnderrun::Stretch` は `init()` が `INVALID_ARGUMENT` で拒否する — 無印の
+  レジスタマップ給仕は後述の **ISR fast path** が担う)
+
+## アクセサの選択 (Stream vs RegMap)
 
 **どちらのアクセサを使うか**:
 - レジスタアドレス + auto-increment + ポインタ保持の I2C 定番デバイス (センサ / PMIC / 設定
   レジスタ) を作る → **`SlaveRegMapAccessor`**。 `serve()` を回すだけで、 `onRead` で live 値・
-  `onWrite` でコマンド副作用を挿す。 ただし 1 read は最大 64B (`kReplyWindowBytes`、 超える読みは
-  ポインタ再シードの複数 read)。
-- 可変長フレーム / echo / ブリッジ / 64B 超の一括 read / 独自プロトコル → 基底
+  `onWrite` でコマンド副作用を挿す。 read 長は無制限 (`kReplyWindowBytes` = 64B はストリームの
+  compose チャンクであって上限ではない。 master が読み続ける限り 8bit wrap で auto-increment
+  し続ける — 定番デバイスと同じ)。 注意: 応答はワイヤより先行して compose される (上界 =
+  backend TX キュー深さ + 1 チャンク。 同梱 backend では 1 byte read でも最大 2 チャンク =
+  128B 分 `onRead` が発火し得る。 旧・単窓設計でも read 長に依らず 64B 分発火していた)。
+  read-to-clear 型レジスタは先行発火を許容できる設計にする。
+- 可変長フレーム / echo / ブリッジ / 独自プロトコル → 基底
   **`SlaveStreamAccessor::serve(Source*, Sink*)`** で能動給仕。
 
 最小 echo (基底 Stream、 完全版は `experiments/v2/test/i2c_slave/device/i2c_echo.cpp`):
@@ -170,9 +236,13 @@ for (;;) {
 I2C echo は **write 取引で受けた内容を、続く別取引の read で返す split プロトコル** (同一取引内で
 即返すのではない)。 そのため write 長を `echo_len` として取引を跨いで保持する。
 
+## 応答ポリシーの詳細
+
 **backend = stretch プリミティブ / accessor = 応答ポリシー**: backend が提供する土台は
 「master の read 要求に対しデータが無ければ SCL stretch でバスを保持し、 `write` が来たら
-応答を載せて解除する」プリミティブ (= 窓モデルの `tx_underrun=stretch` 経路)。 この土台の上に
+応答を載せて解除する」プリミティブ (= 窓モデルの `tx_underrun=stretch` 経路)。 stretch を
+持たない SoC (ESP32 無印) ではこのプリミティブは提供できず、 代わりに backend が
+`bindIsrRegMap` (後述の ISR fast path) を提供する。 この土台の上に
 **アクセサが応答ポリシーを載せる**:
 
 - **`SlaveStreamAccessor`** (基底): プロトコルブリッジやカスタムデバイス向けの純ストリーム。
@@ -224,20 +294,30 @@ I2C echo は **write 取引で受けた内容を、続く別取引の read で�
   write の先頭 byte = ポインタ設定、 以降の byte = `reg_file[p+offset]=val` + `onWrite(p+offset,val)`。
   **ポインタは取引を跨いで保持**され、 SPLIT (register write → STOP → 別取引の pure read) は
   先行 write が設定したポインタに対して解決する。 アクセサは受信を逐次適用するため自前バッファの
-  上限を持たない。 backend の RX は **`kRxCapacity` の 2 の冪リング** (software backend = 64B、
-  espidf LL backend = 32B)。 これは取引あたりの通算上限ではなく **未読バックログの上限** — 利用側 (`serve()` /
-  tick ループ) が `read()` で捌き続ける限り、 1 取引で `kRxCapacity` を遥かに超えるバイト
-  (例: 256B レジスタファイルの一括 write) を受信できる。 **未読が `kRxCapacity` に達した時のみ
-  超過バイトが破棄される** (= consumer が追いつかなかった合図)。 破棄は silent でなく backend の
-  `rxOverflowCount()` (software / espidf) で検知でき、 非ゼロ = consumer 遅延 (または read 未実行) を表す。
-  なお espidf の **非 LL callback 経路** は STOP 後に取引全体を一括受領しドレイン余地が無いため、
-  そこでは `kRxCapacity` が硬い取引あたり上限のまま (末尾切り詰め)。 **read 側 (master の >64B
-  読み出し)**: backend の TX は上記のとおり `kTxCapacity` リング + ストリーミングなので取引あたり
-  上限は無いが、 `SlaveRegMapAccessor` は取引ごとに `kReplyWindowBytes` = 64B の応答窓を 1 つだけ
-  compose する設計のため、 **1 回の RegMap read は最大 64B** (レジスタマップ規約であって backend 制約
-  ではない)。 レジスタデバイスから 64B 超を読むときはポインタを再シードした複数 read に分ける。
-  取引あたり無制限の純ストリーム read が要るなら基底の `SlaveStreamAccessor` を直接使う
-  (応答を逐次 `write` で供給する。 echo デバイスがこの形)。
+  上限を持たない。 backend の RX は **2 の冪リング**で、 上限は取引あたりの通算でなく
+  **未読バックログ** に対して効く — 利用側 (`serve()` / tick ループ) が `read()` で捌き続ける
+  限り、 1 取引でリングを遥かに超えるバイト (例: 256B レジスタファイルの一括 write) を受信
+  できる。 バックログ超過時の挙動は backend で異なる: **software backend** (64B) は超過バイトを
+  破棄し `rxOverflowCount()` で検知できる (非ゼロ = consumer 遅延または read 未実行)。
+  **espidf LL backend** は未読が back-pressure 閾値 `kRxCapacity` (32B) に達すると **SCL
+  stretch hold で master を停止し、 破棄しない** (read() の空き待ち)。 STOP 時だけは以後の
+  stretch で master を止められないため、 HW FIFO に残った尻尾 (≤32B) を閾値の先の **STOP 尻尾
+  予備領域** (リング物理 `kRxArrayCapacity` = 64B) へ格納する — consumer が微遅延しても
+  33〜64B write の尻尾は失われず、 `rxOverflowCount()` は防御経路 (取引スロット枯渇等) でしか
+  増えない。 **espidf BE flavor** (ESP32 無印の既定、 後述) は ISR が逐次 drain するが
+  stretch が無いため back-pressure は掛けられない — リング超過は破棄され
+  `rxOverflowCount()` が増える。 ただし regmap ISR fast path が bind されている間は受信を
+  リング非経由でレジスタファイルへ直接適用するため、 この経路では増えない。 なお espidf の
+  **非 LL callback 経路** (v2 driver、 BE の LL ヘッダが揃わない構成のみのフォールバック) は
+  STOP 後に取引全体を一括受領しドレイン余地が無いため、 そこでは `kRxArrayCapacity` (64B)
+  が硬い取引あたり上限 (末尾切り詰め、 `rxOverflowCount()` で検知)。 **read 側 (master の >64B
+  読み出し)**: backend の TX は上記のとおり `kTxCapacity` リング + ストリーミングで取引あたり
+  上限が無く、 `SlaveRegMapAccessor::serve()` もリングの空きに合わせて `kReplyWindowBytes` = 64B
+  チャンクを継続 compose するため、 **1 回の RegMap read に長さ上限は無い** (8-bit wrap の
+  auto-increment で読み続けられる。 参考実装 ESP32_I2C_slave_example と同じ意味論)。 compose は
+  ワイヤより最大 1 チャンク先行し、 読まれなかった分は STOP で破棄される (`onRead` の先行発火に
+  注意 — §どちらのアクセサを使うか)。 独自プロトコルの純ストリーム read は基底の
+  `SlaveStreamAccessor` を直接使う (応答を逐次 `write` で供給する。 echo デバイスがこの形)。
 
   最小例 (温度センサ風、 `onRead` で live 値を just-in-time 合成):
 
@@ -263,7 +343,10 @@ I2C echo は **write 取引で受けた内容を、続く別取引の read で�
     応答 compose (書込適用前) → write → 書込相を complete まで完全ドレイン (available を全部
     読んでから complete 判定) → end」。 待ちは基底アクセサと同じ `waitForActivity` で
     イベント駆動 (ISR backend は通知で起床)。 `timeout_ms` の stall-escape も同義 (既定
-    `TIMEOUT_FOREVER` は完走まで給仕、 有限値は無進展でその取引を諦めて返る)。
+    `TIMEOUT_FOREVER` は完走まで給仕、 有限値は無進展でその取引を諦めて返る)。 regmap の
+    consumer はワイヤが動く限り必ず進む (受信は即レジスタ適用・応答 pump は tx ring 有界) ため、
+    取引中の stall = master 側の無活動のみ — escape は discard 段階を持たず即時放棄で、 放棄前に
+    適用済みのレジスタ書込はそのまま残る (書込途中で切断された実レジスタデバイスと同じ意味論)。
   - **取引ステップ API** (`beginExchange`/`ingest`/`composeReply`) = 純レジスタマップ・ロジックを
     bus I/O から分離して公開したもの。 `serve()` が上記順序で合成する素であり、 **単一スレッドで
     bus が ServiceRunner tick で進むモデル** (`serve()` のブロッキング poll が使えない) 向けに
@@ -276,19 +359,72 @@ I2C echo は **write 取引で受けた内容を、続く別取引の read で�
 
 応答の組成は既定で**タスク文脈** (stretch が master を保持する間にアクセサ層が応答を作る)。
 stretch を持つ SoC では応答に遅延があっても master を確実に待たせられるため、 ISR 同期でなく
-タスク文脈での任意ロジックが成立する。 レジスタマップを ISR 内で直接給仕する高速パスは
-stretch 対応 SoC 限定の最適化として後続段階に置く。
+タスク文脈での任意ロジックが成立する。
 
-backend 実装:
+## ISR regmap fast path (`bindIsrRegMap`)
+
+**ISR regmap fast path (`bindIsrRegMap`)**: stretch を持たない SoC (ESP32 無印) では
+タスク文脈の組成が write-then-read (repeated start) の間合い (400kHz で数十 µs) に原理的に
+間に合わないため、 レジスタマップの給仕自体を backend の ISR へ委譲する経路を持つ。
+契約は `ISlaveBus` の optional 仮想関数 (既定実装は `false` = 未対応):
+
+```cpp
+using RegMapOnReadFn  = uint8_t (*)(uint8_t reg, void *ctx);
+using RegMapOnWriteFn = void (*)(uint8_t reg, uint8_t value, void *ctx);
+struct IsrRegMapBinding {
+    data::DataSpan reg_file{};
+    RegMapOnReadFn on_read   = nullptr;
+    void *on_read_ctx        = nullptr;
+    RegMapOnWriteFn on_write = nullptr;
+    void *on_write_ctx       = nullptr;
+    uint8_t pointer       = 0;
+    bool pointer_received = false;
+    uint32_t write_offset = 0;
+    uint32_t tx_offset    = 0;
+};
+virtual bool bindIsrRegMap(IsrRegMapBinding *binding);
+virtual void unbindIsrRegMap(IsrRegMapBinding *binding);
+```
+
+`binding` は呼び出し側 (`SlaveRegMapAccessor`) が所有し、bind の間じゅう存続させる (デストラクタで
+unbind する)。backend は単一の可変スロットだけを持ち、bind は常に「後勝ち」— 新しい bind は前の
+binding に触れず単にスロットを差し替える。unbind は渡された `binding` が現在のスロットと一致する
+ときだけ解除する (所有権照合。一致しなければ no-op — 既に他の bind に上書きされた古い binding を
+誤って解除しない)。
+
+`SlaveRegMapAccessor` が構築時 (および hook 差し替え時) に自動で bind を試み、 成立した
+backend では受信の解釈 (先頭 byte = ポインタ、 以降 = レジスタ書込み + `onWrite`) と読出し
+応答の先読み充填 (`onRead` / `reg_file` から TX FIFO を再構成) を **ISR が直接**行う。
+`serve()` は取引完了待ちに縮退し、 アプリの使い方は変わらない。 制約:
+
+- **hook は ISR 文脈で呼ばれる**: `onRead`/`onWrite` は IRAM 配置 (`IRAM_ATTR`)・非ブロッキング・
+  短時間で返ることが**アプリの責務**になる (タスク文脈給仕の backend では従来どおり)
+- `reg_file` へのアプリ直接アクセス (`getRegister`/`setRegister`) は byte 単位アトミック前提
+  (従来と同じ保証水準 — 複数 byte のスナップショット一貫性は保証しない)
+- 読出し応答は wire より最大 TX FIFO 深さ (32B) 先行して充填される。 `onRead` の live 値は
+  「master が読む瞬間」でなく「充填された瞬間」の値になり、 呼び出し回数も読出し byte 数とは
+  一致しない (per-read 厳密カウンタ的な意味論は stretch 対応 SoC 限定)
+- best-effort: stretch が無いため ISR が間に合わない場合 (長い割込み禁止区間との重なり等) に
+  古い応答が返る・ゼロ間隔連続 write が連結解釈される可能性は残る (稀。 確実性が要る用途は
+  stretch 対応 SoC を使う)
+
+## backend 実装
+
 - `SlaveBus_software` は `SlaveLineDriver` 越しに SCL/SDA を観測・drive する cooperative
   protocol engine (`service::IService`、 ServiceRunner で poll)。 native test では
   `VirtualOpenDrainBus` と組み合わせ、 probe ACK、 write、 read-only、 write-then-read、
   address NACK、 data NACK、 clock stretch timeout、 STOP 時 SDA stuck-low、 read 末尾
   master NACK 観測に加え、 窓の分離・Tx 自動消滅・underrun fill を固定している。
-- 実機向け ESP-IDF backend は ESP32-S3 の HW clock stretch を使い上記プリミティブを提供する。
-  write-then-read の HW 堅牢化は **stretch 対応 SoC (ESP32-S3) 限定** — ESP32 無印は HW slave
-  stretch 非対応のため fill のみの best-effort (≤400kHz) となる。 remote 公開と arduino
-  backend は後続段階。
+- 実機向け ESP-IDF backend (`SlaveBus_espidf`) は 2 flavor をコンパイル時に自動選択する:
+  **LL flavor** (stretch-cause SoC: S2/S3/C3/C6/H2/P4 等) は HW clock stretch で上記
+  プリミティブを提供し、 write-then-read を HW 保証する。 **BE (best-effort) flavor**
+  (ESP32 無印) は同じ `i2c_ll_*` 直叩き構造 (IDF driver / Kconfig 非依存) で、 stretch の
+  代わりに上記 ISR regmap fast path で write-then-read を給仕する — 受入基準は
+  100/400kHz、 800kHz は参考 (informational)。 fast path を bind しない純ストリーム利用
+  (`SlaveStreamAccessor`) の BE は **fill 意味論**: read 開始までに応答が投入されて
+  いなければ、 その read は `tx_fill_byte` で埋まる (途中投入の反映は FIFO 水位補充以降)。
+  remote 公開と arduino backend は後続段階 (BE flavor 自体は Kconfig 非依存のため
+  arduino ビルドでもコンパイル対象になる)。
   - **ISR の IRAM 配置 (`M5HAL_ESPIDF_I2C_SLAVE_IRAM_ISR`、 既定 1)**: LL stretch backend の
     slave ISR と到達コードは既定で IRAM に置き、 `ESP_INTR_FLAG_IRAM` で登録する — flash cache が
     無効な間 (別タスクの OTA / NVS / SPIFFS write 中) も外部 master にクロックされる slave が応答を
@@ -296,6 +432,13 @@ backend 実装:
     この堅牢性は IRAM を ~1〜2KB 消費する。 **I2C slave 稼働中に flash を書かないと保証できるビルドは
     `M5HAL_ESPIDF_I2C_SLAVE_IRAM_ISR=0` で opt-out** でき、 IRAM_ATTR と IRAM 割込フラグの両方が外れて
     IRAM を回収する (代償 = flash-cache 無効窓中の slave 応答は保証されない)。
+  - **既知の限界 (LL flavor 一部 SoC・800kHz)**: H2 系など一部 SoC では、 multi-slave バス上で
+    エラーが高頻度に連続する 800kHz 運用下において、 slave 側が SW 再初期化 (release/init・
+    クロックゲート再構成を含む) でも回復しない状態に陥りうることが実測で確認されている
+    ([esp-idf#15444](https://github.com/espressif/esp-idf/issues/15444) と同系統の master 側
+    ISR/timeout レースが引き金であり、 M5HAL 固有のバグではない)。 この制約により
+    **実用推奨は 400kHz まで**とし、 800kHz は BE flavor と同様に参考 (informational) 止まりとする。
+    回復にはチップリセット相当の操作が必要。
 - 実機 bit-bang slave は edge 捕捉・ACK setup の timing 制約が厳しいため低クロック実験用と
   位置付ける。
 

@@ -15,8 +15,8 @@
 //      reply from a MemorySource over echo_buf[0..echo_len].
 // So whatever the master writes, it reads back verbatim. Each serve() call handles
 // ONE transaction with the Source/Sink streaming model (the slave counterpart of the
-// master's transfer(Source*, Sink*)). It exercises BOTH per-transaction caps removed
-// in S21, now with back-pressure rather than truncation:
+// master's transfer(Source*, Sink*)). It exercises BOTH formerly-per-transaction
+// caps, since removed in favor of back-pressure rather than truncation:
 //   - the RX ring (a single write far exceeds kRxCapacity; the RX_FULL stretch backs
 //     the master off while serve() drains into the Sink -- no byte dropped), and
 //   - the TX ring + TX_EMPTY underrun stretch (a single read far exceeds kTxCapacity;
@@ -111,7 +111,32 @@ extern "C" void app_main(void)
     // overwrites echo_buf from offset 0 (fresh Sink); a read commits nothing, so
     // echo_len and the buffer persist for it. Back-pressure (RX ring stretch, TX
     // underrun stretch) is handled inside serve()/the backend, not here.
+#if defined(M5HAL_TEST_ECHO_SERVE_STALL_EVERY)
+    uint32_t serve_count = 0;
+#endif
     for (;;) {
+#ifdef M5HAL_TEST_ECHO_SERVE_DELAY_MS
+        // Diag knob (opt-in via build flag): simulate a delayed consumer so the ISR
+        // faces a full RX ring at the master's STOP. Exposes the STOP-tail band
+        // (unread ring == kRxCapacity, tail below the RX water-mark still in the HW
+        // FIFO) that back-pressure cannot cover -- see slave.inl drainRxLocked()'s
+        // STOP path. Never define this for acceptance runs.
+        m5hal::runtime::delayMs(M5HAL_TEST_ECHO_SERVE_DELAY_MS);
+#endif
+#ifdef M5HAL_TEST_ECHO_SERVE_STALL_EVERY
+        // Diag knob (opt-in, pair with M5HAL_TEST_ECHO_SERVE_STALL_MS): stall ONE
+        // serve() in every M5HAL_TEST_ECHO_SERVE_STALL_EVERY calls, long enough to
+        // exceed the master's HW SCL timeout (Wire ~13-20 ms, IDF gen5 2 ms), so the
+        // master ABORTS that transaction mid-flight. The surrounding serves run
+        // undelayed, so the sweep becomes an abort-recovery regression: the stalled
+        // round may fail, but every non-stalled round must stay OK (a failure
+        // spilling into later rounds = the slave's transaction accounting did not
+        // recover). Use an odd EVERY so the stall alternates between the write and
+        // read serve of a round. Never define this for acceptance runs.
+        if (++serve_count % M5HAL_TEST_ECHO_SERVE_STALL_EVERY == 0) {
+            m5hal::runtime::delayMs(M5HAL_TEST_ECHO_SERVE_STALL_MS);
+        }
+#endif
         m5hal::data::MemorySink sink{m5hal::data::DataSpan{echo_buf + echo_offset, kEchoCap - echo_offset}};
         m5hal::data::MemorySource src{m5hal::data::ConstDataSpan{echo_buf, echo_len}};
 

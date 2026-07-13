@@ -9,6 +9,7 @@
 #include <esp_err.h>
 #include <freertos/FreeRTOS.h>
 
+#include "../../../../../hal/v2/diag.hpp"
 #include "../../../freertos/hal/runtime/time.hpp"
 
 namespace m5::hal::v2::uart {
@@ -85,6 +86,16 @@ bool sameConfig(const uart::AccessConfig& lhs, const uart::AccessConfig& rhs)
     return ::m5::hal::v2::detail::timeoutMsToTicks(timeout_ms);
 }
 
+// RAII unlock for a runtime::Mutex critical section (mirrors the pattern in
+// service.inl's ControlUnlock) so an early return can never leak the lock.
+struct MutexUnlock {
+    runtime::Mutex* m;
+    ~MutexUnlock()
+    {
+        m->unlock();
+    }
+};
+
 }  // namespace impl_espidf
 }  // namespace
 
@@ -96,10 +107,18 @@ result_t<void> Bus_espidf::init(const BusConfig_espidf& config)
     }
     // Re-init: release the previous driver while `_port` still names the
     // OLD port (otherwise `uart_driver_install` fails on the already-
-    // installed port and the old driver leaks).
+    // installed port and the old driver leaks). release() takes its own
+    // `_state_mutex` critical section below; do not nest another one around
+    // it (the mutex is non-recursive).
     if (_installed) {
         (void)release();
     }
+
+    if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
+        return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+    }
+    impl_espidf::MutexUnlock state_unlock{&_state_mutex};
+
     _config = config;
     _port   = new_port;
 
@@ -124,6 +143,11 @@ result_t<void> Bus_espidf::init(const BusConfig_espidf& config)
 
 result_t<void> Bus_espidf::release(void)
 {
+    if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
+        return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+    }
+    impl_espidf::MutexUnlock state_unlock{&_state_mutex};
+
     if (_installed) {
         // Transactional release (D1/D9): clear flags only after the ESP-IDF
         // delete succeeds (see i2c gen4). On error keep _installed set so the
@@ -138,16 +162,59 @@ result_t<void> Bus_espidf::release(void)
     return {};
 }
 
-result_t<void> Bus_espidf::applyConfig(const uart::AccessConfig& cfg)
+uint32_t Bus_espidf::reconfigSkips()
 {
+    if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
+        return 0;
+    }
+    impl_espidf::MutexUnlock state_unlock{&_state_mutex};
+    return _reconfig_skips;
+}
+
+result_t<void> Bus_espidf::applyConfig(bus::IAccessor* owner, Channel entered, const uart::AccessConfig& cfg)
+{
+    if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
+        return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+    }
+    impl_espidf::MutexUnlock state_unlock{&_state_mutex};
+
     if (!_installed || cfg.baud_rate == 0 || cfg.data_bits < 5 || cfg.data_bits > 8 ||
         (cfg.stop_bits != 1 && cfg.stop_bits != 2)) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
-    if (_configured && impl_espidf::sameConfig(_applied_cfg, cfg)) {
+    if (!_configured) {
+        // First apply on a fresh driver install: no other owner can be
+        // mid-transfer yet (spec/design/uart.md), so no quiescence gate.
+        return applyConfigLocked(cfg);
+    }
+    if (impl_espidf::sameConfig(_applied_cfg, cfg)) {
         return {};
     }
 
+    if (owner == nullptr) {
+        // A reconfigure without an accessor identity cannot prove quiescence.
+        ++_reconfig_skips;
+        M5HAL_DIAG("uart reconfig skipped: no accessor identity (skips=%u)", static_cast<unsigned>(_reconfig_skips));
+        return {};
+    }
+
+    // Reconfigure: apply only when the opposite channel is quiescent for
+    // `owner` (spec/design/uart.md; IBus::tryAcquireOppositeChannel is the
+    // sanctioned exception to the channel-lock -> state-mutex ordering).
+    auto& ibus = static_cast<IBus&>(owner->getBus());
+    auto grant = ibus.tryAcquireOppositeChannel(owner, entered);
+    if (!grant.granted) {
+        ++_reconfig_skips;
+        M5HAL_DIAG("uart reconfig skipped: opposite channel busy (skips=%u)", static_cast<unsigned>(_reconfig_skips));
+        return {};  // keep serving the currently applied config
+    }
+    auto applied = applyConfigLocked(cfg);
+    ibus.releaseOppositeChannel(owner, grant);
+    return applied;
+}
+
+result_t<void> Bus_espidf::applyConfigLocked(const uart::AccessConfig& cfg)
+{
     ::uart_config_t native_cfg = {};
     native_cfg.baud_rate       = static_cast<int>(cfg.baud_rate);
     native_cfg.data_bits       = impl_espidf::wordLength(cfg.data_bits);
@@ -210,7 +277,7 @@ result_t<size_t> Bus_espidf::rawReadableBytes()
 
 result_t<size_t> Bus_espidf::write(bus::IAccessor* owner, const uart::AccessConfig& cfg, data::Source* src, size_t len)
 {
-    auto applied = applyConfig(cfg);
+    auto applied = applyConfig(owner, Channel::Tx, cfg);
     if (!applied.has_value()) {
         return m5::stl::make_unexpected(applied.error());
     }
@@ -224,7 +291,7 @@ result_t<size_t> Bus_espidf::write(bus::IAccessor* owner, const uart::AccessConf
 
 result_t<size_t> Bus_espidf::read(bus::IAccessor* owner, const uart::AccessConfig& cfg, data::Sink* dst, size_t len)
 {
-    auto applied = applyConfig(cfg);
+    auto applied = applyConfig(owner, Channel::Rx, cfg);
     if (!applied.has_value()) {
         return m5::stl::make_unexpected(applied.error());
     }
@@ -233,7 +300,7 @@ result_t<size_t> Bus_espidf::read(bus::IAccessor* owner, const uart::AccessConfi
 
 result_t<size_t> Bus_espidf::readableBytes(bus::IAccessor* owner, const uart::AccessConfig& cfg)
 {
-    auto applied = applyConfig(cfg);
+    auto applied = applyConfig(owner, Channel::Rx, cfg);
     if (!applied.has_value()) {
         return m5::stl::make_unexpected(applied.error());
     }

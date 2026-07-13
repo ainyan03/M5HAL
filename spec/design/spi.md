@@ -21,8 +21,10 @@ SPI は I2C と同じく `Bus` / `Accessor` / `TransferDesc` / `Source` / `Sink`
   override する。
 
 この層を土台に、software bit-bang SPI は同期 transfer と低速実機 wire self-test
-まで実装済み。 ESP-IDF hardware SPI は polling master backend の初版を追加済みで、
-今後は実機 smoke と、software SPI の cooperative service 化を段階的に進める。
+まで実装済み。software SPI は `M5_Hal.Services` の service runner に登録済みで、
+cooperative スケジューリングで駆動される (§software SPI variant の実装方針)。
+ESP-IDF hardware SPI は polling master backend の初版を追加済みで、今後は実機
+smoke を段階的に進める。
 
 ## Bus の入手
 
@@ -48,7 +50,9 @@ native handle / host は各 variant 固有の `BusConfig` に置く。各 varian
 - Arduino variant: `SPIClass* spi` を明示する。`init(BusConfig)` はその
   `SPIClass` に `begin` / `end` を行い、`attach(SPIClass&)` は caller-owned
   lifecycle として扱う。
-- ESP-IDF variant: `spi_host_device_t host` を持つ。既定値は `SPI2_HOST`。
+- ESP-IDF master variant: `spi_host_device_t host` を持つ。既定値は `SPI2_HOST`。
+  これは framework 固有 config が native host を受ける欄であり、共通 slave config の
+  `controller` (0 起点のプール index) とは単位が異なる。
 - software variant: native handle を持たないため、共通 config を空派生した
   `BusConfig_software` を公開する (variant 固有型を受けることで sibling config の
   流入をコンパイルエラーにする — [variants.md](variants.md) §offer 要件)。
@@ -85,6 +89,69 @@ LCD 文脈 (D/C ビット内蔵 9-bit) とセンサ文脈 (MOSI/MISO 共有半�
 衝突する多義語のため採らない。メソッド名と選択される enum 値の語彙が一致する
 ので、対応が見たまま分かる。戻り値は `*this` で、後続のフィールド代入に
 チェーンできる。
+
+## コントローラの占有
+
+SPI master の論理割当、standalone SPI slave、外部初期化済み host への `attach()` は、同じ
+ハードウェアコントローラのプールを共有する。プール外の利用者は `SPI::claimController(intent)` で
+external claim を取得し、利用を止めてから `releaseClaimedController(controller)` で返す。
+
+`SlaveBusConfig::controller` は claim が返した **0 起点の controller index** を受ける。ESP-IDF の
+生の `spi_host_device_t` ではない。ESP-IDF backend は内部で `SPI2_HOST + controller` へ変換し、
+flash / PSRAM 用の `SPI1_HOST` はプールにも slave にも含めない。
+
+```cpp
+auto claim = M5_Hal.SPI.claimController();  // 既定 = Auto
+if (!claim.has_value()) { /* 全コントローラ使用中、または不適格 */ }
+
+spi::SlaveBusConfig cfg;
+// pins / mode ...
+cfg.controller = claim.value();
+auto init = slave_bus.init(cfg);
+if (!init.has_value()) {
+    M5_Hal.SPI.releaseClaimedController(claim.value());
+}
+
+// claim を先に返すと、まだ動いている slave と master 再配置が衝突する。
+if (slave_bus.release().has_value()) {
+    M5_Hal.SPI.releaseClaimedController(claim.value());
+}
+```
+
+`controller = -1` (既定値) は standalone 互換の「backend 既定 host (`SPI2_HOST`) を台帳外で使う」
+経路であり、同じ host の master との衝突を検出できない自己責任モードである。台帳を使う実運用では
+claim 経由を推奨する。`-1` 以外の負値と、存在しない controller index は `init()` が
+`INVALID_ARGUMENT` で拒否する。
+
+外部で初期化する ESP-IDF host は、**`spi_bus_initialize()` より前**に対応 controller を claim する。
+`Bus_espidf::attach(host, claimed_controller)` は生 host と claim の index が一致することを検証するが、
+claim 自体の所有権は caller に残す。解放順序は `Bus_espidf::release()` → 外部
+`spi_bus_free()` → `SPI.releaseClaimedController(claimed_controller)` である。`release()` は M5HAL
+内部の device / worker 利用だけを止め、caller-owned host を free せず claim も返さない。
+
+```cpp
+auto claim = M5_Hal.SPI.claimController(spi::requireController(0));
+if (!claim.has_value()) { /* SPI2 host は使用中、または不適格 */ }
+
+auto host = static_cast<spi_host_device_t>(SPI2_HOST + claim.value());
+// spi_bus_initialize(host, ...) は claim 成功後に行う
+auto attached = bus.attach(host, claim.value());
+
+// 使用終了時。各段が成功した場合だけ次の所有権を返す。
+auto detached = bus.release();
+if (detached.has_value()) {
+    auto freed = spi_bus_free(host);
+    if (freed == ESP_OK) {
+        auto unclaimed = M5_Hal.SPI.releaseClaimedController(claim.value());
+        // unclaim 失敗時は claim.value() を保持して再試行する
+    }
+}
+```
+
+attach 内で初めて claim すると、それ以前の外部 `spi_bus_initialize()` と master の衝突を防げない。
+逆に `Bus_espidf::release()` が claim を返すと、外部 host がまだ初期化済みの窓で pool が再貸与できる。
+そのため claim は外部 host の全寿命を包む caller-owned とする。`SPI1_HOST`、範囲外 host、host と
+controller の不一致は attach を `INVALID_ARGUMENT` で拒否する。
 
 ## TransferDesc の役割
 
@@ -158,6 +225,20 @@ read/write の自然な違いを表現するため、 `spi_read_dummy_cycle` と
 write dummy を `TransferDesc::dummy_cycles` に詰める。 特定 command だけ dummy 数が
 違う場合は、 caller が `TransferDesc` を直接組んで `transfer()` を呼ぶ。
 
+### transaction 中のエラー
+
+transaction (CS 保持区間) 内の segment 群は 1 個の論理操作を成す (command 送信 →
+data 授受、のような依存チェーン)。したがって **segment の失敗は種別を問わず
+transaction に latch される** — `IBus::transfer` の同期エラー (pre-flight 拒否) も、
+`waitTransfer` で表面化する wire 失敗も同じ扱い。latch 後は同一 transaction 内の
+後続 transfer が同じエラーで reject され、`endTransaction` も同じエラーを報告する。
+復帰は新しい transaction の開始 (`beginTransaction` が latch をクリアする) =
+チェーン先頭からのやり直し。契約の意味論は I2C と共通
+([i2c.md](i2c.md) §transaction 中のエラー — 不採用案の要約もそちら)。
+
+- backend (IBus 実装者) の義務: 同期エラーを返す場合は**ワイヤに触れる前に拒否する**。
+  これは latch 意味論とは独立に、wire 状態の整合を保証するための契約。
+
 ## ワイヤタイミング不変条件
 
 これらは全 backend が守るべきプロトコル正当性の契約である。
@@ -166,6 +247,15 @@ write dummy を `TransferDesc::dummy_cycles` に詰める。 特定 command だ�
 first→second level の順**で刻む。各 dummy cycle が必ず sample edge への遷移を 1 回持ち、
 設定数ぶんの clock がデバイス側で正確に数えられる。「!CPOL→CPOL」順は CPHA=0 で先頭
 cycle が無遷移となり、ワイヤ上の dummy clock が 1 少なくなる off-by-one を生むため採らない。
+
+**MOSI は launch edge の前に確定させる** (software master): 各 bit の MOSI 更新は
+launch edge (sample edge の反対側エッジ) を打つ**前**にワイヤへ出す。hardware master の
+MOSI 出力遅延は edge から数 ns だが、GPIO 書込み 2 回の順序が「CLK → MOSI」だと MOSI が
+edge から書込みギャップ分 (数百 ns、割り込みでさらに伸びる) 遅れる。launch edge 近傍で
+MOSI をサンプルする slave (ESP32 初代 slave の CPHA=1 で実測) はこの遅れで**1 つ前の bit**
+を読み、受信ストリーム全体が 1 bit 遅れてずれる (先頭に 0 が挿入された形)。MOSI 先行なら
+標準 slave の hold 条件 (直前 sample edge から half period) も崩れない。native
+回帰 = test_software_spi_wire_order (launch/sample 両エッジ時点の MOSI 有効性)。
 
 **CS deassert 前の SCK 復帰**: 転送の終端では CS deassert の前に SCK を idle level
 (CPOL) へ復帰させ、さらに half period 分の settle を置く (CPHA=1 系は元々 idle で終わるため
@@ -185,17 +275,51 @@ device handle はトランザクションを跨いでキャッシュされ、構
 変わったときだけ再生成 + settle が走る — 同一構成の連続トランザクションでは SCK は前回の終端で
 既にアイドルに置かれている。
 
+**full-duplex 最終 RX バイトの 0x00 上書き (ESP-IDF backend / ESP32 初代 master の既知の制約)**:
+ESP32 (初代) の ESP-IDF hardware master による DMA 全二重転送では、受信バッファの最終
+1 バイトが 0x00 に上書きされる。2 系統の配線・複数モード/周波数の実機 A/B で再現し、
+スレーブの応答内容に依存しない (スレーブ不在で MISO がフロートし全バイト 0xFF を読む交換でも、
+最終バイトだけが 0x00 になる)。ESP32-S3 の hardware master では同一条件 (複数 mode・
+30 交換連続) で発生しないことを実測済み。software master variant でも発生しない。
+最終バイトまで意味を持つ全二重 read が必要な場合は software master を使うか、受信長を
+1 バイト余分に確保して末尾を読み捨てる。
+
+**ESP32 (初代) slave の mode 0/2 における MISO 1-bit 早送り (ESP-IDF backend の既知の制約)**:
+ESP32 (初代) を SPI slave にすると、mode 0/2 では master の受信ストリーム全体が 1 bit
+早くずれる (各受信バイトが「期待値を 1 bit 左シフトし、次バイトの MSB を下位に継いだ値」に
+なる)。ESP-IDF driver が同 SoC の DMA シリコン問題を回避するため slave の clock phase を
+変更しており、slave 出力が最大半クロック早く現れる副作用 (driver ソース内コメントに明記)。
+周波数 (100kHz/1MHz で実測不変) にも master 実装 (hardware/software) にも依存せず決定論的に
+再現する。mode 1/3 では発生せず、転送長 (4 の倍数以外の 3/7/30 を含む)・partial (early CS
+deassert) を含めて送受とも全バイト一致を実測済み。受信 (MOSI) はどの mode でも影響を受けない。
+**ESP32 (初代) を slave にする場合は mode 1 または 3 を使う**。
+
+**ESP32 (初代) slave の低速 SCLK における RX 末尾 word 欠落 (ESP-IDF backend の既知の制約)**:
+ESP32 (初代) の DMA slave は、SCLK が遅いと受信データの**最終 word 域 (末尾 1〜4 バイト)**
+が DMA へ書かれず 0x00 のまま残る。bit 数カウント (`trans_len`) は全長を報告するため、
+戻り値からは検出できない。hardware master の一様なクロックでは 200kHz 以下で全 mode 決定論的に
+再現し、250kHz 以上では発生しない (32 バイト転送で実測)。software (bit-bang) master は
+poll 律速で実効クロックがこの帯域に入るため、設定周波数に関わらず mode 0/2 で常に発現する
+(mode 1/3 は bit-bang の不均一 cadence でも実測上発現しない)。転送長には依存せず、常に最終
+word 域だけが欠ける (長さが 4 の倍数でない場合は末尾の端数バイト)。機構はシリコン内部
+(mode 0/2 の DMA 位相 workaround と同族) で外部からは制御できない。**ESP32 (初代) を slave
+にする場合、master は実効 SCLK ≥ 250kHz (推奨 400kHz 以上) の hardware master を使う**。
+software master を使う必要がある場合は mode 1/3 に限る。
+
 ## software SPI variant の実装方針
 
 `variants::frameworks::software` の SPI master は、 GPIO `Pin` を push-pull
-で駆動する bit-bang 実装として扱う。現状は `TransferService` が command /
-address / dummy / data phase を持つ小さな `IService` 互換 state machine として
-存在し、通常の `Bus::transfer` では同期 runner 的に完了まで回す。
+で駆動する bit-bang 実装として扱う。`Bus_software` は `service::IService` を実装し
+`M5_Hal.Services`（service runner）に登録済みで、command / address / dummy / data
+phase を持つ小さな state machine として cooperative に駆動される。auto-run が
+稼働していなければ `Bus::transfer` の呼び出し元が `runOnce()` で自力ポンプし、
+同期 transfer のように完了まで回す (service.md の R2 契約どおり、runner 稼働中の
+呼び出し元は `runOnce()` の try-lock に委ねる — 詳細は
+[service.md](service.md) §API 契約)。
 
-I2C と違い、SPI は clock stretch や open-drain rise wait がないため、同期実装は
-比較的単純に保てる。一方で、将来 `M5_Hal.Services` の service runner へ載せる場合に備え、
-byte 転送は `ByteTransferState` として bit/edge 単位に分解し、GPIO 操作後は
-runner に戻せる構造へ寄せている。
+I2C と違い、SPI は clock stretch や open-drain rise wait がないため、状態機械は
+比較的単純に保てる。byte 転送は `ByteTransferState` として bit/edge 単位に分解し、
+GPIO 操作後は runner に戻せる構造にしている。
 
 段階移行の方針:
 
@@ -219,19 +343,25 @@ runner に戻せる構造へ寄せている。
 - 表示デバイス等で多い write-only transfer では MISO sample 分岐を byte loop
   から外す。 MISO がある read/full-duplex path は別経路で維持し、MOSI-only の
   clock/MOSI hot path をできるだけ細く保つ。
-- service runner に外部公開する場合は、transfer 途中の `Source` / `Sink` chunk
-  lifetime と CS assert 区間を API 契約として追加で固定する。
+- transfer 途中の `Source` / `Sink` chunk lifetime と CS assert 区間は、service
+  runner 経由の cooperative 駆動下でも `bus_accessor.md` §transaction 契約の
+  規約 (short transfer は totals が真実、sugar は開いている transaction に参加)
+  がそのまま適用される。
 
 timing は I2C と同様に `fastTick()` / `fastTickFrequencyHz()` 由来の half period
-で管理する。CPOL=1 では CS assert 前に SCLK を idle-high へ置く。これを怠ると、
+で管理する。ポール間のスケジューリングは service private の仮想時計
+(`ServiceContext::elapsed` の積算、[service.md](service.md) §時間契約) で行い、
+エッジ刻み自体は呼び出し内で `ctx.local_tick` を起点に生 `fastTick()` へスピンする
+二軸構成をとる — 絶対 tick がポール (= タスク/コア) を跨いで比較されることはない。
+呼び出し内スピン中のコア移動だけは契約でも守れないため、**精密なビットバン波形を
+要する producer タスクはコアへピン留めすることを推奨**する。
+CPOL=1 では CS assert 前に SCLK を idle-high へ置く。これを怠ると、
 CS active 直後に余分な active edge として観測されることがあるため、native test
 と embedded wire self-test の両方で固定する。
 
 ## 将来拡張
 
-- **software SPI の service 化**: `TransferService` を `M5_Hal.Services` の service runner へ載せ、
-  cooperative スケジューリングで動かせるようにする。現行の同期 transfer path と wire semantic は
-  その前提として native / embedded test で固定する。
+- ESP-IDF hardware SPI の実機 smoke 拡充 (§当面の目標)。
 - **ESP-IDF SPI master variant の拡充**: polling master の初版を起点に、DMA 転送・
   interrupt driven path・バージョン差分吸収を段階的に追加する。
 - **dual/quad/octal 幅・DMA hint**: concrete variant 実装で必要性が固まった時点で

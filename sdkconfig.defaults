@@ -4,18 +4,31 @@
 # as a library/component keep their own sdkconfig.
 #
 # CONFIG_FREERTOS_HZ=1000: the I2C slave HIL device (experiments/v2/test/i2c_slave)
-# polls the accessor with delayMs(1) waits = one FreeRTOS tick. At the IDF default
-# 100 Hz that tick is 10 ms, which dominated the slave's per-transaction response
-# latency and made an occasional readback overrun the master's tolerance. A 1 ms
-# tick keeps the polling fine enough for the 2-board HIL matrix to pass clean.
+# serves its accessor event-driven (the espidf backend's waitForActivity blocks on
+# an ISR notification), but the wait's safety timeout and the base accessor's
+# delayMs(1) polling fallback both resolve in FreeRTOS ticks. At the IDF default
+# 100 Hz one tick is 10 ms, which coarsens those waits enough to have made an
+# occasional readback overrun the master's tolerance (measured back when the
+# consumer was purely delayMs(1)-polled). A 1 ms tick keeps the timing fine.
 # Harmless for the compile-only check envs.
 CONFIG_FREERTOS_HZ=1000
+
+# CONFIG_I2C_ENABLE_SLAVE_DRIVER_VERSION_2=y: on IDF 5.4/5.5, classic ESP32 has
+# no stretch-cause HW so M5HAL's SlaveBus_espidf falls back to the "v2 driver"
+# fill-only best-effort path (M5HAL_ESPIDF_I2C_HAS_SLAVE_V2, see
+# variants/frameworks/espidf/detail/espidf_version.hpp). Without this Kconfig
+# option that macro is 0 and SlaveBus_espidf::init isn't compiled at all on
+# classic ESP32 -- this is what makes Core2 usable as an I2C slave in the multi-board
+# master-role-rotation HIL rig. No-op on stretch-cause SoCs (S3/C6/H2/...):
+# they already select the LL path regardless of this option (slave.hpp's gate
+# is `LL || HAS_SLAVE_V2`, and LL wins when both are available).
+CONFIG_I2C_ENABLE_SLAVE_DRIVER_VERSION_2=y
 
 # TCP tuning for the remote-bus stream path (RemoteServerTCP examples). The IDF
 # defaults (TCP_WND 5744 = 4xMSS, no SACK) turn a single lost WiFi segment into
 # a full host-side RTO stall: with only 4 segments in flight there are rarely
 # enough dup-ACKs for fast retransmit, so every loss costs ~250 ms. Measured on
-# Core2 (2026-07-03): remote I2S throughput 58-65 KB/s with 20-25% of host bytes
+# Core2: remote I2S throughput 58-65 KB/s with 20-25% of host bytes
 # being retransmissions; with a 16xMSS window + SACK the same link sustains the
 # 44.1 kHz stereo nominal rate (176.4 KB/s) with headroom (~190 KB/s ceiling).
 # RAM cost is per open TCP connection and only while data is queued.

@@ -233,7 +233,7 @@ inline void useResult(const T& value)
 // idioms: the integer marker (usable in #if AND static_assert) and the
 // entity-identity check (flat injection is a using-directive, so the flat
 // name and the variant alias denote the same type).
-// I2C is the runtime facade (ADR 034): the unsuffixed `i2c::Bus` is the facade
+// I2C is the runtime facade: the unsuffixed `i2c::Bus` is the facade
 // class, NOT the winner variant alias. The winner is now expressed through the
 // `BusConfig` alias + the `BackendFor` trait (`init(BusConfig)` creates that
 // backend), so the scan-order winner is checked against that backend type.
@@ -276,7 +276,9 @@ static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_MUTEX != M5HAL_V2_VARIANT_ID_NON
               "some variant must provide runtime::Mutex (bus::IBus embeds it)");
 static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_TASK != M5HAL_V2_VARIANT_ID_NONE,
               "some variant must provide runtime::Task");
-#if defined(ARDUINO)
+static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_EVENT != M5HAL_V2_VARIANT_ID_NONE,
+              "some variant must provide runtime::Event (the ServiceRunner idle wait blocks on it)");
+#if defined(ARDUINO) && defined(ESP_PLATFORM)
 static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME == M5HAL_V2_VARIANT_ID_FRAMEWORK_ARDUINO,
               "scan order: arduino wins the runtime time injection when present");
 static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_MUTEX == M5HAL_V2_VARIANT_ID_FRAMEWORK_FREERTOS,
@@ -284,6 +286,29 @@ static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_MUTEX == M5HAL_V2_VARIANT_ID_FRA
 static_assert(
     std::is_same<::m5::hal::v2::runtime::Mutex, ::m5::variants::frameworks::freertos::hal::v2::runtime::Mutex>::value,
     "the unsuffixed name and the freertos variant type must be the same entity");
+static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_EVENT == M5HAL_V2_VARIANT_ID_FRAMEWORK_FREERTOS,
+              "scan order: freertos wins runtime::Event on arduino (a stub win here would turn the "
+              "idle runner into a busy loop)");
+static_assert(
+    std::is_same<::m5::hal::v2::runtime::Event, ::m5::variants::frameworks::freertos::hal::v2::runtime::Event>::value,
+    "the unsuffixed name and the freertos variant type must be the same entity");
+#elif defined(ARDUINO)
+// Non-ESP32 Arduino core (RP2040 / SAMD51, see _checker.hpp's variant
+// allowlist): no FreeRTOS, no <thread> — arduino still wins the time
+// injection, but Mutex/Event fall through to the stub fallback (single-task
+// fakes; see stub/hal/runtime/runtime.hpp).
+static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME == M5HAL_V2_VARIANT_ID_FRAMEWORK_ARDUINO,
+              "scan order: arduino wins the runtime time injection when present");
+static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_MUTEX == M5HAL_V2_VARIANT_ID_FRAMEWORK_STUB,
+              "scan order: no freertos/posix here, so the stub fake backs runtime::Mutex");
+static_assert(
+    std::is_same<::m5::hal::v2::runtime::Mutex, ::m5::variants::frameworks::stub::hal::v2::runtime::Mutex>::value,
+    "the unsuffixed name and the stub variant type must be the same entity");
+static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_EVENT == M5HAL_V2_VARIANT_ID_FRAMEWORK_STUB,
+              "scan order: no freertos/posix here, so the stub fake backs runtime::Event");
+static_assert(
+    std::is_same<::m5::hal::v2::runtime::Event, ::m5::variants::frameworks::stub::hal::v2::runtime::Event>::value,
+    "the unsuffixed name and the stub variant type must be the same entity");
 #elif defined(ESP_PLATFORM)
 static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME == M5HAL_V2_VARIANT_ID_FRAMEWORK_ESPIDF,
               "scan order: espidf wins the runtime time injection on a plain IDF build");
@@ -291,6 +316,12 @@ static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_MUTEX == M5HAL_V2_VARIANT_ID_FRA
               "scan order: freertos wins runtime::Mutex on espidf (FreeRTOS-hosted)");
 static_assert(
     std::is_same<::m5::hal::v2::runtime::Mutex, ::m5::variants::frameworks::freertos::hal::v2::runtime::Mutex>::value,
+    "the unsuffixed name and the freertos variant type must be the same entity");
+static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_EVENT == M5HAL_V2_VARIANT_ID_FRAMEWORK_FREERTOS,
+              "scan order: freertos wins runtime::Event on espidf (a stub win here would turn the "
+              "idle runner into a busy loop)");
+static_assert(
+    std::is_same<::m5::hal::v2::runtime::Event, ::m5::variants::frameworks::freertos::hal::v2::runtime::Event>::value,
     "the unsuffixed name and the freertos variant type must be the same entity");
 #elif M5HAL_FRAMEWORK_HAS_POSIX
 static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME == M5HAL_V2_VARIANT_ID_FRAMEWORK_POSIX,
@@ -300,9 +331,19 @@ static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_MUTEX == M5HAL_V2_VARIANT_ID_FRA
 static_assert(
     std::is_same<::m5::hal::v2::runtime::Mutex, ::m5::variants::frameworks::posix::hal::v2::runtime::Mutex>::value,
     "the unsuffixed name and the posix variant type must be the same entity");
+static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_EVENT == M5HAL_V2_VARIANT_ID_FRAMEWORK_POSIX,
+              "scan order: posix provides runtime::Event on a plain host build");
+static_assert(
+    std::is_same<::m5::hal::v2::runtime::Event, ::m5::variants::frameworks::posix::hal::v2::runtime::Event>::value,
+    "the unsuffixed name and the posix variant type must be the same entity");
 #else
 static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME == M5HAL_V2_VARIANT_ID_FRAMEWORK_STUB,
               "scan order: the stub fake backs runtime when no other variant offers it");
+static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_EVENT == M5HAL_V2_VARIANT_ID_FRAMEWORK_STUB,
+              "scan order: the stub fake backs runtime::Event when no other variant offers it");
+static_assert(
+    std::is_same<::m5::hal::v2::runtime::Event, ::m5::variants::frameworks::stub::hal::v2::runtime::Event>::value,
+    "the unsuffixed name and the stub variant type must be the same entity");
 #endif
 
 // ---- Typed registry mirror ------------------------------------
@@ -325,7 +366,7 @@ inline void compileCommonApiSurface(void)
     i2c_bus_cfg.pin_scl = 22;
     i2c_bus_cfg.pin_sda = 21;
     detail::useResult(i2c_bus.init(i2c_bus_cfg));
-    // S20 tag-pin ctors on the kind base: either order, positional stays out.
+    // tag-pin ctors on the kind base: either order, positional stays out.
     detail::useResult(i2c_bus.init(detail::i2c::IBusConfig{detail::i2c::Scl{22}, detail::i2c::Sda{21}}));
     detail::useResult(i2c_bus.init(detail::i2c::IBusConfig{detail::i2c::Sda{21}, detail::i2c::Scl{22}}));
     static_assert(!std::is_constructible<detail::i2c::IBusConfig, int, int>::value,
@@ -401,7 +442,7 @@ inline void compileCommonApiSurface(void)
     uart_bus_cfg.pin_tx = 17;
     uart_bus_cfg.pin_rx = 16;
     detail::useResult(uart_bus.init(uart_bus_cfg));
-    // S20 tag-pin ctors on the kind base: either order.
+    // tag-pin ctors on the kind base: either order.
     detail::useResult(uart_bus.init(detail::uart::IBusConfig{detail::uart::Tx{17}, detail::uart::Rx{16}}));
     detail::useResult(uart_bus.init(detail::uart::IBusConfig{detail::uart::Rx{16}, detail::uart::Tx{17}}));
     detail::uart::AccessConfig uart_cfg;
@@ -528,7 +569,7 @@ inline void compileArduinoApiSurface(void)
     ::m5::hal::v2::uart::BusConfig_arduino uart_cfg;
     uart_cfg.setSerial(Serial1);
 
-    // S20 tag-pin ctors, inherited by the variant configs; the
+    // tag-pin ctors, inherited by the variant configs; the
     // variant-specific field stays assignable after tag construction.
     ::m5::hal::v2::i2c::BusConfig_arduino i2c_tag_cfg{::m5::hal::v2::i2c::Scl{22}, ::m5::hal::v2::i2c::Sda{21}};
     i2c_tag_cfg.wire = &Wire;
@@ -556,7 +597,7 @@ inline void compileEspidfApiSurface(void)
     static_assert(sizeof(::m5::hal::v2::i2c::Bus_espidf) > 0, "ESP-IDF I2C Bus type must be visible");
     detail::useResult(i2c_cfg);
 
-    // S20 tag-pin ctors, inherited by the variant config.
+    // tag-pin ctors, inherited by the variant config.
     ::m5::hal::v2::i2c::BusConfig_espidf i2c_tag_cfg{::m5::hal::v2::i2c::Scl{22}, ::m5::hal::v2::i2c::Sda{21}};
     detail::useResult(i2c_tag_cfg);
 #endif
@@ -571,7 +612,7 @@ inline void compileEspidfApiSurface(void)
     static_assert(sizeof(::m5::hal::v2::uart::Bus_espidf) > 0, "ESP-IDF UART Bus type must be visible");
     detail::useResult(uart_cfg);
 
-    // S20 tag-pin ctors; `port_num` stays assignable after tag construction.
+    // tag-pin ctors; `port_num` stays assignable after tag construction.
     ::m5::hal::v2::uart::BusConfig_espidf uart_tag_cfg{::m5::hal::v2::uart::Tx{17}, ::m5::hal::v2::uart::Rx{16}};
     uart_tag_cfg.port_num = 1;
     detail::useResult(uart_tag_cfg);
@@ -641,6 +682,9 @@ inline void compileRuntimeApiSurface(void)
     if (mutex.lock(0)) {
         mutex.unlock();
     }
+    runtime::Event event;
+    event.notify();
+    detail::useResult(event.wait(0));
 }
 
 inline void compileApiSurface(void)

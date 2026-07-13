@@ -26,6 +26,16 @@ struct DataChunk {
     size_t rx = 0;
 };
 
+bool chunkUsesBothBuffers(const DataChunk& chunk)
+{
+    return chunk.tx > 0 && chunk.rx > 0;
+}
+
+int rxBufferIndexForChunk(const DataChunk& chunk, int tx_idx)
+{
+    return chunkUsesBothBuffers(chunk) ? (tx_idx ^ 1) : tx_idx;
+}
+
 error::error_t mapEspErr(::esp_err_t err)
 {
     switch (err) {
@@ -188,17 +198,24 @@ void Bus_espidf::workerLoop(void)
     while (true) {
         (void)::ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        int front_idx = 0;
-        int back_idx  = 1;
+        int front_tx_idx = 0;
         impl_espidf::DataChunk front{_worker_front_tx_len, _worker_front_rx_len};
-        auto worker_err = error::error_t::OK;
+        int front_rx_idx = impl_espidf::rxBufferIndexForChunk(front, front_tx_idx);
+        auto worker_err  = error::error_t::OK;
 
         while (_in_flight) {
             auto prepare_error = error::error_t::OK;
-            auto next = impl_espidf::prepareChunk(_worker_src, _worker_tx_remaining, _worker_dst, _worker_rx_remaining,
-                                                  _dma_buf[back_idx], kMaxDmaChunk);
-            if (!next.has_value()) {
-                prepare_error = next.error();
+            impl_espidf::DataChunk next{};
+            const int next_tx_idx      = front_tx_idx ^ 1;
+            const bool front_uses_both = impl_espidf::chunkUsesBothBuffers(front);
+            if (!front_uses_both) {
+                auto prepared = impl_espidf::prepareChunk(_worker_src, _worker_tx_remaining, _worker_dst,
+                                                          _worker_rx_remaining, _dma_buf[next_tx_idx], kMaxDmaChunk);
+                if (prepared.has_value()) {
+                    next = prepared.value();
+                } else {
+                    prepare_error = prepared.error();
+                }
             }
 
             auto ended = impl_espidf::endChunk(_device);
@@ -207,9 +224,20 @@ void Bus_espidf::workerLoop(void)
             }
 
             if (worker_err == error::error_t::OK) {
-                auto completed = impl_espidf::completeChunk(_worker_dst, _dma_buf[front_idx], front, _transfer_totals);
+                auto completed =
+                    impl_espidf::completeChunk(_worker_dst, _dma_buf[front_rx_idx], front, _transfer_totals);
                 if (!completed.has_value()) {
                     worker_err = completed.error();
+                }
+            }
+
+            if (front_uses_both && worker_err == error::error_t::OK) {
+                auto prepared = impl_espidf::prepareChunk(_worker_src, _worker_tx_remaining, _worker_dst,
+                                                          _worker_rx_remaining, _dma_buf[next_tx_idx], kMaxDmaChunk);
+                if (prepared.has_value()) {
+                    next = prepared.value();
+                } else {
+                    prepare_error = prepared.error();
                 }
             }
 
@@ -222,22 +250,23 @@ void Bus_espidf::workerLoop(void)
                 break;
             }
 
-            if (next.value().tx == 0 && next.value().rx == 0) {
+            if (next.tx == 0 && next.rx == 0) {
                 _in_flight = false;
                 break;
             }
 
-            auto started = impl_espidf::startChunk(_device, _dma_trans[back_idx], _dma_buf[back_idx],
-                                                   _dma_buf[back_idx], next.value());
+            const int next_rx_idx = impl_espidf::rxBufferIndexForChunk(next, next_tx_idx);
+            auto started          = impl_espidf::startChunk(_device, _dma_trans[next_tx_idx], _dma_buf[next_tx_idx],
+                                                            _dma_buf[next_rx_idx], next);
             if (!started.has_value()) {
                 worker_err = started.error();
                 _in_flight = false;
                 break;
             }
 
-            front     = next.value();
-            front_idx = back_idx;
-            back_idx ^= 1;
+            front        = next;
+            front_tx_idx = next_tx_idx;
+            front_rx_idx = next_rx_idx;
             _worker_remaining =
                 _worker_tx_remaining > _worker_rx_remaining ? _worker_tx_remaining : _worker_rx_remaining;
         }
@@ -277,22 +306,23 @@ void Bus_espidf::waitInFlight(void)
     _worker_remaining = 0;
 }
 
-error::error_t Bus_espidf::attach(::spi_host_device_t host)
+error::error_t Bus_espidf::attach(::spi_host_device_t host, int8_t claimed_controller)
 {
-    if (_owns_bus) {
-        (void)release();
+    if (!detail_espidf_spi::attachedControllerMatches(static_cast<int>(host), claimed_controller,
+                                                      hardwareControllerCountForSPI(), static_cast<int>(SPI2_HOST))) {
+        return error::error_t::INVALID_ARGUMENT;
     }
-    if (_device != nullptr) {
-        (void)removeDevice();
+    // Re-entry (attach called again while device/worker/DMA buffers from a
+    // prior attach() or init() are still held) tears down first so nothing
+    // is silently overwritten and orphaned.
+    auto released = release();
+    if (!released.has_value()) {
+        return released.error();
     }
-    _host     = host;
-    _owns_bus = false;
-    if (_dma_buf[0] == nullptr) {
-        _dma_buf[0] = static_cast<uint8_t*>(::heap_caps_aligned_alloc(4, kMaxDmaChunk, MALLOC_CAP_DMA));
-    }
-    if (_dma_buf[1] == nullptr) {
-        _dma_buf[1] = static_cast<uint8_t*>(::heap_caps_aligned_alloc(4, kMaxDmaChunk, MALLOC_CAP_DMA));
-    }
+    _host       = host;
+    _owns_bus   = false;
+    _dma_buf[0] = static_cast<uint8_t*>(::heap_caps_aligned_alloc(4, kMaxDmaChunk, MALLOC_CAP_DMA));
+    _dma_buf[1] = static_cast<uint8_t*>(::heap_caps_aligned_alloc(4, kMaxDmaChunk, MALLOC_CAP_DMA));
     if (_dma_buf[0] == nullptr || _dma_buf[1] == nullptr) {
         if (_dma_buf[0] != nullptr) {
             ::heap_caps_free(_dma_buf[0]);
@@ -304,24 +334,26 @@ error::error_t Bus_espidf::attach(::spi_host_device_t host)
         }
         return error::error_t::OUT_OF_RESOURCE;
     }
-    if (_worker_task == nullptr) {
-        auto created = ::xTaskCreatePinnedToCore(workerEntry, "m5hal-spi", 4096, this, configMAX_PRIORITIES - 2,
-                                                 &_worker_task, xPortGetCoreID());
-        if (created != pdPASS) {
-            ::heap_caps_free(_dma_buf[0]);
-            _dma_buf[0] = nullptr;
-            ::heap_caps_free(_dma_buf[1]);
-            _dma_buf[1] = nullptr;
-            return error::error_t::OUT_OF_RESOURCE;
-        }
+    auto created = ::xTaskCreatePinnedToCore(workerEntry, "m5hal-spi", 4096, this, configMAX_PRIORITIES - 2,
+                                             &_worker_task, xPortGetCoreID());
+    if (created != pdPASS) {
+        ::heap_caps_free(_dma_buf[0]);
+        _dma_buf[0] = nullptr;
+        ::heap_caps_free(_dma_buf[1]);
+        _dma_buf[1] = nullptr;
+        return error::error_t::OUT_OF_RESOURCE;
     }
     return error::error_t::OK;
 }
 
 result_t<void> Bus_espidf::init(const BusConfig_espidf& config)
 {
-    if (_owns_bus) {
-        (void)release();
+    // Re-entry tears down whatever the previous attach()/init() left behind
+    // regardless of ownership form, so the DMA buffers and worker task below
+    // are never allocated on top of still-live resources.
+    auto released = release();
+    if (!released.has_value()) {
+        return m5::stl::make_unexpected(released.error());
     }
     _config = config;
     _host   = config.host;
@@ -588,9 +620,8 @@ result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const spi::MasterAcce
         return {};
     }
 
-    const bool full_duplex_chunk = first.value().tx > 0 && first.value().rx > 0;
-    uint8_t* rx_buf              = full_duplex_chunk ? _dma_buf[1] : _dma_buf[0];
-    auto started                 = impl_espidf::startChunk(_device, _dma_trans[0], _dma_buf[0], rx_buf, first.value());
+    uint8_t* rx_buf = _dma_buf[impl_espidf::rxBufferIndexForChunk(first.value(), 0)];
+    auto started    = impl_espidf::startChunk(_device, _dma_trans[0], _dma_buf[0], rx_buf, first.value());
     if (!started.has_value()) {
         return m5::stl::make_unexpected(started.error());
     }
@@ -616,6 +647,20 @@ result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const spi::MasterAcce
         return {};
     }
 
+    if (_worker_task == nullptr) {
+        // A failed release() can delete the worker task yet leave this
+        // backend adopted (the swap aborts keep-old on a release error);
+        // notifying a null handle would crash. Drain the already-started
+        // first chunk and fail loudly instead.
+        auto ended      = impl_espidf::endChunk(_device);
+        _in_flight      = false;
+        _worker_status  = error::error_t::OK;
+        _transfer_owner = nullptr;
+        if (!ended.has_value()) {
+            return m5::stl::make_unexpected(ended.error());
+        }
+        return m5::stl::make_unexpected(error::error_t::IO_ERROR);
+    }
     _worker_src          = src;
     _worker_dst          = dst;
     _worker_tx_remaining = tx_remaining;

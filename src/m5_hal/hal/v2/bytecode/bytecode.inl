@@ -773,6 +773,11 @@ result_t<void> BytecodeEncoder::evtGpioState(const types::gpio_number_t* pins, c
 result_t<void> BytecodeEncoder::streamTransfer(types::bus_kind_t kind, uint8_t bus_id, uint8_t stream_id,
                                                uint32_t tx_len, uint32_t rx_len, data::ConstDataSpan meta)
 {
+    // meta_size is a single u8 on the wire (p[3]); reject anything that would
+    // silently truncate. A null data pointer with non-zero size is incoherent.
+    if (meta.size > 255 || (meta.data == nullptr && meta.size != 0)) {
+        return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
+    }
     const size_t payload_size = 4 + 8 + meta.size;  // kind+bus_id+stream_id+meta_size + tx_len(4) + rx_len(4) + meta
     auto payload              = beginInstruction(OpCode::BusStreamTransfer, payload_size);
     if (!payload.has_value()) {
@@ -1715,6 +1720,13 @@ result_t<void> BytecodeRunner::opBusTransfer(data::ConstDataSpan payload)
     auto result          = bus->ops->transfer(*bus, meta, src, dst, actual_tx_len, actual_rx_len);
     if (!result.has_value()) {
         return m5::stl::make_unexpected(result.error());
+    }
+    // Clamp to the allocated dst before recording the store length (same
+    // guard as streamTransferChunk): a backend over-reporting actual_rx_len
+    // must not make the slot claim bytes beyond its buffer — a later
+    // StoreData would read out of bounds.
+    if (actual_rx_len > dst.size) {
+        actual_rx_len = dst.size;
     }
     if (slot != nullptr) {
         slot->len = actual_rx_len;

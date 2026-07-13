@@ -28,8 +28,8 @@ constexpr int PIN_UART_RX = 16;
 #define M5HAL_EXAMPLE_HOWTOUSEUART_BAUD 115200
 #endif
 
-// Borrowed handle, assigned in setup().
-// For borrow model details, see HowToUse/I2C and README.
+// Shared owner, assigned in setup().
+// For ownership model details, see HowToUse/I2C and README.
 std::shared_ptr<m5hal::uart::IBus> uart_bus;
 m5hal::uart::AccessConfig acc_cfg;
 
@@ -126,7 +126,7 @@ void setup()
     m5hal::uart::BusConfig bus_cfg{m5hal::uart::Tx{PIN_UART_TX}, m5hal::uart::Rx{PIN_UART_RX}};
     bus_cfg.setSerial(Serial1);
 
-    // Borrow the bus from M5_Hal (it owns the instance; you hold a shared handle).
+    // Acquire the interned bus. This shared handle owns its lifetime.
     auto acquired = m5hal::M5_Hal.UART.acquire(bus_cfg);
     if (!acquired.has_value()) {
         printError("uart bus acquire", acquired.error());
@@ -139,7 +139,7 @@ void setup()
     acc_cfg.inter_byte_timeout_ms = 5;
     acc_cfg.write_timeout_ms      = 100;
 
-    // Bind the reused accessors to the borrowed bus once. bind / setConfig only
+    // Bind the reused accessors to the acquired bus once. bind / setConfig only
     // fail while an access window is open, which never happens here.
     const bool bound = uart_tx.bind(*uart_bus).has_value() && uart_tx.setConfig(acc_cfg).has_value() &&
                        uart_rx.bind(*uart_bus).has_value() && uart_rx.setConfig(acc_cfg).has_value();

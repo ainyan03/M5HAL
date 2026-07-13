@@ -70,6 +70,14 @@ private:
 
         bool closed() const override;
 
+        // Drop any in-flight reserve(): called from RingFIFO::reset()/setBuf()
+        // so a stale commit() after a reset cannot pass the `N <= _reserved`
+        // check and hand the consumer bytes that were never written.
+        void clearReserved()
+        {
+            _reserved = 0;
+        }
+
     private:
         RingFIFO& _owner;
         size_t _reserved = 0;

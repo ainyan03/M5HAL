@@ -85,9 +85,9 @@ public:
     result_t<bus::TransferTotals> waitTransfer(bus::IAccessor* owner, const i2c::MasterAccessConfig& cfg) override;
     bool transferBusy(bus::IAccessor* owner) override;
 
-    // This backend drives a dedicated ESP-IDF I2C peripheral. The phase-3
+    // This backend drives a dedicated ESP-IDF I2C peripheral. The
     // controller pool assigns the port through BusConfig_espidf::i2c_port; the
-    // query API reports it (ADR 034) so the resolver's incumbency check and a
+    // query API reports it so the resolver's incumbency check and a
     // holder watching for a downgrade both see the live state.
     types::backend_kind_t backendKind(void) const override
     {
@@ -139,15 +139,19 @@ private:
 #if M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5
     result_t<void> ensureDevice(const i2c::MasterAccessConfig& cfg);
     result_t<void> removeDevice(void);
+    void recoverBusAfterWireFault(error::error_t mapped, uint32_t wire_timeout_ms);
 
     ::i2c_master_bus_handle_t _bus_handle = nullptr;
     ::i2c_master_dev_handle_t _dev_handle = nullptr;
     bool _owns_bus                        = false;
-    bool _dev_async                       = false;
-    uint16_t _dev_addr                    = 0;
-    uint32_t _dev_freq                    = 0;
-    uint32_t _dev_scl_wait_us             = 0;
-    bool _dev_address_is_10bit            = false;
+    // Wire-fault recovery released the bus but could not rebuild it (e.g.
+    // transient NO_MEM); transfer() retries the rebuild lazily.
+    bool _rebuild_pending      = false;
+    bool _dev_async            = false;
+    uint16_t _dev_addr         = 0;
+    uint32_t _dev_freq         = 0;
+    uint32_t _dev_scl_wait_us  = 0;
+    bool _dev_address_is_10bit = false;
     // The configured port (gen5 takes it via i2c_master_bus_config_t but keeps
     // no member); cached so controllerId() reports the pool's assignment.
     int _controller_port = -1;
@@ -182,7 +186,7 @@ struct BackendFor<BusConfig_espidf> {
     using type = Bus_espidf;
 };
 
-// Phase-3 hardware backend factory (ADR 034). Builds a Bus_espidf for a logical
+// hardware backend factory. Builds a Bus_espidf for a logical
 // request, binding the leased controller index to the ESP-IDF I2C port. This is
 // the only code that knows about i2c_port, so the kind-generic BusView / pool
 // stay variant-agnostic. M5HALCore wires this into i2c::BusView when this

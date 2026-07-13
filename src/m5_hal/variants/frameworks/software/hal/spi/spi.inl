@@ -97,9 +97,9 @@ TransferPlan makePlan(const spi::MasterAccessConfig& cfg, bool has_mosi, bool ha
     plan.cpha     = (cfg.spi_mode & 0x01) != 0;
     plan.has_mosi = has_mosi;
     plan.has_miso = has_miso;
-    // A bit is driven as first clock level -> MOSI update -> second clock
-    // level. This keeps the MOSI/MISO work in one half-cycle instead of
-    // spreading it across both.
+    // A bit is driven as MOSI update -> first clock level -> second clock
+    // level (MOSI ordering rationale = writeFirstEdge). This keeps the
+    // MOSI/MISO work in one half-cycle instead of spreading it across both.
     plan.first_level  = plan.cpol ^ plan.cpha;
     plan.second_level = !plan.first_level;
 
@@ -202,10 +202,18 @@ private:
 
     void writeFirstEdge(gpio::Pin& clk, gpio::Pin& mosi, const TransferPlan& plan)
     {
-        clk.write(plan.first_level);
+        // MOSI must already be valid when the launch edge appears on the
+        // wire: some slaves sample MOSI near the launch edge instead of the
+        // nominal sample edge (classic ESP32 slave in CPHA=1 — a hardware
+        // master's output delay is a few ns, but a GPIO write gap after the
+        // edge makes such a slave read the PREVIOUS bit, shifting the whole
+        // stream 1 bit late). Writing MOSI first also removes the window
+        // where preemption between the two writes stretches that gap.
+        // Canonical doc = spec/design/spi.md wire-timing invariants.
         if (plan.has_mosi) {
             mosi.write((_tx_byte & plan.masks[_bit_index]) != 0);
         }
+        clk.write(plan.first_level);
         _pending_second_edge = true;
     }
 
@@ -278,12 +286,16 @@ public:
     void begin(const spi::MasterAccessConfig& cfg, const spi::TransferDesc& desc, data::Source* src, size_t tx_len,
                data::Sink* dst, size_t rx_len, service::fast_tick_t half_tick, bool has_mosi, bool has_miso)
     {
-        _plan          = makePlan(cfg, has_mosi, has_miso);
-        _tx            = src;
-        _rx            = dst;
-        _tx_remaining  = (src != nullptr) ? tx_len : 0;
-        _rx_remaining  = (dst != nullptr) ? rx_len : 0;
-        _half_tick     = half_tick;
+        _plan         = makePlan(cfg, has_mosi, has_miso);
+        _tx           = src;
+        _rx           = dst;
+        _tx_remaining = (src != nullptr) ? tx_len : 0;
+        _rx_remaining = (dst != nullptr) ? rx_len : 0;
+        _half_tick    = half_tick;
+        // Intra-call spin anchor: begin() itself paces real edges through
+        // setDC (enterPhase below), so it reads the live counter once. This
+        // absolute tick never leaves the call — polls re-derive their own
+        // real-axis anchor from ctx (see service()).
         _due_tick      = service::fastTick();
         _command       = desc.command;
         _address       = desc.address;
@@ -303,6 +315,12 @@ public:
         _chunk_index = 0;
         _clk.write(_plan.cpol);
         enterPhase(firstPhase());
+        // Virtual-timeline origin: begin() exits right at its last real edge
+        // (setDC spins to _due_tick before writing), so "last edge position"
+        // maps to virtual now. Sub-half-period mapping error only delays the
+        // first polled edge — the safe direction.
+        _svc_now = 0;
+        _due_v   = 0;
     }
 
     bool active() const
@@ -326,19 +344,40 @@ public:
             return service::ServiceResult::Done;
         }
 
+        // Two-axis bookkeeping: scheduling decisions live on the private
+        // virtual timeline (_svc_now/_due_v, advanced only by caller-vouched
+        // elapsed), while the edge pacing below spins on the real counter.
+        // Map _due_v into THIS call's real axis through the fixed point
+        // (local_tick <-> _svc_now); after the mapping, every comparison in
+        // the body is same-axis/same-call, so the pre-existing real-tick
+        // machinery runs unchanged. The mapping runs for EVERY poll —
+        // including the dummy phase, which bypasses the gate below but still
+        // paces edges from _due_tick (a carried-over real tick here was the
+        // exact cross-core comparison this contract removes).
+        _svc_now += ctx.elapsed;
+        _due_tick = static_cast<service::fast_tick_t>(ctx.local_tick - (_svc_now - _due_v));
+
         uint_fast8_t edge_budget = 0;
         if (_phase != Phase::dummy) {
             const auto next_due = nextEdgeDue();
-            if (!service::hasReached(ctx.now_tick, next_due)) {
-                return {service::ServiceResult::Idle, next_due};
+            if (!service::hasReached(ctx.local_tick, next_due)) {
+                // Not due yet: _due_tick was not advanced, no write-back
+                // needed. next_due is ahead of local_tick here, so the
+                // difference is the positive relative hint.
+                return {service::ServiceResult::Idle, static_cast<service::fast_tick_t>(next_due - ctx.local_tick)};
             }
-            edge_budget = availableEdgeBudget(ctx.now_tick, next_due);
+            edge_budget = availableEdgeBudget(ctx.local_tick, next_due);
         }
 
         auto polled = poll(edge_budget);
+        // Write the advanced edge position back onto the virtual axis via
+        // the same fixed point, whatever poll() did to _due_tick (edge
+        // steps, DC waits, late re-anchor).
+        _due_v = static_cast<service::fast_tick_t>(_svc_now + (_due_tick - ctx.local_tick));
         if (!polled.has_value()) {
             _error = polled.error();
             enterDone();  // park the clock at idle even on the error path
+            _due_v = static_cast<service::fast_tick_t>(_svc_now + (_due_tick - ctx.local_tick));
             return service::ServiceResult::Error;
         }
         return polled.value();
@@ -628,7 +667,14 @@ private:
     data::DataSpan _rx_span{};
     bus::TransferTotals _totals{};
     service::fast_tick_t _half_tick = 1;
-    service::fast_tick_t _due_tick  = 0;
+    // Real-axis edge cursor, valid only WITHIN one call (begin or a poll):
+    // re-derived from ctx at every poll entry, written back to _due_v at
+    // poll exit. Never compared against a tick from another call.
+    service::fast_tick_t _due_tick = 0;
+    // Private virtual clock and the virtual image of _due_tick (last edge
+    // position, half period NOT included).
+    service::fast_tick_t _svc_now = 0;
+    service::fast_tick_t _due_v   = 0;
     ByteTransferState _byte{};
     size_t _chunk_len        = 0;
     size_t _chunk_index      = 0;
@@ -673,9 +719,8 @@ service::ServicePoll Bus_software::serviceImpl(const service::ServiceContext& ct
 
 void Bus_software::unregisterTransferService(void)
 {
-    if (_transfer_registered) {
+    if (_transfer_registered.exchange(false, std::memory_order_relaxed)) {
         (void)M5_Hal.Services.remove(*this);
-        _transfer_registered = false;
     }
 }
 
@@ -686,33 +731,39 @@ void Bus_software::clearTransferService(void)
         delete static_cast<impl_software::TransferService*>(_transfer_service);
         _transfer_service = nullptr;
     }
-    _transfer_owner  = nullptr;
-    _transfer_active = false;
-    _transfer_done   = true;
-    _transfer_error  = error::error_t::OK;
+    _transfer_owner = nullptr;
+    _transfer_error = error::error_t::OK;
     _transfer_totals.clear();
+    _transfer_gate.reset();
 }
 
 service::ServicePoll Bus_software::serviceTransfer(const service::ServiceContext& ctx)
 {
-    if (!_transfer_active || _transfer_done) {
+    using GateState = service::CompletionGate::State;
+    if (_transfer_gate.state() != GateState::Busy) {
         unregisterTransferService();
         return service::ServiceResult::Idle;
     }
 
     auto* service = static_cast<impl_software::TransferService*>(_transfer_service);
     auto result   = service->service(ctx);
+    // Terminal order matters: finish() must precede unregisterTransferService().
+    // Once _transfer_registered is cleared, a concurrent teardown
+    // (release()/dtor/init) skips the synchronous remove() and may delete the
+    // service and reset the gate -- a finish() issued after that would write
+    // freed/cleared storage. Publishing first keeps every write to this object
+    // inside the window the teardown's remove() still waits for.
     if (result == service::ServiceResult::Error) {
         _transfer_error  = service->error();
         _transfer_totals = service->totals();
+        _transfer_gate.finish(GateState::Error);
         unregisterTransferService();
-        _transfer_done = true;
         return result;
     }
     if (result == service::ServiceResult::Done) {
         _transfer_totals = service->totals();
+        _transfer_gate.finish(GateState::Done);
         unregisterTransferService();
-        _transfer_done = true;
         return result;
     }
     return result;
@@ -842,22 +893,22 @@ result_t<void> Bus_software::transfer(bus::IAccessor* owner, const spi::MasterAc
     }
     _transfer_service = transfer_service;
     _transfer_owner   = owner;
-    _transfer_active  = true;
-    _transfer_done    = false;
     _transfer_error   = error::error_t::OK;
+    _transfer_gate.arm();
 
     transfer_service->begin(cfg, desc, src, tx_len, dst, rx_len, half_tick.value(), has_mosi, has_miso);
-    auto first = serviceTransfer(service::ServiceContext{service::fastTick()});
+    // First poll: a fresh stream vouches for nothing yet (elapsed 0);
+    // local_tick anchors the intra-call edge spins.
+    auto first = serviceTransfer(service::ServiceContext{0, service::fastTick()});
     if (first == service::ServiceResult::Error) {
         const auto err = _transfer_error;
         clearTransferService();
         return m5::stl::make_unexpected(err);
     }
 
-    if (!_transfer_done) {
-        if (M5_Hal.Services.add(*this)) {
-            _transfer_registered = true;
-        } else {
+    if (_transfer_gate.busy()) {
+        _transfer_registered.store(true, std::memory_order_relaxed);
+        if (!M5_Hal.Services.add(*this)) {
             clearTransferService();
             return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
         }
@@ -869,22 +920,45 @@ result_t<void> Bus_software::transfer(bus::IAccessor* owner, const spi::MasterAc
 result_t<bus::TransferTotals> Bus_software::waitTransfer(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg)
 {
     (void)cfg;
-    if (_transfer_active && _transfer_owner != owner) {
+    using GateState = service::CompletionGate::State;
+    if (_transfer_gate.state() != GateState::Idle && _transfer_owner != owner) {
         return m5::stl::make_unexpected(error::error_t::BUSY);
     }
 
-    while (_transfer_active && !_transfer_done && _transfer_error == error::error_t::OK) {
-        if (_transfer_registered && M5_Hal.Services.autoRunActive()) {
-            runtime::yield();
+    // Yield budget sized to outlast a typical transfer: the sleep phase
+    // quantizes completion latency to the FreeRTOS tick (10 ms at the
+    // IDF-default 100 Hz), so it must stay the priority-inversion liveness
+    // backstop, not the expected path (measured: a short yield
+    // phase doubled the 256-byte exchange median on a 100 Hz-tick build).
+    service::SpinBackoff backoff{50000};
+    // Sole-pumper poll stream: measured per iteration so a task that
+    // migrates cores mid-wait gap-drops (elapsed=0) instead of comparing
+    // ticks from two different cycle counters.
+    service::TickStream pump_stream;
+    while (_transfer_gate.busy()) {
+        if (_transfer_registered.load(std::memory_order_relaxed)) {
+            // Runner-owned state: pump only through runOnce()'s try-lock so
+            // this thread can never poll the same TransferService concurrently
+            // with the runner task (double-pump window at auto-run start).
+            // The wait must eventually BLOCK, not merely yield: taskYIELD()
+            // only yields to READY tasks of the SAME priority.
+            if (M5_Hal.Services.autoRunActive() || !M5_Hal.Services.runOnce()) {
+                backoff.step();
+            } else {
+                backoff.reset();
+            }
         } else {
-            auto result = serviceTransfer(service::ServiceContext{service::fastTick()});
-            if (result == service::ServiceResult::Error) {
+            // Unpublished state: this thread is the sole pumper; spin at full
+            // speed to honor the bit-bang half-period schedule (no backoff).
+            const auto s = service::sampleTickWithDomain();
+            if (serviceTransfer(service::ServiceContext{pump_stream.step(s.tick, s.domain), s.tick}) ==
+                service::ServiceResult::Error) {
                 break;
             }
         }
     }
 
-    if (error::isError(_transfer_error)) {
+    if (_transfer_gate.state() == GateState::Error) {
         const auto err = _transfer_error;
         clearTransferService();
         return m5::stl::make_unexpected(err);
@@ -897,7 +971,7 @@ result_t<bus::TransferTotals> Bus_software::waitTransfer(bus::IAccessor* owner, 
 
 bool Bus_software::transferBusy(bus::IAccessor* owner)
 {
-    return _transfer_active && _transfer_owner == owner && !_transfer_done && _transfer_error == error::error_t::OK;
+    return _transfer_gate.busy() && _transfer_owner == owner;
 }
 
 result_t<void> Bus_software::beginTransaction(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg)

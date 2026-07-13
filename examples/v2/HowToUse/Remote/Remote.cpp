@@ -87,36 +87,36 @@ static void scanI2C(m5hal::Hal& hal)
     // Read register 0x00 from the first device. Target address and clock live
     // in the accessor config; readRegister wraps its own bus transaction (the
     // same pattern as the local I2C example).
-    m5hal::i2c::MasterAccessConfig acc_cfg;
-    acc_cfg.i2c_addr = first_addr;
-    acc_cfg.freq     = 100000;
-    m5hal::i2c::MasterAccessor acc{bus.value(), acc_cfg};
+    {
+        m5hal::i2c::MasterAccessConfig acc_cfg;
+        acc_cfg.i2c_addr = first_addr;
+        acc_cfg.freq     = 100000;
+        m5hal::i2c::MasterAccessor acc{bus.value(), acc_cfg};
 
-    auto reg = acc.readRegister(0x00);  // 1-byte register-address default
-    if (reg.has_value()) {
-        ::printf("  [0x%02X] reg 0x00 = 0x%02X\n", first_addr, reg.value());
-    } else {
-        ::printf("  [0x%02X] readRegister failed: %s\n", first_addr, m5hal::error::toString(reg.error()));
+        auto reg = acc.readRegister(0x00);  // 1-byte register-address default
+        if (reg.has_value()) {
+            ::printf("  [0x%02X] reg 0x00 = 0x%02X\n", first_addr, reg.value());
+        } else {
+            ::printf("  [0x%02X] readRegister failed: %s\n", first_addr, m5hal::error::toString(reg.error()));
+        }
     }
 
     // Explicitly release the bus. For remote backends this sends
-    // BusRelease to the peer so the device frees the hardware resource.
-    // After release(), drop the shared_ptr — further operations are
-    // undefined.
+    // BusRelease to the peer so the device frees the hardware resource. All
+    // accessors must be gone first; release consumes and clears this owner.
     auto rel = hal.I2C.release(bus.value());
     if (rel.has_value()) {
         ::printf("  I2C bus released.\n");
     } else {
         ::printf("  I2C release failed: %s\n", m5hal::error::toString(rel.error()));
     }
-    bus.value().reset();
 }
 
 // ---------------------------------------------------------------------------
 // GPIO port read (if the remote device exposes GPIO).
 // Current implementation returns host-side cached values seeded at
-// connection time. Live push updates require server-side subscribe
-// handler (not yet implemented).
+// connection time. Live push updates use GpioSubscribe / EvtGpioState
+// (see spec/design/remote.md, push events) and are not demonstrated here.
 // ---------------------------------------------------------------------------
 static void readGPIO(m5hal::Hal& hal)
 {

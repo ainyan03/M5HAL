@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 #include <M5HAL_v2.hpp>
 #include <m5_hal/hal/v2/remote/server_handler.hpp>
 #include <m5_hal/variants/frameworks/posix/hal/remote/tcp_connection.hpp>
@@ -17,6 +18,28 @@ namespace {
 
 using namespace m5::hal::v2;
 namespace posix_remote = m5::variants::frameworks::posix::hal::v2::remote;
+
+// Endpoint parsing rejects out-of-range ports before any socket work.
+// Regression anchor: the port accumulator only checked 65535 after the
+// digit loop, so a long digit string could wrap unsigned long back into
+// range and "connect" to an unintended port.
+TEST(PosixTcpEndpointParse, RejectsOutOfRangeAndOverflowingPorts)
+{
+    remote::DeviceConfig cfg;
+    cfg.response_timeout_ms = 50;
+
+    const char* bad_endpoints[] = {
+        "127.0.0.1:0",
+        "127.0.0.1:65536",
+        "127.0.0.1:4294967297",            // wraps 32-bit unsigned long to 1
+        "127.0.0.1:18446744073709551617",  // wraps 64-bit unsigned long to 1
+    };
+    for (const char* ep : bad_endpoints) {
+        auto r = posix_remote::PosixTcpConnection::create(ep, cfg);
+        ASSERT_FALSE(r.has_value()) << ep;
+        EXPECT_EQ(r.error(), error::error_t::INVALID_ARGUMENT) << ep;
+    }
+}
 
 #define ASSERT_OK_RESULT(expr)                                                                    \
     do {                                                                                          \
@@ -214,6 +237,32 @@ protected:
     remote::BsdTcpRemoteServer server;
 };
 
+class ServerPump {
+public:
+    explicit ServerPump(remote::BsdTcpRemoteServer& server) : _server{server}, _worker{[this]() { run(); }}
+    {
+    }
+
+    ~ServerPump()
+    {
+        _running.store(false, std::memory_order_release);
+        _worker.join();
+    }
+
+private:
+    void run()
+    {
+        while (_running.load(std::memory_order_acquire)) {
+            (void)_server.service();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    remote::BsdTcpRemoteServer& _server;
+    std::atomic<bool> _running{true};
+    std::thread _worker;
+};
+
 TEST_F(TcpRemoteServerE2E, TwoClientsConnectAndReceiveCapabilities)
 {
     auto a = connectOk();
@@ -319,6 +368,57 @@ TEST_F(TcpRemoteServerE2E, ConnectionExposesRemoteGpioAfterSubscribeRoundTrip)
     EXPECT_EQ(a.conn->gpio()->getPortCount(), 1);
 }
 
+TEST_F(TcpRemoteServerE2E, HalReconnectKeepsOldGpioPinStorageClosedAndDistinct)
+{
+    server.setConnectionSetupHandler(
+        [](void*, remote::Server& srv) -> result_t<void> {
+            srv.setGPIOGroup(M5_Hal.Gpio);
+            return {};
+        },
+        nullptr);
+
+    char endpoint[80];
+    std::snprintf(endpoint, sizeof(endpoint), "127.0.0.1:%u", static_cast<unsigned>(server.boundPort()));
+    char remote_endpoint[96];
+    std::snprintf(remote_endpoint, sizeof(remote_endpoint), "tcp:%s", endpoint);
+
+    ServerPump pump{server};
+    Hal hal;
+    remote::DeviceConfig cfg;
+    cfg.response_timeout_ms = 500;
+    ASSERT_OK_RESULT(hal.connect(remote_endpoint, cfg));
+    ASSERT_TRUE(hal.hasRemoteGpio());
+
+    const auto old_number = types::makeGpioNumber(hal.remoteGpioSlot(), 0);
+    auto old_result       = hal.Gpio.tryGetPin(old_number);
+    ASSERT_TRUE(old_result.has_value());
+    auto old_pin                = old_result.value();
+    auto* old_port              = old_pin.getPort();
+    const bool old_cached_level = old_pin.read();
+    auto old_port_result        = hal.Gpio.getPort(hal.remoteGpioSlot(), 0);
+    ASSERT_TRUE(old_port_result.has_value());
+    auto old_port_access          = old_port_result.value();
+    const uint32_t old_port_cache = old_port_access.port->readPort();
+
+    ASSERT_OK_RESULT(hal.connect(remote_endpoint, cfg));
+    ASSERT_TRUE(hal.hasRemoteGpio());
+    auto new_result = hal.Gpio.tryGetPin(types::makeGpioNumber(hal.remoteGpioSlot(), 0));
+    ASSERT_TRUE(new_result.has_value());
+    EXPECT_NE(new_result.value().getPort(), old_port);
+    auto new_port_result = hal.Gpio.getPort(hal.remoteGpioSlot(), 0);
+    ASSERT_TRUE(new_port_result.has_value());
+    EXPECT_NE(new_port_result.value().port, old_port_access.port);
+
+    // The old pin is not silently rebound to the new device/session.  Its
+    // connection is closed, so void operations are no-ops and reads retain
+    // the final cache without dereferencing freed connection storage.
+    old_pin.write(!old_cached_level);
+    old_pin.setMode(types::GpioMode::Output);
+    EXPECT_EQ(old_pin.read(), old_cached_level);
+    old_port_access.port->writePort(~old_port_cache, old_port_cache);
+    EXPECT_EQ(old_port_access.port->readPort(), old_port_cache);
+}
+
 TEST(TcpRemoteStreamSoak, UartWriteCompletesBeyondCreditDriftWindow)
 {
     SessionPair pair;
@@ -376,5 +476,6 @@ TEST(TcpRemoteStreamSoak, UartWriteCompletesBeyondCreditDriftWindow)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

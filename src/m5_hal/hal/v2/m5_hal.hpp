@@ -90,6 +90,10 @@ M5HAL_INLINE_V2 namespace v2
     class Hal {
         bus::IHalBackend* _backend;
         remote::RemoteConnectionState* _connection = nullptr;
+        // A Pin/PortAccess is a non-owning value handle.  Preserve only the
+        // disconnected GPIO ports until this Hal dies; never retain the old
+        // connection, session object, or transport buffers.
+        std::unique_ptr<remote::RemoteGpioOwner> _retired_remote_gpios;
 
     public:
         gpio::GPIOGroup Gpio;
@@ -140,6 +144,12 @@ M5HAL_INLINE_V2 namespace v2
           side. The defaulted `DeviceConfig` is sufficient for a standard
           connection. `port` is a serial device path (e.g. "/dev/ttyUSB0",
           "COM5"); `endpoint` is "host:port" (e.g. "192.168.1.10:3333").
+
+          A remote `gpio::Pin` / `GPIOGroup::PortAccess` obtained before a
+          successful reconnect is never rebound to the new peer. Its port
+          storage remains valid until this `Hal` is destroyed, but its old
+          session is closed: reads return the final cached level, while writes
+          and mode changes are no-ops.
           @{
          */
         result_t<void> connect(const char* endpoint = nullptr, const remote::DeviceConfig& cfg = {});
@@ -153,6 +163,11 @@ M5HAL_INLINE_V2 namespace v2
             return _connection != nullptr;
         }
 
+        // Borrowed low-level escape hatch. The pointer is valid only until the
+        // next connect/initUart/initTcp call or this Hal's destruction. Bus
+        // proxies use an internal shared session handle and remain safely
+        // callable after that point (they report CLOSED instead of retaining
+        // this connection).
         remote::RemoteSession* session(void);
         const remote::Capabilities* capabilities(void) const;
         result_t<bool> pumpRemote(const remote::PumpConfig& cfg = {});
@@ -199,6 +214,17 @@ M5HAL_INLINE_V2 namespace v2
             if (r.has_value()) {
                 _remote_gpio_slot = slot;
                 _has_remote_gpio  = true;
+            }
+        }
+        void retireRemoteGPIO()
+        {
+            if (_connection == nullptr) {
+                return;
+            }
+            auto owner = _connection->releaseGpioOwnership();
+            if (owner != nullptr) {
+                owner->next           = std::move(_retired_remote_gpios);
+                _retired_remote_gpios = std::move(owner);
             }
         }
         types::gpio_slot_t _remote_gpio_slot = 0;

@@ -193,14 +193,34 @@ public:
     result_t<void> commitPlaceholder(IManagedBus& mb, uint32_t timeout_ms) const override
     {
         auto& self = static_cast<BusType&>(mb);
-        return self.swapBackendWith(timeout_ms, /*allow_null=*/true,
-                                    [&]() -> IBus* { return this->makePlaceholder(mb); });
+        // The resolver only routes a bus here while it is CURRENTLY hardware
+        // (AllocationCore's demote step), so the pre-swap controller read
+        // below is always the one the swap is about to give up: on a failed
+        // rebuild, the rollback factory re-makes hardware on that same
+        // controller instead of leaving the bus without a backend.
+        const int8_t cur = self.controllerId();
+        // A null placeholder is a valid outcome ONLY for a software-less
+        // kind (makePlaceholder() returns null by design there, not by
+        // failure). A kind WITH a software factory returning null instead
+        // means the build itself failed (e.g. OOM): that must be treated as
+        // a swap failure so the rollback factory below runs, rather than
+        // silently landing the bus on no backend at all.
+        return self.swapBackendWith(
+            timeout_ms, /*allow_null=*/_sw_factory == nullptr, [&]() -> IBus* { return this->makePlaceholder(mb); },
+            [this, &mb, cur]() -> IBus* { return this->makeHardware(mb, cur); });
     }
     result_t<void> commitHardware(IManagedBus& mb, int8_t controller, uint32_t timeout_ms) const override
     {
         auto& self = static_cast<BusType&>(mb);
-        return self.swapBackendWith(timeout_ms, /*allow_null=*/false,
-                                    [&]() -> IBus* { return this->makeHardware(mb, controller); });
+        // The resolver only routes a bus here once it is off hardware (see
+        // commitPlaceholder above -- a same-pass demote runs first), so the
+        // rollback factory recreating the placeholder is always correct: for
+        // a kind with a software placeholder it rebuilds that backend, and
+        // for a software-less kind makePlaceholder() itself returns null,
+        // which is the correct pending fallback.
+        return self.swapBackendWith(
+            timeout_ms, /*allow_null=*/false, [&]() -> IBus* { return this->makeHardware(mb, controller); },
+            [this, &mb]() -> IBus* { return this->makePlaceholder(mb); });
     }
     bool uniformControllers(void) const override
     {
@@ -270,6 +290,10 @@ public:
     result_t<void> commitBuses(types::bus_kind_t kind, uint32_t timeout_ms) override;
 
     uint8_t hardwareInUse(types::bus_kind_t kind) const override;
+
+    result_t<int8_t> claimController(types::bus_kind_t kind, const types::AllocationIntent& intent) override;
+
+    result_t<void> releaseClaimedController(types::bus_kind_t kind, int8_t controller) override;
 
 private:
     static constexpr size_t kMaxKinds = 5;

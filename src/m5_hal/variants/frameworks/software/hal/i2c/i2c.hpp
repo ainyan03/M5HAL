@@ -5,7 +5,10 @@
 #include "../../../../../hal/v2/gpio/port.hpp"
 #include "../../../../../hal/v2/i2c/i2c.hpp"
 #include "../../../../../hal/v2/m5_hal.hpp"
+#include "../../../../../hal/v2/service/completion_gate.hpp"
 #include "../../../../../hal/v2/service/service.hpp"
+
+#include <atomic>
 
 // I2C bit-bang implementation. Drives SCL / SDA through the
 // `m5::hal::v2::gpio::Pin` value type; callers populate
@@ -100,7 +103,7 @@ public:
 
     void begin(MasterLineDriver& lines, const MasterTiming& timing, ::m5::hal::v2::service::fast_tick_t now_tick);
 
-    ::m5::hal::v2::service::ServiceResult service(const ::m5::hal::v2::service::ServiceContext& ctx);
+    ::m5::hal::v2::service::ServiceResult service(::m5::hal::v2::service::fast_tick_t now_tick);
 
     State state() const;
 
@@ -137,7 +140,7 @@ public:
 
     void restart(uint8_t byte, ::m5::hal::v2::service::fast_tick_t now_tick);
 
-    ::m5::hal::v2::service::ServiceResult service(const ::m5::hal::v2::service::ServiceContext& ctx);
+    ::m5::hal::v2::service::ServiceResult service(::m5::hal::v2::service::fast_tick_t now_tick);
 
     State state() const;
 
@@ -193,7 +196,7 @@ public:
 
     void begin(MasterLineDriver& lines, const MasterTiming& timing, ::m5::hal::v2::service::fast_tick_t now_tick);
 
-    ::m5::hal::v2::service::ServiceResult service(const ::m5::hal::v2::service::ServiceContext& ctx);
+    ::m5::hal::v2::service::ServiceResult service(::m5::hal::v2::service::fast_tick_t now_tick);
 
     State state() const;
 
@@ -235,7 +238,7 @@ public:
 
     void restart(bool ack_after_read, ::m5::hal::v2::service::fast_tick_t now_tick);
 
-    ::m5::hal::v2::service::ServiceResult service(const ::m5::hal::v2::service::ServiceContext& ctx);
+    ::m5::hal::v2::service::ServiceResult service(::m5::hal::v2::service::fast_tick_t now_tick);
 
     State state() const;
 
@@ -297,7 +300,7 @@ public:
     void beginReadBuffer(MasterLineDriver& lines, const MasterTiming& timing, uint8_t* data, size_t len, bool last_nack,
                          ::m5::hal::v2::service::fast_tick_t now_tick);
 
-    ::m5::hal::v2::service::ServiceResult service(const ::m5::hal::v2::service::ServiceContext& ctx);
+    ::m5::hal::v2::service::ServiceResult service(::m5::hal::v2::service::fast_tick_t now_tick);
 
     Operation operation() const;
 
@@ -314,16 +317,15 @@ public:
 private:
     bool ackAfterRead(size_t index) const;
 
-    ::m5::hal::v2::service::ServiceResult serviceAddress(const ::m5::hal::v2::service::ServiceContext& ctx);
+    ::m5::hal::v2::service::ServiceResult serviceAddress(::m5::hal::v2::service::fast_tick_t now_tick);
 
-    ::m5::hal::v2::service::ServiceResult serviceWriteBuffer(const ::m5::hal::v2::service::ServiceContext& ctx);
+    ::m5::hal::v2::service::ServiceResult serviceWriteBuffer(::m5::hal::v2::service::fast_tick_t now_tick);
 
-    ::m5::hal::v2::service::ServiceResult serviceReadBuffer(const ::m5::hal::v2::service::ServiceContext& ctx);
+    ::m5::hal::v2::service::ServiceResult serviceReadBuffer(::m5::hal::v2::service::fast_tick_t now_tick);
     template <typename Service>
-    ::m5::hal::v2::service::ServiceResult serviceActive(Service& service,
-                                                        const ::m5::hal::v2::service::ServiceContext& ctx)
+    ::m5::hal::v2::service::ServiceResult serviceActive(Service& service, ::m5::hal::v2::service::fast_tick_t now_tick)
     {
-        auto result = service.service(ctx);
+        auto result = service.service(now_tick);
         if (result == ::m5::hal::v2::service::ServiceResult::Done) {
             _operation = Operation::Idle;
         } else if (result == ::m5::hal::v2::service::ServiceResult::Error) {
@@ -334,9 +336,9 @@ private:
     }
     template <typename Service>
     ::m5::hal::v2::service::ServiceResult serviceComposite(Service& service,
-                                                           const ::m5::hal::v2::service::ServiceContext& ctx)
+                                                           ::m5::hal::v2::service::fast_tick_t now_tick)
     {
-        auto result = service.service(ctx);
+        auto result = service.service(now_tick);
         if (result == ::m5::hal::v2::service::ServiceResult::Error) {
             _error     = service.error();
             _operation = Operation::Idle;
@@ -381,11 +383,10 @@ struct BusConfig_software : public IBusConfig {
 
 class Bus_software : public IBus, private service::IService {
 public:
+    ~Bus_software() override;
+
     result_t<void> init(const BusConfig_software& config);
-    result_t<void> release(void) override
-    {
-        return {};
-    }
+    result_t<void> release(void) override;
 
     result_t<void> transfer(bus::IAccessor* owner, const MasterAccessConfig& cfg, const TransferDesc& desc,
                             data::Source* src, size_t tx_len, data::Sink* dst, size_t rx_len) override;
@@ -402,10 +403,9 @@ private:
     gpio::Pin _pin_sda{};
     void* _transfer_state           = nullptr;
     bus::IAccessor* _transfer_owner = nullptr;
-    bool _transfer_active           = false;
-    bool _transfer_registered       = false;
-    bool _transfer_done             = true;
-    error::error_t _transfer_error  = error::error_t::OK;
+    std::atomic<bool> _transfer_registered{false};
+    service::CompletionGate _transfer_gate;
+    error::error_t _transfer_error = error::error_t::OK;
     bus::TransferTotals _transfer_totals{};
 };
 
@@ -415,7 +415,7 @@ struct BackendFor<BusConfig_software> {
     using type = Bus_software;
 };
 
-// Phase-3 software backend factory: builds a bit-bang Bus_software from a
+// software backend factory: builds a bit-bang Bus_software from a
 // LogicalBusConfig's pins. M5HALCore wires this into i2c::BusView (the logical
 // acquire path). The software variant is always present, so this is the
 // universal software fallback used when a bus is not (or not yet) on hardware.

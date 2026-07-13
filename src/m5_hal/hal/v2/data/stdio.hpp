@@ -59,9 +59,22 @@ public:
         return ConstDataSpan{_buf, avail};
     }
 
+    /*!
+      @brief Advance the read cursor by up to `N` bytes.
+
+      Clamped to the bytes currently buffered (`_used - _cursor`): asking
+      to skip more than that is not a contract violation (spec/design/
+      data_io.md §Source documents over-skip as a supported usage), but
+      unlike `StreamSource` (which queues the excess as a pending skip to
+      consume on arrival) or a memory-backed Source (which would move to
+      end-of-stream), the excess here is silently dropped and `eof()`
+      does not become true — a not-yet-arrived byte on a live console fd
+      may simply not exist yet, so there is nothing to queue against.
+     */
     result_t<void> advance(size_t N) override
     {
-        size_t skip = N < _used ? N : _used;
+        size_t remain = _used - _cursor;
+        size_t skip   = N < remain ? N : remain;
         _cursor += skip;
         return {};
     }
@@ -133,12 +146,28 @@ public:
 
     result_t<void> commit(size_t N) override
     {
+        _partial    = 0;
         size_t todo = N < kCapacity ? N : kCapacity;
-        if (todo > 0 && _file != nullptr) {
-            ::fwrite(_buf, 1, todo, _file);
-            ::fflush(_file);
+        if (todo == 0 || _file == nullptr) {
+            return {};
+        }
+        // Acceptance boundary is the FILE* stream: bytes fwrite() took are
+        // accepted even if the subsequent flush fails (the FILE abstraction
+        // cannot recount bytes lost past its own buffer). A short fwrite()
+        // reports the accepted prefix via partialCommitAccepted() so a
+        // driving caller advances upstream by exactly what went through.
+        size_t written = ::fwrite(_buf, 1, todo, _file);
+        int flushed    = ::fflush(_file);
+        if (written < todo || flushed != 0) {
+            _partial = written;
+            return m5::stl::make_unexpected(error::error_t::IO_ERROR);
         }
         return {};
+    }
+
+    size_t partialCommitAccepted() const override
+    {
+        return _partial;
     }
 
     bool closed() const override
@@ -149,7 +178,8 @@ public:
 private:
     static constexpr size_t kCapacity = 512;
 
-    FILE* _file = nullptr;
+    FILE* _file     = nullptr;
+    size_t _partial = 0;
     uint8_t _buf[kCapacity];
 };
 

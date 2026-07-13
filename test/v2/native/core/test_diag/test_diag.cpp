@@ -6,6 +6,7 @@
 // the flag (so this suite never needs a rebuild with the flag on).
 
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 #include <M5HAL_v2.hpp>
 #include <m5_hal/hal/v2/diag.hpp>
 
@@ -72,5 +73,6 @@ TEST(M5HalDiag, SetSinkReceivesFileLineFuncAndFormattedArgs)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

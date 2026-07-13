@@ -21,6 +21,8 @@
 #include <IOKit/serial/ioss.h>
 #endif
 
+#include "../../../../../hal/v2/diag.hpp"
+
 namespace m5::hal::v2::uart {
 
 namespace {
@@ -157,6 +159,16 @@ error::error_t posixIOError()
     return error::error_t::IO_ERROR;
 }
 
+// RAII unlock for a runtime::Mutex critical section (mirrors the pattern in
+// service.inl's ControlUnlock) so an early return can never leak the lock.
+struct MutexUnlock {
+    runtime::Mutex* m;
+    ~MutexUnlock()
+    {
+        m->unlock();
+    }
+};
+
 }  // namespace impl_posix
 }  // namespace
 
@@ -172,7 +184,7 @@ bool Bus_posix::baudToSpeed(uint32_t baud, uint32_t& out_speed)
 
 result_t<void> Bus_posix::init(const BusConfig_posix& config)
 {
-    (void)release();
+    (void)release();  // release() takes its own _state_mutex critical section
     _config      = config;
     _device_path = config.device_path;  // termios open is lazy (first write/read)
     _tx_coalesce = config.tx_coalesce_bytes;
@@ -181,6 +193,11 @@ result_t<void> Bus_posix::init(const BusConfig_posix& config)
 
 result_t<void> Bus_posix::release(void)
 {
+    if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
+        return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+    }
+    impl_posix::MutexUnlock state_unlock{&_state_mutex};
+
     if (_owns_fd && _fd >= 0) {
         ::close(_fd);
     }
@@ -188,6 +205,15 @@ result_t<void> Bus_posix::release(void)
     _owns_fd = false;
     _begun   = false;
     return {};
+}
+
+uint32_t Bus_posix::reconfigSkips()
+{
+    if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
+        return 0;
+    }
+    impl_posix::MutexUnlock state_unlock{&_state_mutex};
+    return _reconfig_skips;
 }
 
 error::error_t Bus_posix::open(const char* device_path, uint32_t baud)
@@ -200,13 +226,23 @@ error::error_t Bus_posix::open(const char* device_path, uint32_t baud)
     if (fd < 0) {
         return impl_posix::posixIOError();
     }
-    _fd      = fd;
-    _owns_fd = true;
-    _begun   = false;
+
+    if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
+        ::close(fd);
+        return error::error_t::TIMEOUT_ERROR;
+    }
+    {
+        impl_posix::MutexUnlock state_unlock{&_state_mutex};
+        _fd      = fd;
+        _owns_fd = true;
+        _begun   = false;
+    }
 
     uart::AccessConfig cfg;
     cfg.baud_rate = baud;
-    auto applied  = applyConfig(cfg);
+    // First apply on this fd: owner/entered are unused on that path (see
+    // applyConfig), so a null owner and Channel::None are safe here.
+    auto applied = applyConfig(nullptr, Channel::None, cfg);
     if (!applied.has_value()) {
         (void)release();
         return applied.error();
@@ -217,29 +253,41 @@ error::error_t Bus_posix::open(const char* device_path, uint32_t baud)
 error::error_t Bus_posix::attach(int fd)
 {
     (void)release();
-    _fd      = fd;
-    _owns_fd = false;  // caller keeps ownership of the descriptor
-    _begun   = false;
+    if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
+        return error::error_t::TIMEOUT_ERROR;
+    }
+    {
+        impl_posix::MutexUnlock state_unlock{&_state_mutex};
+        _fd      = fd;
+        _owns_fd = false;  // caller keeps ownership of the descriptor
+        _begun   = false;
+    }
 
     // Configure the line to raw immediately (symmetric with open()), so a peer
     // that writes before our first read sees a raw — not canonical — slave and
     // the bytes are delivered rather than line-buffered. The real per-access
     // baud/format is re-applied on the first write/read if it differs.
     uart::AccessConfig cfg;
-    auto applied = applyConfig(cfg);
+    auto applied = applyConfig(nullptr, Channel::None, cfg);  // first apply: no gate needed (see above)
     if (!applied.has_value()) {
         return applied.error();
     }
     return error::error_t::OK;
 }
 
-result_t<void> Bus_posix::applyConfig(const uart::AccessConfig& cfg)
+result_t<void> Bus_posix::applyConfig(bus::IAccessor* owner, Channel entered, const uart::AccessConfig& cfg)
 {
     if (cfg.baud_rate == 0 || cfg.data_bits != 8 || (cfg.stop_bits != 1 && cfg.stop_bits != 2)) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
 
+    if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
+        return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+    }
+    impl_posix::MutexUnlock state_unlock{&_state_mutex};
+
     // Lazily open the configured device when no fd has been adopted yet.
+    // Part of the first apply below (no reconfigure gate needed for it).
     if (_fd < 0) {
         if (_device_path == nullptr) {
             return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
@@ -253,10 +301,39 @@ result_t<void> Bus_posix::applyConfig(const uart::AccessConfig& cfg)
         _begun   = false;
     }
 
-    if (_begun && impl_posix::sameConfig(_applied_cfg, cfg)) {
+    if (!_begun) {
+        // First apply on this fd: no other owner can be mid-transfer yet
+        // (spec/design/uart.md), so no quiescence gate is needed.
+        return applyConfigLocked(cfg);
+    }
+    if (impl_posix::sameConfig(_applied_cfg, cfg)) {
         return {};
     }
 
+    if (owner == nullptr) {
+        // A reconfigure without an accessor identity cannot prove quiescence.
+        ++_reconfig_skips;
+        M5HAL_DIAG("uart reconfig skipped: no accessor identity (skips=%u)", static_cast<unsigned>(_reconfig_skips));
+        return {};
+    }
+
+    // Reconfigure: apply only when the opposite channel is quiescent for
+    // `owner` (spec/design/uart.md; IBus::tryAcquireOppositeChannel is the
+    // sanctioned exception to the channel-lock -> state-mutex ordering).
+    auto& ibus = static_cast<IBus&>(owner->getBus());
+    auto grant = ibus.tryAcquireOppositeChannel(owner, entered);
+    if (!grant.granted) {
+        ++_reconfig_skips;
+        M5HAL_DIAG("uart reconfig skipped: opposite channel busy (skips=%u)", static_cast<unsigned>(_reconfig_skips));
+        return {};  // keep serving the currently applied config
+    }
+    auto applied = applyConfigLocked(cfg);
+    ibus.releaseOppositeChannel(owner, grant);
+    return applied;
+}
+
+result_t<void> Bus_posix::applyConfigLocked(const uart::AccessConfig& cfg)
+{
     speed_t speed          = 0;
     const bool have_bconst = impl_posix::baudConstant(cfg.baud_rate, speed);
 #if !defined(__APPLE__)
@@ -357,14 +434,17 @@ result_t<size_t> Bus_posix::rawWrite(const uint8_t* data, size_t len, uint32_t t
     return done;
 }
 
-result_t<void> Bus_posix::flushCoalesced(uint32_t timeout_ms)
+result_t<void> Bus_posix::flushCoalescedLocked(uint32_t timeout_ms)
 {
     if (_co_used == 0) {
         return {};
     }
     const size_t pending = _co_used;
     _co_used             = 0;  // reset first: a failed flush must not replay stale bytes
-    auto w               = rawWrite(_co_buf, pending, timeout_ms);
+    // B12: rawWrite runs while _state_mutex is still held (the accepted
+    // trade-off — see spec/design/uart.md — a concurrent RX-side flush call
+    // waits up to write_timeout_ms behind this write instead of racing it).
+    auto w = rawWrite(_co_buf, pending, timeout_ms);
     if (!w.has_value()) {
         return m5::stl::make_unexpected(w.error());
     }
@@ -374,10 +454,18 @@ result_t<void> Bus_posix::flushCoalesced(uint32_t timeout_ms)
     return {};
 }
 
+result_t<void> Bus_posix::flushCoalesced(uint32_t timeout_ms)
+{
+    if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
+        return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+    }
+    impl_posix::MutexUnlock state_unlock{&_state_mutex};
+    return flushCoalescedLocked(timeout_ms);
+}
+
 result_t<size_t> Bus_posix::write(bus::IAccessor* owner, const uart::AccessConfig& cfg, data::Source* src, size_t len)
 {
-    (void)owner;
-    auto applied = applyConfig(cfg);
+    auto applied = applyConfig(owner, Channel::Tx, cfg);
     if (!applied.has_value()) {
         return m5::stl::make_unexpected(applied.error());
     }
@@ -394,6 +482,9 @@ result_t<size_t> Bus_posix::write(bus::IAccessor* owner, const uart::AccessConfi
         size_t n = 0;
         if (cap == 0 || span.value().size >= cap) {
             // Write-through (coalescing off, or the span alone fills a batch).
+            // flushCoalesced() (self-locking) drains any stale coalesced
+            // bytes first; this rawWrite of the NEW span is deliberately NOT
+            // under _state_mutex (B12: only _co_buf/_co_used need it).
             auto f = flushCoalesced(cfg.write_timeout_ms);
             if (!f.has_value()) {
                 return m5::stl::make_unexpected(f.error());
@@ -404,8 +495,15 @@ result_t<size_t> Bus_posix::write(bus::IAccessor* owner, const uart::AccessConfi
             }
             n = w.value();
         } else {
+            // Coalesce-buffer append (B12): capacity check + optional flush +
+            // memcpy + size update must be one atomic step against a
+            // concurrent RX-side flushCoalesced() call.
+            if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
+                return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+            }
+            impl_posix::MutexUnlock state_unlock{&_state_mutex};
             if (_co_used + span.value().size > cap) {
-                auto f = flushCoalesced(cfg.write_timeout_ms);
+                auto f = flushCoalescedLocked(cfg.write_timeout_ms);
                 if (!f.has_value()) {
                     return m5::stl::make_unexpected(f.error());
                 }
@@ -463,7 +561,7 @@ result_t<size_t> Bus_posix::rawReadableBytes()
 
 result_t<size_t> Bus_posix::read(bus::IAccessor* owner, const uart::AccessConfig& cfg, data::Sink* dst, size_t len)
 {
-    auto applied = applyConfig(cfg);
+    auto applied = applyConfig(owner, Channel::Rx, cfg);
     if (!applied.has_value()) {
         return m5::stl::make_unexpected(applied.error());
     }
@@ -476,7 +574,7 @@ result_t<size_t> Bus_posix::read(bus::IAccessor* owner, const uart::AccessConfig
 
 result_t<size_t> Bus_posix::readableBytes(bus::IAccessor* owner, const uart::AccessConfig& cfg)
 {
-    auto applied = applyConfig(cfg);
+    auto applied = applyConfig(owner, Channel::Rx, cfg);
     if (!applied.has_value()) {
         return m5::stl::make_unexpected(applied.error());
     }

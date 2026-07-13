@@ -35,7 +35,7 @@ SPI の CS assert/deassert のような kind 固有の電気的 session は、 b
 | 動詞 | 表すもの | 使う kind |
 |---|---|---|
 | `beginAccess` / `endAccess` | **排他期間 (bus ロックの取得・解放)** — 複数の transaction を内包し得る | i2c / spi / uart / i2s 共通 (基底) |
-| `beginTransaction` / `endTransaction` | **1 つの取引区間** (下表。`endTransaction` は区間の `TransferTotals` を返す) | i2c / spi / uart / i2s 共通 (2026-07-02、ADR-040 T3) |
+| `beginTransaction` / `endTransaction` | **1 つの取引区間** (下表。`endTransaction` は区間の `TransferTotals` を返す) | i2c / spi / uart / i2s 共通 |
 
 `beginTransaction` は**全 kind 共通の「相手との 1 取引区間」**であり、区間中は他 accessor
 (= 他スレッド) が同じチャネル/バスに割り込めない。区間が物理的に何を維持するかだけが
@@ -49,7 +49,7 @@ kind ごとに異なる:
 | I2S | 同上 |
 
 UART/I2S へ transaction を置く動機は「複数スレッドが同じ Bus を共有し、それぞれが複数 write を
-1 まとまりで送る」場面の排他を、kind に依らず同じ動詞で書けるようにすること (ADR-040 T3=C)。
+1 まとまりで送る」場面の排他を、kind に依らず同じ動詞で書けるようにすること。
 非同期進行 (`transferBusy` / `waitTransfer`) は I2C/SPI のみで、stream kind には提供しない。
 
 **共有の単位 (契約)**: `Bus` はスレッド間で共有してよいが、**`Accessor` は共有してはならない**
@@ -114,14 +114,14 @@ i2c_bus.transfer(&accessor, cfg, desc, &tx_source, &rx_sink);
 
 ## Bus の保持
 
-bus の入手・共有は **全 kind 共通の所有レジストリモデル** (ADR 034)。I2C / SPI はさらに intent 駆動の
-HW 割当 (phase 3) を持つ。UART / I2S は同じ `commitBuses()` / `hardwareInUse()` / logical acquire
+bus の入手・共有は **全 kind 共通の所有レジストリモデル**。I2C / SPI はさらに intent 駆動の
+HW 割当を持つ。UART / I2S は同じ `commitBuses()` / `hardwareInUse()` / logical acquire
 surface を持つが、現時点では static-backend policy で運用する。
 
 ### 全 kind = 所有レジストリ (identity acquire) — `M5_Hal.<KIND>`
 
 I2C / SPI / UART / I2S はすべて **`M5_Hal` が所有する共有 `bus::BusRegistry` に bus をインターンする**。
-利用者は物理配線 (ピン) で `acquire(cfg)` し、`shared_ptr` を借りる:
+利用者は物理配線 (ピン) で `acquire(cfg)` し、所有権を持つ `shared_ptr` を取得する:
 
 ```cpp
 auto i2c  = M5_Hal.I2C.acquire(m5hal::i2c::BusConfig{m5hal::i2c::Scl{22}, m5hal::i2c::Sda{21}});
@@ -148,18 +148,65 @@ m5hal::i2c::MasterAccessor dev{i2c.value(), acc_cfg};  // shared_ptr 直渡し =
 - **戻り値 = `result_t<shared_ptr<kind::IBus>>`** — 成功なら shared_ptr、失敗は明示 error。
   「範囲外 / 未登録がどちらも null」という旧 slot API の曖昧は構造的に消える。
 - **寿命 = registry が weak インターン**。返した `shared_ptr` が最後まで保持されている間 bus は生き、
-  **最後の保持者が手放すと解放** (バス dtor → backend release) されスロットが再利用される。**accessor を
+  **最後の保持者が手放すと自然解放** (bus dtor → backend release) される。通常のローカル bus は
+  weak pointer の失効後、次の registry 操作でスロットを回収する。remote のように外部資源の
+  解放確認が必要な bus は lifecycle tombstone を併用し、確認できた場合だけ identity / 外部 ID を
+  再利用する。確認不能なら tombstone を保持する (後述および [remote.md](remote.md) §動的バス生成)。
+  **accessor を
   `shared_ptr` から直接構築すると accessor が bus を co-own する** (`MasterAccessor dev{i2c.value(), cfg}`) ので、
   accessor が生きている間は bus も生き、利用者が別途 `shared_ptr` を保持し続けなくてよい (acquire の一時値から
   直接渡しても安全)。`IBus&` を渡す構築 (`dev{*i2c.value(), cfg}`) は自前所有のエスケープ用で、その場合は
   従来どおり bus を accessor より長く生かすのが利用者の契約。ボード層 (M5Unified) が ref を持ち続ければ内蔵
   バスは生存する。
+- **明示 release = exact-instance の consuming close**。`hal.<KIND>.release(bus)` は non-const
+  `shared_ptr&` を取る (各 kind の宣言形は
+  `result_t<void> release(std::shared_ptr<IBus>& bus)`)。registry 内の実体がその pointer と一致し、
+  かつ caller が唯一の
+  strong owner のときだけ実行する。Accessor や別の `shared_ptr` が co-own 中なら `BUSY`、
+  同一 identity の別実体や他 registry の bus なら `INVALID_ARGUMENT`。成功時は引数の
+  `shared_ptr` を reset する。release 中の同一 identity は acquire できず `BUSY` とする。
+  release 判定後に外部 `weak_ptr` が旧実体を復活させても、共有 lifecycle gate がRPC完了前に
+  旧実体を閉じるため、その操作は `CLOSED` となる。外部資源の自然解放を確認できない場合は
+  registry slotを `Quarantined` tombstoneとして保持し、同一identityの再取得を`BUSY`にする。
+  これにより、操作可能な旧 bus と新 bus が別 mutex で同じ配線を駆動する状態を作らない。
+
+明示 release の前に Accessor と alias を破棄する。成功時は `bus` 自体が空になるため、caller が
+追加の `reset()` を行う必要はない。失敗時は所有権を caller へ戻すので、原因を除いて同じ handle で
+再試行できる。
+
+```cpp
+auto bus = hal.I2C.acquire(cfg);
+if (!bus) { /* handle error */ }
+{
+    m5hal::i2c::MasterAccessor device{bus.value(), access_cfg};
+    // use device
+}  // Accessor の co-own を先に終える
+auto released = hal.I2C.release(bus.value());
+// success: bus.value() == nullptr; BUSY: alias/Accessor/release がまだ競合中
+```
+
+外部 identity を持つ bus は proxy と registry で同じ `BusLifecycle` を共有する。状態遷移は次の
+一方向を正本とする。
+
+```text
+Open --close開始--> Releasing --成功--> Closed
+  ^                      |
+  +------失敗rollback----+
+
+Open --自然解放の確認不能--> Quarantined
+```
+
+operation は `Open` の間だけ開始でき、開始済み operation と close は同じ gate で直列化される。
+`Closed` / `Quarantined` から操作は再開せず `CLOSED`。`Releasing` 中は registry の同一 identity
+acquire と別 release を `BUSY` にする。`Quarantined` は接続/backend 全体の cleanup まで identity を
+占有し、確認していない外部 ID の ABA 再利用を防ぐ。
+
 - **総数キャップ** (全 kind 合計の固定上限 `BusRegistry::kCapacity`) があり、満杯の acquire は `OUT_OF_RESOURCE`。
 - **直接構築も可**: `<kind>::Bus bus; bus.init(cfg);` も引き続き可能 (acquire はインターン共有が要るときの
   導線)。無印 `<kind>::Bus` は runtime facade で、backend は `init` に渡す config 型で選ぶ
   ([variants.md](variants.md) §facade kind / 各 kind の spec)。
 
-### I2C / SPI: intent 駆動の HW 割当 (phase 3)
+### I2C / SPI: intent 駆動の HW 割当
 
 I2C / SPI は上記に加え `acquire(LogicalBusConfig{pins, intent})` + 明示 `commitBuses()` で
 HW コントローラ割当を遅延解決し、ロック下で backend を hot-swap (reassign) できる。
@@ -169,12 +216,40 @@ HW コントローラ割当を遅延解決し、ロック下で backend を hot-
 
 ### UART / I2S: static-backend policy
 
-UART / I2S も `BusView` の形は I2C / SPI と揃える。つまり `commitBuses()` は呼べるが no-op、
-`hardwareInUse()` は 0、`acquire(LogicalBusConfig)` は surface と入力 validation だけを持つ。
+UART / I2S も `BusView` の形は I2C / SPI と揃える (実装は共有 — §BusView の実装共有)。つまり
+`commitBuses()` は呼べるが no-op、`hardwareInUse()` は 0 (`BusTraits::MANAGED_ALLOCATION = false`)、
+`acquire(LogicalBusConfig)` は surface と入力 validation だけを持つ。
 有効な logical request は `NOT_IMPLEMENTED`、identity 不正または `AllocationIntent` の require/forbid
 衝突は `INVALID_ARGUMENT`。実際の bus 生成は `acquire<CfgT>(cfg)` が担い、backend は初回 acquire の
 config 型で固定される。将来 UART/I2S に controller allocation policy を入れる場合も、利用者が覚える
 top-level API 名は変えない。
+
+### BusView の実装共有 — `bus::BusViewCore<Traits>`
+
+4 kind の `BusView` は `bus::BusViewCore<Traits>` を共有し、 各 kind の `BusView` は
+**`createBusConfig()` のオーバーロードだけを持つ薄い派生**である。 kind 差は `BusTraits` が持つ。
+
+- `Traits::MANAGED_ALLOCATION` — `true` = managed policy (I2C / SPI、 `hardwareInUse()` は backend へ
+  委譲)、 `false` = static-backend policy (UART / I2S、 `hardwareInUse()` は 0)
+- `createBusConfig()` はピン型 (`Scl`/`Sda`、 `Clk`/`Mosi`/`Miso` 等) が kind 固有のため共有できず、
+  各 kind の派生に残る
+
+**なぜ共有するのか**: `BusView` は `IHalBackend` の共通フックを呼び出す唯一の場所である。 kind ごとに
+コピーを持つと、 **新しいフックを足しても呼び出し側の一部が更新されず、 エラーも出さずに黙って
+何もしない**経路ができる (実例: `completeLogicalRequest` は 4 kind 共通の仕組みだが、 共有前は
+I2C の `BusView` からしか呼ばれていなかった)。 実装を 1 本にすれば呼び忘れが起こらない。
+
+**フック呼び出しの契約**: `acquire(const LogicalBusConfig&)` は identity 導出の**前に**
+`IHalBackend::completeLogicalRequest()` を必ず呼ぶ。 補完フックを持たない kind では既定の no-op が
+返るだけで、 呼び出し自体は省略しない。
+
+**なぜ typed acquire は非 virtual テンプレートなのか**: `acquire<CfgT>(cfg)` は具象 config 型を
+必要とし (variant backend の選択に使う)、 具象型は virtual 境界を越えられない。 この経路は本質的に
+ローカルであり、 remote backend は別機構を提供する。 一方 logical 経路と commit は型消去された
+要求を扱うため virtual で、 local / remote の双方が実装できる。
+
+**local / remote 透過はテンプレート化と独立**: `BusViewCore` は `IHalBackend*` を保持する。
+backend の差し替え可能性はこのポインタが担保しており、 テンプレートかどうかとは関係しない。
 
 ### `bus::BusGroup` (slot 公開テーブル) — utility
 
@@ -222,20 +297,18 @@ I2C / SPI / UART は **物理バス上に複数の通信相手を載せる** モ
 
 ## transaction 契約 (short transfer / sugar の区間参加)
 
-2026-07-02 決定 (ADR-040 T1/T2)。
-
-### short transfer: `tx_len` / `rx_len` は上限、totals が真実 (T1=A)
+### short transfer: `tx_len` / `rx_len` は上限、totals が真実
 
 `transfer(desc, Source*, tx_len, Sink*, rx_len)` の長さ引数は**上限**であり、`Source` が
 `tx_len` より先に EOF に達した場合・`Sink` が先に閉じた場合は**エラーではなく自然な転送終了**
 として扱う。実際に授受した量は `TransferTotals` (次の `transfer` 開始時または `endTransaction`
 で確定) にのみ記録され、不足の検出は呼び手が totals と要求長を比較して行う。span 版 sugar は
-長さが既知なのでこの規約の影響を受けない (write 系は full-or-fail、[ADR-039] の戻り値規約)。
+長さが既知なのでこの規約の影響を受けない (write 系は full-or-fail — 成功時は要求長を返す)。
 
 **Why**: `Source`/`Sink` は `peek`/`reserve` が要求より短く返せる設計であり、「長さは正確な契約」
 という前提の方が層の設計と合わない。remote 経由の可変長ストリームとも整合する。
 
-### sugar は開いている transaction に参加する (T2=A)
+### sugar は開いている transaction に参加する
 
 単発 sugar (`write` / `read` / `readRegister` 等) は内部で transaction を自動開始・終了するが、
 **呼び出し時点で明示 transaction が開いていれば depth 合成でそこに参加**し、物理区間

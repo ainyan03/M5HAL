@@ -113,17 +113,25 @@ struct TransferDesc : public bus::ITransferDesc {
 - 「prefix を inline buffer で値型保持」 は I2C 固有の判断 (短いバイト列を caller の手間なく渡す)。 SPI のように構造化されているなら inline buffer は不要
 - 1-引数 template ctor を持たせるかは kind ごとに判断 (SPI は構造化中心なので不要、 UART は raw bytes 中心なので I2C と同じパターンが効くかも)
 
-## sugar (≤ 2) と TransferDesc ctor (≤ 4) の非対称
+## sugar (`int reg`) と TransferDesc ctor (≤ 4) の非対称
 
-| API | SFINAE 制約 | 用途 |
+公開 I2C API に型駆動の register sugar (`readRegister<TReg>` 等) は存在しない。 register
+address の幅は `MasterAccessConfig::register_address_bytes` (`0`/`1` = 1 byte、 `2` = 2 byte)
+が唯一の決定源で、 呼び出し引数の C++ 型は幅に影響しない (`i2c.hpp:510-538` の doc comment
+を参照)。
+
+| API | 制約 | 用途 |
 |---|---|---|
-| sugar `writeRegister<TReg>` / `readRegister<TReg>` | `sizeof(TReg) ≤ 2` | M5UU `M5UnitComponent` と signature 整合。 typical case (1-byte / 2-byte register address) |
-| sugar `writeRegister(int)` / `readRegister(int)` | `register_address_bytes` が `0` / `1` / `2` | Arduino-style 直値呼び出し。 `0` / `1` は 1 byte、 `2` は 2 byte |
+| sugar `writeRegister(int)` / `readRegister(int)` | `register_address_bytes` が `0` / `1` / `2` | 典型ケース。 `makeLiteralRegisterDesc` が幅チェック済み `TransferDesc` を組み立てる |
 | `TransferDesc` 1-引数 ctor | `sizeof(T) ≤ 4` | 低レイヤ利用者向け自由度。 4-byte register address (極めて稀) は caller が `TransferDesc{uint32_t{...}}` で対応 |
 
-「典型ケースは sugar、 高度ケースは TransferDesc 直接組み立て」 の棲み分け。 型付き sugar は `TransferDesc{reg}` template ctor に委譲する。 signed literal sugar は `register_address_bytes` を正規化してから `TransferDesc` を組み立てる。
+「典型ケースは `int reg` sugar、 高度ケースは TransferDesc 直接組み立て」 の棲み分け。
+`writeRegister(int reg, ...)` / `readRegister(int reg, ...)` は内部で `makeLiteralRegisterDesc(reg)`
+を呼び、 `register_address_bytes` に基づき幅チェック済みの `TransferDesc` を組み立ててから
+transfer する。
 
-sugar 仕様は [i2c.md](i2c.md) §register sugar を参照。
+sugar 仕様は [i2c.md](i2c.md) §register sugar、 公開シグネチャは
+`i2c.hpp:539-615` を参照。
 
 ## byte order の規約
 

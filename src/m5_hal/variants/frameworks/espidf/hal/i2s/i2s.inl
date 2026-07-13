@@ -6,6 +6,7 @@
 
 #if defined(ESP_PLATFORM) && M5HAL_ESPIDF_I2S_HAS_STD
 
+#include <driver/gpio.h>
 #include <esp_err.h>
 #include <freertos/FreeRTOS.h>
 
@@ -74,11 +75,11 @@ bool sameAccessConfig(const i2s::AccessConfig& a, const i2s::AccessConfig& b)
 // (memcpy-like). dst == src does the swap in place; otherwise dst and src must
 // not overlap. Both must be >= 2-byte aligned; len need not be a multiple of 4 —
 // a trailing 2-byte tail (len % 4 == 2) is copied verbatim (no pair to swap).
-// This undoes the I2S HW v2 L/R-slot transpose (see Bus_espidf::_swap16).
+// This undoes the I2S HW v1 L/R-slot transpose (see Bus_espidf::_swap16).
 //
 // The shape — two INDEPENDENT 16-bit loads, then 16-bit stores to the SWAPPED
 // offsets (the swap is the addressing, no ALU op in the load->store chain) — is
-// deliberate for the Xtensa LX6/LX7 of HW v2 (classic ESP32 / ESP32-S2): an
+// deliberate for the Xtensa LX6/LX7 of HW v1 (classic ESP32 / ESP32-S2): an
 // l32i + funnel-shift would stall on the 2-cycle load-use latency (the shift
 // waits on the load), the two l16ui do not. At -O2/-Os/-O3 GCC compiles this C
 // to exactly that (a zero-overhead `loop` + l16ui x2 + s16i x2 — verified by
@@ -185,6 +186,8 @@ result_t<void> Bus_espidf::init(const BusConfig_espidf& config)
     _dma_rx_available.store(0, std::memory_order_relaxed);
     _dma_capacity    = 0;
     _dma_rx_capacity = 0;
+    _dma_tx_frames   = 0;
+    _dma_rx_frames   = 0;
     return {};
 }
 
@@ -218,12 +221,63 @@ void Bus_espidf::destroyChannel(void)
         ::i2s_del_channel(_rx_handle);
         _rx_handle = nullptr;
     }
+    // Unbind the pins ourselves: unlike spi_bus_free (gpio_reset_pin) and the
+    // I2C deinit (gpio_output_disable), i2s_del_channel only revokes the
+    // esp_gpio_reserve bookkeeping — the GPIO matrix routing and the
+    // peripheral-controlled output enable survive the delete, so every output
+    // pin keeps actively driving its frozen level (measured on ESP32 and
+    // ESP32-S3 with IDF 5.5: a deleted channel's BCLK/WS/DOUT ignores external
+    // pulls until something re-takes the pin). gpio_reset_pin returns them to
+    // the chip-default high-Z-with-pullup state, matching what the other bus
+    // kinds' vendor drivers leave behind. _config still holds the pins this
+    // channel was created with (re-init overwrites it only after this runs).
+    const int pins[] = {_config.pin_bclk, _config.pin_ws, _config.pin_dout, _config.pin_din, _config.pin_mclk};
+    for (int pin : pins) {
+        if (pin >= 0) {
+            ::gpio_reset_pin(static_cast<gpio_num_t>(pin));
+        }
+    }
     _channel_enabled = false;
     _configured      = false;
     _dma_in_flight.store(0, std::memory_order_relaxed);
     _dma_rx_available.store(0, std::memory_order_relaxed);
     _dma_capacity    = 0;
     _dma_rx_capacity = 0;
+    _dma_tx_frames   = 0;
+    _dma_rx_frames   = 0;
+}
+
+// ---------------------------------------------------------------------------
+// updateDerivedState
+// ---------------------------------------------------------------------------
+void Bus_espidf::updateDerivedState(const i2s::AccessConfig& cfg, size_t& out_frame_bytes)
+{
+    // Classic ESP32 (I2S HW v1) cannot duplicate a mono sample into both slots
+    // in hardware: with slot_mode MONO the sample effectively updates a
+    // fixed-slot mono amplifier at fs/2 (measured on Core2/NS4168: correct
+    // 440 Hz fundamental plus fs/2 and fs/2±440 spurs — half-rate imaging).
+    // M5Unified avoids the same trap on this silicon by duplicating each
+    // sample into both 16-bit halves of its 32-bit mixing frames and only
+    // uses the hardware mono registers (tx_mono/tx_chan_equal) on HW v2.
+    // So on HW v1 we run stereo slots and duplicate in write()/read()
+    // (_expand_mono); HW v2 and later keep the native mono slot mode.
+#if SOC_I2S_HW_VERSION_1
+    _expand_mono = (cfg.channels == 1);
+#else
+    _expand_mono = false;
+#endif
+    const size_t slots = _expand_mono ? 2u : cfg.channels;
+    out_frame_bytes    = static_cast<size_t>(cfg.bits_per_sample / 8) * slots;
+
+    // 16-bit stereo on HW v1 transposes the two 16-bit halves of each 32-bit
+    // FIFO word (= the L/R slots); undo it in the DMA buffer (see _swap16 doc
+    // in the header). Mono is duplicated (L==R, no-op) and 24/32-bit fill a
+    // whole word.
+#if SOC_I2S_HW_VERSION_1
+    _swap16 = (cfg.bits_per_sample == 16) && (slots == 2) && !_expand_mono;
+#else
+    _swap16 = false;
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -278,6 +332,36 @@ result_t<void> Bus_espidf::ensureChannel(const i2s::AccessConfig& cfg)
         // protocol-level pre-notification would be needed to eliminate
         // the transient entirely.
         if (_configured && _tx_handle != nullptr && _rx_handle != nullptr) {
+            // Recompute _expand_mono / _swap16 for the new cfg BEFORE building
+            // the slot/clock config below: without this call the slot mode and
+            // the write()/read() byte-swap path would keep using the PREVIOUS
+            // cfg's derived state against the newly reconfigured hardware.
+            size_t reconfig_frame_bytes = 0;
+            updateDerivedState(cfg, reconfig_frame_bytes);
+
+            // This path never tears down the channel, but the driver DOES
+            // reallocate every descriptor's buffer when the new slot mode
+            // changes the frame size (i2s_std_set_slot re-derives the buffer
+            // size from the active slot count; measured on ESP32-S3: the DMA
+            // heap swings by half the capacity on a mono<->stereo switch,
+            // stays put on a rate-only change). The descriptor geometry
+            // (desc_num * frame_num) is kept, so capacity tracks
+            // frames * frame_bytes. Reallocation also discards whatever was
+            // in flight, so the counts drop with it; on a rate-only change
+            // buffers and counts survive alike and both stay untouched.
+            // Frame size is constant on HW v1 (_expand_mono pins stereo
+            // slots), so there this whole block is a no-op.
+            const size_t new_tx_capacity = _dma_tx_frames * reconfig_frame_bytes;
+            const size_t new_rx_capacity = _dma_rx_frames * reconfig_frame_bytes;
+            if (new_tx_capacity != _dma_capacity) {
+                _dma_capacity = new_tx_capacity;
+                _dma_in_flight.store(0, std::memory_order_relaxed);
+            }
+            if (new_rx_capacity != _dma_rx_capacity) {
+                _dma_rx_capacity = new_rx_capacity;
+                _dma_rx_available.store(0, std::memory_order_relaxed);
+            }
+
             const ::i2s_slot_mode_t slot_mode_fdx =
                 (cfg.channels == 1 && !_expand_mono) ? I2S_SLOT_MODE_MONO : I2S_SLOT_MODE_STEREO;
             ::i2s_std_clk_config_t clk_cfg   = I2S_STD_CLK_DEFAULT_CONFIG(cfg.sample_rate_hz);
@@ -320,32 +404,11 @@ result_t<void> Bus_espidf::ensureChannel(const i2s::AccessConfig& cfg)
         // Single-channel bus: disable → destroy → recreate below.
         destroyChannel();
 
-        // --- Frame size (bytes per DMA frame = 1 sample across all slots).
-        // Classic ESP32 (I2S HW v2) cannot duplicate a mono sample into both
-        // slots in hardware: with slot_mode MONO the sample effectively updates
-        // a fixed-slot mono amplifier at fs/2 (measured on Core2/NS4168: correct
-        // 440 Hz fundamental plus fs/2 and fs/2±440 spurs — half-rate imaging).
-        // M5Unified avoids the same trap on this silicon by duplicating each
-        // sample into both 16-bit halves of its 32-bit mixing frames and only
-        // uses the hardware mono registers (tx_mono/tx_chan_equal) on HW v2.
-        // So on HW v2 we run stereo slots and duplicate in write()
-        // (_expand_mono); HW v2 and later keep the native mono slot mode.
-#if SOC_I2S_HW_VERSION_1
-        _expand_mono = (cfg.channels == 1);
-#else
-        _expand_mono = false;
-#endif
-        const size_t slots       = _expand_mono ? 2u : cfg.channels;
-        const size_t frame_bytes = static_cast<size_t>(cfg.bits_per_sample / 8) * slots;
-
-        // 16-bit stereo on HW v2 transposes the two 16-bit halves of each 32-bit
-        // FIFO word (= the L/R slots); undo it in the DMA buffer (see _swap16 doc).
-        // Mono is duplicated (L==R, no-op) and 24/32-bit fill a whole word.
-#if SOC_I2S_HW_VERSION_1
-        _swap16 = (cfg.bits_per_sample == 16) && (slots == 2) && !_expand_mono;
-#else
-        _swap16 = false;
-#endif
+        // --- Frame size (bytes per DMA frame = 1 sample across all slots) and
+        // the _expand_mono / _swap16 derived state (see updateDerivedState for
+        // why HW v1 needs them).
+        size_t frame_bytes = 0;
+        updateDerivedState(cfg, frame_bytes);
 
         // --- Which channels to open is pin-driven: DOUT enables TX, DIN enables RX.
         // At least one must be wired, or there is nothing to drive.
@@ -383,12 +446,20 @@ result_t<void> Bus_espidf::ensureChannel(const i2s::AccessConfig& cfg)
         chan_cfg.dma_frame_num       = want_tx ? tx_frame_num : rx_frame_num;
         chan_cfg.auto_clear          = true;  // underrun → silence
 
-        // The RX channel inherits chan_cfg's geometry, so its true capacity is that
-        // geometry (when RX is the only channel this equals the rx_buffer_size
-        // sizing already in _dma_rx_capacity, but when paired with TX it is the TX
-        // geometry — recompute either way to stay correct).
+        // Both channels inherit chan_cfg's geometry, so the true capacity per
+        // direction is that geometry (when RX is the only channel this equals
+        // the rx_buffer_size sizing already in _dma_rx_capacity, but when
+        // paired with TX it is the TX geometry — recompute either way to stay
+        // correct). The frames factor is kept per direction so the full-duplex
+        // reconfig path above can re-derive capacity when the frame size
+        // changes (the driver keeps the geometry but reallocates the buffers).
+        const size_t chan_frames = static_cast<size_t>(chan_cfg.dma_desc_num) * chan_cfg.dma_frame_num;
+        if (want_tx) {
+            _dma_tx_frames = chan_frames;
+        }
         if (want_rx) {
-            _dma_rx_capacity = static_cast<size_t>(chan_cfg.dma_desc_num) * chan_cfg.dma_frame_num * frame_bytes;
+            _dma_rx_frames   = chan_frames;
+            _dma_rx_capacity = chan_frames * frame_bytes;
         }
 
         esp_err_t ret = ::i2s_new_channel(&chan_cfg, want_tx ? &_tx_handle : nullptr, want_rx ? &_rx_handle : nullptr);
@@ -399,7 +470,7 @@ result_t<void> Bus_espidf::ensureChannel(const i2s::AccessConfig& cfg)
         }
 
         // --- Slot / clock config (Philips standard; stereo slots when
-        // _expand_mono substitutes for the unusable HW v2 mono mode)
+        // _expand_mono substitutes for the unusable HW v1 mono mode)
         const ::i2s_slot_mode_t slot_mode =
             (cfg.channels == 1 && !_expand_mono) ? I2S_SLOT_MODE_MONO : I2S_SLOT_MODE_STEREO;
 
@@ -621,7 +692,7 @@ result_t<size_t> Bus_espidf::write(bus::IAccessor* owner, const i2s::AccessConfi
         }
 
         if (_swap16) {
-            // HW v2 16-bit stereo: write through a bounce with each frame's L/R
+            // HW v1 16-bit stereo: write through a bounce with each frame's L/R
             // 16-bit halves transposed so the silicon's transpose lands the data
             // back in standard order on the wire. Accounting is 1:1 (no mono
             // expansion); only whole 4-byte frames are written so the swap never
@@ -787,7 +858,7 @@ result_t<size_t> Bus_espidf::read(bus::IAccessor* owner, const i2s::AccessConfig
         }
 
         if (_expand_mono) {
-            // HW v2 mono capture: the DMA delivers duplicated stereo frames, so
+            // HW v1 mono capture: the DMA delivers duplicated stereo frames, so
             // read physical stereo into a bounce buffer and keep the left slot
             // of each frame as the logical mono sample. `want` (and `done`) stay
             // in logical (mono) bytes; only the i2s_channel_read size is physical.
@@ -847,7 +918,7 @@ result_t<size_t> Bus_espidf::read(bus::IAccessor* owner, const i2s::AccessConfig
         }
 
         if (_swap16) {
-            // HW v2 16-bit stereo: capture whole frames, then transpose each
+            // HW v1 16-bit stereo: capture whole frames, then transpose each
             // frame's L/R 16-bit halves in place to undo the silicon's transpose
             // (the wire carries standard Philips). Round to 4-byte frames and
             // complete any partial frame so the swap never straddles a boundary.
@@ -984,7 +1055,7 @@ result_t<size_t> Bus_espidf::readableBytes(bus::IAccessor* owner, const i2s::Acc
 
     const size_t available = _dma_rx_available.load(std::memory_order_relaxed);
     // Public accounting stays in logical (mono) bytes; the physical capture is
-    // duplicated stereo on HW v2 mono, so halve it.
+    // duplicated stereo on HW v1 mono, so halve it.
     return _expand_mono ? available / 2 : available;
 }
 

@@ -11,6 +11,7 @@
 
 #include <M5HAL_v2.hpp>
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 
 #include <csignal>
 
@@ -22,8 +23,8 @@
 #include <termios.h>  // for the B<rate> baud constants checked in AcceptsHighBaudRates
 #include <unistd.h>
 
-#include <atomic>
 #include <cstring>
+#include <future>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -36,7 +37,7 @@ namespace uart  = ::m5::hal::v2::uart;
 namespace data  = ::m5::hal::v2::data;
 namespace error = ::m5::hal::v2::error;
 
-// S20: the posix variant never reads the pin fields (`device_path` is
+// The posix variant never reads the pin fields (`device_path` is
 // the connection identity), so it deliberately does NOT inherit the
 // tag-pin constructors — a one-line pin construction would only look
 // complete while leaving `device_path` unset.
@@ -237,7 +238,7 @@ TEST(PosixUART, StreamSourcePullsFromRxAccessor)
     EXPECT_EQ(rest->data[1], 0xA5);
 }
 
-TEST(PosixUART, StreamSourceTimesOutWhenIdle)
+TEST(PosixUART, StreamSourceReturnsEmptyWhenIdle)
 {
     PtyPair pty;
     ASSERT_TRUE(pty.open());
@@ -253,9 +254,10 @@ TEST(PosixUART, StreamSourceTimesOutWhenIdle)
     data::StreamSource src{dev.rx(), data::DataSpan{scratch, sizeof(scratch)}};
 
     auto peeked = src.peek(8);
-    ASSERT_FALSE(peeked.has_value());
-    EXPECT_EQ(peeked.error(), error::error_t::TIMEOUT_ERROR);
-    EXPECT_FALSE(src.eof());  // a timeout is recoverable, not end-of-stream
+    ASSERT_TRUE(peeked.has_value());
+    EXPECT_EQ(peeked->size, 0u);
+    EXPECT_FALSE(src.eof());  // idle is recoverable, not end-of-stream
+    EXPECT_FALSE(src.closed());
 }
 
 TEST(PosixUART, StreamSinkPushesToTxAccessor)
@@ -587,6 +589,233 @@ TEST(PosixUART, BaudTableMapsKnownConstants)
     EXPECT_FALSE(Bus::baudToSpeed(12345, s));
 }
 
+// UART state mutex + reconfiguration quiescence gate. These four tests
+// exercise Bus_posix::reconfigSkips() (a diagnostic counter, see
+// spec/design/uart.md), not the physical line speed (a pty ignores it).
+
+// T1: with neither channel busy, a reconfigure applies immediately and never
+// counts a skip.
+TEST(PosixUART, ReconfigureAppliesWhenChannelsAreQuiescent)
+{
+    PtyPair pty;
+    ASSERT_TRUE(pty.open());
+
+    uart::Bus_posix bus;
+    ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
+
+    auto cfg_a = makeConfig();
+    uart::TxAccessor tx{bus, cfg_a};
+
+    const uint8_t tx1[] = {0x01};
+    ASSERT_TRUE(tx.write(data::ConstDataSpan{tx1, sizeof(tx1)}).has_value());
+    EXPECT_EQ(bus.reconfigSkips(), 0u);
+
+    auto cfg_b      = cfg_a;
+    cfg_b.baud_rate = 9600;
+    ASSERT_TRUE(tx.setConfig(cfg_b).has_value());
+    const uint8_t tx2[] = {0x02};
+    ASSERT_TRUE(tx.write(data::ConstDataSpan{tx2, sizeof(tx2)}).has_value());
+    EXPECT_EQ(bus.reconfigSkips(), 0u);
+}
+
+// T2: an open RX access window (on a SEPARATE accessor from TX, not its
+// combined-lock peer) makes a concurrent TX reconfigure not-granted (the
+// transfer still succeeds, using the config already in effect); once the
+// window closes the same pending config applies without counting a further
+// skip. This is decided by the same-task guard (step 2 of
+// IBus::tryAcquireOppositeChannel): both accessors run on this
+// one test thread, so the RX channel's lock-task slot matches the calling
+// task id while its owner is neither `tx` nor `tx`'s lock peer, and the
+// gate returns not-granted WITHOUT attempting a try-lock (a same-thread
+// try_lock would be undefined behavior on POSIX std::timed_mutex).
+TEST(PosixUART, ReconfigureSkipsWhenOppositeChannelBusy)
+{
+    PtyPair pty;
+    ASSERT_TRUE(pty.open());
+
+    uart::Bus_posix bus;
+    ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
+
+    auto cfg_a = makeConfig();
+    uart::RxAccessor rx{bus, cfg_a};
+    uart::TxAccessor tx{bus, cfg_a};
+
+    // Establish cfg_a as the applied config (first write on this fd: no gate).
+    const uint8_t seed[] = {0x00};
+    ASSERT_TRUE(tx.write(data::ConstDataSpan{seed, sizeof(seed)}).has_value());
+    EXPECT_EQ(bus.reconfigSkips(), 0u);
+
+    // Hold the RX channel open, then ask for a different config from TX: the
+    // same-task guard sees this thread's task id on the RX slot (owned by
+    // `rx`, unrelated to `tx`) and reports not-granted without a try-lock.
+    ASSERT_TRUE(rx.beginAccess().has_value());
+
+    auto cfg_b      = cfg_a;
+    cfg_b.baud_rate = 9600;
+    ASSERT_TRUE(tx.setConfig(cfg_b).has_value());
+    const uint8_t probe[] = {0x11};
+    auto written          = tx.write(data::ConstDataSpan{probe, sizeof(probe)});
+    ASSERT_TRUE(written.has_value()) << "err=" << error::toString(written.error());
+    EXPECT_EQ(written.value(), sizeof(probe));  // transfer proceeds with the still-applied config
+    EXPECT_EQ(bus.reconfigSkips(), 1u);
+
+    ASSERT_TRUE(rx.endAccess().has_value());
+
+    // Same (still-pending) cfg_b, now that RX is idle: applies this time,
+    // without counting a second skip.
+    auto written2 = tx.write(data::ConstDataSpan{probe, sizeof(probe)});
+    ASSERT_TRUE(written2.has_value()) << "err=" << error::toString(written2.error());
+    EXPECT_EQ(bus.reconfigSkips(), 1u);
+}
+
+// T3: a combined uart::Accessor::transfer() call holds both channels itself
+// (via two SEPARATE per-channel owners, _tx and _rx -- see
+// uart::Accessor::beginAccess), but the two are wired as each other's lock
+// peer (bus::IAccessor::lockPeer, set by uart::Accessor's ctor). The
+// write-half's gate check (entered=Tx, opposite=Rx) sees `_rx_lock_owner ==
+// &_rx == owner->lockPeer()`, so step 1 (self/peer hold) grants it directly
+// -- no try-lock, no skip. The read-half's gate check (entered=Rx,
+// opposite=Tx) likewise sees the SAME owner (&_tx) directly on
+// `_tx_lock_owner`, so step 1 fires there too. Net effect: the new config
+// applies with zero skips, and it is already in effect for the write half
+// of this very transfer (not just the read half).
+TEST(PosixUART, ReconfigureViaCombinedAccessorApplies)
+{
+    PtyPair pty;
+    ASSERT_TRUE(pty.open());
+
+    uart::Bus_posix bus;
+    ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
+
+    auto cfg_a = makeConfig();
+    uart::Accessor dev{bus, cfg_a};
+
+    // Establish cfg_a (first write on this fd: no gate).
+    const uint8_t seed[] = {0x00};
+    ASSERT_TRUE(dev.write(data::ConstDataSpan{seed, sizeof(seed)}).has_value());
+    EXPECT_EQ(bus.reconfigSkips(), 0u);
+
+    auto cfg_b      = cfg_a;
+    cfg_b.baud_rate = 9600;
+    ASSERT_TRUE(dev.setConfig(cfg_b).has_value());
+
+    const uint8_t txbuf[] = {0xAA};
+    uint8_t rxbuf[4]      = {};
+    auto totals = dev.transfer(data::ConstDataSpan{txbuf, sizeof(txbuf)}, data::DataSpan{rxbuf, sizeof(rxbuf)});
+    ASSERT_TRUE(totals.has_value()) << "err=" << error::toString(totals.error());
+    EXPECT_EQ(totals.value().tx, sizeof(txbuf));
+    EXPECT_EQ(bus.reconfigSkips(), 0u);
+
+    // The new config was already in effect for the transfer above: a
+    // further write with the SAME cfg_b is a no-op sameConfig match and
+    // counts no skip either.
+    ASSERT_TRUE(dev.tx().write(data::ConstDataSpan{txbuf, sizeof(txbuf)}).has_value());
+    EXPECT_EQ(bus.reconfigSkips(), 0u);
+}
+
+// T5: a genuine CROSS-THREAD hold of the opposite channel (a different task,
+// as opposed to T2's same-thread/different-accessor case) is the only
+// scenario that reaches step 3 of IBus::tryAcquireOppositeChannel (the
+// non-blocking try-lock actually attempted, and actually failing because
+// another thread really does hold the RX mutex). The handshake between the
+// two threads is fully deterministic (std::promise/future), not sleep-based:
+// `other` signals once its RX window is open, main signals back once its
+// write (and the reconfigure attempt inside it) has completed, and `other`
+// only closes the window after that.
+TEST(PosixUART, ReconfigureSkipsWhenOppositeHeldByAnotherThread)
+{
+    PtyPair pty;
+    ASSERT_TRUE(pty.open());
+
+    uart::Bus_posix bus;
+    ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
+
+    auto cfg_a = makeConfig();
+    uart::RxAccessor rx{bus, cfg_a};
+    uart::TxAccessor tx{bus, cfg_a};
+
+    // Establish cfg_a as the applied config (first write on this fd: no gate).
+    const uint8_t seed[] = {0x00};
+    ASSERT_TRUE(tx.write(data::ConstDataSpan{seed, sizeof(seed)}).has_value());
+    EXPECT_EQ(bus.reconfigSkips(), 0u);
+
+    std::promise<void> rx_opened_promise;
+    std::future<void> rx_opened = rx_opened_promise.get_future();
+    std::promise<void> may_close_promise;
+    std::future<void> may_close = may_close_promise.get_future();
+
+    std::thread other([&]() {
+        ASSERT_TRUE(rx.beginAccess().has_value());
+        rx_opened_promise.set_value();
+        may_close.wait();
+        ASSERT_TRUE(rx.endAccess().has_value());
+    });
+
+    rx_opened.wait();
+
+    // Reconfigure TX while `other` (a DIFFERENT thread) holds RX: the
+    // same-task guard (step 2) does not fire here -- the RX lock-task slot
+    // holds `other`'s task id, not this (main) thread's -- so the gate falls
+    // through to the non-blocking try-lock (step 3), which fails because
+    // `other` genuinely holds the RX mutex. Not granted -> skip.
+    auto cfg_b      = cfg_a;
+    cfg_b.baud_rate = 9600;
+    ASSERT_TRUE(tx.setConfig(cfg_b).has_value());
+    const uint8_t probe[] = {0x11};
+    auto written          = tx.write(data::ConstDataSpan{probe, sizeof(probe)});
+    ASSERT_TRUE(written.has_value()) << "err=" << error::toString(written.error());
+    EXPECT_EQ(written.value(), sizeof(probe));  // transfer proceeds with the still-applied config
+    EXPECT_EQ(bus.reconfigSkips(), 1u);
+
+    may_close_promise.set_value();
+    other.join();
+
+    // RX is idle now: the same (still-pending) cfg_b applies without
+    // counting a second skip.
+    auto written2 = tx.write(data::ConstDataSpan{probe, sizeof(probe)});
+    ASSERT_TRUE(written2.has_value()) << "err=" << error::toString(written2.error());
+    EXPECT_EQ(bus.reconfigSkips(), 1u);
+}
+
+// T4: TX-side coalescing defers small writes; an RX-side readableBytes()
+// flushes the pending bytes before it reports (posix Bus_posix::flushCoalesced,
+// B12). A fresh Bus_posix is init()'d with coalescing enabled and then
+// attach()'d to the pty slave (init() sets _tx_coalesce; attach() adopts the
+// fd without touching it — see Bus_posix::release()).
+TEST(PosixUART, CoalesceFlushesOnRxReadableBytes)
+{
+    PtyPair pty;
+    ASSERT_TRUE(pty.open());
+
+    uart::BusConfig_posix bus_cfg;
+    bus_cfg.tx_coalesce_bytes = 64;
+    uart::Bus_posix bus;
+    ASSERT_TRUE(bus.init(bus_cfg).has_value());
+    ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
+
+    auto cfg = makeConfig();
+    uart::Accessor dev{bus, cfg};
+    ASSERT_TRUE(dev.setConfig(cfg).has_value());
+
+    const uint8_t pat[] = {0x9A, 0x9B, 0x9C};
+    auto written        = dev.write(data::ConstDataSpan{pat, sizeof(pat)});
+    ASSERT_TRUE(written.has_value());
+    EXPECT_EQ(written.value(), sizeof(pat));
+
+    // Not yet on the wire: still sitting in the coalescing buffer.
+    EXPECT_FALSE(waitReadable(pty.master, 50));
+
+    // The RX-side readableBytes() call flushes the coalescing buffer first.
+    auto avail = dev.readableBytes();
+    ASSERT_TRUE(avail.has_value());
+
+    ASSERT_TRUE(waitReadable(pty.master, 1000)) << "coalesced bytes never reached the master";
+    uint8_t got[16] = {};
+    ssize_t n       = ::read(pty.master, got, sizeof(got));
+    ASSERT_EQ(n, static_cast<ssize_t>(sizeof(pat)));
+    EXPECT_EQ(::memcmp(got, pat, sizeof(pat)), 0);
+}
+
 }  // namespace
 
 #else  // M5HAL_FRAMEWORK_HAS_POSIX
@@ -604,5 +833,6 @@ int main(int argc, char** argv)
     // test run is not killed during teardown.
     ::signal(SIGHUP, SIG_IGN);
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

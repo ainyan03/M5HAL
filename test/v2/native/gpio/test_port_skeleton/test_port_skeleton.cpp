@@ -16,6 +16,7 @@
 // The contract is defined in spec/design/gpio.md.
 
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 #include <M5HAL_v2.hpp>
 
 namespace {
@@ -125,5 +126,6 @@ TEST(PortSkeleton, AllBitsIndependent)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

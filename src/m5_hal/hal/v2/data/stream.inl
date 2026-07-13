@@ -54,7 +54,7 @@ m5::hal::v2::result_t<ConstDataSpan> StreamSource::peek(size_t max_len)
             return m5::stl::make_unexpected(drained.error());
         }
         if (_pending_skip > 0) {
-            return m5::stl::make_unexpected(m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+            return ConstDataSpan{};
         }
     }
     // Compaction only ever runs right after `advance` consumed a
@@ -68,8 +68,9 @@ m5::hal::v2::result_t<ConstDataSpan> StreamSource::peek(size_t max_len)
     // Top up whenever the request is not yet satisfied: one blocking
     // read, bounded by the reader's own timeout policy. After the
     // timeout the caller gets whatever did arrive (a short peek);
-    // only a still-empty buffer reports TIMEOUT_ERROR. Callers that
-    // must not block check `readableBytes()` first.
+    // a still-empty buffer returns an empty successful span (idle,
+    // not an error). Callers that must not block check
+    // `readableBytes()` first.
     const size_t want = std::min(max_len, _scratch.size);
     if (want > buffered() && _filled < _scratch.size) {
         auto got = _reader->read(DataSpan{_scratch.data + _filled, _scratch.size - _filled});
@@ -79,7 +80,7 @@ m5::hal::v2::result_t<ConstDataSpan> StreamSource::peek(size_t max_len)
         _filled += got.value();
     }
     if (buffered() == 0) {
-        return m5::stl::make_unexpected(m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+        return ConstDataSpan{};
     }
     return ConstDataSpan{_scratch.data, std::min(buffered(), max_len)};
 }
@@ -171,6 +172,10 @@ m5::hal::v2::result_t<DataSpan> StreamSink::reserve(size_t max_len)
 
 m5::hal::v2::result_t<void> StreamSink::commit(size_t N)
 {
+    // Reset first so the early-error returns below can never leave a stale
+    // accepted count from a previous commit() for callers that consult
+    // partialCommitAccepted() after ANY failing commit.
+    _last_accepted = 0;
     if (_writer == nullptr) {
         return m5::stl::make_unexpected(m5::hal::v2::error::error_t::CLOSED);
     }
@@ -178,18 +183,23 @@ m5::hal::v2::result_t<void> StreamSink::commit(size_t N)
         return m5::stl::make_unexpected(m5::hal::v2::error::error_t::BUFFER_OVERFLOW);
     }
     if (N == 0) {
+        _last_accepted = 0;
         return {};
     }
     auto wrote = _writer->write(ConstDataSpan{_scratch.data, N});
     if (!wrote.has_value()) {
+        _last_accepted = 0;
         return m5::stl::make_unexpected(wrote.error());
     }
+    _last_accepted = wrote.value();
     if (wrote.value() != N) {
         // A short write's dominant cause is the writer's own write
         // timeout — classify it as TIMEOUT_ERROR (retryable), symmetric
         // with the read side, instead of a fatal-looking IO_ERROR.
-        // NOTE: bytes may sit half-flushed on the wire; the caller
-        // decides whether to resync/retransmit.
+        // The accepted prefix is recorded in _last_accepted (readable
+        // via partialCommitAccepted()) so a caller pumping bytes from
+        // an upstream Source can advance by that prefix instead of
+        // resending it (0) or silently dropping the remainder (N).
         return m5::stl::make_unexpected(m5::hal::v2::error::error_t::TIMEOUT_ERROR);
     }
     return {};

@@ -3,6 +3,7 @@
 
 #include <M5HAL_v2.hpp>
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -10,7 +11,7 @@
 #include <memory>
 #include <vector>
 
-// i2s::Bus facade (phase 1) + i2s::BusView intern (phase 2) + RX / full-duplex
+// i2s::Bus facade + i2s::BusView intern + RX / full-duplex
 // tests.
 //
 // I2S is offered only by the espidf variant (ESP-only), so there is no I2S
@@ -131,7 +132,7 @@ namespace {
 namespace v2 = m5::hal::v2;
 }
 
-// ---- i2s::Bus facade (phase 1) -----------------------------------------------
+// ---- i2s::Bus facade -----------------------------------------------
 
 TEST(I2sBusFacade, InitWithFakeBackendSucceeds)
 {
@@ -187,7 +188,7 @@ TEST(I2sBusFacade, QueryApiBeforeInitReturnsDefaults)
     EXPECT_EQ(facade.maxFrequency(), 0u);
 }
 
-// ---- i2s::BusView intern (phase 2) -------------------------------------------
+// ---- i2s::BusView intern -------------------------------------------
 
 TEST(I2sBusView, SamePinsReturnSameInstance)
 {
@@ -321,7 +322,7 @@ TEST(I2sBusViewCoOwn, AccessorOutlivesAcquireTemporary)
     EXPECT_EQ(tx.getBusConfig().getBusKind(), v2::types::bus_kind_t::I2S);
 }
 
-// ---- i2s::Bus facade RX forward (phase 1) ------------------------------------
+// ---- i2s::Bus facade RX forward ------------------------------------
 
 TEST(I2sBusFacade, ReadForwardedToBackend)
 {
@@ -424,7 +425,7 @@ TEST(I2sBusFacade, RxOnlyRejectsWriteAndReportsZeroWritable)
     EXPECT_EQ(wb.value(), 0u);
 }
 
-// ---- i2s::RxAccessor (phase 1) -----------------------------------------------
+// ---- i2s::RxAccessor -----------------------------------------------
 
 TEST(I2sRxAccessor, ReadDrainsBus)
 {
@@ -578,5 +579,6 @@ TEST(I2sRole, DefaultRoleIsMaster)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

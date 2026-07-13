@@ -8,11 +8,13 @@
 #include "../../../../../hal/v2/gpio/group.hpp"
 #include "../../../../../hal/v2/gpio/port.hpp"
 #include "../../../../../hal/v2/memory/allocator.hpp"
+#include "../../../../../hal/v2/remote/session_handle.hpp"
 #include "../../../../../hal/v2/types.hpp"
-#include "../../session.hpp"
+#include "../../remote_transfer.hpp"
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 
 namespace m5::hal::v2::gpio {
 
@@ -24,27 +26,32 @@ class Port_remote : public gpio::IPort {
 public:
     Port_remote() = default;
 
-    void init(RemoteSession* session, types::gpio_slot_t device_slot, uint8_t port_index)
+    void init(std::shared_ptr<remote::RemoteSessionHandle> session, types::gpio_slot_t device_slot, uint8_t port_index)
     {
-        _session     = session;
+        _session     = std::move(session);
         _device_slot = device_slot;
         _port_index  = port_index;
     }
 
     void setCachedBit(uint32_t mask)
     {
-        _cached |= mask;
+        _cached.fetch_or(mask, std::memory_order_relaxed);
     }
     void clearCachedBit(uint32_t mask)
     {
-        _cached &= ~mask;
+        _cached.fetch_and(~mask, std::memory_order_relaxed);
     }
     void setCachedValue(uint32_t val)
     {
-        _cached = val;
+        _cached.store(val, std::memory_order_relaxed);
     }
 
     result_t<void> syncRead();
+
+    // After the owning Hal reconnects, the old session handle is closed while
+    // this port remains alive for existing Pin/PortAccess values.  Reads
+    // return the last received cache; writes and mode changes are safe no-ops;
+    // syncRead() reports CLOSED.
 
 protected:
     void _writePinEncoded(uint32_t pin_mask, bool v) override;
@@ -58,10 +65,10 @@ protected:
     uint32_t _fromLocalPin(types::gpio_local_pin_t pin_index) const override;
 
 private:
-    RemoteSession* _session         = nullptr;
+    std::shared_ptr<remote::RemoteSessionHandle> _session;
     types::gpio_slot_t _device_slot = 0;
     uint8_t _port_index             = 0;
-    uint32_t _cached                = 0;
+    std::atomic<uint32_t> _cached{0};
 
     friend class GPIO_remote;
 };
@@ -71,11 +78,19 @@ public:
     static constexpr size_t kMaxPorts = 2;
 
     GPIO_remote(RemoteSession& session, types::gpio_slot_t device_slot, uint8_t port_count, uint16_t pin_count);
+    GPIO_remote(std::shared_ptr<remote::RemoteSessionHandle> session, types::gpio_slot_t device_slot,
+                uint8_t port_count, uint16_t pin_count);
 
     gpio::IPort* portForPin(types::gpio_local_pin_t pin_index) const override;
     gpio::IPort* getPort(uint8_t port_number) const override;
     uint16_t getPinCount() const override;
     uint8_t getPortCount() const override;
+    // Remote GPIO pin states arrive via onGpioEvent -> notifyPinStateChanged
+    // (push), never via GPIOGroup's poll pass.
+    bool hasPushEvents() const override
+    {
+        return true;
+    }
     result_t<void> seedCache();
     result_t<void> subscribeAll();
 
@@ -86,6 +101,8 @@ public:
     }
 
     static void onGpioEvent(void* ctx, types::gpio_number_t pin, bool level);
+    // Dispatched while the session Lease is held. Watch callbacks reached from
+    // here must not re-enter this session or start a proxy bus transaction.
     static void onSessionEvent(void* ctx, uint8_t seq, data::ConstDataSpan body);
 
 private:

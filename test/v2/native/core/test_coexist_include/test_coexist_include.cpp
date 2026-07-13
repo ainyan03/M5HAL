@@ -18,6 +18,7 @@
 #include <M5HAL_v2.hpp>
 
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 
 // The platform checkers keep generation-separated macro namespaces:
 // v0 owns the unprefixed names, v2 reports through the variant-id
@@ -43,5 +44,6 @@ TEST(CoexistInclude, BothGenerationsVisibleInOneTU)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

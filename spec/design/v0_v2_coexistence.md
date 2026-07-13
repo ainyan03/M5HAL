@@ -8,7 +8,7 @@
 
 > **両世代が同名で定義する macro (`M5HAL_FRAMEWORK_HAS_ARDUINO` / `_FREERTOS` / `_SDL`、 `M5HAL_STATIC_MACRO_*`) は token 単位で定義を同一に保つこと。**
 
-v0 は凍結のため変更不可。 同一性維持の責任は v2 側の編集にかかる。 逸脱すると同一 TU で両エントリを include するビルド (`test_coexist_include` / `v0v2_check_*`) で redefinition エラーが発生する。
+v0 は変更不可。 同一性維持の責任は v2 側の編集にかかる。 逸脱すると同一 TU で両エントリを include するビルド (`test_coexist_include` / `v0v2_check_*`) で redefinition エラーが発生する。
 
 ## 基本方針
 
@@ -86,12 +86,12 @@ src/
     variants/            v2 のみ
 ```
 
-## v0 の既知制限 (凍結対象)
+## v0 の既知制限 (変更不可のため残る)
 
-v0 は公開互換のための凍結ツリーであり、 以下の制限は修正せず v2 への移行で解消する:
+v0 は公開互換のための変更不可ツリーであり、 以下の制限は修正せず v2 への移行で解消する:
 
 - **対応 chip**: v0 の platform checker が知るのは ESP32 (無印) / S2 / S3 / C3 / C6 / H2 / P4 系の当時の一覧まで。 それ以降の新 chip (C5 / C61 等) は generic fallback で動作し、 platform 固有最適化は乗らない。 新 chip の一次対応は v2 のみ。
-- **software I2C / SPI**: 複数インスタンス管理と排他制御が未整備 (単一インスタンス前提)。 ソース内の TODO は凍結のため対応しない。
+- **software I2C / SPI**: 複数インスタンス管理と排他制御が未整備 (単一インスタンス前提)。 ソース内の TODO は変更不可のため対応しない。
 - **エラーコード**: 細分化されていない (I2C 系 + 汎用のみ)。 詳細な分類は v2 `error_t` を使う。
 
 ## v3/v4 への前方互換レイアウト

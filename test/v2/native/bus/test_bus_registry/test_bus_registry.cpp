@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include <M5HAL_v2.hpp>
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 
 // Reuse the virtual open-drain bus + GPIO injection from the software-I2C
 // suite for the M5_Hal.I2C integration test (real software backend on
@@ -10,7 +11,7 @@
 #include <memory>
 #include <vector>
 
-// bus::BusRegistry (ADR 034 phase 2) — interns buses by (kind, identity),
+// bus::BusRegistry — interns buses by (kind, identity),
 // owns them via shared_ptr/weak_ptr, capacity-bounded. The direct tests pin
 // the registry logic with a no-I/O fake; the M5_Hal.I2C tests cover the
 // real BusView -> facade -> software backend path.
@@ -20,7 +21,48 @@ namespace v2 = m5::hal::v2;
 
 // Minimal i2c bus for the direct registry tests (no I/O; i2c::IBus is
 // instantiable, its virtuals default to NOT_IMPLEMENTED).
-class FakeI2cBus : public v2::i2c::IBus {};
+class FakeI2cBus : public v2::i2c::IBus {
+public:
+    FakeI2cBus() = default;
+    FakeI2cBus(v2::types::gpio_number_t scl, v2::types::gpio_number_t sda)
+    {
+        _config.pin_scl = scl;
+        _config.pin_sda = sda;
+    }
+};
+
+class FakeHalBackend : public v2::bus::IHalBackend {
+public:
+    v2::result_t<std::shared_ptr<v2::bus::IBus>> acquireBusTyped(v2::types::bus_kind_t kind,
+                                                                 const v2::bus::IdentityKey& id,
+                                                                 const v2::bus::IBusConfig& cfg) override
+    {
+        const auto& i2c_cfg = static_cast<const v2::i2c::IBusConfig&>(cfg);
+        return busRegistry().acquireOrFind(kind, id, [&]() -> v2::result_t<std::shared_ptr<v2::bus::IBus>> {
+            ++make_calls;
+            return std::shared_ptr<v2::bus::IBus>{std::make_shared<FakeI2cBus>(i2c_cfg.pin_scl, i2c_cfg.pin_sda)};
+        });
+    }
+
+    v2::result_t<std::shared_ptr<v2::bus::IBus>> acquireBusLogical(v2::types::bus_kind_t kind,
+                                                                   const v2::bus::IdentityKey& id,
+                                                                   const v2::bus::AllocationRequest& req) override
+    {
+        (void)kind;
+        (void)id;
+        (void)req;
+        return m5::stl::make_unexpected(v2::error::error_t::NOT_IMPLEMENTED);
+    }
+
+    v2::result_t<void> commitBuses(v2::types::bus_kind_t kind, uint32_t timeout_ms) override
+    {
+        (void)kind;
+        (void)timeout_ms;
+        return {};
+    }
+
+    int make_calls = 0;
+};
 
 // A fake backend that reports a distinct hardware identity and counts its
 // release(), to verify swapBackend tears down the old backend and the
@@ -173,14 +215,118 @@ TEST(BusRegistry, DroppedBusFreesSlotForReuse)
     EXPECT_EQ(reg.liveCount(), v2::bus::BusRegistry::kCapacity);
 }
 
-// ---- backend query API defaults (ADR 034 phase 3) ------------------------
+TEST(BusRegistryRelease, ReleasingIdentityRejectsAcquireUntilCancel)
+{
+    v2::bus::BusRegistry reg;
+    int calls = 0;
+    auto bus  = reg.acquireOrFind(v2::types::bus_kind_t::I2C, keyOf(22, 21), CountingMaker{&calls});
+    ASSERT_TRUE(bus.has_value()) << "err=" << v2::error::toString(bus.error());
+
+    auto ticket = reg.beginRelease(v2::types::bus_kind_t::I2C, keyOf(22, 21), bus.value());
+    ASSERT_TRUE(ticket.has_value()) << "err=" << v2::error::toString(ticket.error());
+
+    auto during_release = reg.acquireOrFind(v2::types::bus_kind_t::I2C, keyOf(22, 21), CountingMaker{&calls});
+    ASSERT_FALSE(during_release.has_value());
+    EXPECT_EQ(during_release.error(), v2::error::error_t::BUSY);
+    EXPECT_FALSE(reg.findByIdentity(v2::types::bus_kind_t::I2C, keyOf(22, 21)));
+    EXPECT_EQ(calls, 1);
+
+    auto cancelled = reg.cancelRelease(ticket.value());
+    ASSERT_TRUE(cancelled.has_value()) << "err=" << v2::error::toString(cancelled.error());
+    auto after_cancel = reg.acquireOrFind(v2::types::bus_kind_t::I2C, keyOf(22, 21), CountingMaker{&calls});
+    ASSERT_TRUE(after_cancel.has_value()) << "err=" << v2::error::toString(after_cancel.error());
+    EXPECT_EQ(after_cancel.value().get(), bus.value().get());
+    EXPECT_EQ(calls, 1);
+}
+
+TEST(BusViewRelease, ConsumesSoleOwnerAndAllowsReacquire)
+{
+    FakeHalBackend backend;
+    v2::i2c::BusView view{&backend};
+    v2::i2c::BusConfig_software cfg;
+    cfg.pin_scl = 22;
+    cfg.pin_sda = 21;
+
+    auto bus = view.acquire(cfg);
+    ASSERT_TRUE(bus.has_value()) << "err=" << v2::error::toString(bus.error());
+    EXPECT_EQ(backend.make_calls, 1);
+
+    auto released = view.release(bus.value());
+    ASSERT_TRUE(released.has_value()) << "err=" << v2::error::toString(released.error());
+    EXPECT_FALSE(bus.value());
+    EXPECT_EQ(backend.busRegistry().liveCount(), 0u);
+
+    auto reacquired = view.acquire(cfg);
+    ASSERT_TRUE(reacquired.has_value()) << "err=" << v2::error::toString(reacquired.error());
+    EXPECT_TRUE(reacquired.value());
+    EXPECT_EQ(backend.make_calls, 2);
+}
+
+TEST(BusViewRelease, CoOwnerAndAccessorReturnBusyWithoutConsumingCaller)
+{
+    FakeHalBackend backend;
+    v2::i2c::BusView view{&backend};
+    v2::i2c::BusConfig_software cfg;
+    cfg.pin_scl = 22;
+    cfg.pin_sda = 21;
+
+    auto bus = view.acquire(cfg);
+    ASSERT_TRUE(bus.has_value()) << "err=" << v2::error::toString(bus.error());
+    auto* original = bus.value().get();
+    {
+        auto alias = bus.value();
+        auto busy  = view.release(bus.value());
+        ASSERT_FALSE(busy.has_value());
+        EXPECT_EQ(busy.error(), v2::error::error_t::BUSY);
+        EXPECT_EQ(bus.value().get(), original);
+    }
+
+    {
+        v2::i2c::MasterAccessConfig access_cfg;
+        access_cfg.i2c_addr = 0x42;
+        v2::i2c::MasterAccessor accessor{bus.value(), access_cfg};
+        auto busy = view.release(bus.value());
+        ASSERT_FALSE(busy.has_value());
+        EXPECT_EQ(busy.error(), v2::error::error_t::BUSY);
+        EXPECT_EQ(bus.value().get(), original);
+    }
+
+    auto released = view.release(bus.value());
+    ASSERT_TRUE(released.has_value()) << "err=" << v2::error::toString(released.error());
+    EXPECT_FALSE(bus.value());
+}
+
+TEST(BusViewRelease, ForeignBusWithSameIdentityIsInvalidArgument)
+{
+    FakeHalBackend backend;
+    v2::i2c::BusView view{&backend};
+    v2::i2c::BusConfig_software cfg;
+    cfg.pin_scl = 22;
+    cfg.pin_sda = 21;
+
+    auto registered = view.acquire(cfg);
+    ASSERT_TRUE(registered.has_value()) << "err=" << v2::error::toString(registered.error());
+    auto foreign = std::shared_ptr<v2::i2c::IBus>{std::make_shared<FakeI2cBus>(22, 21)};
+
+    auto invalid = view.release(foreign);
+    ASSERT_FALSE(invalid.has_value());
+    EXPECT_EQ(invalid.error(), v2::error::error_t::INVALID_ARGUMENT);
+    EXPECT_TRUE(foreign);
+
+    auto same = view.acquire(cfg);
+    ASSERT_TRUE(same.has_value()) << "err=" << v2::error::toString(same.error());
+    EXPECT_EQ(same.value().get(), registered.value().get());
+    EXPECT_EQ(backend.make_calls, 1);
+}
+
+// ---- backend query API defaults ------------------------
 
 TEST(BusBackendQuery, DefaultsAreSafeForUnmigratedBus)
 {
-    // A bus that has not opted into the phase-3 backend model answers the
+    // A bus that has not opted into the backend model answers the
     // safe defaults: software / no controller / unknown ceiling / never
     // swapped. This keeps the query API harmless for every kind (and test
-    // fake) that inherits it before implementing phase 3.
+    // fake) that inherits it before implementing.
     FakeI2cBus bus;
     v2::bus::IBus& base = bus;
     EXPECT_EQ(base.backendKind(), v2::types::backend_kind_t::Software);
@@ -233,7 +379,7 @@ TEST(I2cBusView, AcquireInternsAndDrivesBackend)
     EXPECT_EQ(a.value()->controllerId(), -1);
 }
 
-// ---- M5_Hal.I2C logical acquire (pins + intent, ADR 034 phase 3) ---------
+// ---- M5_Hal.I2C logical acquire (pins + intent,) ---------
 
 TEST(I2cBusViewLogical, LogicalAcquireCreatesSoftwareBusAndInterns)
 {
@@ -273,12 +419,12 @@ TEST(I2cBusViewLogical, LogicalAcquireCreatesSoftwareBusAndInterns)
     EXPECT_EQ(a.value().get(), b.value().get());  // same wiring -> same bus
 }
 
-// ---- i2c::Bus facade hot-swap (ADR 034 phase 3) --------------------------
+// ---- i2c::Bus facade hot-swap --------------------------
 
 TEST(I2cFacadeSwap, SwapBackendTracksQueryAndBumpsGeneration)
 {
     v2::i2c::Bus facade;
-    // Start on a real software backend via the phase-1 typed init. The pins
+    // Start on a real software backend via the typed init. The pins
     // are arbitrary -- no wire I/O is performed in this test.
     v2::i2c::BusConfig_software sw;
     sw.pin_scl = 22;
@@ -346,7 +492,7 @@ TEST(I2cFacadeRelease, DefaultReleaseIsNoopSuccess)
     EXPECT_TRUE(facade.release().has_value());
 }
 
-// ---- Accessor co-ownership of a borrowed bus (the canonical borrow path) -
+// ---- Accessor co-ownership of an acquired bus (canonical registry path) ---
 //
 // `M5_Hal.<kind>.acquire(cfg)` returns a shared_ptr; constructing an accessor
 // from it co-owns the bus. The registry holds only a weak_ptr, so once the
@@ -391,5 +537,6 @@ TEST(I2cBusViewCoOwn, AccessorOutlivesAcquireTemporary)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

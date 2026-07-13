@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 #include <M5HAL_v2.hpp>
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 
 #include <memory>
 
-// spi::Bus facade (phase 1) + spi::BusView intern (phase 2) tests.
+// spi::Bus facade + spi::BusView intern tests.
 //
 // Wire I/O is not exercised: the software backend resolves pins through the
 // stub GPIO port (native build), so init succeeds for arbitrary pin numbers.
@@ -15,7 +16,7 @@ namespace {
 namespace v2 = m5::hal::v2;
 }
 
-// ---- spi::Bus facade (phase 1) -------------------------------------------
+// ---- spi::Bus facade -------------------------------------------
 
 TEST(SpiBusFacade, InitWithSoftwareBackendSucceeds)
 {
@@ -67,7 +68,7 @@ TEST(SpiBusFacade, GetConfigReflectsPins)
     EXPECT_EQ(stored.pin_miso, 12);
 }
 
-// ---- spi::BusView intern (phase 2) ----------------------------------------
+// ---- spi::BusView intern ----------------------------------------
 
 TEST(SpiBusView, SamePinsReturnSameInstance)
 {
@@ -184,5 +185,6 @@ TEST(SpiBusViewCoOwn, AccessorOutlivesAcquireTemporary)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

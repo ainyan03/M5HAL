@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 #include <M5HAL_v2.hpp>
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 
 // bus::BusGroup — the non-owning slot->bus registry. Every kind (I2C / SPI /
-// UART / I2S) now reaches buses through the owning registry view (ADR 034
-// phase 2), so BusGroup is no longer a per-kind access surface on M5_Hal; it
+// UART / I2S) now reaches buses through the owning registry view (
+//), so BusGroup is no longer a per-kind access surface on M5_Hal; it
 // remains a standalone utility and is exercised here directly. The fake only
 // needs to BE a kind bus; no I/O here.
 
@@ -74,5 +75,6 @@ TEST(BusGroup, RejectsNullOutOfRangeAndOccupiedSlots)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

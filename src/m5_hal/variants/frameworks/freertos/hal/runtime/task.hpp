@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <limits>
 
+#include "../../../../../hal/v2/types.hpp"
+
 namespace m5::variants::frameworks::freertos::hal::v2::runtime {
 
 class Task {
@@ -26,10 +28,12 @@ public:
     Task(const Task&)            = delete;
     Task& operator=(const Task&) = delete;
 
-    bool start(entry_fn_t fn, void* arg, const char* name = nullptr, size_t stack_size = 4096, int priority = 1)
+    bool start(entry_fn_t fn, void* arg, const char* name = nullptr, size_t stack_size = 4096, int priority = 1,
+               int core = ::m5::hal::v2::types::TASK_CORE_ANY)
     {
         if (joinable() || fn == nullptr || stack_size == 0 || stack_size > std::numeric_limits<uint32_t>::max() ||
-            priority < 0 || priority >= static_cast<int>(configMAX_PRIORITIES)) {
+            priority < 0 || priority >= static_cast<int>(configMAX_PRIORITIES) ||
+            core < ::m5::hal::v2::types::TASK_CORE_SAME || core >= static_cast<int>(portNUM_PROCESSORS)) {
             return false;
         }
 
@@ -37,10 +41,21 @@ public:
         _arg = arg;
         _done.store(false, std::memory_order_relaxed);
 
+        BaseType_t core_id = tskNO_AFFINITY;
+        if (core >= 0) {
+            core_id = static_cast<BaseType_t>(core);
+        } else if (core == ::m5::hal::v2::types::TASK_CORE_SAME) {
+            core_id = static_cast<BaseType_t>(xPortGetCoreID());
+        } else if (core == ::m5::hal::v2::types::TASK_CORE_OPPOSITE) {
+            // Complement of the calling core. On a single-core target this
+            // is the calling core itself — equivalent to no affinity.
+            core_id = static_cast<BaseType_t>((xPortGetCoreID() + 1) % portNUM_PROCESSORS);
+        }
+
         TaskHandle_t handle = nullptr;
         const BaseType_t ok =
             xTaskCreatePinnedToCore(taskEntry, name != nullptr ? name : "m5hal-task", static_cast<uint32_t>(stack_size),
-                                    this, static_cast<UBaseType_t>(priority), &handle, tskNO_AFFINITY);
+                                    this, static_cast<UBaseType_t>(priority), &handle, core_id);
         if (ok != pdPASS) {
             _done.store(true, std::memory_order_relaxed);
             _fn  = nullptr;
@@ -83,6 +98,19 @@ private:
     TaskHandle_t _handle = nullptr;
     std::atomic<bool> _done{true};
 };
+
+/*!
+  @brief Opaque identity of the calling task: its FreeRTOS handle.
+
+  Value is meaningful for same-value comparison only (never
+  dereferenced). ServiceRunner uses it to tell a self-call (add/remove
+  issued from inside a service running on the runner's own task) from a
+  foreign thread. Never null in a running task context.
+ */
+inline void* currentTaskId(void)
+{
+    return static_cast<void*>(xTaskGetCurrentTaskHandle());
+}
 
 }  // namespace m5::variants::frameworks::freertos::hal::v2::runtime
 

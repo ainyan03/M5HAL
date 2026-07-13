@@ -12,6 +12,7 @@
 // (M5HAL_WIRE_DUMP=<path> against a real connection), not in gtest.
 
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 #include <M5HAL_v2.hpp>
 #include <m5_hal/variants/frameworks/posix/hal/remote/wire_dump.hpp>
 
@@ -144,5 +145,6 @@ TEST(WireDumpWriterNullDump, WriteIsNoOpAndReportsFullSize)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

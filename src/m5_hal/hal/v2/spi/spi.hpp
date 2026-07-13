@@ -3,6 +3,7 @@
 #define M5_HAL_SPI_SPI_HPP_
 
 #include "../bus/bus.hpp"
+#include "../bus/bus_view.hpp"
 #include "../bus/hal_backend.hpp"
 #include "../bus/managed_bus.hpp"
 #include "../bus/managed_facade.hpp"
@@ -14,7 +15,6 @@
 #include <atomic>
 #include <memory>
 #include <new>
-#include <type_traits>
 
 /*!
   @namespace m5::hal::v2::spi
@@ -130,9 +130,9 @@ struct IBusConfig : public bus::IBusConfig {
 };
 
 /*!
-  @brief Pin + intent acquire request for the phase-3 logical path (ADR 034).
+  @brief Pin + intent acquire request for the logical acquire path.
 
-  `acquire<CfgT>(cfg)` (phase 2) pins a specific backend by config TYPE -- the
+  `acquire<CfgT>(cfg)` pins a specific backend by config TYPE -- the
   explicit route. The logical acquire states the WIRING (CLK / MOSI / MISO, the
   3-wire core that is the bus identity) plus an `AllocationIntent` (built through
   the kind helpers below, e.g. `spi::requireHardware()`) and lets the factory
@@ -322,7 +322,7 @@ struct MasterAccessor : public bus::IAccessor {
     MasterAccessor(IBus& bus, const MasterAccessConfig& access_config);
 
     /*!
-      @brief Co-owning construction from a borrowed bus.
+      @brief Co-owning construction from an acquired shared bus.
 
       `M5_Hal.SPI.acquire(cfg)` returns a `shared_ptr<IBus>`; constructing
       the accessor from it shares ownership so the bus outlives the
@@ -600,6 +600,9 @@ struct BusTraits {
 
     static constexpr types::bus_kind_t KIND              = types::bus_kind_t::SPI;
     static constexpr types::backend_caps_t CAPS_HARDWARE = caps::HARDWARE;
+    /*! @brief SPI uses the managed policy: `BusView::hardwareInUse()` forwards
+               to the backend (see spec/design/bus_accessor.md §managed policy). */
+    static constexpr bool MANAGED_ALLOCATION = true;
 
     template <class CfgT>
     using BackendFor = spi::BackendFor<CfgT>;
@@ -638,7 +641,7 @@ struct BusTraits {
   @brief Runtime facade for an SPI bus (the unsuffixed `spi::Bus`).
 
   Shares all of `bus::ManagedBusFacade<BusTraits>` (lock + accessor binding,
-  swappable backend, query mirror, the ADR 034 hot-swap seam). The only
+  swappable backend, query mirror, the hot-swap seam). The only
   SPI-specific addition is the CS-transaction scope: `beginTransaction` /
   `endTransaction` are forwarded to the live backend (reached through the
   base's protected `backend()`), since those virtuals exist only on `spi::IBus`.
@@ -673,127 +676,18 @@ struct Bus : public bus::ManagedBusFacade<BusTraits> {
 /*!
   @brief Typed SPI view delegating registry and allocation to the HAL backend.
 
-  The typed acquire path uses the backend's registry directly so the concrete
-  config type still selects the local variant backend. The logical acquire and
-  commit paths delegate through `bus::IHalBackend`, allowing the same BusView
-  surface to point at local or future remote backends.
+  Shares the acquire / logical-acquire / commit / release spine with every
+  other kind through `bus::BusViewCore<BusTraits>` (see bus/bus_view.hpp);
+  this derived type adds only the SPI-specific `createBusConfig()` pin
+  overloads. The typed acquire path uses the backend's registry directly so
+  the concrete config type still selects the local variant backend. The
+  logical acquire and commit paths delegate through `bus::IHalBackend`,
+  allowing the same BusView surface to point at local or future remote
+  backends.
  */
-class BusView {
+class BusView : public bus::BusViewCore<BusTraits> {
 public:
-    BusView() : _backend{nullptr}
-    {
-    }
-    explicit BusView(bus::IHalBackend* backend) : _backend{backend}
-    {
-    }
-    BusView(const BusView&)            = delete;
-    BusView& operator=(const BusView&) = delete;
-
-    void setBackend(bus::IHalBackend* backend)
-    {
-        _backend = backend;
-    }
-
-    template <class CfgT>
-    result_t<std::shared_ptr<IBus>> acquire(const CfgT& cfg)
-    {
-        static_assert(std::is_base_of<IBusConfig, CfgT>::value,
-                      "BusView::acquire expects a BusConfig of this bus kind");
-        if (_backend == nullptr) {
-            return m5::stl::make_unexpected(error::error_t::NOT_CONNECTED);
-        }
-        bus::IdentityKey id = BusTraits::identityFromConfig(cfg);
-        if (!id.valid()) {
-            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
-        {
-            auto r = _backend->acquireBusTyped(types::bus_kind_t::SPI, id, cfg);
-            if (r.has_value()) {
-                return std::static_pointer_cast<IBus>(r.value());
-            }
-            if (r.error() != error::error_t::NOT_IMPLEMENTED) {
-                return m5::stl::make_unexpected(r.error());
-            }
-        }
-        if (auto existing = _backend->busRegistry().findByIdentity(types::bus_kind_t::SPI, id)) {
-            if (!BusTraits::configCompatible(static_cast<const IBusConfig&>(existing->getConfig()), cfg)) {
-                return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
-            }
-        }
-        auto acquired = _backend->busRegistry().acquireOrFind(
-            types::bus_kind_t::SPI, id, [&cfg]() -> result_t<std::shared_ptr<bus::IBus>> {
-                std::shared_ptr<Bus> facade{new (std::nothrow) Bus()};
-                if (!facade) {
-                    return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
-                }
-                auto r = facade->init(cfg);
-                if (!r.has_value()) {
-                    return m5::stl::make_unexpected(r.error());
-                }
-                return std::shared_ptr<bus::IBus>{facade};
-            });
-        if (!acquired.has_value()) {
-            return m5::stl::make_unexpected(acquired.error());
-        }
-        return std::static_pointer_cast<IBus>(acquired.value());
-    }
-
-    result_t<std::shared_ptr<IBus>> acquire(const LogicalBusConfig& req)
-    {
-        if (_backend == nullptr) {
-            return m5::stl::make_unexpected(error::error_t::NOT_CONNECTED);
-        }
-        bus::IdentityKey id = BusTraits::identityFromLogical(req);
-        if (!id.valid()) {
-            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
-        if (!req.intent.valid()) {
-            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
-        bus::AllocationRequest ar{types::bus_kind_t::SPI, id, req.intent, &req};
-        auto acquired = _backend->acquireBusLogical(types::bus_kind_t::SPI, id, ar);
-        if (!acquired.has_value()) {
-            return m5::stl::make_unexpected(acquired.error());
-        }
-        return std::static_pointer_cast<IBus>(acquired.value());
-    }
-
-    result_t<void> commitBuses(uint32_t timeout_ms = types::TIMEOUT_FOREVER)
-    {
-        if (_backend == nullptr) {
-            return m5::stl::make_unexpected(error::error_t::NOT_CONNECTED);
-        }
-        return _backend->commitBuses(types::bus_kind_t::SPI, timeout_ms);
-    }
-
-    /*!
-      @brief Explicitly release a bus acquired via acquire().
-
-      Clears the registry slot for the bus so capacity is reclaimed
-      immediately. For a remote backend this also sends BusRelease to
-      the peer. Pass the `shared_ptr<IBus>` returned by acquire().
-      Returns `INVALID_ARGUMENT` if the bus is null, its config pins
-      are invalid, or no matching slot is found in the registry.
-     */
-    result_t<void> release(const std::shared_ptr<IBus>& bus)
-    {
-        if (_backend == nullptr || !bus) {
-            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
-        bus::IdentityKey id = BusTraits::identityFromConfig(bus->getConfig());
-        if (!id.valid()) {
-            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
-        return _backend->releaseBus(types::bus_kind_t::SPI, id);
-    }
-
-    uint8_t hardwareInUse(void) const
-    {
-        if (_backend == nullptr) {
-            return 0;
-        }
-        return _backend->hardwareInUse(types::bus_kind_t::SPI);
-    }
+    using bus::BusViewCore<BusTraits>::BusViewCore;
 
     LogicalBusConfig createBusConfig(Clk clk, Mosi mosi, Miso miso, types::AllocationIntent intent = {}) const
     {
@@ -803,9 +697,6 @@ public:
     {
         return {clk, mosi, intent};
     }
-
-private:
-    bus::IHalBackend* _backend;
 };
 
 /*!

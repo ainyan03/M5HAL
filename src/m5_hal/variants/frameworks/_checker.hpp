@@ -16,15 +16,48 @@
 #define M5HAL_FRAMEWORK_HAS_ARDUINO 0
 #endif
 
-// The arduino variant is implemented against the arduino-esp32 core only
-// (TwoWire::begin(sda, scl), SPIClass::transferBytes, ...), and no other
-// variant covers a non-ESP32 Arduino core either (software depends on
-// <thread>). Fail loudly here instead of letting the build die deep
-// inside a variant header. Remove this gate when a non-ESP32 Arduino
-// core gains a supported variant set. See spec/design/variants.md.
-#if defined(ARDUINO) && !defined(ESP_PLATFORM)
-#error "M5HAL currently supports the arduino-esp32 core only; this Arduino core is not yet supported."
+// The arduino variant targets arduino-esp32 plus a short allowlist of other
+// Arduino cores that the variant's ESP_PLATFORM-gated fallback paths (Wire /
+// SPI begin() overloads, runtime::Mutex) have been written against: RP2040
+// (arduino-pico), SAMD51 (Adafruit/Arduino SAMD core), STM32 (official
+// ST core / STM32duino), nRF52840 (Adafruit nRF52 core), and ESP8266
+// (official ESP8266 Arduino core — Espressif silicon but NOT ESP_PLATFORM;
+// it takes the generic paths except where noted per call site). None is
+// HIL-verified (build-check only, see spec/design/variants.md); other
+// Arduino cores still fail loudly here instead of dying deep inside a
+// variant header. Widen this allowlist only after adding the matching
+// fallback path.
+//
+// ARDUINO_ARCH_MBED is excluded explicitly: ArduinoCore-mbed's RP2040 boards
+// also define ARDUINO_ARCH_RP2040, but that core is a different, unverified
+// surface (Mbed OS underneath, its own GCC toolchain whose <chrono> the
+// Arduino.h abs()/round() macros corrupt) — only earlephilhower's
+// arduino-pico core has been written against here.
+#if defined(ARDUINO_ARCH_RP2040) && !defined(ARDUINO_ARCH_MBED)
+#define M5HAL_ARDUINO_VARIANT_SUPPORTED_ 1
+#elif defined(ARDUINO_ARCH_SAMD) && defined(__SAMD51__)
+#define M5HAL_ARDUINO_VARIANT_SUPPORTED_ 1
+#elif defined(ARDUINO_ARCH_STM32)
+#define M5HAL_ARDUINO_VARIANT_SUPPORTED_ 1
+// Adafruit nRF52 core only: the sandeepmistry core (ARDUINO_ARCH_NRF5, no
+// ARDUINO_NRF52_ADAFRUIT) and Arduino's mbed-based nRF boards (Nano 33 BLE:
+// ARDUINO_ARCH_MBED) are different, unverified surfaces.
+#elif defined(ARDUINO_ARCH_NRF52) && defined(ARDUINO_NRF52_ADAFRUIT)
+#define M5HAL_ARDUINO_VARIANT_SUPPORTED_ 1
+#elif defined(ARDUINO_ARCH_ESP8266)
+#define M5HAL_ARDUINO_VARIANT_SUPPORTED_ 1
+#elif defined(ESP_PLATFORM)
+#define M5HAL_ARDUINO_VARIANT_SUPPORTED_ 1
+#else
+#define M5HAL_ARDUINO_VARIANT_SUPPORTED_ 0
 #endif
+
+#if defined(ARDUINO) && !M5HAL_ARDUINO_VARIANT_SUPPORTED_
+#error \
+    "M5HAL's arduino variant supports arduino-esp32, RP2040 (arduino-pico), SAMD51, STM32 (official ST core), nRF52840 (Adafruit nRF52 core), and ESP8266 only; this Arduino core is not yet supported."
+#endif
+
+#undef M5HAL_ARDUINO_VARIANT_SUPPORTED_
 
 // ESP-IDF detection. ESP_PLATFORM means the ESP-IDF API surface is
 // available, including Arduino-on-IDF and ESP-IDF projects that add

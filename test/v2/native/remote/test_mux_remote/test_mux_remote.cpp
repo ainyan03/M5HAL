@@ -2,14 +2,18 @@
 // Native gtest for RemoteSession / RemoteServerAdapter (new frame-based API).
 
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 #include <M5HAL_v2.hpp>
 #include <m5_hal/variants/frameworks/remote/backend.hpp>
+#include <m5_hal/variants/frameworks/remote/detail_helpers.hpp>
 #include <m5_hal/hal/v2/remote/server_handler.hpp>
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <thread>
 #include <vector>
 
@@ -17,6 +21,26 @@ namespace {
 
 using namespace m5::hal::v2;
 namespace mem = memory;
+
+size_t pumpValue(data::MuxFrameEncoder& enc)
+{
+    auto r = enc.pump();
+    if (!r.has_value()) {
+        ADD_FAILURE() << "MuxFrameEncoder::pump failed: " << error::toString(r.error());
+        return 0;
+    }
+    return r.value();
+}
+
+size_t pumpValue(data::MuxFrameDecoder& dec, data::Source& src)
+{
+    auto r = dec.pump(src);
+    if (!r.has_value()) {
+        ADD_FAILURE() << "MuxFrameDecoder::pump failed: " << error::toString(r.error());
+        return 0;
+    }
+    return r.value();
+}
 
 struct SessionPair {
     mem::Allocator& alloc = mem::defaultAllocator();
@@ -33,13 +57,13 @@ struct SessionPair {
 
     void pump()
     {
-        enc_a.pump();
+        pumpValue(enc_a);
         transfer(enc_a.output(), wire_ab.sink());
-        dec_b.pump(wire_ab.source());
+        pumpValue(dec_b, wire_ab.source());
 
-        enc_b.pump();
+        pumpValue(enc_b);
         transfer(enc_b.output(), wire_ba.sink());
-        dec_a.pump(wire_ba.source());
+        pumpValue(dec_a, wire_ba.source());
     }
 
     static void transfer(data::Source& src, data::Sink& dst)
@@ -183,9 +207,9 @@ result_t<void> pollGpioEventBody(remote::RemoteServerHandler& handler, std::vect
     if (!poll.has_value()) {
         return m5::stl::make_unexpected(poll.error());
     }
-    enc.pump();
+    pumpValue(enc);
     SessionPair::transfer(enc.output(), frames.sink());
-    dec.pump(frames.source());
+    pumpValue(dec, frames.source());
     return {};
 }
 
@@ -485,9 +509,9 @@ struct MuxFrameCapture {
 
 static void pumpEncoderToDecoder(data::MuxFrameEncoder& enc, data::RingFIFO& wire, data::MuxFrameDecoder& dec)
 {
-    enc.pump();
+    pumpValue(enc);
     SessionPair::transfer(enc.output(), wire.sink());
-    dec.pump(wire.source());
+    pumpValue(dec, wire.source());
 }
 
 class DynamicBusCreatePeer {
@@ -507,6 +531,8 @@ public:
 
     size_t create_count  = 0;
     size_t release_count = 0;
+    bool fail_release    = false;
+    std::function<void()> release_hook;
     types::bus_kind_t last_kind{types::bus_kind_t::I2C};
     uint8_t last_bus_id = 0xFF;
     std::vector<uint8_t> last_pin_config;
@@ -518,10 +544,16 @@ private:
         auto* peer        = static_cast<DynamicBusCreatePeer*>(ctx);
         peer->last_kind   = kind;
         peer->last_bus_id = bus_id;
+        if (!create && peer->fail_release) {
+            return m5::stl::make_unexpected(error::error_t::IO_ERROR);
+        }
         if (create) {
             ++peer->create_count;
             peer->last_pin_config.assign(pin_config.data, pin_config.data + pin_config.size);
         } else {
+            if (peer->release_hook) {
+                peer->release_hook();
+            }
             ++peer->release_count;
             peer->last_pin_config.clear();
         }
@@ -564,7 +596,7 @@ struct RemoteConfigCompatHarness {
 };
 
 // Mimics the POSIX UART transport's write coalescing (`Bus_posix`, sized
-// for I2S remote-audio throughput per ADR 023): small writes sit buffered
+// for I2S remote-audio throughput): small writes sit buffered
 // until either the buffer would overflow, or a read is attempted on this
 // same connection ("flush-before-read", real UART reads and writes share
 // one `Bus_posix` instance). Couples one outgoing wire (buffered) with one
@@ -935,7 +967,7 @@ TEST(MuxRemoteSession, RequestNoResponseFlushesCoalescingTransport)
     // writes stranded in the coalescing buffer until some unrelated later
     // read happens to flush them — this is what made plain `gpio wr`
     // silently never reach the device on a generic-server Core2
-    // (2026-07-01 HIL finding; `gpio mode`/`gpio rawrd` use request(),
+    // (HIL finding; `gpio mode`/`gpio rawrd` use request(),
     // which always follows with a blocking read and so never hit this).
     auto peeked = pair.wire_ab.source().peek(64);
     ASSERT_TRUE(peeked.has_value());
@@ -1138,6 +1170,306 @@ TEST(RemoteTransferWire, BusRemoteScriptsMatchLegacyOpcodeBytes)
         ASSERT_EQ(peer.requests.size(), 1u);
         EXPECT_EQ(peer.requests[0], expectedUartStreamScript(3, 0, cfg, sizeof(tx), sizeof(rx)));
     }
+}
+
+TEST(RemoteTransferWire, UartI2sProxiesRejectUnboundSessionAndNullArguments)
+{
+    uart::AccessConfig ucfg;
+    i2s::AccessConfig icfg;
+    uint8_t buf[4] = {};
+    data::MemorySource src{buf, sizeof(buf)};
+    data::MemorySink dst{buf, sizeof(buf)};
+
+    {
+        // A proxy without a session must fail loudly, not report success.
+        uart::Bus_remote uart_bus;
+        i2s::Bus_remote i2s_bus;
+        auto uw = uart_bus.write(nullptr, ucfg, &src, sizeof(buf));
+        ASSERT_FALSE(uw.has_value());
+        EXPECT_EQ(uw.error(), error::error_t::INVALID_STATE);
+        auto ur = uart_bus.read(nullptr, ucfg, &dst, sizeof(buf));
+        ASSERT_FALSE(ur.has_value());
+        EXPECT_EQ(ur.error(), error::error_t::INVALID_STATE);
+        auto iw = i2s_bus.write(nullptr, icfg, &src, sizeof(buf));
+        ASSERT_FALSE(iw.has_value());
+        EXPECT_EQ(iw.error(), error::error_t::INVALID_STATE);
+        auto ir = i2s_bus.read(nullptr, icfg, &dst, sizeof(buf));
+        ASSERT_FALSE(ir.has_value());
+        EXPECT_EQ(ir.error(), error::error_t::INVALID_STATE);
+    }
+
+    {
+        SessionPair pair;
+        remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+        ScriptCapturePeer peer{pair.enc_b};
+        attachScriptCapturePeer(pair, peer, session);
+
+        uart::Bus_remote uart_bus{session, 0, uart::IBusConfig{}};
+        i2s::Bus_remote i2s_bus{session, 1};
+
+        // A nonzero length with a null Source/Sink is an API contract
+        // violation, not an empty transfer.
+        auto uw = uart_bus.write(nullptr, ucfg, nullptr, sizeof(buf));
+        ASSERT_FALSE(uw.has_value());
+        EXPECT_EQ(uw.error(), error::error_t::INVALID_ARGUMENT);
+        auto ur = uart_bus.read(nullptr, ucfg, nullptr, sizeof(buf));
+        ASSERT_FALSE(ur.has_value());
+        EXPECT_EQ(ur.error(), error::error_t::INVALID_ARGUMENT);
+        auto iw = i2s_bus.write(nullptr, icfg, nullptr, sizeof(buf));
+        ASSERT_FALSE(iw.has_value());
+        EXPECT_EQ(iw.error(), error::error_t::INVALID_ARGUMENT);
+        auto ir = i2s_bus.read(nullptr, icfg, nullptr, sizeof(buf));
+        ASSERT_FALSE(ir.has_value());
+        EXPECT_EQ(ir.error(), error::error_t::INVALID_ARGUMENT);
+
+        // Zero length stays a no-op success and puts nothing on the wire.
+        auto uz = uart_bus.write(nullptr, ucfg, &src, 0);
+        ASSERT_TRUE(uz.has_value());
+        EXPECT_EQ(uz.value(), 0u);
+        auto iz = i2s_bus.read(nullptr, icfg, &dst, 0);
+        ASSERT_TRUE(iz.has_value());
+        EXPECT_EQ(iz.value(), 0u);
+        EXPECT_TRUE(peer.requests.empty());
+    }
+}
+
+TEST(RemoteTransferWire, ClosedSessionHandleMakesExistingProxyReturnClosed)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    auto handle = std::make_shared<remote::RemoteSessionHandle>();
+    handle->bind(session);
+    uart::Bus_remote bus{handle, 0, uart::IBusConfig{}};
+
+    handle->close();
+    uart::AccessConfig cfg;
+    uint8_t byte = 0x5A;
+    data::MemorySource src{&byte, 1};
+    auto written = bus.write(nullptr, cfg, &src, 1);
+    ASSERT_FALSE(written.has_value());
+    EXPECT_EQ(written.error(), error::error_t::CLOSED);
+}
+
+TEST(RemoteTransferWire, HeterogeneousProxiesSerializeOneInflightSession)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    ScriptCapturePeer peer{pair.enc_b};
+    attachScriptCapturePeer(pair, peer, session);
+    auto handle = std::make_shared<remote::RemoteSessionHandle>();
+    handle->bind(session);
+    uart::Bus_remote uart_bus{handle, 0, uart::IBusConfig{}};
+    i2s::Bus_remote i2s_bus{handle, 1, i2s::IBusConfig{}};
+    uart::AccessConfig uart_cfg;
+    i2s::AccessConfig i2s_cfg;
+    std::atomic<bool> start{false};
+    std::atomic<bool> uart_ok{false};
+    std::atomic<bool> i2s_ok{false};
+
+    std::thread uart_thread{[&] {
+        uint8_t payload[] = {0x11, 0x12};
+        data::MemorySource src{payload, sizeof(payload)};
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        uart_ok.store(uart_bus.write(nullptr, uart_cfg, &src, sizeof(payload)).has_value(), std::memory_order_release);
+    }};
+    std::thread i2s_thread{[&] {
+        uint8_t payload[] = {0x21, 0x22};
+        data::MemorySource src{payload, sizeof(payload)};
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        i2s_ok.store(i2s_bus.write(nullptr, i2s_cfg, &src, sizeof(payload)).has_value(), std::memory_order_release);
+    }};
+
+    start.store(true, std::memory_order_release);
+    uart_thread.join();
+    i2s_thread.join();
+    EXPECT_TRUE(uart_ok.load(std::memory_order_acquire));
+    EXPECT_TRUE(i2s_ok.load(std::memory_order_acquire));
+    ASSERT_EQ(peer.requests.size(), 2u);
+    EXPECT_TRUE(scriptContainsOpcode(peer.requests[0], bytecode::OpCode::BusStreamTransfer));
+    EXPECT_TRUE(scriptContainsOpcode(peer.requests[1], bytecode::OpCode::BusStreamTransfer));
+}
+
+TEST(RemoteI2cLock, UsesCommonTimedMutexContract)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    i2c::Bus_remote bus{session, 0, i2c::IBusConfig{}};
+    i2c::MasterAccessConfig cfg;
+    i2c::MasterAccessor first{bus, cfg};
+    i2c::MasterAccessor second{bus, cfg};
+    std::atomic<bool> first_locked{false};
+    std::atomic<bool> release_first{false};
+    std::atomic<bool> holder_ok{false};
+
+    std::thread holder{[&] {
+        auto locked = first.beginAccess(0);
+        holder_ok.store(locked.has_value(), std::memory_order_release);
+        first_locked.store(true, std::memory_order_release);
+        while (!release_first.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        if (locked.has_value()) {
+            holder_ok.store(first.endAccess().has_value(), std::memory_order_release);
+        }
+    }};
+
+    while (!first_locked.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    EXPECT_TRUE(holder_ok.load(std::memory_order_acquire));
+    auto blocked                 = second.beginAccess(10);
+    const bool timed_out         = !blocked.has_value();
+    error::error_t blocked_error = timed_out ? blocked.error() : error::error_t::OK;
+    if (blocked.has_value()) {
+        (void)second.endAccess();
+    }
+    release_first.store(true, std::memory_order_release);
+    holder.join();
+    EXPECT_TRUE(timed_out);
+    EXPECT_EQ(blocked_error, error::error_t::TIMEOUT_ERROR);
+    ASSERT_TRUE(holder_ok.load(std::memory_order_acquire));
+
+    auto acquired = second.beginAccess(50);
+    ASSERT_TRUE(acquired.has_value()) << "err=" << error::toString(acquired.error());
+    auto unlocked = second.endAccess();
+    ASSERT_TRUE(unlocked.has_value()) << "err=" << error::toString(unlocked.error());
+}
+
+TEST(RemoteBackend, ProxyLastOwnerBestEffortReleasesPeerBus)
+{
+    RemoteConfigCompatHarness h;
+    auto acquired = h.hal.I2C.acquire(i2c::LogicalBusConfig{i2c::Scl{22}, i2c::Sda{21}});
+    ASSERT_TRUE(acquired.has_value()) << "err=" << error::toString(acquired.error());
+    ASSERT_EQ(h.peer.create_count, 1u);
+    ASSERT_EQ(h.peer.release_count, 0u);
+
+    acquired.value().reset();
+    EXPECT_EQ(h.peer.release_count, 1u);
+}
+
+TEST(RemoteBackend, FailedDestructorReleaseQuarantinesBusId)
+{
+    RemoteConfigCompatHarness h;
+    h.peer.fail_release = true;
+    auto first          = h.hal.I2C.acquire(i2c::LogicalBusConfig{i2c::Scl{22}, i2c::Sda{21}});
+    ASSERT_TRUE(first.has_value()) << "err=" << error::toString(first.error());
+    ASSERT_EQ(h.peer.last_bus_id, 0u);
+
+    first.value().reset();
+    EXPECT_EQ(h.peer.release_count, 0u);
+    EXPECT_EQ(h.backend.busRegistry().liveCount(), 1u);
+
+    h.peer.fail_release = false;
+    auto blocked        = h.hal.I2C.acquire(i2c::LogicalBusConfig{i2c::Scl{22}, i2c::Sda{21}});
+    ASSERT_FALSE(blocked.has_value());
+    EXPECT_EQ(blocked.error(), error::error_t::BUSY);
+
+    auto second = h.hal.I2C.acquire(i2c::LogicalBusConfig{i2c::Scl{32}, i2c::Sda{33}});
+    ASSERT_TRUE(second.has_value()) << "err=" << error::toString(second.error());
+    EXPECT_EQ(h.peer.last_bus_id, 1u);
+}
+
+TEST(RemoteBackend, ExplicitReleaseClosesProxyRevivedFromWeakPointer)
+{
+    RemoteConfigCompatHarness h;
+    auto acquired = h.hal.I2C.acquire(i2c::LogicalBusConfig{i2c::Scl{22}, i2c::Sda{21}});
+    ASSERT_TRUE(acquired.has_value()) << "err=" << error::toString(acquired.error());
+
+    std::weak_ptr<bus::IBus> weak = acquired.value();
+    std::shared_ptr<bus::IBus> revived;
+    h.peer.release_hook = [&]() { revived = weak.lock(); };
+    auto released       = h.hal.I2C.release(acquired.value());
+    ASSERT_TRUE(released.has_value()) << "err=" << error::toString(released.error());
+    ASSERT_TRUE(revived);
+
+    auto stale = std::static_pointer_cast<i2c::IBus>(revived);
+    i2c::MasterAccessConfig cfg;
+    i2c::TransferDesc desc;
+    auto operation = stale->transfer(nullptr, cfg, desc, nullptr, 0, nullptr, 0);
+    ASSERT_FALSE(operation.has_value());
+    EXPECT_EQ(operation.error(), error::error_t::CLOSED);
+}
+
+TEST(RemoteBackend, ExplicitReleaseFailureRollsBackAndCanRetry)
+{
+    RemoteConfigCompatHarness h;
+    auto acquired = h.hal.I2C.acquire(i2c::LogicalBusConfig{i2c::Scl{22}, i2c::Sda{21}});
+    ASSERT_TRUE(acquired.has_value()) << "err=" << error::toString(acquired.error());
+
+    h.peer.fail_release = true;
+    auto failed         = h.hal.I2C.release(acquired.value());
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), error::error_t::IO_ERROR);
+    ASSERT_TRUE(acquired.value());
+
+    h.peer.fail_release = false;
+    auto retried        = h.hal.I2C.release(acquired.value());
+    ASSERT_TRUE(retried.has_value()) << "err=" << error::toString(retried.error());
+    EXPECT_FALSE(acquired.value());
+    EXPECT_EQ(h.peer.release_count, 1u);
+}
+
+TEST(RemoteBackend, NaturalReleaseInsideSessionLeaseDoesNotDeadlockAndQuarantinesId)
+{
+    RemoteConfigCompatHarness h;
+    const i2c::LogicalBusConfig cfg{i2c::Scl{22}, i2c::Sda{21}};
+    auto acquired = h.hal.I2C.acquire(cfg);
+    ASSERT_TRUE(acquired.has_value()) << "err=" << error::toString(acquired.error());
+    ASSERT_EQ(h.peer.last_bus_id, 0u);
+
+    auto handle = h.session.sharedHandle();
+    {
+        remote::RemoteSessionHandle::Lease session_lease{*handle};
+        ASSERT_TRUE(session_lease);
+        acquired.value().reset();
+    }
+    EXPECT_EQ(h.peer.release_count, 0u);
+
+    auto same_identity = h.hal.I2C.acquire(cfg);
+    ASSERT_FALSE(same_identity.has_value());
+    EXPECT_EQ(same_identity.error(), error::error_t::BUSY);
+    EXPECT_EQ(h.backend.busRegistry().liveCount(), 1u);
+
+    auto reacquired = h.hal.I2C.acquire(i2c::LogicalBusConfig{i2c::Scl{32}, i2c::Sda{33}});
+    ASSERT_TRUE(reacquired.has_value()) << "err=" << error::toString(reacquired.error());
+    EXPECT_EQ(h.peer.last_bus_id, 1u);
+}
+
+TEST(RemoteBackend, NaturalReleaseKeepsIdentityTombstonedThroughPeerCallback)
+{
+    RemoteConfigCompatHarness h;
+    const i2c::LogicalBusConfig cfg{i2c::Scl{22}, i2c::Sda{21}};
+    auto acquired = h.hal.I2C.acquire(cfg);
+    ASSERT_TRUE(acquired.has_value()) << "err=" << error::toString(acquired.error());
+
+    error::error_t callback_error = error::error_t::OK;
+    h.peer.release_hook           = [&]() {
+        auto during_release = h.hal.I2C.acquire(cfg);
+        ASSERT_FALSE(during_release.has_value());
+        callback_error = during_release.error();
+    };
+    acquired.value().reset();
+    EXPECT_EQ(callback_error, error::error_t::BUSY);
+    EXPECT_EQ(h.peer.release_count, 1u);
+
+    h.peer.release_hook = {};
+    auto reacquired     = h.hal.I2C.acquire(cfg);
+    ASSERT_TRUE(reacquired.has_value()) << "err=" << error::toString(reacquired.error());
+    EXPECT_EQ(h.peer.last_bus_id, 0u);
+}
+
+TEST(RemoteSessionHandle, BorrowedHandlesShareCanonicalGate)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    auto first  = remote::makeBorrowedSessionHandle(session);
+    auto second = remote::makeBorrowedSessionHandle(session);
+    ASSERT_TRUE(first);
+    EXPECT_EQ(first.get(), second.get());
 }
 
 TEST(RemoteTransferWire, RepeatedUartWriteOmitsUnchangedConfigure)
@@ -1440,9 +1772,9 @@ TEST(RemoteServerHandler, GpioPollReadsSubscribedPortOnceAndEmitsPinEvents)
     EXPECT_EQ(device.port.read_port_calls, 1u);
     EXPECT_EQ(device.port.read_pin_calls, 0u);
 
-    enc.pump();
+    pumpValue(enc);
     SessionPair::transfer(enc.output(), frames.sink());
-    dec.pump(frames.source());
+    pumpValue(dec, frames.source());
     ASSERT_FALSE(event_body.empty());
 
     bytecode::BytecodeRunner runner{alloc};
@@ -1503,9 +1835,9 @@ TEST(RemoteServerHandler, GpioPollHandlesSubscribedPortOnePins)
     EXPECT_EQ(device.ports[1].read_port_calls, 1u);
     EXPECT_EQ(device.ports[1].read_pin_calls, 0u);
 
-    enc.pump();
+    pumpValue(enc);
     SessionPair::transfer(enc.output(), frames.sink());
-    dec.pump(frames.source());
+    pumpValue(dec, frames.source());
     ASSERT_FALSE(event_body.empty());
 
     bytecode::BytecodeRunner runner{alloc};
@@ -1676,9 +2008,9 @@ TEST(RemoteServerHandler, GpioSubscribeRequestEmitsInitialSnapshotEvent)
                                                         {script_buf, script.written()}, enc, dec);
     ASSERT_TRUE(handled.has_value());
 
-    enc.pump();
+    pumpValue(enc);
     SessionPair::transfer(enc.output(), frames.sink());
-    dec.pump(frames.source());
+    pumpValue(dec, frames.source());
 
     ASSERT_GE(capture_frames.kinds.size(), 2u);
     EXPECT_EQ(capture_frames.kinds[0], frame::Kind::Event);
@@ -2158,9 +2490,9 @@ TEST(RemoteServerStreamTransfer, TxRxPendingCompletesOnlyAfterBothDirectionsFini
     uint8_t tx_bytes[] = {0x11, 0x22, 0x33};
     data::MemorySource tx_src{tx_bytes, sizeof(tx_bytes)};
     ASSERT_TRUE(pair.enc_a.attach(2, tx_src));
-    pair.enc_a.pump();
+    pumpValue(pair.enc_a);
     SessionPair::transfer(pair.enc_a.output(), pair.wire_ab.sink());
-    pair.dec_b.pump(pair.wire_ab.source());
+    pumpValue(pair.dec_b, pair.wire_ab.source());
 
     auto first_poll = server.poll(pair.enc_b, 100);
     ASSERT_TRUE(first_poll.has_value()) << "err=" << error::toString(first_poll.error());
@@ -2244,6 +2576,38 @@ TEST(RemoteServerStreamTransfer, StreamTransferMustBeTerminal)
     EXPECT_EQ(runner.reportedOffset(), configure_offset);
     capture.frames.clear();
 
+    // rx-only stream transfers defer the response the same way, so the
+    // terminal rule applies to them too: a later instruction's stored
+    // slots would be dropped from the deferred Response.
+    data::MemorySink rx_script{script_buf, sizeof(script_buf)};
+    bytecode::BytecodeEncoder rx_enc{rx_script};
+    e                           = rx_enc.streamTransfer(types::bus_kind_t::I2S, 0, 5, 0, 8, {});
+    const size_t rx_only_offset = rx_script.written();
+    if (e.has_value()) {
+        e = rx_enc.i2sConfig(0, cfg);
+    }
+    if (e.has_value()) {
+        e = rx_enc.end();
+    }
+    ASSERT_TRUE(e.has_value()) << "err=" << error::toString(e.error());
+
+    auto rx_handled = remote::RemoteServerHandler::handler(&handler, frame::Kind::Request, 10,
+                                                           {script_buf, rx_script.written()}, pair.enc_b, pair.dec_b);
+    ASSERT_TRUE(rx_handled.has_value()) << "err=" << error::toString(rx_handled.error());
+    EXPECT_FALSE(server.responseDeferred());
+    pumpEncoderToDecoder(pair.enc_b, pair.wire_ba, pair.dec_a);
+    ASSERT_EQ(capture.frames.size(), 1u);
+    EXPECT_EQ(capture.frames[0].kind, frame::Kind::Response);
+    EXPECT_EQ(capture.frames[0].seq, 10);
+    bytecode::BytecodeRunner rx_runner{mem::defaultAllocator()};
+    rx_runner.setReceiveOnly(true);
+    auto rx_run = rx_runner.run({capture.frames[0].payload.data(), capture.frames[0].payload.size()});
+    ASSERT_TRUE(rx_run.has_value()) << "err=" << error::toString(rx_run.error());
+    ASSERT_TRUE(rx_runner.statusReported());
+    EXPECT_EQ(rx_runner.reportedStatus(), error::error_t::INVALID_ARGUMENT);
+    EXPECT_EQ(rx_runner.reportedOffset(), rx_only_offset);
+    capture.frames.clear();
+
     data::MemorySink second_script{script_buf, sizeof(script_buf)};
     bytecode::BytecodeEncoder second_enc{second_script};
     e = second_enc.streamTransfer(types::bus_kind_t::I2S, 0, 4, 8, 0, {});
@@ -2324,7 +2688,7 @@ TEST(MuxRemoteSession, AttachStreamDataRoundtrip)
     auto* server_rx = pair.dec_b.createStream(id, 512);
     ASSERT_NE(server_rx, nullptr);
 
-    pair.enc_a.pump();
+    pumpValue(pair.enc_a);
     pair.pump();
 
     auto peeked = server_rx->peek(256);
@@ -2340,6 +2704,650 @@ TEST(MuxRemoteSession, AttachStreamDataRoundtrip)
     EXPECT_EQ(rx_buf[1], 0xFE);
 
     session_a.detachStream(id);
+}
+
+// ---- RemoteSession stream_id quarantine (host-timeout resync) -------------
+//
+// A peer that captures a Request's seq/b3 but withholds its Response,
+// standing in for a device that is still mid-transfer when the host gives up
+// waiting (spec/design/remote.md §timeout / resync). sendPendingResponse()
+// releases it later on demand so tests can control exactly when the
+// "delayed terminal frame" arrives.
+struct DelayedResponsePeer {
+    data::MuxFrameEncoder* enc = nullptr;
+    bool captured              = false;
+    uint8_t seq                = 0;
+
+    static void onFrame(void* ctx, const frame::View& view)
+    {
+        auto* p = static_cast<DelayedResponsePeer*>(ctx);
+        if (view.kind == frame::Kind::Request) {
+            p->captured = true;
+            p->seq      = view.b3;
+        }
+    }
+
+    void sendPendingResponse()
+    {
+        const uint8_t payload[] = {0x00};
+        enc->writeFrame(frame::Kind::Response, seq, {payload, sizeof(payload)});
+    }
+};
+
+// Answers the current Request normally, but first (once) replays a stale
+// Response for an earlier, already-quarantined seq — reproducing the
+// "mismatched frame observed while awaitResponse() is waiting on a *later*
+// request" release path.
+struct StaleThenCurrentResponsePeer {
+    data::MuxFrameEncoder* enc = nullptr;
+    bool has_stale             = false;
+    uint8_t stale_seq          = 0;
+
+    void queueStale(uint8_t seq)
+    {
+        has_stale = true;
+        stale_seq = seq;
+    }
+
+    static void onFrame(void* ctx, const frame::View& view)
+    {
+        auto* p = static_cast<StaleThenCurrentResponsePeer*>(ctx);
+        if (view.kind != frame::Kind::Request) {
+            return;
+        }
+        if (p->has_stale) {
+            const uint8_t stale_payload[] = {0x01};
+            p->enc->writeFrame(frame::Kind::Response, p->stale_seq, {stale_payload, sizeof(stale_payload)});
+            p->has_stale = false;
+        }
+        const uint8_t resp[] = {0x02};
+        p->enc->writeFrame(frame::Kind::Response, view.b3, {resp, sizeof(resp)});
+    }
+};
+
+// Answers every normal Request immediately (same seq echoed back), but
+// never answers a NORESP request (bit7 of B3 set) — matching the real
+// protocol contract for requestNoResponse() (spec/design/remote.md
+// "NORESP request").
+struct NorespAwareEchoPeer {
+    data::MuxFrameEncoder* enc = nullptr;
+
+    static void onFrame(void* ctx, const frame::View& view)
+    {
+        auto* p = static_cast<NorespAwareEchoPeer*>(ctx);
+        if (view.kind != frame::Kind::Request || (view.b3 & 0x80) != 0) {
+            return;
+        }
+        const uint8_t resp[] = {0x00};
+        p->enc->writeFrame(frame::Kind::Response, view.b3, {resp, sizeof(resp)});
+    }
+};
+
+// A Source whose peek()/advance() always fail. Used to force a pumpWire()
+// error strictly after a Request has already been enqueued/flushed to a
+// separate, real TX sink — reproducing the "post-enqueue, non-timeout
+// pump error" case (F4/F5) without needing a peer at all.
+class AlwaysFailingSource : public data::Source {
+public:
+    result_t<data::ConstDataSpan> peek(size_t) override
+    {
+        return m5::stl::make_unexpected(error::error_t::IO_ERROR);
+    }
+    result_t<void> advance(size_t) override
+    {
+        return m5::stl::make_unexpected(error::error_t::IO_ERROR);
+    }
+    bool eof() const override
+    {
+        return false;
+    }
+};
+
+static void setPairPeerPoll(SessionPair& pair, remote::RemoteSession& session)
+{
+    session.setPeerPoll(
+        [](void* ctx) {
+            auto* p = static_cast<SessionPair*>(ctx);
+            p->pump();
+        },
+        &pair);
+}
+
+TEST(MuxRemoteSession, TimedOutStreamIsNotImmediatelyReused)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    setPairPeerPoll(pair, session);
+
+    DelayedResponsePeer peer;
+    peer.enc = &pair.enc_b;
+    pair.dec_b.setFrameHandler(&DelayedResponsePeer::onFrame, &peer);
+
+    auto cfg                = session.getConfig();
+    cfg.response_timeout_ms = 5;
+    session.setConfig(cfg);
+
+    const uint8_t id0 = session.attachStream(nullptr, nullptr);
+    ASSERT_EQ(id0, 0u);
+
+    const uint8_t script[] = {0x00};
+    uint8_t seq0           = 0xFF;
+    auto timed_out         = session.request({script, sizeof(script)}, &seq0);
+    ASSERT_FALSE(timed_out.has_value());
+    EXPECT_EQ(timed_out.error(), error::error_t::TIMEOUT_ERROR);
+    ASSERT_TRUE(peer.captured);
+    session.quarantineStream(id0, seq0);
+
+    // The quarantined id must not come back out of allocateStreamId() while
+    // its release condition is still unmet.
+    const uint8_t next = session.attachStream(nullptr, nullptr);
+    ASSERT_NE(next, 0xFF);
+    EXPECT_NE(next, id0);
+    session.detachStream(next);
+}
+
+TEST(MuxRemoteSession, DelayedResponseObservedViaPollReleasesQuarantineForReuse)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    setPairPeerPoll(pair, session);
+
+    DelayedResponsePeer peer;
+    peer.enc = &pair.enc_b;
+    pair.dec_b.setFrameHandler(&DelayedResponsePeer::onFrame, &peer);
+
+    auto cfg                = session.getConfig();
+    cfg.response_timeout_ms = 5;
+    session.setConfig(cfg);
+
+    const uint8_t id0 = session.attachStream(nullptr, nullptr);
+    ASSERT_EQ(id0, 0u);
+    const uint8_t script[] = {0x00};
+    uint8_t seq0           = 0xFF;
+    auto timed_out         = session.request({script, sizeof(script)}, &seq0);
+    ASSERT_FALSE(timed_out.has_value());
+    session.quarantineStream(id0, seq0);
+
+    // Fill the rest of the pool so id0 is the only slot that a subsequent
+    // allocateStreamId() could hand out once released.
+    std::array<uint8_t, remote::RemoteSession::kMaxStreams> filled{};
+    size_t filled_count = 0;
+    for (;;) {
+        const uint8_t id = session.attachStream(nullptr, nullptr);
+        if (id == 0xFF) {
+            break;
+        }
+        filled[filled_count++] = id;
+    }
+    EXPECT_EQ(session.attachStream(nullptr, nullptr), 0xFF);
+
+    // The delayed terminal Response arrives and is observed purely through
+    // poll() — no awaitResponse() is pending at this point.
+    peer.sendPendingResponse();
+    auto polled = session.poll();
+    ASSERT_TRUE(polled.has_value());
+
+    const uint8_t reused = session.attachStream(nullptr, nullptr);
+    EXPECT_EQ(reused, id0);
+    session.detachStream(reused);
+
+    for (size_t i = 0; i < filled_count; ++i) {
+        session.detachStream(filled[i]);
+    }
+}
+
+TEST(MuxRemoteSession, MismatchedFrameDuringAwaitResponseReleasesQuarantine)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    setPairPeerPoll(pair, session);
+
+    DelayedResponsePeer stall_peer;
+    stall_peer.enc = &pair.enc_b;
+    pair.dec_b.setFrameHandler(&DelayedResponsePeer::onFrame, &stall_peer);
+
+    auto cfg                = session.getConfig();
+    cfg.response_timeout_ms = 5;
+    session.setConfig(cfg);
+
+    const uint8_t id0 = session.attachStream(nullptr, nullptr);
+    ASSERT_EQ(id0, 0u);
+    const uint8_t script[] = {0x00};
+    uint8_t seq0           = 0xFF;
+    auto timed_out         = session.request({script, sizeof(script)}, &seq0);
+    ASSERT_FALSE(timed_out.has_value());
+    session.quarantineStream(id0, seq0);
+
+    // The next request's peer replays the stale Response for the timed-out
+    // seq before answering the new one, so awaitResponse() must observe the
+    // mismatch (b3 != its own awaiting seq) and still release id0.
+    StaleThenCurrentResponsePeer peer2;
+    peer2.enc = &pair.enc_b;
+    peer2.queueStale(stall_peer.seq);
+    pair.dec_b.setFrameHandler(&StaleThenCurrentResponsePeer::onFrame, &peer2);
+
+    cfg.response_timeout_ms = 2000;
+    session.setConfig(cfg);
+    const uint8_t script2[] = {0x01};
+    auto ok                 = session.request({script2, sizeof(script2)});
+    ASSERT_TRUE(ok.has_value()) << "err=" << error::toString(ok.error());
+
+    const uint8_t reused = session.attachStream(nullptr, nullptr);
+    EXPECT_EQ(reused, id0);
+    session.detachStream(reused);
+}
+
+TEST(MuxRemoteSession, ShortQuarantineTimerExpiresWithoutAnyResponse)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    setPairPeerPoll(pair, session);
+
+    DelayedResponsePeer peer;
+    peer.enc = &pair.enc_b;
+    pair.dec_b.setFrameHandler(&DelayedResponsePeer::onFrame, &peer);
+
+    auto cfg                 = session.getConfig();
+    cfg.response_timeout_ms  = 5;
+    cfg.stream_quarantine_ms = 5;  // shortened insurance timer
+    session.setConfig(cfg);
+
+    const uint8_t id0 = session.attachStream(nullptr, nullptr);
+    ASSERT_EQ(id0, 0u);
+    const uint8_t script[] = {0x00};
+    uint8_t seq0           = 0xFF;
+    auto timed_out         = session.request({script, sizeof(script)}, &seq0);
+    ASSERT_FALSE(timed_out.has_value());
+    session.quarantineStream(id0, seq0);
+
+    // No Response ever arrives for this seq — only the insurance timer can
+    // release the entry.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    const uint8_t reused = session.attachStream(nullptr, nullptr);
+    EXPECT_EQ(reused, id0);
+    session.detachStream(reused);
+}
+
+TEST(MuxRemoteSession, AllStreamsQuarantinedExhaustsAttachPool)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    setPairPeerPoll(pair, session);
+
+    DelayedResponsePeer peer;
+    peer.enc = &pair.enc_b;
+    pair.dec_b.setFrameHandler(&DelayedResponsePeer::onFrame, &peer);
+
+    auto cfg                = session.getConfig();
+    cfg.response_timeout_ms = 5;
+    session.setConfig(cfg);
+
+    const uint8_t script[] = {0x00};
+    for (uint8_t i = 0; i < remote::RemoteSession::kMaxStreams; ++i) {
+        const uint8_t id = session.attachStream(nullptr, nullptr);
+        ASSERT_EQ(id, i);
+        uint8_t seq    = 0xFF;
+        auto timed_out = session.request({script, sizeof(script)}, &seq);
+        ASSERT_FALSE(timed_out.has_value());
+        session.quarantineStream(id, seq);
+    }
+
+    EXPECT_EQ(session.attachStream(nullptr, nullptr), 0xFF);
+}
+
+TEST(MuxRemoteSession, QuarantinedStreamDataFrameDoesNotLeakIntoNewSink)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    setPairPeerPoll(pair, session);
+
+    DelayedResponsePeer peer;
+    peer.enc = &pair.enc_b;
+    pair.dec_b.setFrameHandler(&DelayedResponsePeer::onFrame, &peer);
+
+    auto cfg                = session.getConfig();
+    cfg.response_timeout_ms = 5;
+    session.setConfig(cfg);
+
+    const uint8_t id0 = session.attachStream(nullptr, nullptr);
+    ASSERT_EQ(id0, 0u);
+    const uint8_t script[] = {0x00};
+    uint8_t seq0           = 0xFF;
+    auto timed_out         = session.request({script, sizeof(script)}, &seq0);
+    ASSERT_FALSE(timed_out.has_value());
+    session.quarantineStream(id0, seq0);
+
+    uint8_t rx_buf[64] = {};
+    data::MemorySink rx_sink{rx_buf, sizeof(rx_buf)};
+    const uint8_t id1 = session.attachStream(nullptr, &rx_sink);
+    ASSERT_EQ(id1, 1u);
+
+    // Stray Data for the still-quarantined id must not surface anywhere —
+    // it targets a stream whose Sink was cleared by quarantineStream(), so
+    // the decoder has to drop it (mux.inl deliverData() null-Sink path).
+    const uint8_t stray[] = {0xEE, 0xEE};
+    pair.enc_b.writeFrame(frame::Kind::Data, id0, {stray, sizeof(stray)});
+
+    // Legitimate Data for the new transfer's id, in the same pump batch.
+    const uint8_t good[] = {0x01, 0x02};
+    pair.enc_b.writeFrame(frame::Kind::Data, id1, {good, sizeof(good)});
+
+    pair.pump();
+
+    EXPECT_EQ(rx_buf[0], 0x01);
+    EXPECT_EQ(rx_buf[1], 0x02);
+    EXPECT_EQ(rx_buf[2], 0x00);  // untouched — the stray Data never reached this sink
+    session.detachStream(id1);
+}
+
+TEST(MuxRemoteSession, HelloClearsAllQuarantine)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    setPairPeerPoll(pair, session);
+
+    DelayedResponsePeer peer;
+    peer.enc = &pair.enc_b;
+    pair.dec_b.setFrameHandler(&DelayedResponsePeer::onFrame, &peer);
+
+    auto cfg                = session.getConfig();
+    cfg.response_timeout_ms = 5;
+    session.setConfig(cfg);
+
+    const uint8_t id0 = session.attachStream(nullptr, nullptr);
+    ASSERT_EQ(id0, 0u);
+    const uint8_t script[] = {0x00};
+    uint8_t seq0           = 0xFF;
+    auto timed_out         = session.request({script, sizeof(script)}, &seq0);
+    ASSERT_FALSE(timed_out.has_value());
+    session.quarantineStream(id0, seq0);
+
+    // Switch the peer to answer HelloReq so hello() can succeed.
+    pair.dec_b.setFrameHandler(
+        [](void* ctx, const frame::View& view) {
+            auto* enc = static_cast<data::MuxFrameEncoder*>(ctx);
+            if (view.kind == frame::Kind::HelloReq) {
+                uint8_t caps[] = {remote::kProtocolVersion, 0};
+                enc->writeFrame(frame::Kind::HelloResp, view.b3, {caps, sizeof(caps)});
+            }
+        },
+        &pair.enc_b);
+
+    cfg.response_timeout_ms = 2000;
+    session.setConfig(cfg);
+    auto hr = session.hello();
+    ASSERT_TRUE(hr.has_value()) << "err=" << error::toString(hr.error());
+
+    const uint8_t reused = session.attachStream(nullptr, nullptr);
+    EXPECT_EQ(reused, id0);
+    session.detachStream(reused);
+}
+
+TEST(MuxRemoteSession, ResetDoesNotClearQuarantine)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    setPairPeerPoll(pair, session);
+
+    DelayedResponsePeer peer;
+    peer.enc = &pair.enc_b;
+    pair.dec_b.setFrameHandler(&DelayedResponsePeer::onFrame, &peer);
+
+    auto cfg                = session.getConfig();
+    cfg.response_timeout_ms = 5;
+    session.setConfig(cfg);
+
+    const uint8_t id0 = session.attachStream(nullptr, nullptr);
+    ASSERT_EQ(id0, 0u);
+    const uint8_t script[] = {0x00};
+    uint8_t seq0           = 0xFF;
+    auto timed_out         = session.request({script, sizeof(script)}, &seq0);
+    ASSERT_FALSE(timed_out.has_value());
+    session.quarantineStream(id0, seq0);
+
+    // reset() is fire-and-forget: the host never waits for the device's
+    // reset Response, so a successful send proves nothing about whether
+    // the device has stopped the old transfer (F2 / spec/design/remote.md
+    // §timeout / resync, item 3). Only a terminal-frame match, the
+    // insurance timer, or hello() may release the entry.
+    cfg.response_timeout_ms = 2000;
+    session.setConfig(cfg);
+    auto reset_result = session.reset();
+    ASSERT_TRUE(reset_result.has_value()) << "err=" << error::toString(reset_result.error());
+
+    const uint8_t next = session.attachStream(nullptr, nullptr);
+    ASSERT_NE(next, 0xFF);
+    EXPECT_NE(next, id0);
+    session.detachStream(next);
+}
+
+TEST(MuxRemoteSession, StaleDataRefreshesQuarantineInactivityTimer)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    setPairPeerPoll(pair, session);
+
+    DelayedResponsePeer peer;
+    peer.enc = &pair.enc_b;
+    pair.dec_b.setFrameHandler(&DelayedResponsePeer::onFrame, &peer);
+
+    auto cfg                = session.getConfig();
+    cfg.response_timeout_ms = 5;
+    // Margins are deliberately wide (50ms refresh vs 250ms window): a loaded
+    // CI host can stall this thread for tens of ms, which must not read as
+    // "the producer went quiet".
+    cfg.stream_quarantine_ms = 250;
+    session.setConfig(cfg);
+
+    const uint8_t id0 = session.attachStream(nullptr, nullptr);
+    ASSERT_EQ(id0, 0u);
+    const uint8_t script[] = {0x00};
+    uint8_t seq0           = 0xFF;
+    auto timed_out         = session.request({script, sizeof(script)}, &seq0);
+    ASSERT_FALSE(timed_out.has_value());
+    session.quarantineStream(id0, seq0);
+
+    // Keep delivering stray Data for the quarantined id across more wall
+    // time than one insurance-timer window (8 * 50ms > 250ms). Each arrival
+    // must reset the "last activity seen" clock via the stale-Data observer
+    // (F1) — mirroring the server's own inactivity semantics
+    // (Config::stream_quarantine_ms) instead of expiring on a fixed
+    // deadline.
+    const uint8_t stray[] = {0xEE};
+    for (int i = 0; i < 8; ++i) {
+        pair.enc_b.writeFrame(frame::Kind::Data, id0, {stray, sizeof(stray)});
+        pair.pump();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    const uint8_t still_quarantined = session.attachStream(nullptr, nullptr);
+    ASSERT_NE(still_quarantined, 0xFF);
+    EXPECT_NE(still_quarantined, id0);
+    session.detachStream(still_quarantined);
+
+    // Once the stray Data stops, the insurance timer runs its course from
+    // its last refresh.
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    const uint8_t reused = session.attachStream(nullptr, nullptr);
+    EXPECT_EQ(reused, id0);
+    session.detachStream(reused);
+}
+
+TEST(MuxRemoteSession, StaleDataRefreshesQuarantineForRxBearingStream)
+{
+    // Same as above but the quarantined stream HAD an rx Sink (the common
+    // shape for the contamination hazard): after quarantineStream() the
+    // decoder stream stays `active` with its direct Sink cleared, which is
+    // a different deliverData() branch than the never-had-a-Sink case — it
+    // must feed the inactivity timer all the same.
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    setPairPeerPoll(pair, session);
+
+    DelayedResponsePeer peer;
+    peer.enc = &pair.enc_b;
+    pair.dec_b.setFrameHandler(&DelayedResponsePeer::onFrame, &peer);
+
+    auto cfg                = session.getConfig();
+    cfg.response_timeout_ms = 5;
+    // Same wide margins as the tx-only variant above (load tolerance).
+    cfg.stream_quarantine_ms = 250;
+    session.setConfig(cfg);
+
+    uint8_t rx_buf[32];
+    data::MemorySink rx_sink{rx_buf, sizeof(rx_buf)};
+    const uint8_t id0 = session.attachStream(nullptr, &rx_sink);
+    ASSERT_EQ(id0, 0u);
+    const uint8_t script[] = {0x00};
+    uint8_t seq0           = 0xFF;
+    auto timed_out         = session.request({script, sizeof(script)}, &seq0);
+    ASSERT_FALSE(timed_out.has_value());
+    session.quarantineStream(id0, seq0);
+
+    const uint8_t stray[] = {0xEE};
+    for (int i = 0; i < 8; ++i) {
+        pair.enc_b.writeFrame(frame::Kind::Data, id0, {stray, sizeof(stray)});
+        pair.pump();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    const uint8_t still_quarantined = session.attachStream(nullptr, nullptr);
+    ASSERT_NE(still_quarantined, 0xFF);
+    EXPECT_NE(still_quarantined, id0);
+    session.detachStream(still_quarantined);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    const uint8_t reused = session.attachStream(nullptr, nullptr);
+    EXPECT_EQ(reused, id0);
+    session.detachStream(reused);
+}
+
+// Calls remoteTransferWire() directly (the actual production integration
+// branch every Bus_remote::transfer()/write()/read() runs through) instead
+// of manually invoking quarantineStream() the way the RemoteSession-level
+// quarantine tests do. Reverting remote_transfer.inl's quarantine-vs-detach
+// decision to an unconditional detach would leave those tests green, but
+// must fail this one (F8).
+TEST(RemoteTransferWire, TimedOutRequestAutoQuarantinesStreamIdThroughProductionPath)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    setPairPeerPoll(pair, session);
+
+    // Captures the Request but never answers it — the peer's device-side
+    // processing is still "in flight" from the host's point of view.
+    DelayedResponsePeer peer;
+    peer.enc = &pair.enc_b;
+    pair.dec_b.setFrameHandler(&DelayedResponsePeer::onFrame, &peer);
+
+    auto cfg                = session.getConfig();
+    cfg.response_timeout_ms = 5;
+    session.setConfig(cfg);
+
+    uint8_t tx[]  = {0x01, 0x02, 0x03};
+    uint8_t rx[4] = {};
+    data::MemorySource src{tx, sizeof(tx)};
+    data::MemorySink dst{rx, sizeof(rx)};
+
+    auto r = remote::remoteTransferWire(&session, types::bus_kind_t::UART, 0, {}, {}, &src, sizeof(tx), &dst,
+                                        sizeof(rx), cfg.response_timeout_ms);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), error::error_t::TIMEOUT_ERROR);
+    ASSERT_TRUE(peer.captured);
+
+    // remoteTransferWire() attached stream_id 0 (fresh session) and must
+    // have quarantined it on this timeout, not freed it for immediate
+    // reuse.
+    const uint8_t next = session.attachStream(nullptr, nullptr);
+    ASSERT_NE(next, 0xFF);
+    EXPECT_NE(next, 0u);
+    session.detachStream(next);
+}
+
+TEST(MuxRemoteSession, SeqWrapDuringQuarantineDoesNotMisreleaseIt)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    setPairPeerPoll(pair, session);
+
+    DelayedResponsePeer peer;
+    peer.enc = &pair.enc_b;
+    pair.dec_b.setFrameHandler(&DelayedResponsePeer::onFrame, &peer);
+
+    auto cfg                = session.getConfig();
+    cfg.response_timeout_ms = 5;
+    session.setConfig(cfg);
+
+    const uint8_t id0 = session.attachStream(nullptr, nullptr);
+    ASSERT_EQ(id0, 0u);
+    const uint8_t script[] = {0x00};
+    uint8_t seq0           = 0xFF;
+    auto timed_out         = session.request({script, sizeof(script)}, &seq0);
+    ASSERT_FALSE(timed_out.has_value());
+    ASSERT_EQ(seq0, 0u);  // first seq issued by a fresh session
+    session.quarantineStream(id0, seq0);
+
+    // Switch to a peer that answers normal requests immediately (echoing
+    // their seq) but stays silent for NORESP ones, matching the protocol.
+    NorespAwareEchoPeer echo_peer;
+    echo_peer.enc = &pair.enc_b;
+    pair.dec_b.setFrameHandler(&NorespAwareEchoPeer::onFrame, &echo_peer);
+    cfg.response_timeout_ms = 2000;
+    session.setConfig(cfg);
+
+    // Cycle the seq counter across the full 7 bit space (128 values) via
+    // NORESP requests. Without nextSeq() skipping the quarantined seq
+    // (F3), the 128th call here would land back on seq 0 — id0's own
+    // quarantined seq — and a later unrelated Response for that reused seq
+    // would incorrectly release id0's quarantine.
+    const uint8_t norresp_script[] = {0x01};
+    for (int i = 0; i < 127; ++i) {
+        auto r = session.requestNoResponse({norresp_script, sizeof(norresp_script)});
+        ASSERT_TRUE(r.has_value()) << "err=" << error::toString(r.error()) << " i=" << i;
+    }
+
+    // This normal request must NOT have been assigned seq 0 (skipped
+    // because it is still quarantined), and its Response must not release
+    // id0's entry.
+    const uint8_t script2[] = {0x02};
+    uint8_t seq1            = 0xFF;
+    auto ok                 = session.request({script2, sizeof(script2)}, &seq1);
+    ASSERT_TRUE(ok.has_value()) << "err=" << error::toString(ok.error());
+    EXPECT_NE(seq1, 0u);
+
+    const uint8_t next = session.attachStream(nullptr, nullptr);
+    ASSERT_NE(next, 0xFF);
+    EXPECT_NE(next, id0);
+    session.detachStream(next);
+}
+
+TEST(MuxRemoteSession, NonTimeoutPumpErrorAfterEnqueueAlsoQuarantines)
+{
+    SessionPair pair;
+    AlwaysFailingSource failing_rx;
+    // wire_tx is a real, working sink (pair.wire_ab.sink()) so writeFrame()
+    // + flushTx() genuinely enqueue and drain the Request before the
+    // always-failing RX source is ever touched — reproducing "the Request
+    // left the host, but the failure that follows has nothing to do with a
+    // response timeout" (F4/F5), the simplest peer-free form of this case.
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, failing_rx, pair.wire_ab.sink()};
+
+    const uint8_t id0 = session.attachStream(nullptr, nullptr);
+    ASSERT_EQ(id0, 0u);
+
+    const uint8_t script[] = {0x00};
+    uint8_t seq0           = 0xFF;
+    auto req               = session.request({script, sizeof(script)}, &seq0);
+    ASSERT_FALSE(req.has_value());
+    EXPECT_NE(req.error(), error::error_t::TIMEOUT_ERROR);
+    ASSERT_TRUE(session.lastRequestEnqueued());
+
+    session.quarantineStream(id0, seq0);
+    const uint8_t next = session.attachStream(nullptr, nullptr);
+    ASSERT_NE(next, 0xFF);
+    EXPECT_NE(next, id0);
+    session.detachStream(next);
 }
 
 struct CreditFlowPair {
@@ -2443,7 +3451,7 @@ TEST(MuxRemoteCreditFlow, CreditResentAfterTempReleaseEvenWhenAbsoluteValueIsUnc
 
     credit_b.pump(pair.enc_b, pair.dec_b);
     SessionPair::transfer(pair.enc_b.output(), pair.wire_ba.sink());
-    EXPECT_EQ(pair.dec_a.pump(pair.wire_ba.source()), 1u);
+    EXPECT_EQ(pumpValue(pair.dec_a, pair.wire_ba.source()), 1u);
     ASSERT_TRUE(pair.enc_a.creditGated());
     const uint8_t advertised = pair.enc_a.remoteCredit();
     ASSERT_GT(advertised, 0u);
@@ -2464,9 +3472,9 @@ TEST(MuxRemoteCreditFlow, CreditResentAfterTempReleaseEvenWhenAbsoluteValueIsUnc
         data::MemorySource tx_src{raw.data() + cycle * frame::kMaxDataPayload, frame::kMaxDataPayload};
         ASSERT_TRUE(pair.enc_a.attach(0, tx_src));
         ASSERT_EQ(pair.enc_a.remoteCredit(), advertised) << "cycle=" << cycle;
-        EXPECT_EQ(pair.enc_a.pump(), 1u) << "cycle=" << cycle;
+        EXPECT_EQ(pumpValue(pair.enc_a), 1u) << "cycle=" << cycle;
         SessionPair::transfer(pair.enc_a.output(), pair.wire_ab.sink());
-        EXPECT_EQ(pair.dec_b.pump(pair.wire_ab.source()), 1u) << "cycle=" << cycle;
+        EXPECT_EQ(pumpValue(pair.dec_b, pair.wire_ab.source()), 1u) << "cycle=" << cycle;
         ASSERT_EQ(rx_blocks->blockCount(), 1u) << "cycle=" << cycle;
 
         auto p = rx_src->peek(frame::kMaxDataPayload);
@@ -2480,7 +3488,7 @@ TEST(MuxRemoteCreditFlow, CreditResentAfterTempReleaseEvenWhenAbsoluteValueIsUnc
 
         credit_b.pump(pair.enc_b, pair.dec_b);
         SessionPair::transfer(pair.enc_b.output(), pair.wire_ba.sink());
-        EXPECT_EQ(pair.dec_a.pump(pair.wire_ba.source()), 1u) << "cycle=" << cycle;
+        EXPECT_EQ(pumpValue(pair.dec_a, pair.wire_ba.source()), 1u) << "cycle=" << cycle;
         EXPECT_EQ(pair.enc_a.remoteCredit(), advertised) << "cycle=" << cycle;
         restored_credit_sum += pair.enc_a.remoteCredit();
     }
@@ -2745,16 +3753,16 @@ struct TwoThreadWire {
 
     void clientPump()
     {
-        enc_a.pump();
+        pumpValue(enc_a);
         SessionPair::transfer(enc_a.output(), wire_ab.sink());
-        dec_a.pump(wire_ba.source());
+        pumpValue(dec_a, wire_ba.source());
     }
 
     void serverPump()
     {
-        enc_b.pump();
+        pumpValue(enc_b);
         SessionPair::transfer(enc_b.output(), wire_ba.sink());
-        dec_b.pump(wire_ab.source());
+        pumpValue(dec_b, wire_ab.source());
         if (g_active_e2e_server != nullptr) {
             g_active_e2e_server->processPending();
         }
@@ -2984,10 +3992,145 @@ TEST(E2EStreamTransfer, SPIFullDuplexEchoMatches)
     }
 }
 
+// A peer that answers every Request with a Response carrying no terminal
+// Report (or an empty payload) — exercises RemoteSession::checkResponse's
+// protocol contract that a report-less response is a protocol violation.
+struct NoReportResponsePeer {
+    data::MuxFrameEncoder* enc = nullptr;
+    bool empty_response        = false;
+
+    void handle(const frame::View& view)
+    {
+        if (view.kind != frame::Kind::Request) {
+            return;
+        }
+        if (empty_response) {
+            enc->writeFrame(frame::Kind::Response, view.b3, {});
+            return;
+        }
+        uint8_t resp_buf[frame::kMaxPayload];
+        data::MemorySink resp_sink{resp_buf, sizeof(resp_buf)};
+        bytecode::BytecodeEncoder resp{resp_sink};
+        // Terminator only: a well-formed script that reports nothing.
+        auto r = resp.end();
+        if (r.has_value()) {
+            enc->writeFrame(frame::Kind::Response, view.b3, {resp_buf, resp_sink.written()});
+        }
+    }
+
+    static void onFrame(void* ctx, const frame::View& view)
+    {
+        static_cast<NoReportResponsePeer*>(ctx)->handle(view);
+    }
+};
+
+static void runNoReportCase(bool empty_response)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    NoReportResponsePeer peer;
+    peer.enc            = &pair.enc_b;
+    peer.empty_response = empty_response;
+    pair.dec_b.setFrameHandler(&NoReportResponsePeer::onFrame, &peer);
+    session.setPeerPoll([](void* ctx) { static_cast<SessionPair*>(ctx)->pump(); }, &pair);
+
+    uint8_t script_buf[remote::kMaxScriptSize];
+    data::MemorySink script{script_buf, sizeof(script_buf)};
+    bytecode::BytecodeEncoder enc{script};
+    auto e = enc.end();
+    ASSERT_TRUE(e.has_value()) << "err=" << error::toString(e.error());
+    auto req = session.request({script_buf, script.written()});
+    ASSERT_TRUE(req.has_value()) << "err=" << error::toString(req.error());
+
+    auto chk = session.checkResponse();
+    ASSERT_FALSE(chk.has_value()) << "expected PROTOCOL_ERROR for a report-less response";
+    EXPECT_EQ(chk.error(), error::error_t::PROTOCOL_ERROR);
+}
+
+TEST(RemoteSessionCheckResponse, MissingReportIsProtocolError)
+{
+    runNoReportCase(/*empty_response=*/false);
+}
+
+TEST(RemoteSessionCheckResponse, EmptyResponseIsProtocolError)
+{
+    runNoReportCase(/*empty_response=*/true);
+}
+
+// The remote I2C proxy encodes the transfer prefix into a fixed
+// meta_buf[1 + PREFIX_CAPACITY]; a prefix_len beyond capacity must be rejected
+// up front instead of overflowing the stack buffer in encodeI2cMeta.
+TEST(RemoteI2cProxy, TransferRejectsOverlongPrefix)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    i2c::IBusConfig bus_cfg;
+    i2c::Bus_remote host_bus{session, 0, bus_cfg};
+
+    i2c::MasterAccessConfig cfg;
+    i2c::TransferDesc desc;
+    desc.prefix_len = static_cast<uint8_t>(i2c::TransferDesc::PREFIX_CAPACITY + 1);
+
+    auto r = host_bus.transfer(nullptr, cfg, desc, nullptr, 0, nullptr, 0);
+    ASSERT_FALSE(r.has_value()) << "expected INVALID_ARGUMENT for an over-length I2C prefix";
+    EXPECT_EQ(r.error(), error::error_t::INVALID_ARGUMENT);
+}
+
+// HelloResp must serialize the server's statically registered bus capabilities
+// as [proto_ver][flags][n]([bus_kind][bus_id])*n, and the host decoder must see
+// them (spec/design/remote.md §hello).
+TEST(RemoteServerHandler, HelloRespReportsRegisteredCapabilities)
+{
+    SessionPair pair;
+    MuxFrameCapture capture;
+    pair.dec_a.setFrameHandler(&MuxFrameCapture::onFrame, &capture);
+    remote::RemoteServerHandler handler;
+    uint8_t scratch[remote::kMaxScriptSize];
+    remote::Server server{data::DataSpan{scratch, sizeof(scratch)}};
+
+    PatternI2CBus i2c_bus{0x42, 16};
+    i2c::MasterAccessConfig i2c_cfg;
+    i2c::MasterAccessor i2c_acc{i2c_bus, i2c_cfg};
+    ASSERT_TRUE(server.registerI2C(0, i2c_acc).has_value());
+
+    uart::AccessConfig uart_cfg;
+    EchoUARTBus uart_bus;
+    uart::Accessor uart_acc{uart_bus, uart_cfg};
+    ASSERT_TRUE(server.registerUART(2, uart_acc).has_value());
+
+    handler.server = &server;
+
+    auto hello = remote::RemoteServerHandler::handler(&handler, frame::Kind::HelloReq, 7, {}, pair.enc_b, pair.dec_b);
+    ASSERT_TRUE(hello.has_value()) << "err=" << error::toString(hello.error());
+    pumpEncoderToDecoder(pair.enc_b, pair.wire_ba, pair.dec_a);
+    ASSERT_EQ(capture.frames.size(), 1u);
+    ASSERT_EQ(capture.frames[0].kind, frame::Kind::HelloResp);
+
+    const auto& body = capture.frames[0].payload;
+    auto caps        = remote::detail::decodeHelloCaps(data::ConstDataSpan{body.data(), body.size()});
+    ASSERT_TRUE(caps.has_value()) << "err=" << error::toString(caps.error());
+    EXPECT_EQ(caps->proto_ver, remote::kProtocolVersion);
+    ASSERT_EQ(caps->bus_count, 2u);
+
+    bool saw_i2c = false, saw_uart = false;
+    for (size_t i = 0; i < caps->bus_count; ++i) {
+        if (caps->buses[i].kind == types::bus_kind_t::I2C && caps->buses[i].bus_id == 0) {
+            saw_i2c = true;
+        }
+        if (caps->buses[i].kind == types::bus_kind_t::UART && caps->buses[i].bus_id == 2) {
+            saw_uart = true;
+        }
+    }
+    EXPECT_TRUE(saw_i2c) << "I2C(0) capability missing from HelloResp";
+    EXPECT_TRUE(saw_uart) << "UART(2) capability missing from HelloResp";
+    EXPECT_FALSE(caps->has_gpio);
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

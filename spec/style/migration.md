@@ -30,7 +30,7 @@ v0 API 利用者が v2 API に移行する際の指針を示す。
 | API | 配置 | 備考 |
 |---|---|---|
 | `error::error_t` / `error::isError` / `error::isOk` | `hal/error.hpp` | cross-cutting な型 |
-| `types::PeripheralType` / `types::BusType` / `types::GpioMode` | `hal/types.hpp` | 命名維持 |
+| `types::GpioMode` | `hal/types.hpp` | 命名維持 |
 | `types::gpio_number_t` | `hal/types.hpp` | pin 指定の基本型 |
 | `M5HAL_V2_TARGET_PLATFORM_*` / `M5HAL_FRAMEWORK_HAS_*` | 各 `_checker.hpp` | variant 機構で利用。 platform 系は世代分離のため `M5HAL_V2_` プレフィックス (無印は v0 が所有) |
 
@@ -44,6 +44,7 @@ v0 API 利用者が v2 API に移行する際の指針を示す。
 | 旧 I2C 操作 / software I2C singleton | `write` / `read` / `writeRegister` / `readRegister` / `probe` + software variant | [design/i2c.md](../design/i2c.md) 参照 |
 | `Bus::beginAccess(AccessConfig&)` factory | 利用者が `Accessor` を直接構築 | [design/bus_accessor.md](../design/bus_accessor.md) §Bus の保持 参照 |
 | 旧 `interface::gpio::*` 抽象 | `IGPIO` / `IPort` / `Pin` / `GPIOGroup` | [design/gpio.md](../design/gpio.md) 参照 |
+| `types::BusType` / `types::PeripheralType` | `types::BusKind` (`bus_kind_t`) | 識別子を英語コメントと整合させ改名 (旧 `bus_type_t` 等は v0 のみ)。`PeripheralType` は v0/platform 固有概念で v2 `hal/types.hpp` には対応物なし。[style/glossary.md](glossary.md) 参照 |
 
 ## v2 で使わない要素
 
@@ -61,7 +62,7 @@ v0 API 利用者が v2 API に移行する際の指針を示す。
 
 | 機能 | 説明 |
 |---|---|
-| リモートバス機構 | `Hal::connect(endpoint)` (endpoint = `"uart:<path>"` / `"tcp:<host>:<port>"`。 typed API `initUart(port)` / `initTcp("host:port")` も存続) で遠隔 M5HAL server に接続し、 同型 `hal.I2C.acquire()` / `SPI.acquire()` 等で proxy bus を取得する。 追加のビルドフラグは不要 (`M5HAL_CONFIG_REMOTE=1` は winner scan へ remote variant を参加させる別用途の opt-in)。 詳細は [design/remote.md](../design/remote.md) |
+| リモートバス機構 | `Hal::connect(endpoint)` (endpoint = `"uart:<path>"` / `"tcp:<host>:<port>"`。 typed API `initUart(port)` / `initTcp("host:port")` も存続) で遠隔 M5HAL server に接続し、 同型 `hal.I2C.acquire()` / `SPI.acquire()` 等で proxy bus を取得する。reconnect 前の proxy は旧 connection を延命せず以後 `CLOSED`。明示解放は Accessor/alias を先に破棄して `hal.<KIND>.release(bus)` を呼び、成功時に handle 自体が reset される。追加のビルドフラグは不要 (`M5HAL_CONFIG_REMOTE=1` は winner scan へ remote variant を参加させる別用途の opt-in)。 詳細は [design/remote.md](../design/remote.md) / [design/bus_accessor.md](../design/bus_accessor.md) |
 
 ## 移行時の確認項目
 

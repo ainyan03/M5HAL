@@ -48,7 +48,7 @@ public:
 
     memory::Allocator* allocator() const;
 
-    size_t pump();
+    m5::hal::v2::result_t<size_t> pump();
 
     bool writeFrame(frame::Kind kind, uint8_t b3, ConstDataSpan payload = {});
 
@@ -94,6 +94,14 @@ public:
 
     using frame_handler_t = void (*)(void* ctx, const frame::View& view);
 
+    // Fires when a Data frame arrives for a stream_id that currently has no
+    // registered destination (stream_id < kMaxStreams, inactive, non-empty
+    // payload) — i.e. the frame is about to be silently dropped. Upper
+    // layers (RemoteSession) use this to detect straggling Data for a
+    // timed-out-but-quarantined stream_id and keep its insurance timer
+    // alive for as long as the peer is still producing for it.
+    using stale_data_fn = void (*)(void* ctx, uint8_t stream_id);
+
     MuxFrameDecoder() = default;
 
     explicit MuxFrameDecoder(memory::Allocator& alloc);
@@ -101,6 +109,8 @@ public:
     void setAllocator(memory::Allocator& alloc);
 
     void setFrameHandler(frame_handler_t fn, void* ctx);
+
+    void setStaleDataObserver(stale_data_fn fn, void* ctx);
 
     Source* createStream(uint8_t stream_id, uint8_t* buf, size_t buf_size);
 
@@ -131,7 +141,7 @@ public:
 
     size_t blockStreamReleasedTotal() const;
 
-    size_t pump(Source& wire_in);
+    m5::hal::v2::result_t<size_t> pump(Source& wire_in);
 
     void releaseAll();
 
@@ -150,21 +160,29 @@ private:
         uint8_t* owned_buf = nullptr;
         bool active        = false;
         bool block_mode    = false;
+        // Bytes of the current (not-yet-fully-delivered) Data frame's
+        // payload already committed to the sink. deliverData() resumes
+        // from here instead of offset 0 when the sink backpressures
+        // mid-payload (pump() does not consume the frame in that case, so
+        // the next pump() call is handed the identical payload again).
+        size_t partial_offset = 0;
     };
 
     bool deliverData(uint8_t stream_id, ConstDataSpan payload);
 
     bool deliverBlockData(Stream& s, ConstDataSpan payload);
 
-    bool beginPendingFrame(Source& wire_in, ConstDataSpan bytes);
-    bool fillPendingFrame(Source& wire_in);
+    m5::hal::v2::result_t<bool> beginPendingFrame(Source& wire_in, ConstDataSpan bytes);
+    m5::hal::v2::result_t<bool> fillPendingFrame(Source& wire_in);
     void updatePendingFrameNeed();
     void consumePendingFrame(size_t consumed);
     void clearPendingFrame();
 
-    memory::Allocator* _alloc = nullptr;
-    frame_handler_t _handler  = nullptr;
-    void* _handler_ctx        = nullptr;
+    memory::Allocator* _alloc    = nullptr;
+    frame_handler_t _handler     = nullptr;
+    void* _handler_ctx           = nullptr;
+    stale_data_fn _stale_data_fn = nullptr;
+    void* _stale_data_ctx        = nullptr;
     Stream _streams[kMaxStreams];
     uint8_t _pending_frame[frame::kMaxFrameSize]{};
     size_t _pending_len  = 0;

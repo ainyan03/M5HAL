@@ -4,7 +4,10 @@
 
 #include "slave.hpp"
 
-#if defined(ESP_PLATFORM) && (M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_HAS_SLAVE_V2)
+// M5HAL_ESPIDF_HOST_HARNESS: mirrors the same gate in slave.hpp so this .inl
+// compiles unmodified under the native host regression harness.
+#if (defined(ESP_PLATFORM) || defined(M5HAL_ESPIDF_HOST_HARNESS)) && \
+    (M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_SLAVE_LL_BE || M5HAL_ESPIDF_I2C_HAS_SLAVE_V2)
 
 #include <algorithm>
 #include <esp_err.h>
@@ -14,7 +17,7 @@
 #include "../../../freertos/hal/runtime/time.hpp"
 #include <freertos/task.h>
 
-#if M5HAL_ESPIDF_I2C_SLAVE_LL
+#if M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_SLAVE_LL_BE
 #include <driver/gpio.h>
 #include <esp_rom_gpio.h>
 #include <hal/i2c_ll.h>
@@ -69,7 +72,7 @@ namespace m5::hal::v2::i2c {
 namespace {
 namespace impl_espidf_slave {
 
-#if !M5HAL_ESPIDF_I2C_SLAVE_LL
+#if !(M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_SLAVE_LL_BE)
 error::error_t mapEspErr(::esp_err_t err)
 {
     switch (err) {
@@ -97,6 +100,85 @@ error::error_t mapEspErr(::esp_err_t err)
     return ::m5::hal::v2::detail::timeoutMsToTicks(timeout_ms);
 }
 
+// Resolves SlaveBusConfig::controller (a claimed hardware controller index,
+// or -1 for "backend default -- ledger-external, self-responsibility") to a
+// validated port number. -1 becomes port 0, the pre-claim hardcoded default.
+// Any other negative value, an out-of-range index, or an LP_I2C index is
+// rejected: clock-stretch / ISR slave mode drives only a plain HP instance.
+// ESP-IDF numbers LP_I2C ports after all HP ports (SOC_HP_I2C_NUM is the
+// HP-only count on a chip that splits the two; SOC_I2C_NUM is the sole port
+// count on a chip that does not), so rejecting everything from
+// SOC_HP_I2C_NUM upward (falling back to SOC_I2C_NUM when the chip has no
+// HP/LP split) excludes the LP range on every chip shape.
+::m5::hal::v2::result_t<int8_t> resolveSlaveControllerPort(int8_t controller)
+{
+    if (controller == -1) {
+        return int8_t{0};
+    }
+    if (controller < 0) {
+        // Only -1 is the documented default-port sentinel; any other
+        // negative value is a corrupted / miscomputed index, not a request.
+        return m5::stl::make_unexpected(::m5::hal::v2::error::error_t::INVALID_ARGUMENT);
+    }
+#if defined(SOC_HP_I2C_NUM)
+    constexpr int8_t kPortLimit = static_cast<int8_t>(SOC_HP_I2C_NUM);
+#elif defined(SOC_I2C_NUM)
+    constexpr int8_t kPortLimit = static_cast<int8_t>(SOC_I2C_NUM);
+#else
+    constexpr int8_t kPortLimit = 1;
+#endif
+    if (controller >= kPortLimit) {
+        return m5::stl::make_unexpected(::m5::hal::v2::error::error_t::INVALID_ARGUMENT);
+    }
+    return controller;
+}
+
+bool waitTaskStopped(::portMUX_TYPE* mux, bool& task_running)
+{
+    // pdMS_TO_TICKS(1) truncates to 0 at the default 100 Hz tick rate, where
+    // vTaskDelay(0) only yields. Delay a whole tick and bound the wait by
+    // elapsed ticks. The budget itself truncates to 0 below 10 Hz, so floor it
+    // at one tick to keep the wait non-empty at any configTICK_RATE_HZ. The
+    // outer iteration cap is a defensive backstop, independent of tick
+    // advancement: for any configTICK_RATE_HZ <= 1000 the tick budget is
+    // <= 100, so on real hardware the elapsed-tick check fires at or before
+    // the cap (above 1000 Hz the cap fires first and merely shortens the
+    // wait); its real job is to guard a host that never advances
+    // xTaskGetTickCount() (no scheduler), where the tick check alone would
+    // spin forever instead of returning the bounded false.
+    const ::TickType_t start     = ::xTaskGetTickCount();
+    const ::TickType_t raw_ticks = pdMS_TO_TICKS(100);
+    const ::TickType_t budget    = (raw_ticks != 0) ? raw_ticks : 1;
+    for (uint32_t i = 0; i < 100; ++i) {
+        bool running = false;
+        portENTER_CRITICAL_SAFE(mux);
+        running = task_running;
+        portEXIT_CRITICAL_SAFE(mux);
+        if (!running) {
+            return true;
+        }
+        if ((::xTaskGetTickCount() - start) >= budget) {
+            return false;
+        }
+        ::vTaskDelay(1);
+    }
+    return false;
+}
+
+#if M5HAL_ESPIDF_I2C_SLAVE_LL_BE
+// Interrupt bit names differ by chip generation (classic ESP32: FULL/EMPTY,
+// every other slave-capable SoC: WM). Both mean "RX FIFO at/above threshold" /
+// "TX FIFO below threshold"; probe for the WM name and fall back to the
+// classic one, mirroring ESP32_I2C_slave_example's INT_RX_WM/INT_TX_WM.
+#if defined(I2C_RXFIFO_WM_INT_ENA_M)
+constexpr uint32_t kBeRxWmIntr = I2C_RXFIFO_WM_INT_ENA_M;
+constexpr uint32_t kBeTxWmIntr = I2C_TXFIFO_WM_INT_ENA_M;
+#else
+constexpr uint32_t kBeRxWmIntr = I2C_RXFIFO_FULL_INT_ENA_M;
+constexpr uint32_t kBeTxWmIntr = I2C_TXFIFO_EMPTY_INT_ENA_M;
+#endif
+#endif  // M5HAL_ESPIDF_I2C_SLAVE_LL_BE
+
 }  // namespace impl_espidf_slave
 }  // namespace
 
@@ -122,9 +204,16 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
 #if !defined(SOC_I2C_SUPPORT_SLAVE) || !SOC_I2C_SUPPORT_SLAVE
     return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
 #endif
+    const auto port_r = impl_espidf_slave::resolveSlaveControllerPort(cfg.controller);
+    if (!port_r.has_value()) {
+        return m5::stl::make_unexpected(port_r.error());
+    }
 
     if (_hw != nullptr || _task != nullptr || _intr != nullptr) {
-        (void)release();
+        auto released = release();
+        if (!released.has_value()) {
+            return m5::stl::make_unexpected(released.error());
+        }
     }
     _config  = cfg;
     _pin_scl = cfg.pin_scl;
@@ -150,7 +239,7 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
         return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
     }
 
-    const ::i2c_port_t port = I2C_NUM_0;
+    const ::i2c_port_t port = static_cast<::i2c_port_t>(port_r.value());
     ::i2c_dev_t* const hw   = I2C_LL_GET_HW(port);
     _hw                     = hw;
 
@@ -178,6 +267,28 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
     }
 #endif
 
+    // Functional (controller) clock, distinct from the APB bus clock above. C6/H2
+    // boot code explicitly gates it off (PCR i2c_sclk_en) and the P4 reset value is
+    // disabled, so without this the peripheral is dead on cold boot there; S3-class
+    // chips only work because their reset value happens to be enabled. Must come
+    // AFTER i2c_ll_reset_register (the reset clears it). On P4 the clock control is
+    // shared across peripherals and i2c_ll_set_source_clk is an RCC-atomic
+    // function-like macro (same `::`-prefix caveat as the RCC block above).
+    // A/B diagnosis knob: -DM5HAL_I2C_SLAVE_NO_CONTROLLER_CLOCK skips this block
+    // (the pre-fix behavior) to reproduce the cold-boot failure on C6/H2.
+#if defined(M5HAL_I2C_SLAVE_NO_CONTROLLER_CLOCK)
+    // skipped: cold-boot A/B baseline
+#elif defined(SOC_PERIPH_CLK_CTRL_SHARED) && SOC_PERIPH_CLK_CTRL_SHARED
+    PERIPH_RCC_ATOMIC()
+    {
+        i2c_ll_enable_controller_clock(hw, true);
+        i2c_ll_set_source_clk(hw, I2C_CLK_SRC_DEFAULT);
+    }
+#else
+    i2c_ll_enable_controller_clock(hw, true);
+    i2c_ll_set_source_clk(hw, I2C_CLK_SRC_DEFAULT);
+#endif
+
     // Route SDA and SCL to the I2C peripheral by hand, via the GPIO matrix,
     // WITHOUT the legacy driver/i2c.h i2c_set_pin(): every M5HAL build also links
     // the new (driver-ng) I2C master, and any legacy I2C driver call aborts at
@@ -189,6 +300,10 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
     const uint32_t out_sig[2]  = {i2c_periph_signal[port].sda_out_sig, i2c_periph_signal[port].scl_out_sig};
     const uint32_t in_sig[2]   = {i2c_periph_signal[port].sda_in_sig, i2c_periph_signal[port].scl_in_sig};
     for (int i = 0; i < 2; ++i) {
+        // Route the pad itself to the GPIO matrix (IO_MUX MCU_SEL): none of the
+        // calls below touch it, so a pin whose reset function is not GPIO (e.g.
+        // plain ESP32 GPIO1/3 = UART) would never reach the matrix without this.
+        ::esp_rom_gpio_pad_select_gpio(pins[i]);
         (void)::gpio_set_level(pins[i], 1);
         (void)::gpio_set_direction(pins[i], GPIO_MODE_INPUT_OUTPUT_OD);
         (void)::gpio_set_pull_mode(pins[i], GPIO_PULLUP_ONLY);
@@ -243,7 +358,10 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
 
     if (::esp_intr_alloc(i2c_periph_signal[port].irq, M5HAL_I2C_SLAVE_ISR_INTR_FLAGS, &SlaveBus_espidf::isrThunk, this,
                          &_intr) != ESP_OK) {
-        (void)release();
+        auto released = release();
+        if (!released.has_value()) {
+            return m5::stl::make_unexpected(released.error());
+        }
         return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
     }
     _baseline_intrs = I2C_RXFIFO_WM_INT_ENA_M | I2C_TRANS_COMPLETE_INT_ENA_M | I2C_SLAVE_STRETCH_INT_ENA_M;
@@ -289,15 +407,8 @@ result_t<void> SlaveBus_espidf::release(void)
         _task_stop = true;
         portEXIT_CRITICAL_SAFE(&_mux);
         notifyTaskFromTask();
-        for (uint32_t i = 0; i < 100; ++i) {
-            bool running = false;
-            portENTER_CRITICAL_SAFE(&_mux);
-            running = _task_running;
-            portEXIT_CRITICAL_SAFE(&_mux);
-            if (!running) {
-                break;
-            }
-            ::vTaskDelay(pdMS_TO_TICKS(1));
+        if (!impl_espidf_slave::waitTaskStopped(&_mux, _task_running)) {
+            return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
         }
         _task = nullptr;
     }
@@ -341,12 +452,22 @@ bool SlaveBus_espidf::drainRxLocked(uint32_t count, bool can_hold)
     }
     uint8_t buf[SOC_I2C_FIFO_LEN];
     M5HAL_MARK_HI(M5HAL_I2C_SLAVE_MARK_RXDRAIN);
+    // The STOP-tail reserve (rx[] beyond the back-pressure threshold) must absorb
+    // the deepest possible FIFO tail: at STOP the backlog is <= kRxCapacity (the
+    // hold machine enforces it) and the FIFO holds <= SOC_I2C_FIFO_LEN.
+    static_assert(kRxCapacity + SOC_I2C_FIFO_LEN <= kRxArrayCapacity,
+                  "rx[] reserve cannot absorb a full HW FIFO at STOP");
     while (count) {
         // rx[] is a power-of-two ring: the cap bounds the UNREAD backlog
         // (rx_size - rx_read), not the per-transaction total. While read() drains
         // (freeing space), this ISR path can store far more than kRxCapacity bytes
-        // across one transaction.
-        const size_t freespace = kRxCapacity - (_current->rx_size - _current->rx_read);
+        // across one transaction. Mid-transaction (can_hold) the cap is the
+        // back-pressure threshold; at STOP (no later stretch can hold the master)
+        // it is the full array, so the FIFO tail spills into the reserve instead
+        // of dropping.
+        const size_t cap       = can_hold ? kRxCapacity : kRxArrayCapacity;
+        const size_t backlog   = _current->rx_size - _current->rx_read;
+        const size_t freespace = (backlog < cap) ? (cap - backlog) : 0;
         if (freespace == 0) {
             if (can_hold) {
                 // Ring full mid-transaction: leave the remaining `count` bytes in the
@@ -356,8 +477,9 @@ bool SlaveBus_espidf::drainRxLocked(uint32_t count, bool can_hold)
                 M5HAL_MARK_LO(M5HAL_I2C_SLAVE_MARK_RXDRAIN);
                 return true;
             }
-            // STOP / no later lift: drain and drop the tail that no longer fits
-            // (only reached if the consumer never caught up; surfaced via rxOverflow).
+            // STOP with even the reserve full: defensive only -- the hold machine
+            // bounds the backlog to kRxCapacity, so backlog + FIFO tail fits the
+            // array (static_assert above). Drain and surface via rxOverflow.
             uint8_t c = (count > SOC_I2C_FIFO_LEN) ? SOC_I2C_FIFO_LEN : static_cast<uint8_t>(count);
             ::i2c_ll_read_rxfifo(_hw, buf, c);
             _rx_overflow_count += c;
@@ -370,7 +492,7 @@ bool SlaveBus_espidf::drainRxLocked(uint32_t count, bool can_hold)
         }
         ::i2c_ll_read_rxfifo(_hw, buf, c);
         for (uint8_t i = 0; i < c; ++i) {
-            _current->rx[(_current->rx_size++) & (kRxCapacity - 1)] = buf[i];
+            _current->rx[(_current->rx_size++) & (kRxArrayCapacity - 1)] = buf[i];
         }
         count -= c;
     }
@@ -393,10 +515,20 @@ void SlaveBus_espidf::snapshotResponseLocked()
     _resp_len        = 0;
     _resp_pos        = 0;
     Transaction* txn = _open;
-    if (txn != nullptr) {
-        while (txn->tx_read < txn->tx_size && _resp_len < kTxCapacity) {
-            _resp[_resp_len++] = txn->tx[(txn->tx_read++) & (kTxCapacity - 1)];
-        }
+    // Stale-reply guard (same _open == _current rule as the RX_FULL lift in read()):
+    // pay out only when the accessor's open transaction IS the transaction on the
+    // wire. A write's STOP clears _current in the ISR, but _open lingers until
+    // serve() closes it -- on a slow CPU (H2 @ 96MHz) a zero-gap follow-up read's
+    // address-match beats that close, and the reply composed DURING the completed
+    // write (pre-write register state; expires-at-STOP by design) must not leak into
+    // the new read. On a mismatch _resp stays empty, so the caller keeps the stretch
+    // held until the accessor opens the wire's transaction and composes afresh (or
+    // the stretch budget expires into fill bytes).
+    if (txn == nullptr || txn != _current) {
+        return;
+    }
+    while (txn->tx_read < txn->tx_size && _resp_len < kTxCapacity) {
+        _resp[_resp_len++] = txn->tx[(txn->tx_read++) & (kTxCapacity - 1)];
     }
 }
 
@@ -428,6 +560,14 @@ void SlaveBus_espidf::fillTxFromRespLocked()
 
 void SlaveBus_espidf::enterTxHoldFromIsrLocked(bool& task_woken, bool address_read)
 {
+    // RX back-pressure owns the physical stretch until read() has first drained
+    // the ring and the residual FIFO tail. Do not reclassify it as a TX hold:
+    // write() would then release SCL while RX still has no space. Once read()
+    // lifts RX_FULL, the read reaches TX_EMPTY and re-enters here to establish
+    // the normal TX hold (or refill immediately from an already queued reply).
+    if (_hold_kind == HoldKind::rx_full) {
+        return;
+    }
     _hold_kind       = address_read ? HoldKind::address_read : HoldKind::tx_empty;
     _request_pending = true;
     _request_tick    = ::xTaskGetTickCountFromISR();
@@ -523,15 +663,68 @@ void SlaveBus_espidf::handleIsr()
     // stretch, which holds until the app streams more. Enabled on read-stretch release
     // and disabled at STOP / when the reply is exhausted (so it never fires on writes).
 #if M5HAL_I2C_SLAVE_TX_WM
-    if ((ints & I2C_TXFIFO_WM_INT_ENA_M) && is_read) {
-        snapshotResponseLocked();
-        if (_resp_pos < _resp_len) {
-            fillTxFromRespLocked();
+    if (ints & I2C_TXFIFO_WM_INT_ENA_M) {
+        if (is_read) {
+            snapshotResponseLocked();
+            if (_resp_pos < _resp_len) {
+                fillTxFromRespLocked();
+            } else {
+                ::i2c_ll_disable_intr_mask(hw, I2C_TXFIFO_WM_INT_ENA_M);
+            }
         } else {
+            // Storm brake: the raw TXFIFO_WM source is level-type (valid while the
+            // FIFO count stays below the threshold), and is_read (sr.slave_rw) only
+            // tracks the most recent ADDRESS MATCH. If a read's STOP teardown was
+            // skipped and a write follows, the WM keeps re-asserting with neither a
+            // fill nor a disable on this path -- disable it here so a stale-direction
+            // pass can never spin the ISR.
             ::i2c_ll_disable_intr_mask(hw, I2C_TXFIFO_WM_INT_ENA_M);
         }
     }
 #endif
+
+    // STOP: mark the transaction complete and discard the TX bytes the master did
+    // not read (the window's Tx auto-vanish). Handled BEFORE the stretch causes:
+    // when a delayed ISR pass sees both the previous transaction's STOP and the
+    // next transaction's ADDRESS_MATCH stretch in one snapshot, the bus-order is
+    // STOP first -- processing it after the stretch branch would tear down the
+    // hold/_current that ADDRESS_MATCH just set up for the NEW transaction (and a
+    // pure read following a write would silently re-use the completed transaction).
+    if (ints & I2C_TRANS_COMPLETE_INT_ENA_M) {
+        if (rx) {
+            // Transaction ending: there is no later read() to lift a hold, so drain
+            // all and drop any tail that no longer fits (back-pressure normally keeps
+            // the ring from being full here; a drop means the consumer never caught up).
+            drainRxLocked(rx, false);
+            rx = 0;
+        }
+        // TX teardown is direction-INDEPENDENT: is_read is stale here both in the
+        // race where the next transaction's address phase already ran before this
+        // pass, and deterministically at the final STOP of a read->RESTART->write
+        // composite. Gating on it leaves the level-type TXFIFO_WM armed with nothing
+        // left to disable it (see the storm brake above). A write-STOP's TX FIFO is
+        // idle, so the unconditional reset is harmless in that direction.
+        ::i2c_ll_disable_intr_mask(hw, I2C_TXFIFO_WM_INT_ENA_M);
+        ::i2c_ll_txfifo_rst(hw);
+        if (_current != nullptr) {
+            _current->complete = true;
+        }
+        // Close the current transaction so the NEXT bus transaction allocates a
+        // fresh slot. Without this, a read that follows a separate write (SPLIT /
+        // a register write then a plain read) re-uses the completed write
+        // transaction instead of getting its own, so the accessor has nothing new
+        // to open and the read intermittently goes unserved. Mirrors the software
+        // backend's stopCondition().
+        const uint32_t masked = clearHoldLocked();
+        if (masked != 0) {
+            ::i2c_ll_slave_clear_stretch(hw);
+            enableMaskedInterrupts(masked);
+        }
+        _current         = nullptr;
+        _request_pending = false;
+        _resp_len        = 0;  // this read's reply is spent; next read snapshots afresh
+        _resp_pos        = 0;
+    }
 
     // Stretch: the HW is holding SCL low waiting for us.
     if (ints & I2C_SLAVE_STRETCH_INT_ENA_M) {
@@ -611,43 +804,514 @@ void SlaveBus_espidf::handleIsr()
         M5HAL_MARK_LO(M5HAL_I2C_SLAVE_MARK_STRETCH);
     }
 
-    // STOP: mark the transaction complete and discard the TX bytes the master did
-    // not read (the window's Tx auto-vanish).
-    if (ints & I2C_TRANS_COMPLETE_INT_ENA_M) {
-        if (rx) {
-            // Transaction ending: there is no later read() to lift a hold, so drain
-            // all and drop any tail that no longer fits (back-pressure normally keeps
-            // the ring from being full here; a drop means the consumer never caught up).
-            drainRxLocked(rx, false);
-            rx = 0;
-        }
-        if (is_read) {
-            ::i2c_ll_disable_intr_mask(hw, I2C_TXFIFO_WM_INT_ENA_M);
-            ::i2c_ll_txfifo_rst(hw);
-        }
-        if (_current != nullptr) {
-            _current->complete = true;
-        }
-        // Close the current transaction so the NEXT bus transaction allocates a
-        // fresh slot. Without this, a read that follows a separate write (SPLIT /
-        // a register write then a plain read) re-uses the completed write
-        // transaction instead of getting its own, so the accessor has nothing new
-        // to open and the read intermittently goes unserved. Mirrors the software
-        // backend's stopCondition().
-        const uint32_t masked = clearHoldLocked();
-        if (masked != 0) {
-            ::i2c_ll_slave_clear_stretch(hw);
-            enableMaskedInterrupts(masked);
-        }
-        _current         = nullptr;
-        _request_pending = false;
-        _resp_len        = 0;  // this read's reply is spent; next read snapshots afresh
-        _resp_pos        = 0;
-    }
-
     // Wake the serve() consumer on this activity (RX drained, hold entered, reply
     // room, or STOP) so it drains/fills without waiting out a poll delay -- the key
     // to keeping the RX ring from being full at the master's STOP at high speed.
+    notifyConsumerFromISR(woken);
+
+    portEXIT_CRITICAL_ISR(&_mux);
+
+    if (woken) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+#elif M5HAL_ESPIDF_I2C_SLAVE_LL_BE
+// ---------------------------------------------------------------------------
+// Classic ESP32 path: LL best-effort (no clock stretch). Same GPIO-matrix /
+// RCC / FIFO setup as the LL flavor (see its comments above for the "why"
+// behind each step); the differences are called out below.
+// ---------------------------------------------------------------------------
+
+result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
+{
+    if (cfg.pin_scl < 0 || cfg.pin_sda < 0 || cfg.address_is_10bit || cfg.address > 0x7Fu) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+#if !defined(SOC_I2C_SUPPORT_SLAVE) || !SOC_I2C_SUPPORT_SLAVE
+    return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+#endif
+    // BE has no clock stretch, so nothing can hold the bus while a `stretch`
+    // policy accessor composes its reply -- reject it up front (same guard the
+    // v2 driver flavor uses for the same reason).
+    if (cfg.tx_underrun == i2c::TxUnderrun::Stretch) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+    const auto port_r = impl_espidf_slave::resolveSlaveControllerPort(cfg.controller);
+    if (!port_r.has_value()) {
+        return m5::stl::make_unexpected(port_r.error());
+    }
+
+    if (_hw != nullptr || _task != nullptr || _intr != nullptr) {
+        auto released = release();
+        if (!released.has_value()) {
+            return m5::stl::make_unexpected(released.error());
+        }
+    }
+    _config  = cfg;
+    _pin_scl = cfg.pin_scl;
+    _pin_sda = cfg.pin_sda;
+
+    {
+        portENTER_CRITICAL_SAFE(&_mux);
+        resetStateLocked();
+        _resp_len     = 0;
+        _resp_pos     = 0;
+        _task_stop    = false;
+        _task_running = true;
+        portEXIT_CRITICAL_SAFE(&_mux);
+    }
+    if (::xTaskCreate(&SlaveBus_espidf::taskThunk, "m5hal_i2c_slave", 3072, this, configMAX_PRIORITIES - 1, &_task) !=
+        pdPASS) {
+        portENTER_CRITICAL_SAFE(&_mux);
+        _task_running = false;
+        portEXIT_CRITICAL_SAFE(&_mux);
+        return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+    }
+
+    const ::i2c_port_t port = static_cast<::i2c_port_t>(port_r.value());
+    ::i2c_dev_t* const hw   = I2C_LL_GET_HW(port);
+    _hw                     = hw;
+
+#if defined(SOC_RCC_IS_INDEPENDENT) && SOC_RCC_IS_INDEPENDENT
+    i2c_ll_enable_bus_clock(port, true);
+    i2c_ll_reset_register(port);
+#else
+    PERIPH_RCC_ATOMIC()
+    {
+        i2c_ll_enable_bus_clock(port, true);
+        i2c_ll_reset_register(port);
+    }
+#endif
+
+#if defined(M5HAL_I2C_SLAVE_NO_CONTROLLER_CLOCK)
+    // skipped: cold-boot A/B baseline
+#elif defined(SOC_PERIPH_CLK_CTRL_SHARED) && SOC_PERIPH_CLK_CTRL_SHARED
+    PERIPH_RCC_ATOMIC()
+    {
+        i2c_ll_enable_controller_clock(hw, true);
+        i2c_ll_set_source_clk(hw, I2C_CLK_SRC_DEFAULT);
+    }
+#else
+    i2c_ll_enable_controller_clock(hw, true);
+    i2c_ll_set_source_clk(hw, I2C_CLK_SRC_DEFAULT);
+#endif
+
+    const ::gpio_num_t pins[2] = {static_cast<::gpio_num_t>(cfg.pin_sda), static_cast<::gpio_num_t>(cfg.pin_scl)};
+    const uint32_t out_sig[2]  = {i2c_periph_signal[port].sda_out_sig, i2c_periph_signal[port].scl_out_sig};
+    const uint32_t in_sig[2]   = {i2c_periph_signal[port].sda_in_sig, i2c_periph_signal[port].scl_in_sig};
+    for (int i = 0; i < 2; ++i) {
+        ::esp_rom_gpio_pad_select_gpio(pins[i]);
+        (void)::gpio_set_level(pins[i], 1);
+        (void)::gpio_set_direction(pins[i], GPIO_MODE_INPUT_OUTPUT_OD);
+        (void)::gpio_set_pull_mode(pins[i], GPIO_PULLUP_ONLY);
+        ::esp_rom_gpio_connect_out_signal(pins[i], out_sig[i], false, false);
+        ::esp_rom_gpio_connect_in_signal(pins[i], in_sig[i], false);
+    }
+
+    ::i2c_ll_disable_intr_mask(hw, I2C_LL_INTR_MASK);
+    ::i2c_ll_clear_intr_mask(hw, I2C_LL_INTR_MASK);
+    ::i2c_ll_txfifo_rst(hw);
+    ::i2c_ll_rxfifo_rst(hw);
+
+    hw->ctr.sda_force_out = 1;
+    hw->ctr.scl_force_out = 1;
+    ::i2c_ll_master_rx_full_ack_level(hw, 0);
+    ::i2c_ll_slave_enable_auto_start(hw, true);
+
+    ::i2c_ll_set_slave_addr(hw, cfg.address, false);
+    ::i2c_ll_set_tout(hw, I2C_LL_MAX_TIMEOUT);
+
+    ::i2c_ll_set_sda_timing(hw, 10, 10);
+    ::i2c_ll_master_set_filter(hw, 7);  // light noise filter (not load-bearing)
+    // RX water mark = 1 byte (LL uses FIFO/2): without a stretch to hold the
+    // master, the ISR must capture a write's leading byte as fast as possible
+    // (a repeated-START read can follow immediately). TX stays at FIFO/2, same
+    // cadence as the LL flavor.
+    ::i2c_ll_set_rxfifo_full_thr(hw, 1);
+    ::i2c_ll_set_txfifo_empty_thr(hw, SOC_I2C_FIFO_LEN / 2);
+
+#if !defined(CONFIG_IDF_TARGET_ESP32)
+    // Classic ESP32 has no fifo_prt_en field; every other slave-capable SoC
+    // resets to 1 but this keeps FIFO pointer control explicit.
+    hw->fifo_conf.fifo_prt_en = 1;
+#endif
+    ::i2c_ll_enable_fifo_mode(hw, true);
+    hw->fifo_conf.fifo_addr_cfg_en = 0;
+
+    // No clock-stretch enable block here: i2c_ll_slave_enable_scl_stretch is a
+    // no-op on SoCs without SOC_I2C_SLAVE_CAN_GET_STRETCH_CAUSE (that is what
+    // selects this flavor in the first place), so skip it rather than call a
+    // primitive that does nothing.
+
+    if (::esp_intr_alloc(i2c_periph_signal[port].irq, M5HAL_I2C_SLAVE_ISR_INTR_FLAGS, &SlaveBus_espidf::isrThunk, this,
+                         &_intr) != ESP_OK) {
+        auto released = release();
+        if (!released.has_value()) {
+            return m5::stl::make_unexpected(released.error());
+        }
+        return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+    }
+    ::i2c_ll_enable_intr_mask(
+        hw, impl_espidf_slave::kBeRxWmIntr | I2C_TRANS_COMPLETE_INT_ENA_M | impl_espidf_slave::kBeTxWmIntr);
+    ::i2c_ll_update(hw);
+
+    // Prime the TX FIFO (allocate a transaction and top it up with fill bytes,
+    // same as the STOP handler in handleIsr()) so a read arriving before any
+    // write()/STOP still gets fill bytes instead of stale/garbage data.
+    portENTER_CRITICAL_SAFE(&_mux);
+    _current = allocateTransactionLocked();
+    snapshotResponseLocked();
+    fillTxFromRespLocked();
+    portEXIT_CRITICAL_SAFE(&_mux);
+
+    return {};
+}
+
+void SlaveBus_espidf::restorePins()
+{
+    if (_pin_scl >= 0) {
+        (void)::gpio_reset_pin(static_cast<::gpio_num_t>(_pin_scl));
+    }
+    if (_pin_sda >= 0) {
+        (void)::gpio_reset_pin(static_cast<::gpio_num_t>(_pin_sda));
+    }
+    _pin_scl = -1;
+    _pin_sda = -1;
+}
+
+result_t<void> SlaveBus_espidf::release(void)
+{
+    if (_intr != nullptr) {
+        if (_hw != nullptr) {
+            ::i2c_ll_disable_intr_mask(_hw, I2C_LL_INTR_MASK);
+            ::i2c_ll_clear_intr_mask(_hw, I2C_LL_INTR_MASK);
+        }
+        (void)::esp_intr_free(_intr);
+        _intr = nullptr;
+    }
+
+    if (_task != nullptr) {
+        portENTER_CRITICAL_SAFE(&_mux);
+        _task_stop = true;
+        portEXIT_CRITICAL_SAFE(&_mux);
+        notifyTaskFromTask();
+        if (!impl_espidf_slave::waitTaskStopped(&_mux, _task_running)) {
+            return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+        }
+        _task = nullptr;
+    }
+
+    _hw = nullptr;
+    restorePins();
+
+    portENTER_CRITICAL_SAFE(&_mux);
+    resetStateLocked();
+    _resp_len     = 0;
+    _resp_pos     = 0;
+    _task_stop    = false;
+    _task_running = false;
+    // Drop the regmap fast-path binding along with the rest of the HW state --
+    // a re-init starts from a clean slate; the accessor that owns the binding
+    // struct still holds it and re-binds on its next setOnRead/setOnWrite (or
+    // simply re-constructs). We only drop OUR pointer to it, never touch the
+    // struct itself (we do not own it).
+    _isr_binding = nullptr;
+    portEXIT_CRITICAL_SAFE(&_mux);
+    return {};
+}
+
+bool SlaveBus_espidf::bindIsrRegMap(IsrRegMapBinding* binding)
+{
+    if (binding == nullptr) {
+        return false;
+    }
+    portENTER_CRITICAL_SAFE(&_mux);
+    // Last-bind-wins: just take the slot. The superseded binding (if any) is
+    // left untouched -- its owner still believes it is bound until it calls
+    // unbindIsrRegMap, which is then a no-op (ownership check there).
+    // Per-transaction wire state resets on every (re)bind; `pointer` itself is
+    // NOT touched here -- the caller's initial/persisted value is respected.
+    binding->pointer_received = false;
+    binding->write_offset     = 0;
+    binding->tx_offset        = 0;
+    _isr_binding              = binding;
+    // Re-compose the TX FIFO from the now-bound register map so a read arriving
+    // before the next write/STOP sees regmap data instead of whatever the
+    // plain-stream priming (init(), or a prior binding's hooks) had queued.
+    rebuildTxRegMapLocked();
+    portEXIT_CRITICAL_SAFE(&_mux);
+    return true;
+}
+
+void SlaveBus_espidf::unbindIsrRegMap(IsrRegMapBinding* binding)
+{
+    portENTER_CRITICAL_SAFE(&_mux);
+    // Ownership check: only clear the slot if `binding` is still the one bound
+    // -- a caller whose binding was already superseded by a later bind (see
+    // above) must not rip out the newer one.
+    if (_isr_binding == binding) {
+        _isr_binding = nullptr;
+    }
+    portEXIT_CRITICAL_SAFE(&_mux);
+}
+
+// Drain RX-FIFO bytes into the current transaction's rx ring as raw stream
+// bytes (no register interpretation). Used only while no regmap fast path is
+// bound -- see drainRxRegMapLocked for that path. No back-pressure: see the
+// header contract.
+void SlaveBus_espidf::drainRxLocked(uint32_t count)
+{
+    if (count == 0) {
+        return;
+    }
+    if (_current == nullptr) {
+        _current = allocateTransactionLocked();
+        if (_current == nullptr) {
+            // No transaction slot to hold the bytes: drain to scratch to keep the
+            // HW sane and surface the loss.
+            uint8_t scratch[SOC_I2C_FIFO_LEN];
+            while (count) {
+                uint8_t c = (count > SOC_I2C_FIFO_LEN) ? SOC_I2C_FIFO_LEN : static_cast<uint8_t>(count);
+                ::i2c_ll_read_rxfifo(_hw, scratch, c);
+                count -= c;
+            }
+            ++_rx_overflow_count;
+            return;
+        }
+    }
+    uint8_t buf[SOC_I2C_FIFO_LEN];
+    while (count) {
+        const size_t backlog   = _current->rx_size - _current->rx_read;
+        const size_t freespace = (backlog < kRxArrayCapacity) ? (kRxArrayCapacity - backlog) : 0;
+        uint8_t c              = (count > SOC_I2C_FIFO_LEN) ? SOC_I2C_FIFO_LEN : static_cast<uint8_t>(count);
+        if (freespace == 0) {
+            // Ring full and no later hold to lift it: drop the tail (BE has no
+            // back-pressure primitive), surfaced via rxOverflowCount().
+            ::i2c_ll_read_rxfifo(_hw, buf, c);
+            _rx_overflow_count += c;
+            count -= c;
+            continue;
+        }
+        if (c > freespace) {
+            c = static_cast<uint8_t>(freespace);
+        }
+        ::i2c_ll_read_rxfifo(_hw, buf, c);
+        for (uint8_t i = 0; i < c; ++i) {
+            _current->rx[(_current->rx_size++) & (kRxArrayCapacity - 1)] = buf[i];
+        }
+        count -= c;
+    }
+}
+
+// Same contract as the LL flavor's snapshotResponseLocked (see its comment):
+// pulls the open transaction's unread tx bytes into _resp, only once the
+// current snapshot is fully sent. Must run with _mux held.
+void SlaveBus_espidf::snapshotResponseLocked()
+{
+    if (_resp_pos < _resp_len) {
+        return;
+    }
+    _resp_len        = 0;
+    _resp_pos        = 0;
+    Transaction* txn = _open;
+    if (txn == nullptr || txn != _current) {
+        return;
+    }
+    while (txn->tx_read < txn->tx_size && _resp_len < kTxCapacity) {
+        _resp[_resp_len++] = txn->tx[(txn->tx_read++) & (kTxCapacity - 1)];
+    }
+}
+
+// Fill the TX FIFO from the response snapshot. Unlike the LL flavor (which
+// only needs one fill byte per underrun -- the master stays held under the
+// stretch until the next call), BE has no hold: an exhausted _resp must top
+// the WHOLE free space with tx_fill_byte, or the FIFO stays below the water
+// mark and the level-type TX interrupt spins even with the bus idle. Topping
+// fully also means a write phase's FIFO -- already topped from the last
+// STOP -- never drops back below threshold on its own, so no direction check
+// (is_read) is needed to keep the interrupt from storming during writes.
+// Must run with _mux held.
+void SlaveBus_espidf::fillTxFromRespLocked()
+{
+    uint32_t freelen = 0;
+    ::i2c_ll_get_txfifo_len(_hw, &freelen);
+    if (freelen > SOC_I2C_FIFO_LEN) {
+        freelen = SOC_I2C_FIFO_LEN;
+    }
+    if (freelen == 0) {
+        return;
+    }
+    uint8_t buf[SOC_I2C_FIFO_LEN];
+    uint32_t n = 0;
+    while (n < freelen && _resp_pos < _resp_len) {
+        buf[n++] = _resp[_resp_pos++];
+    }
+    while (n < freelen) {
+        buf[n++] = _config.tx_fill_byte;
+    }
+    ::i2c_ll_write_txfifo(_hw, buf, static_cast<uint8_t>(n));
+}
+
+// Drain RX-FIFO bytes directly into the bound register map: the first byte of
+// each transaction sets _isr_binding->pointer, subsequent bytes store via
+// regMapWriteByte (auto-increment, firing onWrite). No back-pressure and no
+// Transaction.rx[] involvement -- see the header contract. Must run with
+// _mux held, and only while _isr_binding != nullptr.
+void SlaveBus_espidf::drainRxRegMapLocked(uint32_t count)
+{
+    IsrRegMapBinding* binding = _isr_binding;
+    uint8_t buf[SOC_I2C_FIFO_LEN];
+    while (count) {
+        uint8_t c = (count > SOC_I2C_FIFO_LEN) ? SOC_I2C_FIFO_LEN : static_cast<uint8_t>(count);
+        ::i2c_ll_read_rxfifo(_hw, buf, c);
+        for (uint8_t i = 0; i < c; ++i) {
+            if (!binding->pointer_received) {
+                binding->pointer_received = true;
+                binding->pointer          = buf[i];
+            } else {
+                regMapWriteByte(binding->reg_file, static_cast<uint8_t>(binding->pointer + binding->write_offset),
+                                buf[i], binding->on_write, binding->on_write_ctx);
+                ++binding->write_offset;
+            }
+        }
+        count -= c;
+    }
+}
+
+// Fill the TX FIFO's free space from the bound register map starting at
+// _isr_binding->pointer + tx_offset (auto-increment, 8-bit wrap via
+// regMapReadByte). Unlike fillTxFromRespLocked there is no underrun case --
+// the reply IS the register map, so there is always a next byte. Must run
+// with _mux held, and only while _isr_binding != nullptr.
+void SlaveBus_espidf::fillTxRegMapLocked()
+{
+    IsrRegMapBinding* binding = _isr_binding;
+    uint32_t space            = 0;
+    ::i2c_ll_get_txfifo_len(_hw, &space);
+    if (space == 0) {
+        return;
+    }
+    if (space > SOC_I2C_FIFO_LEN) {
+        space = SOC_I2C_FIFO_LEN;
+    }
+    uint8_t buf[SOC_I2C_FIFO_LEN];
+    for (uint32_t i = 0; i < space; ++i) {
+        buf[i] = regMapReadByte(binding->reg_file, static_cast<uint8_t>(binding->pointer + binding->tx_offset + i),
+                                binding->on_read, binding->on_read_ctx);
+    }
+    ::i2c_ll_write_txfifo(_hw, buf, static_cast<uint8_t>(space));
+    binding->tx_offset += space;
+}
+
+// Discard whatever the TX FIFO holds and refill it from the register map at
+// the current pointer (offset 0). A no-op before init() (_hw == nullptr) --
+// bindIsrRegMap can run before the bus is initialized in test code. Must run
+// with _mux held, and only while _isr_binding != nullptr.
+void SlaveBus_espidf::rebuildTxRegMapLocked()
+{
+    if (_hw == nullptr || _isr_binding == nullptr) {
+        return;
+    }
+    ::i2c_ll_txfifo_rst(_hw);
+    _isr_binding->tx_offset = 0;
+    fillTxRegMapLocked();
+}
+
+void SlaveBus_espidf::isrThunk(void* arg)
+{
+    static_cast<SlaveBus_espidf*>(arg)->handleIsr();
+}
+
+void SlaveBus_espidf::handleIsr()
+{
+    ::i2c_dev_t* hw = _hw;
+    if (hw == nullptr) {
+        return;
+    }
+    bool woken = false;
+
+    uint32_t ints = 0;
+    ::i2c_ll_get_intr_mask(hw, &ints);
+    ::i2c_ll_clear_intr_mask(hw, ints);
+
+    uint32_t rx = 0;
+    ::i2c_ll_get_rxfifo_cnt(hw, &rx);
+
+    portENTER_CRITICAL_ISR(&_mux);
+
+    // Snapshot once per pass: bindIsrRegMap/unbindIsrRegMap only run in task
+    // context under this same _mux, so this cannot flip mid-pass.
+    const bool regmap_fast_path = (_isr_binding != nullptr);
+
+    // RX water-mark: drain written bytes. The regmap fast path (see the class
+    // comment) interprets bytes as pointer/register-data directly and
+    // re-composes the TX FIFO from the possibly-new pointer right here -- so a
+    // repeated-START read that follows sees correct data without waiting on a
+    // task. Without a binding, bytes land in the Transaction rx[] ring like the
+    // plain streaming path.
+    if ((ints & impl_espidf_slave::kBeRxWmIntr) && rx) {
+        if (regmap_fast_path) {
+            drainRxRegMapLocked(rx);
+            rebuildTxRegMapLocked();
+        } else {
+            drainRxLocked(rx);
+        }
+        rx = 0;
+    }
+
+    // TX water-mark: the FIFO dropped below the threshold. Per the class
+    // comment, this only happens while genuinely being read (a write phase's
+    // FIFO stays topped from the last STOP and never re-triggers it). Continue
+    // filling from wherever the active source (regmap or the stream _resp
+    // snapshot) left off.
+    if (ints & impl_espidf_slave::kBeTxWmIntr) {
+        if (regmap_fast_path) {
+            fillTxRegMapLocked();
+        } else {
+            snapshotResponseLocked();
+            fillTxFromRespLocked();
+        }
+    }
+
+    // STOP: close out the current transaction and pre-arm a fresh one so the
+    // TX FIFO can be topped up right here -- BE has no address-match interrupt
+    // to defer that to (unlike the LL flavor). Still tracked even under the
+    // regmap fast path (Transaction.complete is what SlaveRegMapAccessor::
+    // serve()'s fast-path branch waits on) -- only the byte payload bypasses
+    // Transaction.rx[]/tx[].
+    if (ints & I2C_TRANS_COMPLETE_INT_ENA_M) {
+        if (rx) {
+            if (regmap_fast_path) {
+                drainRxRegMapLocked(rx);
+            } else {
+                drainRxLocked(rx);
+            }
+            rx = 0;
+        }
+        ::i2c_ll_txfifo_rst(hw);
+        if (_current != nullptr) {
+            _current->complete = true;
+        }
+        _current         = allocateTransactionLocked();
+        _request_pending = false;
+        if (regmap_fast_path) {
+            // Next transaction's first byte is a new pointer (SPLIT / repeat-
+            // read rely on the binding's pointer itself persisting, so it is
+            // NOT reset here).
+            _isr_binding->pointer_received = false;
+            _isr_binding->write_offset     = 0;
+            rebuildTxRegMapLocked();
+        } else {
+            _resp_len = 0;
+            _resp_pos = 0;
+            snapshotResponseLocked();
+            fillTxFromRespLocked();
+        }
+    }
+
+    // Wake the serve() consumer on this activity (RX drained or STOP) so it
+    // drains/opens without waiting out a poll delay.
     notifyConsumerFromISR(woken);
 
     portEXIT_CRITICAL_ISR(&_mux);
@@ -675,9 +1339,16 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
 #endif
+    const auto port_r = impl_espidf_slave::resolveSlaveControllerPort(cfg.controller);
+    if (!port_r.has_value()) {
+        return m5::stl::make_unexpected(port_r.error());
+    }
 
     if (_handle != nullptr || _task != nullptr) {
-        (void)release();
+        auto released = release();
+        if (!released.has_value()) {
+            return m5::stl::make_unexpected(released.error());
+        }
     }
     _config = cfg;
 
@@ -697,7 +1368,7 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
     }
 
     ::i2c_slave_config_t native_cfg         = {};
-    native_cfg.i2c_port                     = I2C_NUM_0;
+    native_cfg.i2c_port                     = static_cast<decltype(native_cfg.i2c_port)>(port_r.value());
     native_cfg.sda_io_num                   = static_cast<::gpio_num_t>(cfg.pin_sda);
     native_cfg.scl_io_num                   = static_cast<::gpio_num_t>(cfg.pin_scl);
     native_cfg.clk_source                   = I2C_CLK_SRC_DEFAULT;
@@ -710,7 +1381,10 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
 
     auto mapped = impl_espidf_slave::mapEspErr(::i2c_new_slave_device(&native_cfg, &_handle));
     if (error::isError(mapped)) {
-        (void)release();
+        auto released = release();
+        if (!released.has_value()) {
+            return m5::stl::make_unexpected(released.error());
+        }
         return m5::stl::make_unexpected(mapped);
     }
 
@@ -719,7 +1393,10 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
     callbacks.on_request                    = &SlaveBus_espidf::onRequest;
     mapped = impl_espidf_slave::mapEspErr(::i2c_slave_register_event_callbacks(_handle, &callbacks, this));
     if (error::isError(mapped)) {
-        (void)release();
+        auto released = release();
+        if (!released.has_value()) {
+            return m5::stl::make_unexpected(released.error());
+        }
         return m5::stl::make_unexpected(mapped);
     }
     return {};
@@ -732,15 +1409,8 @@ result_t<void> SlaveBus_espidf::release(void)
         _task_stop = true;
         portEXIT_CRITICAL_SAFE(&_mux);
         notifyTaskFromTask();
-        for (uint32_t i = 0; i < 100; ++i) {
-            bool running = false;
-            portENTER_CRITICAL_SAFE(&_mux);
-            running = _task_running;
-            portEXIT_CRITICAL_SAFE(&_mux);
-            if (!running) {
-                break;
-            }
-            ::vTaskDelay(pdMS_TO_TICKS(1));
+        if (!impl_espidf_slave::waitTaskStopped(&_mux, _task_running)) {
+            return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
         }
         _task = nullptr;
     }
@@ -769,16 +1439,18 @@ bool SlaveBus_espidf::onReceive(::i2c_slave_dev_handle_t handle, const ::i2c_sla
     if (self == nullptr || evt_data == nullptr) {
         return false;
     }
+    bool task_woken = false;
     portENTER_CRITICAL_ISR(&self->_mux);
     auto* txn = self->allocateTransactionLocked();
     if (txn != nullptr) {
         // Non-LL callback path: the driver delivers the WHOLE transaction post-STOP
         // in one buffer, so there is no mid-transaction draining to make room. Unlike
-        // the streaming drainRxLocked() ring, kRxCapacity is a hard per-transaction
-        // cap here; a longer transaction is truncated (surfaced via rxOverflowCount).
-        // The bytes land at rx[0..copy_len) with rx_read = 0, which is the ring's
-        // natural start, so the wrap-aware read() handles this path unchanged.
-        const size_t copy_len = std::min(static_cast<size_t>(evt_data->length), kRxCapacity);
+        // the streaming drainRxLocked() ring, kRxArrayCapacity is a hard
+        // per-transaction cap here; a longer transaction is truncated (surfaced via
+        // rxOverflowCount). The bytes land at rx[0..copy_len) with rx_read = 0, which
+        // is the ring's natural start, so the wrap-aware read() handles this path
+        // unchanged.
+        const size_t copy_len = std::min(static_cast<size_t>(evt_data->length), kRxArrayCapacity);
         if (copy_len > 0 && evt_data->buffer != nullptr) {
             ::memcpy(txn->rx, evt_data->buffer, copy_len);
         }
@@ -790,8 +1462,11 @@ bool SlaveBus_espidf::onReceive(::i2c_slave_dev_handle_t handle, const ::i2c_sla
             ++self->_rx_overflow_count;
         }
     }
+    // Wake the serve() consumer parked in waitForActivity() so a completed
+    // transaction is drained promptly instead of waiting out its safety timeout.
+    self->notifyConsumerFromISR(task_woken);
     portEXIT_CRITICAL_ISR(&self->_mux);
-    return false;
+    return task_woken;
 }
 
 bool SlaveBus_espidf::onRequest(::i2c_slave_dev_handle_t handle, const ::i2c_slave_request_event_data_t* evt_data,
@@ -814,11 +1489,15 @@ bool SlaveBus_espidf::onRequest(::i2c_slave_dev_handle_t handle, const ::i2c_sla
     self->_request_pending = true;
     self->_request_tick    = ::xTaskGetTickCountFromISR();
     self->notifyTaskFromISR(task_woken);
+    // Also wake the serve() consumer (a separate wait path from the responder
+    // task notified above) so a read request is answered without waiting out
+    // its safety timeout.
+    self->notifyConsumerFromISR(task_woken);
     portEXIT_CRITICAL_ISR(&self->_mux);
     return task_woken;
 }
 
-#endif  // M5HAL_ESPIDF_I2C_SLAVE_LL
+#endif  // M5HAL_ESPIDF_I2C_SLAVE_LL / M5HAL_ESPIDF_I2C_SLAVE_LL_BE / v2 driver
 
 // ===========================================================================
 // Shared transaction-window state machine (HW independent)
@@ -886,8 +1565,8 @@ result_t<size_t> SlaveBus_espidf::read(bus::IAccessor* owner, data::DataSpan dst
     const size_t take = std::min(dst.size, readableBytesOf(*_open));
     if (take > 0) {
         // rx[] is a power-of-two ring; the readable span may wrap past the end.
-        const size_t start = _open->rx_read & (kRxCapacity - 1);
-        const size_t first = std::min(take, kRxCapacity - start);
+        const size_t start = _open->rx_read & (kRxArrayCapacity - 1);
+        const size_t first = std::min(take, kRxArrayCapacity - start);
         ::memcpy(dst.data, _open->rx + start, first);
         if (take > first) {
             ::memcpy(static_cast<uint8_t*>(dst.data) + first, _open->rx, take - first);
@@ -976,7 +1655,16 @@ result_t<size_t> SlaveBus_espidf::write(bus::IAccessor* owner, data::ConstDataSp
         }
         _open->tx_size += take;
 #if M5HAL_ESPIDF_I2C_SLAVE_LL
-        if ((_hold_kind == HoldKind::address_read || _hold_kind == HoldKind::tx_empty) && _hw != nullptr) {
+        // _open == _current gates the release (same stale-reply guard as
+        // snapshotResponseLocked()): a held read stretch belongs to the WIRE's
+        // transaction, so bytes queued onto a lingering completed transaction
+        // (serve() still finishing the preceding write's exchange) must NOT
+        // trip this release -- snapshotResponseLocked() would yield nothing and
+        // the fill-byte underrun branch would hand the master a bogus leading
+        // fill byte. Keep the hold and notify instead; the accessor's write()
+        // to the wire's own transaction releases it with the real reply.
+        if ((_hold_kind == HoldKind::address_read || _hold_kind == HoldKind::tx_empty) && _hw != nullptr &&
+            _open == _current) {
             snapshotResponseLocked();
             fillTxFromRespLocked();
             const uint32_t masked = clearHoldLocked();
@@ -1121,6 +1809,15 @@ SlaveBus_espidf::Transaction* SlaveBus_espidf::oldestOpenableTransactionLocked()
 
 void SlaveBus_espidf::discardTransactionLocked(Transaction& txn)
 {
+#if M5HAL_ESPIDF_I2C_SLAVE_LL
+    if (&txn == _current && _hold_kind == HoldKind::rx_full) {
+        const uint32_t masked = clearHoldLocked();
+        if (_hw != nullptr) {
+            ::i2c_ll_slave_clear_stretch(_hw);
+            enableMaskedInterrupts(masked & _baseline_intrs);
+        }
+    }
+#endif
     if (&txn == _current) {
         _current = nullptr;
     }
@@ -1233,7 +1930,11 @@ void SlaveBus_espidf::requestTaskLoop()
         portENTER_CRITICAL_SAFE(&_mux);
         if (!_task_stop && (_hold_kind == HoldKind::address_read || _hold_kind == HoldKind::tx_empty) &&
             _hw != nullptr) {
-            const bool have_data = (_open != nullptr && _open->tx_read < _open->tx_size);
+            // _open == _current mirrors snapshotResponseLocked()'s stale-reply guard:
+            // unread tx bytes on a lingering completed transaction must keep the hold
+            // (waiting for serve() to open the wire's transaction and compose afresh),
+            // not trip a premature snapshot whose empty _resp pays out a fill byte.
+            const bool have_data = (_open != nullptr && _open == _current && _open->tx_read < _open->tx_size);
             const bool hold      = (_config.tx_underrun == i2c::TxUnderrun::Stretch) && !have_data &&
                               (requestWaitTicksLocked(::xTaskGetTickCount()) != 0);
             if (!hold) {
@@ -1261,6 +1962,12 @@ void SlaveBus_espidf::requestTaskLoop()
                 ::i2c_ll_enable_intr_mask(hw_release, enable_after_release);
             }
         }
+#elif M5HAL_ESPIDF_I2C_SLAVE_LL_BE
+        // BE has no clock stretch to hold, so there is nothing to release here:
+        // the ISR fills/streams TX directly (see handleIsr()'s TX water-mark
+        // and STOP handling). This task exists only to satisfy the shared
+        // wake/stop machinery (waitForActivity, release()); its loop body is a
+        // deliberate no-op for this flavor.
 #else
         for (;;) {
             uint8_t local[kTxCapacity] = {};

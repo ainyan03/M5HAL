@@ -57,6 +57,13 @@ private:
     // Close and delete both channels if they exist.
     void destroyChannel(void);
 
+    // Recompute _expand_mono / _swap16 from cfg (see the field comments below
+    // for why HW v2 needs them) and report the resulting frame size (bytes per
+    // DMA frame) for DMA buffer sizing. Shared by ensureChannel's create path
+    // and its in-place full-duplex reconfig path so neither can apply a slot
+    // config while working from stale derived state.
+    void updateDerivedState(const i2s::AccessConfig& cfg, size_t& out_frame_bytes);
+
     // Static event callbacks registered with i2s_channel_register_event_callback.
     static bool onSentCallback(::i2s_chan_handle_t handle, ::i2s_event_data_t* event, void* user_ctx);
     static bool onRecvCallback(::i2s_chan_handle_t handle, ::i2s_event_data_t* event, void* user_ctx);
@@ -95,14 +102,23 @@ private:
     // from rx_buffer_size); bounds _dma_rx_available.
     size_t _dma_rx_capacity = 0;
 
-    // channels==1 on I2S HW v2 (classic ESP32): run stereo slots and let
+    // DMA descriptor geometry (dma_desc_num * dma_frame_num) applied at channel
+    // creation, per direction. The IDF keeps this geometry across the
+    // full-duplex reconfig path but reallocates every descriptor's buffer when
+    // the new slot mode changes the frame size, so the effective capacity is
+    // frames * frame_bytes — these hold the constant `frames` factor for that
+    // recomputation (frame_bytes is per-AccessConfig).
+    size_t _dma_tx_frames = 0;
+    size_t _dma_rx_frames = 0;
+
+    // channels==1 on I2S HW v1 (classic ESP32): run stereo slots and let
     // write() duplicate each sample into L/R (see ensureChannel for why the
     // native mono slot mode is unusable there). Public accounting (write
     // return, writableBytes, the remote credit built on them) stays in
     // logical mono bytes; _dma_in_flight alone holds physical bytes.
     bool _expand_mono = false;
 
-    // 16-bit stereo on I2S HW v2 (classic ESP32 / ESP32-S2): the silicon packs
+    // 16-bit stereo on I2S HW v1 (classic ESP32 / ESP32-S2): the silicon packs
     // two 16-bit samples into a 32-bit FIFO word with the halves transposed
     // (Espressif documents this as "data swapped every two data"), which for
     // stereo swaps the L/R slots. write()/read() undo it in the DMA buffer so the

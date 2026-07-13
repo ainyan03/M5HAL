@@ -20,15 +20,21 @@
 #endif
 #endif
 
-#if (defined(M5HAL_FRAMEWORK_HAS_ARDUINO) && M5HAL_FRAMEWORK_HAS_ARDUINO) || \
-    (defined(M5HAL_FRAMEWORK_HAS_ESPIDF) && M5HAL_FRAMEWORK_HAS_ESPIDF) ||   \
+// Arduino only counts as an active bus config source when it is
+// arduino-esp32: this remote server implementation assumes ESP-IDF-family
+// SPI/Wire/task APIs underneath the Arduino surface (SPIClass layout,
+// pdMS_TO_TICKS/vTaskDelay/esp_restart). Other Arduino cores (RP2040 /
+// SAMD51, see _checker.hpp's variant allowlist) fall through to the
+// "!HAS_ACTIVE_BUS_CONFIG_" paths below instead.
+#if ((defined(M5HAL_FRAMEWORK_HAS_ARDUINO) && M5HAL_FRAMEWORK_HAS_ARDUINO) && defined(ESP_PLATFORM)) || \
+    (defined(M5HAL_FRAMEWORK_HAS_ESPIDF) && M5HAL_FRAMEWORK_HAS_ESPIDF) ||                              \
     (defined(M5HAL_FRAMEWORK_HAS_POSIX) && M5HAL_FRAMEWORK_HAS_POSIX)
 #define M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ACTIVE_BUS_CONFIG_ 1
 #else
 #define M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ACTIVE_BUS_CONFIG_ 0
 #endif
 
-#if defined(M5HAL_FRAMEWORK_HAS_ARDUINO) && M5HAL_FRAMEWORK_HAS_ARDUINO
+#if defined(M5HAL_FRAMEWORK_HAS_ARDUINO) && M5HAL_FRAMEWORK_HAS_ARDUINO && defined(ESP_PLATFORM)
 #define M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_BUS_CONFIG_ 1
 #else
 #define M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_BUS_CONFIG_ 0

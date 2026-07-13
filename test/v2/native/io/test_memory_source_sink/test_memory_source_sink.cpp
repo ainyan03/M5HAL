@@ -3,12 +3,13 @@
 //
 // Mechanically verifies the behavioural contract of the memory-backed
 // Source / Sink: `peek` is idempotent and monotonically non-decreasing,
-// an empty span on `peek` means end-of-stream, an empty `DataSpan`
-// on `reserve` means closed, sequential `advance` discards bytes,
+// memory-backed empty spans coincide with end-of-stream/closed,
+// sequential `advance` discards bytes,
 // `advance` past the end drops the excess, and `reserve` mirrors the
 // idempotency of `peek`. Spec: spec/design/data_io.md.
 
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 #include <M5HAL_v2.hpp>
 
 #include <array>
@@ -348,6 +349,47 @@ TEST(LimitedSource, PeekDoesNotConsumeLimit)
     EXPECT_EQ(p3->data[0], 0x12);
 }
 
+// A base Source whose advance() fails on demand — models a streaming
+// derivation hitting a transport error.
+class FailingAdvanceSource : public Source {
+public:
+    m5::hal::v2::result_t<ConstDataSpan> peek(size_t max_len) override
+    {
+        static const uint8_t bytes[16] = {};
+        return ConstDataSpan{bytes, max_len < sizeof(bytes) ? max_len : sizeof(bytes)};
+    }
+    m5::hal::v2::result_t<void> advance(size_t) override
+    {
+        if (fail) {
+            return m5::stl::make_unexpected(m5::hal::v2::error::error_t::IO_ERROR);
+        }
+        return {};
+    }
+    bool eof() const override
+    {
+        return false;
+    }
+
+    bool fail = true;
+};
+
+TEST(LimitedSource, AdvanceFailureDoesNotChargeCap)
+{
+    // Regression anchor: the cap was charged before the base advance, so a
+    // caller retrying after a base error consumed the budget twice.
+    FailingAdvanceSource base;
+    LimitedSource src{base, 8};
+
+    auto failed = src.advance(4);
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), m5::hal::v2::error::error_t::IO_ERROR);
+    EXPECT_EQ(src.remaining(), 8u);  // nothing was consumed
+
+    base.fail = false;
+    ASSERT_TRUE(src.advance(4).has_value());
+    EXPECT_EQ(src.remaining(), 4u);  // charged exactly once
+}
+
 TEST(LimitedSink, LimitBeforeBaseExhausts)
 {
     // 16-byte base buffer, limit = 4 -> closed after 4 bytes.
@@ -512,5 +554,6 @@ TEST(MemorySink, RemainingDecreasesAfterCommitCapacityInvariant)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

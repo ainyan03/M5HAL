@@ -17,6 +17,7 @@
 #define M5HAL_VARIANT_CURRENT_HAS_HAL_RUNTIME_ 1
 #define M5HAL_VARIANT_CURRENT_HAS_HAL_RUNTIME_MUTEX_ 1
 #define M5HAL_VARIANT_CURRENT_HAS_HAL_RUNTIME_TASK_  1
+#define M5HAL_VARIANT_CURRENT_HAS_HAL_RUNTIME_EVENT_ 1
 // I2C / SPI / UART are not yet declared because their abstract bases
 // are not finalized. As stubs are added in later stages, the matching
 // HAS_HAL_*_ macros will be appended here.

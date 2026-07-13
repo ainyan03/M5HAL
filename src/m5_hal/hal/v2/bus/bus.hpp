@@ -10,6 +10,7 @@
 
 #include <M5Utility.hpp>
 
+#include <atomic>
 #include <memory>
 #include <utility>
 
@@ -22,6 +23,135 @@ namespace m5::hal::v2::bus {
 struct IBus;
 struct IAccessConfig;
 struct IAccessor;
+
+/*!
+  @brief Shared operation/close gate for a bus whose external identity may
+         outlive its concrete proxy.
+
+  Operations hold an `Operation` for their complete use of the external
+  resource.  A close first changes Open -> Releasing while holding the same
+  mutex, so it waits for earlier operations and excludes later ones.  A failed
+  close rolls back to Open; a successful close leaves a permanent Closed
+  tombstone.  The registry retains this object after the bus weak_ptr expires,
+  preventing an identity (and, for remote buses, its numeric id) from being
+  reused while natural destruction is still releasing it.
+ */
+class BusLifecycle {
+public:
+    enum class State : uint8_t { Open, Releasing, Quarantined, Closed };
+
+    class Operation {
+    public:
+        explicit Operation(BusLifecycle& lifecycle, uint32_t timeout_ms = types::TIMEOUT_FOREVER)
+            : _lifecycle{&lifecycle}, _locked{lifecycle._mutex.lock(timeout_ms)}
+        {
+            if (!_locked) {
+                _error = error::error_t::TIMEOUT_ERROR;
+            } else if (lifecycle._state.load(std::memory_order_acquire) != State::Open) {
+                _error = error::error_t::CLOSED;
+                lifecycle._mutex.unlock();
+                _locked = false;
+            }
+        }
+        ~Operation()
+        {
+            if (_locked) {
+                _lifecycle->_mutex.unlock();
+            }
+        }
+        Operation(const Operation&)            = delete;
+        Operation& operator=(const Operation&) = delete;
+
+        explicit operator bool() const
+        {
+            return _locked;
+        }
+        error::error_t error() const
+        {
+            return _error;
+        }
+
+    private:
+        BusLifecycle* _lifecycle = nullptr;
+        bool _locked             = false;
+        error::error_t _error    = error::error_t::OK;
+    };
+
+    class Close {
+    public:
+        explicit Close(BusLifecycle& lifecycle, uint32_t timeout_ms = types::TIMEOUT_FOREVER)
+            : _lifecycle{&lifecycle}, _locked{lifecycle._mutex.lock(timeout_ms)}
+        {
+            if (_locked) {
+                if (lifecycle._state.load(std::memory_order_acquire) == State::Open) {
+                    lifecycle._state.store(State::Releasing, std::memory_order_release);
+                } else {
+                    lifecycle._mutex.unlock();
+                    _locked = false;
+                }
+            }
+        }
+        ~Close()
+        {
+            if (_locked) {
+                // An unfinished close is a failed close.
+                _lifecycle->_state.store(State::Open, std::memory_order_release);
+                _lifecycle->_mutex.unlock();
+            }
+        }
+        Close(const Close&)            = delete;
+        Close& operator=(const Close&) = delete;
+
+        explicit operator bool() const
+        {
+            return _locked;
+        }
+        error::error_t error() const
+        {
+            return _locked ? error::error_t::OK : error::error_t::BUSY;
+        }
+        void rollback()
+        {
+            finish(State::Open);
+        }
+        void commit()
+        {
+            finish(State::Closed);
+        }
+        void quarantine()
+        {
+            finish(State::Quarantined);
+        }
+
+    private:
+        void finish(State state)
+        {
+            if (_locked) {
+                _lifecycle->_state.store(state, std::memory_order_release);
+                _lifecycle->_mutex.unlock();
+                _locked = false;
+            }
+        }
+        BusLifecycle* _lifecycle = nullptr;
+        bool _locked             = false;
+    };
+
+    State state() const
+    {
+        return _state.load(std::memory_order_acquire);
+    }
+
+    // Destruction-time escape when the current callback already owns the
+    // non-recursive operation gate. No id may be reused after this path.
+    void quarantineWithoutLock()
+    {
+        _state.store(State::Quarantined, std::memory_order_release);
+    }
+
+private:
+    mutable runtime::Mutex _mutex;
+    std::atomic<State> _state{State::Open};
+};
 
 //-------------------------------------------------------------------------
 /*!
@@ -143,10 +273,10 @@ struct IAccessor {
     /*!
       @brief Co-owning construction: the accessor shares ownership of the bus.
 
-      The canonical "borrow from M5_Hal" path: `M5_Hal.<kind>.acquire(cfg)`
-      hands back a `shared_ptr<IBus>`, and constructing an accessor from it
-      keeps the bus alive for as long as the accessor lives. This makes the
-      borrow safe even when the caller does not separately retain the
+      The canonical registry-acquire path: `M5_Hal.<kind>.acquire(cfg)` hands
+      back an owning `shared_ptr<IBus>`, and constructing an accessor from it
+      keeps the bus alive for as long as the accessor lives. This remains safe
+      even when the caller does not separately retain the
       `shared_ptr` (e.g. `Accessor dev{acquire(cfg).value(), cfg}` — the
       temporary would otherwise drop and dangle the bus).
 
@@ -193,6 +323,24 @@ struct IAccessor {
     /*! @brief Return whether the accessor currently holds an access window. */
     bool inAccess(void) const;
 
+    /*!
+      @brief Sibling accessor sharing one logical lock scope with this one
+             (combined-accessor plumbing — e.g. the TX/RX children of
+             `uart::Accessor`). Reconfiguration gates use it to recognize
+             that "the opposite channel's holder" is in fact the caller
+             itself. Set once at construction of the combined accessor;
+             never mutated afterwards (not thread-safe to change while in
+             use).
+     */
+    IAccessor* lockPeer(void) const
+    {
+        return _lock_peer;
+    }
+    void setLockPeer(IAccessor* peer)
+    {
+        _lock_peer = peer;
+    }
+
 protected:
     // Unbound construction is protected: only a derivation that also
     // offers the kind-typed bind() may expose it.
@@ -217,6 +365,9 @@ protected:
     // Empty unless the accessor co-owns its bus (constructed from a
     // shared_ptr). Pins the bus lifetime; `_bus` aliases `_owner.get()`.
     std::shared_ptr<IBus> _owner{};
+    // nullptr unless this accessor is one half of a combined accessor (see
+    // lockPeer() above).
+    IAccessor* _lock_peer = nullptr;
 };
 
 //-------------------------------------------------------------------------
@@ -236,6 +387,11 @@ struct IBus {
 public:
     virtual ~IBus()                                 = default;
     virtual const IBusConfig& getConfig(void) const = 0;
+    /*! @brief Optional lifetime tombstone used by externally-backed buses. */
+    virtual std::shared_ptr<BusLifecycle> lifecycleHandle(void) const
+    {
+        return {};
+    }
     types::bus_kind_t getBusKind(void) const;
 
     // IBus initialization is intentionally NOT part of this abstract
@@ -293,11 +449,11 @@ public:
      */
     virtual result_t<void> unlock(IAccessor* owner);
 
-    // Backend query API (ADR 034 phase 3). These describe HOW the bus is
+    // Backend query API. These describe HOW the bus is
     // currently driven, so a holder can react to a hot-swap (e.g. a
     // hardware->software downgrade when a controller is reassigned). They
     // are non-pure with safe defaults: any bus that has not opted into the
-    // phase-3 backend model answers "software / no controller / unknown
+    // swappable-backend model answers "software / no controller / unknown
     // ceiling / never swapped", which never misleads a caller into assuming
     // hardware guarantees. The runtime facade forwards these to its live
     // backend so the answers track swaps.
@@ -323,7 +479,7 @@ public:
       @brief Upper frequency the current backend can sustain, in Hz; 0 = unknown.
 
       Lets a holder notice a capability drop after a downgrade to software
-      (ADR 034: declare the ceiling rather than silently slow down).
+      (declare the ceiling rather than silently slow down).
      */
     virtual uint32_t maxFrequency(void) const;
 
@@ -349,7 +505,7 @@ protected:
   by static dispatch. For UART / I2S split accessors that is the TX-only or
   RX-only `beginAccess`, NOT the base `IAccessor::beginAccess` (which is
   non-virtual and would otherwise be sliced to the combined-channel lock,
-  blocking the opposite channel and risking self-deadlock) (D2/F2). Use CTAD:
+  blocking the opposite channel and risking self-deadlock). Use CTAD:
   `ScopedAccess guard{tx_accessor};` deduces the accessor type. Master /
   single-channel accessors deduce to themselves and behave exactly as before.
 

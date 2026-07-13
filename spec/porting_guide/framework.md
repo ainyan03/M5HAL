@@ -64,7 +64,7 @@ src/m5_hal/variants/frameworks/<name>/
    X(FRAMEWORK_MYFW, 7)
    ```
 
-値は既存の末尾 + 1。**一度公開した値は永久凍結** (改番・再利用禁止)。
+値は既存の末尾 + 1。**一度公開した値は以後変更不可** (改番・再利用禁止)。
 
 ## 4. framework 検出を追加する
 
@@ -266,7 +266,9 @@ result_t<void> transfer(..., const TransferDesc& desc, ...) {
     // data level restore
     bool has_phase_dc = (desc.command_dc_level >= 0) || (desc.address_dc_level >= 0);
     if (has_phase_dc) {
-        int8_t restore = (desc.data_dc_level >= 0) ? desc.data_dc_level : 1;
+        int8_t restore = (desc.data_dc_level >= 0)
+            ? desc.data_dc_level
+            : (desc.dc_level_valid ? static_cast<int8_t>(desc.dc_level) : currentDataLevel());
         setDC(dc_pin, restore);
     }
     // data phase
@@ -329,21 +331,13 @@ variant 追加の最低限の検証:
 
 ## チェックリスト
 
-追加時に確認する全項目 (詳細は [../design/variants.md](../design/variants.md) §追加時チェックリスト):
+正式なチェックリスト (ディレクトリ一式・`_offer.hpp`・variant ID 登録・検出マクロ・scan order・
+`offer_all.inl`・build_check・配置表更新) は [../design/variants.md](../design/variants.md)
+§追加時チェックリストが正本。framework variant 固有で同ページに無い項目のみここに残す:
 
-- [ ] `variants/frameworks/<name>/` ディレクトリ一式
-- [ ] `_offer.hpp` (include guard なし、`M5HAL_VARIANT_CURRENT_*_` マクロ)
-- [ ] `variants/ids.hpp` に variant ID 追加 (`#define` + X-macro)
-- [ ] `variants/frameworks/_checker.hpp` に検出マクロ追加
-- [ ] `M5HAL_v2.hpp` の scan order に include 追加
-- [ ] `M5HAL_v2.cpp` に `.inl` include 追加
-- [ ] `_macro/offer_all.inl` の `#elif` チェーンに追加
-- [ ] `BusConfig_<name>` — `IBusConfig` の空派生 (最低限) または拡張
-- [ ] `Bus_<name>` — `IBus` の全 virtual override
-- [ ] `BackendFor<BusConfig_<name>>` — 特殊化
-- [ ] `test/v2/build_check/build_check.hpp` にコンパイルフェンス
-- [ ] spec/reference/directory-layout.md の配置表更新
-- [ ] spec/design/variants.md の走査順・初期スコープ表更新
+- [ ] `BusConfig_<name>` — `IBusConfig` の空派生 (最低限) または拡張 (§7.1)
+- [ ] `Bus_<name>` — `IBus` の全 virtual override (§7.2)
+- [ ] `BackendFor<BusConfig_<name>>` — 特殊化 (§7.3)
 
 ## 参照実装
 

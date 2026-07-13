@@ -50,8 +50,8 @@ public:
     }
 
     result_t<size_t> service();
-    void pumpWire();
-    void flushTx();
+    result_t<void> pumpWire();
+    result_t<void> flushTx();
     void drainTx();
 
 private:

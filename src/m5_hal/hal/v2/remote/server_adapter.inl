@@ -5,8 +5,7 @@
 #include "./server_adapter.hpp"
 
 #include "../diag.hpp"
-
-#include <cstring>
+#include "./wire_drain.hpp"
 
 namespace m5::hal::v2::remote {
 
@@ -22,7 +21,10 @@ result_t<size_t> RemoteServerAdapter::service()
         drainTx();
     }
     if (!_external_poll) {
-        pumpWire();
+        auto pumped = pumpWire();
+        if (!pumped.has_value()) {
+            return m5::stl::make_unexpected(pumped.error());
+        }
     }
     size_t count   = _pending_count;
     _pending_count = 0;
@@ -33,45 +35,38 @@ result_t<size_t> RemoteServerAdapter::service()
         }
     }
     if (!_external_poll) {
-        flushTx();
+        auto flushed = flushTx();
+        if (!flushed.has_value()) {
+            return m5::stl::make_unexpected(flushed.error());
+        }
     }
     return count;
 }
 
-void RemoteServerAdapter::pumpWire()
+result_t<void> RemoteServerAdapter::pumpWire()
 {
     drainTx();
-    _dec->pump(*_wire_rx);
+    auto decoded = _dec->pump(*_wire_rx);
+    if (!decoded.has_value()) {
+        return m5::stl::make_unexpected(decoded.error());
+    }
     sendCreditIfChanged();
-    flushTx();
+    return flushTx();
 }
 
-void RemoteServerAdapter::flushTx()
+result_t<void> RemoteServerAdapter::flushTx()
 {
-    _enc->pump();
+    auto encoded = _enc->pump();
+    if (!encoded.has_value()) {
+        return m5::stl::make_unexpected(encoded.error());
+    }
     drainTx();
+    return {};
 }
 
 void RemoteServerAdapter::drainTx()
 {
-    auto& out = _enc->output();
-    while (!out.eof()) {
-        auto p = out.peek(4096);
-        if (!p.has_value() || p.value().size == 0) {
-            break;
-        }
-        auto rsv = _wire_tx->reserve(p.value().size);
-        if (!rsv.has_value() || rsv.value().size == 0) {
-            break;
-        }
-        size_t n = rsv.value().size < p.value().size ? rsv.value().size : p.value().size;
-        ::memcpy(rsv.value().data, p.value().data, n);
-        auto c = _wire_tx->commit(n);
-        if (!c.has_value()) {
-            break;
-        }
-        (void)out.advance(n);
-    }
+    detail::drainToSink(_enc->output(), *_wire_tx);
 }
 
 void RemoteServerAdapter::frameHandlerThunk(void* ctx, const frame::View& view)
@@ -103,30 +98,22 @@ service::ServicePoll RemoteWireService::serviceImpl(const service::ServiceContex
 {
     (void)ctx;
     drainTx();
-    _dec->pump(*_wire_rx);
+    auto decoded = _dec->pump(*_wire_rx);
+    if (!decoded.has_value()) {
+        return service::ServiceResult::Error;
+    }
     _credit.pump(*_enc, *_dec);
-    _enc->pump();
+    auto encoded = _enc->pump();
+    if (!encoded.has_value()) {
+        return service::ServiceResult::Error;
+    }
     drainTx();
     return service::ServiceResult::Progress;
 }
 
 void RemoteWireService::drainTx()
 {
-    auto& out = _enc->output();
-    while (!out.eof()) {
-        auto p = out.peek(4096);
-        if (!p.has_value() || p.value().size == 0) {
-            break;
-        }
-        auto rsv = _wire_tx->reserve(p.value().size);
-        if (!rsv.has_value() || rsv.value().size == 0) {
-            break;
-        }
-        size_t n = rsv.value().size < p.value().size ? rsv.value().size : p.value().size;
-        ::memcpy(rsv.value().data, p.value().data, n);
-        (void)_wire_tx->commit(n);
-        (void)out.advance(n);
-    }
+    detail::drainToSink(_enc->output(), *_wire_tx);
 }
 
 }  // namespace m5::hal::v2::remote

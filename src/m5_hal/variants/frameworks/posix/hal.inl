@@ -41,9 +41,17 @@ M5HAL_INLINE_V2 namespace v2
         if (_connection != nullptr && _connection->service() != nullptr) {
             (void)Services.remove(*_connection->service());
         }
-        delete _connection;
+        auto* old_connection = _connection;
+        if (old_connection != nullptr) {
+            auto old_handle = old_connection->sessionHandle();
+            if (old_handle) {
+                old_handle->close();
+            }
+            retireRemoteGPIO();
+        }
         _connection = conn.value();
         setBackendAll(&_connection->backend());
+        delete old_connection;
         registerRemoteGPIO(_connection->gpio());
         if (_has_remote_gpio) {
             _connection->bindGpioEvents(Gpio, _remote_gpio_slot);
@@ -69,9 +77,17 @@ M5HAL_INLINE_V2 namespace v2
         if (_connection != nullptr && _connection->service() != nullptr) {
             (void)Services.remove(*_connection->service());
         }
-        delete _connection;
+        auto* old_connection = _connection;
+        if (old_connection != nullptr) {
+            auto old_handle = old_connection->sessionHandle();
+            if (old_handle) {
+                old_handle->close();
+            }
+            retireRemoteGPIO();
+        }
         _connection = conn.value();
         setBackendAll(&_connection->backend());
+        delete old_connection;
         registerRemoteGPIO(_connection->gpio());
         if (_has_remote_gpio) {
             _connection->bindGpioEvents(Gpio, _remote_gpio_slot);

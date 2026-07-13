@@ -4,6 +4,7 @@
 
 #include "../assert.hpp"
 #include "../bus/bus.hpp"
+#include "../bus/bus_view.hpp"
 #include "../bus/hal_backend.hpp"
 #include "../bus/hw_pool.hpp"
 #include "../bus/managed_bus.hpp"
@@ -126,9 +127,9 @@ struct IBusConfig : public bus::IBusConfig {
 };
 
 /*!
-  @brief Pin + intent acquire request for the phase-3 logical path (ADR 034).
+  @brief Pin + intent acquire request for the logical acquire path.
 
-  `acquire<CfgT>(cfg)` (phase 2) pins a specific backend by config TYPE -- the
+  `acquire<CfgT>(cfg)` pins a specific backend by config TYPE -- the
   explicit route. The logical acquire states the WIRING plus an
   `AllocationIntent` (built through the kind helpers below, e.g.
   `i2c::requireHardware()`) and lets the factory pick hardware vs software at
@@ -190,16 +191,23 @@ struct MasterAccessConfig : public bus::IAccessConfig {
     /*!
       @brief On-wire I2C timeout in milliseconds.
 
-      Bounds the time the backend waits for wire-level progress:
-      arduino forwards it to `Wire.setTimeOut`, espidf to the driver's
-      transaction / SCL-stretch timeout, software uses it as the
-      whole-transfer deadline of the bit-bang engine. The software backend
-      clamps values exceeding the fast-tick representable range to the
-      ceiling; the effective ceiling is platform-dependent (native
-      microsecond ticks: about 35 minutes; ESP @ 240 MHz cycle ticks:
-      about 9 seconds). Bus-lock acquisition is NOT a config concern — it
-      is a per-call argument of `beginAccess` / `ScopedAccess` (default:
-      wait forever).
+      Bounds how long the backend tolerates a stalled wire (the software
+      backend alone applies it to the whole transfer, see below):
+      arduino forwards it to `Wire.setTimeOut`; espidf uses it as the
+      peripheral's SCL-stretch timeout (clamped to the peripheral's
+      representable ceiling) and as the stall allowance inside the
+      transaction budget handed to the vendor driver (the budget itself
+      additionally covers the expected wire time of the transfer, so a
+      healthy transfer longer than this value is not cut short); software
+      uses it as the whole-transfer deadline of the bit-bang engine,
+      measured on a shared 64-bit microsecond clock (no platform-dependent
+      ceiling; the check is amortized over polls, so the timeout fires
+      with a small poll-stride slack). The software backend's PER-STRETCH
+      timeout derived from this value still lives in fast ticks and clamps
+      to the representable ceiling (native microsecond ticks: about 35
+      minutes; ESP @ 240 MHz cycle ticks: about 9 seconds). Bus-lock
+      acquisition is NOT a config concern — it is a per-call argument of
+      `beginAccess` / `ScopedAccess` (default: wait forever).
      */
     uint32_t wire_timeout_ms = 1000;
     /*!
@@ -346,7 +354,7 @@ struct MasterAccessor : public bus::IAccessor {
     MasterAccessor(IBus& bus, const MasterAccessConfig& access_config);
 
     /*!
-      @brief Co-owning construction from a borrowed bus.
+      @brief Co-owning construction from an acquired shared bus.
 
       The canonical path: `M5_Hal.I2C.acquire(cfg)` returns a
       `shared_ptr<IBus>`; constructing the accessor from it shares
@@ -719,7 +727,7 @@ struct IBus : public bus::IBus {
       takes the lock before forwarding `this`. Calling this low-level entry
       directly therefore bypasses lock ownership and is unsafe unless the
       caller already holds the bus lock; keep an accessor alive and pass
-      `&accessor`. (D6/F9: documented as informational, not enforced.)
+      `&accessor`. (Documented as informational, not enforced.)
 
       `tx_len` / `rx_len` bound the caller data phases independently.
 
@@ -773,6 +781,9 @@ struct BusTraits {
 
     static constexpr types::bus_kind_t KIND              = types::bus_kind_t::I2C;
     static constexpr types::backend_caps_t CAPS_HARDWARE = caps::HARDWARE;
+    /*! @brief I2C uses the managed policy: `BusView::hardwareInUse()` forwards
+               to the backend (see spec/design/bus_accessor.md §managed policy). */
+    static constexpr bool MANAGED_ALLOCATION = true;
 
     template <class CfgT>
     using BackendFor = i2c::BackendFor<CfgT>;
@@ -806,7 +817,7 @@ struct BusTraits {
 
   All machinery lives in `bus::ManagedBusFacade<BusTraits>`: the mutex +
   lock/unlock, the accessor binding, `getConfig`/`probe`, the swappable backend
-  behind a `unique_ptr`, the query mirror, and the hot-swap seam (ADR 034).
+  behind a `unique_ptr`, the query mirror, and the hot-swap seam.
   This thin derived type just fixes the public name `i2c::Bus` and the I2C
   Traits. `init` selects the backend from the config type via `BackendFor`, so
   `i2c::Bus bus; bus.init(cfg);` keeps working.
@@ -846,136 +857,18 @@ inline m5::hal::v2::result_t<void> MasterAccessor::bind(IBus& bus)
 /*!
   @brief Typed I2C view delegating registry and allocation to the HAL backend.
 
-  The typed acquire path uses the backend's registry directly so the concrete
-  config type still selects the local variant backend. The logical acquire and
-  commit paths delegate through `bus::IHalBackend`, allowing the same BusView
-  surface to point at local or future remote backends.
+  Shares the acquire / logical-acquire / commit / release spine with every
+  other kind through `bus::BusViewCore<BusTraits>` (see bus/bus_view.hpp);
+  this derived type adds only the I2C-specific `createBusConfig()` pin
+  overloads. The typed acquire path uses the backend's registry directly so
+  the concrete config type still selects the local variant backend. The
+  logical acquire and commit paths delegate through `bus::IHalBackend`,
+  allowing the same BusView surface to point at local or future remote
+  backends.
  */
-class BusView {
+class BusView : public bus::BusViewCore<BusTraits> {
 public:
-    BusView() : _backend{nullptr}
-    {
-    }
-    explicit BusView(bus::IHalBackend* backend) : _backend{backend}
-    {
-    }
-    BusView(const BusView&)            = delete;
-    BusView& operator=(const BusView&) = delete;
-
-    void setBackend(bus::IHalBackend* backend)
-    {
-        _backend = backend;
-    }
-
-    template <class CfgT>
-    result_t<std::shared_ptr<IBus>> acquire(const CfgT& cfg)
-    {
-        static_assert(std::is_base_of<IBusConfig, CfgT>::value,
-                      "BusView::acquire expects a BusConfig of this bus kind");
-        if (_backend == nullptr) {
-            return m5::stl::make_unexpected(error::error_t::NOT_CONNECTED);
-        }
-        bus::IdentityKey id = BusTraits::identityFromConfig(cfg);
-        if (!id.valid()) {
-            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
-        {
-            auto r = _backend->acquireBusTyped(types::bus_kind_t::I2C, id, cfg);
-            if (r.has_value()) {
-                return std::static_pointer_cast<IBus>(r.value());
-            }
-            if (r.error() != error::error_t::NOT_IMPLEMENTED) {
-                return m5::stl::make_unexpected(r.error());
-            }
-        }
-        if (auto existing = _backend->busRegistry().findByIdentity(types::bus_kind_t::I2C, id)) {
-            if (!BusTraits::configCompatible(static_cast<const IBusConfig&>(existing->getConfig()), cfg)) {
-                return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
-            }
-        }
-        auto acquired = _backend->busRegistry().acquireOrFind(
-            types::bus_kind_t::I2C, id, [&cfg]() -> result_t<std::shared_ptr<bus::IBus>> {
-                std::shared_ptr<Bus> facade{new (std::nothrow) Bus()};
-                if (!facade) {
-                    return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
-                }
-                auto r = facade->init(cfg);
-                if (!r.has_value()) {
-                    return m5::stl::make_unexpected(r.error());
-                }
-                return std::shared_ptr<bus::IBus>{facade};
-            });
-        if (!acquired.has_value()) {
-            return m5::stl::make_unexpected(acquired.error());
-        }
-        return std::static_pointer_cast<IBus>(acquired.value());
-    }
-
-    result_t<std::shared_ptr<IBus>> acquire(const LogicalBusConfig& req)
-    {
-        if (_backend == nullptr) {
-            return m5::stl::make_unexpected(error::error_t::NOT_CONNECTED);
-        }
-        // Let the backend complete/validate the request (e.g. a low-power
-        // controller's fixed-pin auto-fill) BEFORE identity derivation, so
-        // the completed pins -- not the caller's possibly omitted ones --
-        // become the bus's identity.
-        LogicalBusConfig eff = req;
-        auto rc              = _backend->completeLogicalRequest(types::bus_kind_t::I2C, &eff);
-        if (!rc.has_value()) {
-            return m5::stl::make_unexpected(rc.error());
-        }
-        bus::IdentityKey id = BusTraits::identityFromLogical(eff);
-        if (!id.valid()) {
-            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
-        if (!eff.intent.valid()) {
-            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
-        bus::AllocationRequest ar{types::bus_kind_t::I2C, id, eff.intent, &eff};
-        auto acquired = _backend->acquireBusLogical(types::bus_kind_t::I2C, id, ar);
-        if (!acquired.has_value()) {
-            return m5::stl::make_unexpected(acquired.error());
-        }
-        return std::static_pointer_cast<IBus>(acquired.value());
-    }
-
-    result_t<void> commitBuses(uint32_t timeout_ms = types::TIMEOUT_FOREVER)
-    {
-        if (_backend == nullptr) {
-            return m5::stl::make_unexpected(error::error_t::NOT_CONNECTED);
-        }
-        return _backend->commitBuses(types::bus_kind_t::I2C, timeout_ms);
-    }
-
-    /*!
-      @brief Explicitly release a bus acquired via acquire().
-
-      Clears the registry slot for the bus so capacity is reclaimed
-      immediately. For a remote backend this also sends BusRelease to
-      the peer. Pass the `shared_ptr<IBus>` returned by acquire().
-      Returns `INVALID_ARGUMENT` if the bus is null, its config pins
-      are invalid, or no matching slot is found in the registry.
-     */
-    result_t<void> release(const std::shared_ptr<IBus>& bus)
-    {
-        if (_backend == nullptr || !bus) {
-            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
-        bus::IdentityKey id = BusTraits::identityFromConfig(bus->getConfig());
-        if (!id.valid()) {
-            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
-        return _backend->releaseBus(types::bus_kind_t::I2C, id);
-    }
-
-    uint8_t hardwareInUse(void) const
-    {
-        if (_backend == nullptr) {
-            return 0;
-        }
-        return _backend->hardwareInUse(types::bus_kind_t::I2C);
-    }
+    using bus::BusViewCore<BusTraits>::BusViewCore;
 
     LogicalBusConfig createBusConfig(Scl scl, Sda sda, types::AllocationIntent intent = {}) const
     {
@@ -985,9 +878,6 @@ public:
     {
         return {scl, sda, intent};
     }
-
-private:
-    bus::IHalBackend* _backend;
 };
 
 }  // namespace m5::hal::v2::i2c

@@ -65,7 +65,21 @@ private:
       task holds the lock while a high-priority task spins) will stall the
       high-priority task for the full allocation duration.
      */
+#if defined(ARDUINO_ARCH_RP2040)
+    // RP2040's Cortex-M0+ (ARMv6-M) has no hardware atomic
+    // read-modify-write instruction, and arduino-pico ships no libatomic,
+    // so std::atomic_flag is unlinkable there (undefined reference to
+    // __atomic_test_and_set). lockPool()/unlockPool() fall back to an
+    // interrupt-disable critical section instead — same task-context-only,
+    // no-ISR contract as above, but note this guards only the CURRENT core:
+    // RP2040's second core is not covered (no hardware spinlock used), so a
+    // pool must not be shared across cores on that target. SAMD51
+    // (Cortex-M4F, ARMv7E-M: LDREX/STREX available, atomics inline without
+    // libatomic) stays on the std::atomic_flag path below.
+    mutable bool _lock = false;
+#else
     mutable std::atomic_flag _lock = ATOMIC_FLAG_INIT;
+#endif
 };
 
 }  // namespace m5::hal::v2::memory::detail

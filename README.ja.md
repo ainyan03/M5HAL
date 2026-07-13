@@ -13,9 +13,26 @@ M5 製品向けの HAL (ハードウェア抽象化レイヤ) です。
 
 - ESP32 系ボード。 公開パッケージは `espressif32` platform
   (Arduino-ESP32 または ESP-IDF >= 4.4) を対象としています。
+- C++17 に対応したコンパイラ。
 - [M5Utility](https://github.com/m5stack/M5Utility) — PlatformIO と
   ESP-IDF component manager は自動で取得します。 Arduino IDE では
   M5HAL と併せてインストールしてください。
+
+## インストール
+
+- **Arduino IDE**: ライブラリマネージャから「M5HAL」をインストールし、
+  「M5Utility」も併せてインストールしてください。
+- **PlatformIO**: `platformio.ini` に追加:
+  ```ini
+  lib_deps =
+      m5stack/M5HAL
+  ```
+  M5Utility は依存関係として自動解決されます。
+- **ESP-IDF component manager**: プロジェクトの `idf_component.yml` に追加:
+  ```yaml
+  dependencies:
+    m5stack/M5HAL: "*"
+  ```
 
 ## ドキュメント
 
@@ -49,18 +66,21 @@ v2 は明示的に opt-in して使います。 `<M5HAL_v2.hpp>` を include し
 - **Source / Sink** — stream も見据えた入出力抽象。単純な buffer には
   span / raw pointer overload も使えます
 
-**M5_Hal が bus を所有し、あなたはそれを借ります**: v2 は HAL の中に
-隠れた singleton bus を持ちませんが、`M5_Hal` は kind ごとの所有
-registry を持ちます。推奨経路は、配線を指定して bus を借りることです —
-`M5_Hal.I2C.acquire(cfg)` はピンで intern された shared handle を返すので、
+**配線ごとに一つの共有 bus を acquire します**: v2 は HAL の中に隠れた
+singleton bus を持たず、`M5_Hal` 自身も bus の寿命を保持しません。kind
+ごとの registry が保持するのは weak reference です。推奨経路は、配線を
+指定して bus を acquire することです — `M5_Hal.I2C.acquire(cfg)` はピンで
+intern された shared owner を返すので、
 ボードサポート層と利用者コードが同じピンを指せば *同一* インスタンス
 (一つの物理バス・一つのロック) を共有でき、ワイヤの奪い合いになりません。
-その handle から accessor を作ると、accessor も bus を共有所有します。
+その handle から accessor を作ると、accessor も bus を共有所有します。最後の
+handle または共有所有 accessor が破棄されるまで bus は生存し、その後 backend
+が解放されて weak registry entry が再利用可能になります。
 `M5_Hal` は GPIO / bus registry と service runner を束ねています。
 
 escape hatch: 自分で bus を所有したい場合は、直接構築
 (`i2c::Bus bus; bus.init(cfg);`) して accessor に参照で渡せます —
-borrowing が推奨の既定経路です。バス所有モデルは
+registry 経由の acquire が推奨の既定経路です。バス所有モデルは
 [`spec/design/bus_accessor.md`](spec/design/bus_accessor.md)、共有と
 hardware allocation のデモは
 [`examples/v2/HowToUse/I2CRegistry`](examples/v2/HowToUse/I2CRegistry/)
@@ -88,7 +108,7 @@ I2C の最小形 (**Arduino 環境**):
 
 namespace m5hal = m5::hal::v2;
 
-std::shared_ptr<m5hal::i2c::IBus> i2c_bus;  // 借りた handle
+std::shared_ptr<m5hal::i2c::IBus> i2c_bus;  // 寿命を所有する shared handle
 
 void setup()
 {
@@ -96,7 +116,7 @@ void setup()
     m5hal::i2c::BusConfig bus_cfg{m5hal::i2c::Scl{22}, m5hal::i2c::Sda{21}};
     bus_cfg.wire = &Wire;
 
-    // M5_Hal から bus を借りる (インスタンスは M5_Hal が所有し、こちらは shared handle を持つ)。
+    // intern された bus を acquire する。この shared_ptr が寿命を所有する。
     auto acquired = m5hal::M5_Hal.I2C.acquire(bus_cfg);
     if (!acquired) return;
     i2c_bus = acquired.value();
@@ -110,7 +130,7 @@ void setup()
     dev_cfg.wire_timeout_ms = 100;
     // dev_cfg.register_address_bytes = 2;  // 2-byte register address の device だけ指定
 
-    m5hal::i2c::MasterAccessor dev{i2c_bus, dev_cfg};  // 借りた bus を共有所有
+    m5hal::i2c::MasterAccessor dev{i2c_bus, dev_cfg};  // acquire した bus を共有所有
 
     // 各 transfer は result_t<T> を返す。直接代入せず unwrap する。
     auto id = dev.readRegister(0x00);   // uint8_t ではなく result_t<uint8_t>
@@ -120,11 +140,6 @@ void setup()
     }
 }
 ```
-
-`#include <Wire.h>` が必要なのは、Arduino 環境の既定 I2C backend
-(`i2c::Bus_arduino`) が `TwoWire` への委譲で実装されているためです
-(`bus_cfg.wire = &Wire`)。software / ESP-IDF backend を明示する場合は
-不要になります。
 
 Arduino sketch として試す場合は
 [`examples/v2/HowToUse/I2C`](examples/v2/HowToUse/I2C/)
@@ -140,10 +155,12 @@ m5hal::i2c::BusConfig_software bus_cfg{m5hal::i2c::Scl{22}, m5hal::i2c::Sda{21}}
 auto i2c_bus = m5hal::M5_Hal.I2C.acquire(bus_cfg).value();
 ```
 
-`i2c::Bus` / `i2c::BusConfig` という無印の名前は、ビルド環境で最初に
-申告した backend の suffix 付き型 (`Bus_arduino` 等) への型 alias です。
-`BusConfig` のフィールド構成 (`wire` の有無など) も選択された variant の
-ものになります。
+`#include <Wire.h>` が必要なのは、Arduino 環境の既定 I2C backend
+(`i2c::BusConfig_arduino`) が `TwoWire` ハンドルを保持しているためです
+(`bus_cfg.wire = &Wire`)。software / ESP-IDF の config を渡せば不要になります。
+無印の `i2c::BusConfig` という綴りは、ビルド環境で最初に申告した backend の
+型 alias (`BusConfig_arduino` 等) です。そのフィールド構成 (`wire` の有無
+など) も選択された variant のものになります。
 
 ### よくある間違い (他ライブラリの癖は通用しません)
 
@@ -201,6 +218,17 @@ remote example は serial と TCP の両 transport を用意しています:
 [`examples/v2/HowToUse/Remote`](examples/v2/HowToUse/Remote/) は host facade の入口、
 [`examples/v2/RemoteServerTCP`](examples/v2/RemoteServerTCP/) は device を TCP で公開する例、
 [`examples/v2/RemoteTest`](examples/v2/RemoteTest/) は host 側 protocol test harness です。
+
+remote の一つの `Hal` は、一つの connection session と一つの RPC 直列化 gate を
+所有します。その connection の bus、GPIO proxy、互換 session view、backend 操作は
+すべて同じ gate を通ります。再接続すると旧 session は close され、再接続前の bus
+proxy は以後 `CLOSED` を返し、新しい peer へ付け替えられません。保持済み GPIO object
+が memory-safe なのは所有元 `Hal` の生存中だけです。再接続後は最終 cache 値を読み、
+write / mode change は無視します。明示的な `BusView::release(shared_ptr&)` は caller が
+唯一の owner であることを要求します (先に accessor と alias を破棄する)。成功時は
+handle を consume して空にし、失敗時は元の handle を維持します。完全な lifetime、
+callback、quarantine 規約は [`spec/design/remote.md`](spec/design/remote.md) と
+[`spec/design/bus_accessor.md`](spec/design/bus_accessor.md) を参照してください。
 
 [`examples/v2/HowToUse/Bytecode`](examples/v2/HowToUse/Bytecode/) は、GPIO / I2C / SPI の
 一連の操作を bytecode (byte 配列のまま sketch に記述) で表し、M5Stack Core BASIC の

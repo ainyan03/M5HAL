@@ -33,7 +33,7 @@ using error_t = ::m5::hal::v2::error::error_t;
 // where it is a no-op (lwIP) — macOS/BSD use the per-socket option in
 // configureSocket instead. MSG_DONTWAIT forces the non-blocking probe
 // per call: lwIP has been seen ignoring O_NONBLOCK set through the VFS
-// fcntl on accepted sockets (QEMU eth lane, 2026-07-02), so the flag on
+// fcntl on accepted sockets (QEMU eth lane), so the flag on
 // the call itself is the reliable form.
 #if defined(MSG_NOSIGNAL)
 constexpr int kSendFlags = MSG_NOSIGNAL | MSG_DONTWAIT;
@@ -46,7 +46,7 @@ constexpr int kRecvFlags = MSG_DONTWAIT;
 // poll instead of waiting in select(): on ESP-IDF the vfs select()
 // timeout is armed through an esp_timer one-shot alarm that Espressif
 // QEMU's esp32 machine never delivers, so a 2 ms wait blocks forever
-// (qemu lane, 2026-07-02). Non-blocking recv/send probes behave the
+// (qemu lane). Non-blocking recv/send probes behave the
 // same on lwIP, QEMU and POSIX hosts.
 inline void sleepPollTick()
 {

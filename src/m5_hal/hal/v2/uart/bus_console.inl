@@ -6,6 +6,7 @@
 
 #if defined(ESP_PLATFORM)
 #include <driver/uart.h>
+#include <freertos/task.h>
 #if defined(CONFIG_SOC_USB_SERIAL_JTAG_SUPPORTED) && CONFIG_SOC_USB_SERIAL_JTAG_SUPPORTED
 #include <driver/usb_serial_jtag.h>
 #endif
@@ -22,7 +23,7 @@
 #endif
 #define M5HAL_BUS_CONSOLE_HAS_USB_CDC 1
 #endif
-#elif !defined(_WIN32)
+#elif !defined(_WIN32) && !defined(ARDUINO)
 #include <errno.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
@@ -44,14 +45,57 @@ struct BusConsoleCdcBridge {
 
 #if defined(M5HAL_BUS_CONSOLE_HAS_USB_CDC)
 namespace {
-Bus_console* s_cdc_console = nullptr;
+Bus_console* s_cdc_console                        = nullptr;
+portMUX_TYPE s_cdc_console_mux                    = portMUX_INITIALIZER_UNLOCKED;
+uint32_t s_cdc_console_rx_callback_in_flight      = 0;
+constexpr uint32_t kReleaseCallbackDrainTimeoutMs = 100;
+
+bool waitCdcConsoleRxCallbacksDrained()
+{
+    // pdMS_TO_TICKS(1) truncates to 0 at the default 100 Hz tick rate, where
+    // vTaskDelay(0) only yields. Delay a whole tick and bound the wait by
+    // elapsed ticks. The budget itself truncates to 0 below 10 Hz, so floor it
+    // at one tick to keep the wait non-empty at any configTICK_RATE_HZ.
+    const TickType_t start     = xTaskGetTickCount();
+    const TickType_t raw_ticks = pdMS_TO_TICKS(kReleaseCallbackDrainTimeoutMs);
+    const TickType_t budget    = (raw_ticks != 0) ? raw_ticks : 1;
+    for (;;) {
+        uint32_t in_flight = 0;
+        portENTER_CRITICAL_SAFE(&s_cdc_console_mux);
+        in_flight = s_cdc_console_rx_callback_in_flight;
+        portEXIT_CRITICAL_SAFE(&s_cdc_console_mux);
+        if (in_flight == 0) {
+            return true;
+        }
+        if ((xTaskGetTickCount() - start) >= budget) {
+            return false;
+        }
+        vTaskDelay(1);
+    }
+}
+
 void cdc_rx_callback(int itf, cdcacm_event_t* event)
 {
     (void)itf;
     (void)event;
-    if (s_cdc_console != nullptr) {
-        detail::BusConsoleCdcBridge::onRx(s_cdc_console);
+
+    Bus_console* console = nullptr;
+    portENTER_CRITICAL_SAFE(&s_cdc_console_mux);
+    console = s_cdc_console;
+    if (console != nullptr) {
+        ++s_cdc_console_rx_callback_in_flight;
     }
+    portEXIT_CRITICAL_SAFE(&s_cdc_console_mux);
+
+    if (console == nullptr) {
+        return;
+    }
+
+    detail::BusConsoleCdcBridge::onRx(console);
+
+    portENTER_CRITICAL_SAFE(&s_cdc_console_mux);
+    --s_cdc_console_rx_callback_in_flight;
+    portEXIT_CRITICAL_SAFE(&s_cdc_console_mux);
 }
 }  // namespace
 #endif
@@ -67,7 +111,11 @@ void Bus_console::onCdcRx()
 
 result_t<void> Bus_console::init(FILE* in, FILE* out)
 {
-    (void)release();
+    auto released = release();
+    if (!released.has_value()) {
+        return m5::stl::make_unexpected(released.error());
+    }
+
     if (in == nullptr || out == nullptr) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
@@ -92,9 +140,11 @@ result_t<void> Bus_console::init(FILE* in, FILE* out)
             cdc_cfg.cdc_port                = TINYUSB_CDC_ACM_0;
             cdc_cfg.callback_rx             = cdc_rx_callback;
             if (tinyusb_cdcacm_init(&cdc_cfg) == ESP_OK) {
-                _rx_sem       = xSemaphoreCreateBinary();
+                _rx_sem = xSemaphoreCreateBinary();
+                portENTER_CRITICAL_SAFE(&s_cdc_console_mux);
                 s_cdc_console = this;
-                _transport    = Transport::UsbCdc;
+                portEXIT_CRITICAL_SAFE(&s_cdc_console_mux);
+                _transport = Transport::UsbCdc;
             }
         }
     }
@@ -122,18 +172,42 @@ result_t<void> Bus_console::init(FILE* in, FILE* out)
     return {};
 }
 
+// If release() returns TIMEOUT_ERROR, RX notifications are already stopped and
+// release() must be called again to finish teardown. Resources are deliberately
+// left allocated in that case: leaking a semaphore beats freeing one a callback
+// still holds.
+//
+// The destructor cannot honor that contract — it discards the result, so an
+// in-flight callback that outlives the drain budget still reaches a destroyed
+// object. Clearing the global pointer bounds the exposure to callbacks that had
+// already loaded it; no new callback can enter. Closing the remaining window
+// would require blocking a destructor indefinitely.
 result_t<void> Bus_console::release()
 {
+    if (_transport == Transport::None) {
+        return {};
+    }
+
 #if defined(ESP_PLATFORM)
+#if defined(M5HAL_BUS_CONSOLE_HAS_USB_CDC)
+    if (_transport == Transport::UsbCdc) {
+        (void)tinyusb_cdcacm_unregister_callback(TINYUSB_CDC_ACM_0, CDC_EVENT_RX);
+
+        portENTER_CRITICAL_SAFE(&s_cdc_console_mux);
+        if (s_cdc_console == this) {
+            s_cdc_console = nullptr;
+        }
+        portEXIT_CRITICAL_SAFE(&s_cdc_console_mux);
+
+        if (!waitCdcConsoleRxCallbacksDrained()) {
+            return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+        }
+    }
+#endif
     if (_rx_sem != nullptr) {
         vSemaphoreDelete(_rx_sem);
         _rx_sem = nullptr;
     }
-#if defined(M5HAL_BUS_CONSOLE_HAS_USB_CDC)
-    if (s_cdc_console == this) {
-        s_cdc_console = nullptr;
-    }
-#endif
 #endif
     _file_in   = nullptr;
     _file_out  = nullptr;
@@ -174,7 +248,7 @@ result_t<size_t> Bus_console::rawWrite(const uint8_t* data, size_t len, uint32_t
         default:
             return static_cast<size_t>(0);
     }
-#elif !defined(_WIN32)
+#elif !defined(_WIN32) && !defined(ARDUINO)
     (void)timeout_ms;
     size_t done = ::fwrite(data, 1, len, _file_out);
     ::fflush(_file_out);
@@ -222,7 +296,7 @@ result_t<size_t> Bus_console::rawRead(uint8_t* buf, size_t len, uint32_t timeout
         default:
             return static_cast<size_t>(0);
     }
-#elif !defined(_WIN32)
+#elif !defined(_WIN32) && !defined(ARDUINO)
     fd_set fds;
     FD_ZERO(&fds);
     FD_SET(_fd_in, &fds);
@@ -260,7 +334,7 @@ result_t<size_t> Bus_console::rawReadableBytes()
     if (_transport == Transport::None) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
-#if !defined(_WIN32) && !defined(ESP_PLATFORM)
+#if !defined(_WIN32) && !defined(ESP_PLATFORM) && !defined(ARDUINO)
     int avail = 0;
     if (::ioctl(_fd_in, FIONREAD, &avail) != 0 || avail < 0) {
         return static_cast<size_t>(0);

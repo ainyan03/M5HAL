@@ -17,15 +17,15 @@ error.hpp の doc コメントが正本で、ここは現場の確認手順を�
 | コード | まず疑うこと |
 |---|---|
 | `TIMEOUT_ERROR` | **lock 競合**: 他タスク/別 accessor がバスを保持したまま (有限 timeout を渡した場合のみ — 既定は無限待ち)。**ワイヤ側**: I2C のクロックストレッチが `wire_timeout_ms` を超過、リモートの応答遅延 |
-| `INVALID_ARGUMENT` | API 契約違反: unbound accessor の使用 (release ビルド)、範囲外の引数 (`register_address_bytes` 等)、owner 不一致の `unlock` |
+| `INVALID_ARGUMENT` | API 契約違反: unbound accessor の使用 (release ビルド)、範囲外の引数 (`register_address_bytes` 等)、owner 不一致の `unlock`。BusView の明示 release では null、foreign bus、または同一 identity の別実体 |
 | `INVALID_STATE` | 操作自体は有効だが現在のオブジェクト状態が許可しない: アクセスウィンドウが開いたままの `setConfig`/`bind`、対応する `begin` のない `endAccess`、Remote/Bytecode の登録可能 bus slot / GPIOGroup が未登録 |
 | `NOT_CONNECTED` | `Hal` が未束ね、または remote 専用操作に remote connection が無い。`connect()` / `init()` 後に再試行する |
 | `NOT_IMPLEMENTED` | その variant が対応しない操作 (software SPI の multi-lane モード等)。選択 variant の確認は `M5HAL_V2_SELECTED_VARIANT_<KIND>` ([variants.md](variants.md) §診断) |
 | `I2C_NO_ACK` | アドレス違い (7bit 表記か確認)・プルアップ欠落・配線・デバイス未給電。`bus.probe(addr)` でのスキャンが切り分けの最短 |
 | `I2C_BUS_ERROR` | アービトレーション喪失 (マルチマスタ)・SDA/SCL の張り付き (デバイスのリセットで解消することがある)・ノイズ |
-| `BUSY` | (現行 v2 の lock 競合は `TIMEOUT_ERROR`。`BUSY` はそれ以外の「使用中」資源) |
+| `BUSY` | (現行 v2 の lock 競合は `TIMEOUT_ERROR`。`BUSY` はそれ以外の「使用中」資源)。BusView の明示 release では Accessor/alias が co-own 中、同一 identity が release 中、または自然解放を確認できず tombstone 隔離中 |
 | `IO_ERROR` | OS/ドライバ層の失敗: デバイスパス・権限 (posix)、ドライバの未初期化、USB シリアルの切断 |
-| `CLOSED` | ストリーム/接続の終端。リモートバスでは transport 切断 (peer hang-up 含む) を報告し → セッションの再確立から (`bsd_tcp.hpp:54` 参照。 UART transport では抜線は `IO_ERROR`・無応答は `TIMEOUT_ERROR` として現れる) |
+| `CLOSED` | ストリーム/接続の終端。リモートバスでは transport 切断 (peer hang-up 含む) に加え、reconnect/local 復帰で旧 session handle が失効した proxy 操作、release 成功後に weak から復活した旧 proxy 操作を表す。新しい `Hal` binding から acquire し直す (`bsd_tcp.hpp:54` 参照。 UART transport では抜線は `IO_ERROR`・無応答は `TIMEOUT_ERROR` として現れる) |
 | `DISCONNECTED` | **将来予約** — 現状は `CLOSED` が transport 切断の役割を担う。`DISCONNECTED` は peer が明示的に切断を通知する高水準プロトコル層向けに確保 |
 | `END_OF_STREAM` | ストリームの clean な終端。再データは来ない (`frame.inl:177` 等が実際に返す。ringbuffer Sink 等が返す EOF 表現) |
 | `UNKNOWN_ERROR` | last-resort fallback。`data_io.md` の「可能な限り `UNKNOWN_ERROR` へ潰さず recoverable error の意味を保つ」指針の通り、原因が特定できない場合にのみ使う |
@@ -107,7 +107,7 @@ TRY 風の伝播マクロは提供しない (式の中に return を隠すコス
 囲む処理は [bus_accessor.md](bus_accessor.md) §guarded が cookbook の
 続きにあたる。
 
-## ABI 契約 — i8 範囲と凍結
+## ABI 契約 — i8 範囲と値の変更不可
 
 基底型 `int8_t` はワイヤ形式との契約を兼ねる。bytecode ワイヤが
 エラーコードを 1 byte (i8) で運ぶ仕組みは
@@ -115,7 +115,7 @@ TRY 風の伝播マクロは提供しない (式の中に return を隠すコス
 ここでは値域と安定性の規約のみを定める:
 
 - **-128..127 の外に値を足さない** (i8 で表現できる範囲が上限)
-- 値は公開リリースに載った時点で凍結 (改番・再利用禁止)
+- 値は公開リリースに載った時点で変更不可 (改番・再利用禁止)
 
 ## 関連
 

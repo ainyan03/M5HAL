@@ -28,6 +28,10 @@ uint8_t AllocationCore::hardwareInUse(void) const
 
 result_t<void> AllocationCore::commitBuses(uint32_t timeout_ms)
 {
+    // Excludes claimController/releaseClaimedController for the whole pass:
+    // the plan below and the pool rebuild (_syncPoolFromLive) both assume
+    // nobody else touches the pool mid-commit (see SerialGuard).
+    SerialGuard serial{_serial_mutex};
     const types::bus_kind_t kind = _kind.kind();
 
     // 1. Snapshot all live buses of this kind. The allocation plan is
@@ -77,9 +81,9 @@ result_t<void> AllocationCore::commitBuses(uint32_t timeout_ms)
     const uint8_t capacity = _pool.capacity();
     int8_t target[BusRegistry::kCapacity];
     bool used[HwControllerPool::kMaxControllers] = {false};
-    // D1: a bus whose demote (release) failed must not be re-touched by the
+    // A bus whose demote (release) failed must not be re-touched by the
     // promote loop -- otherwise a hardware retarget would retry release on a
-    // backend whose swap D1 already aborted, defeating the keep-old-on-failure
+    // backend whose swap already aborted, defeating the keep-old-on-failure
     // policy and risking a leaked / mis-accounted controller.
     bool demote_failed[BusRegistry::kCapacity] = {false};
     for (size_t i = 0; i < n; ++i) {
@@ -92,6 +96,15 @@ result_t<void> AllocationCore::commitBuses(uint32_t timeout_ms)
             if (cur >= 0 && static_cast<uint8_t>(cur) < capacity) {
                 used[cur] = true;
             }
+        }
+    }
+    // Reserve externally-claimed controllers (claimController) the same way:
+    // they are occupied by a caller entirely outside this bus list, so a
+    // tier-0 Require targeting one must fail OUT_OF_RESOURCE instead of the
+    // resolver handing it out.
+    for (uint8_t c = 0; c < capacity; ++c) {
+        if (_pool.isExternal(static_cast<int8_t>(c))) {
+            used[c] = true;
         }
     }
     // Tiers 0..3 derived from each managed bus's intent (see allocTier).
@@ -195,11 +208,11 @@ result_t<void> AllocationCore::commitBuses(uint32_t timeout_ms)
         if (target[i] == cur) {
             continue;  // keeper: untouched (required-hardware immunity falls out here)
         }
-        // commitPlaceholder builds + adopts under the bus lock (D1/F1):
+        // commitPlaceholder builds + adopts under the bus lock:
         // makePlaceholder's init() no longer runs outside the swap guard.
         auto r = _kind.commitPlaceholder(*entries[i].managed_bus, timeout_ms);
         if (!r.has_value()) {
-            demote_failed[i] = true;  // its release failed: keep it off the promote loop (D1)
+            demote_failed[i] = true;  // its release failed: keep it off the promote loop
             if (!have_error) {
                 first_error = r;
                 have_error  = true;
@@ -216,7 +229,7 @@ result_t<void> AllocationCore::commitBuses(uint32_t timeout_ms)
             continue;
         }
         if (demote_failed[i]) {
-            continue;  // demote/release failed above; do not retry a swap on this bus (D1)
+            continue;  // demote/release failed above; do not retry a swap on this bus
         }
         if (entries[i].backend_kind == types::backend_kind_t::Hardware && entries[i].controller_id == target[i]) {
             continue;
@@ -228,7 +241,7 @@ result_t<void> AllocationCore::commitBuses(uint32_t timeout_ms)
             }
             continue;
         }
-        // commitHardware builds + adopts under the bus lock (D1/F1); a null
+        // commitHardware builds + adopts under the bus lock; a null
         // hardware factory result becomes OUT_OF_RESOURCE inside it.
         auto r = _kind.commitHardware(*entries[i].managed_bus, target[i], timeout_ms);
         if (!r.has_value()) {
@@ -257,7 +270,7 @@ void AllocationCore::_syncPoolFromLive(IBus* const* qbus, size_t n)
     }
 }
 
-bool AllocationCore::_eligible(const IManagedBus& bus, const types::AllocationIntent& want, int8_t controller) const
+bool AllocationCore::_eligibleCaps(const types::AllocationIntent& want, int8_t controller) const
 {
     // The capability check runs for EVERY kind, uniform or not: a uniform
     // kind's controllerCaps() is a constant (Traits::CAPS_HARDWARE), so a
@@ -284,9 +297,94 @@ bool AllocationCore::_eligible(const IManagedBus& bus, const types::AllocationIn
             return false;
         }
     }
+    return true;
+}
+
+bool AllocationCore::_eligible(const IManagedBus& bus, const types::AllocationIntent& want, int8_t controller) const
+{
+    if (!_eligibleCaps(want, controller)) {
+        return false;
+    }
+    if (_kind.uniformControllers()) {
+        return true;
+    }
     // Pin-domain check: non-uniform only, consulted last so the capability /
     // opt-in filters above still run identically to before.
     return _kind.controllerAcceptsBus(bus, controller);
+}
+
+result_t<int8_t> AllocationCore::claimController(const types::AllocationIntent& intent)
+{
+    SerialGuard serial{_serial_mutex};
+    if (!intent.valid() || (intent.forbid & types::backend_caps::HARDWARE) != 0) {
+        // A claim is defined as hardware occupancy: an intent that forbids
+        // hardware (or is otherwise malformed) cannot be satisfied by one.
+        return m5::stl::make_unexpected(m5::hal::v2::error::error_t::INVALID_ARGUMENT);
+    }
+    const uint8_t capacity = _pool.capacity();
+
+    if (intent.controller_mode == types::ControllerMode::Require) {
+        const int8_t pin = intent.controller_id;
+        if (pin < 0 || static_cast<uint8_t>(pin) >= capacity || !_eligibleCaps(intent, pin)) {
+            // Out of range or capability-ineligible: a configuration error,
+            // not a resource shortage.
+            return m5::stl::make_unexpected(m5::hal::v2::error::error_t::INVALID_ARGUMENT);
+        }
+        if (!_pool.claimExternal(pin)) {
+            return m5::stl::make_unexpected(m5::hal::v2::error::error_t::OUT_OF_RESOURCE);
+        }
+        return pin;
+    }
+
+    if (intent.controller_mode == types::ControllerMode::Prefer) {
+        const int8_t pin = intent.controller_id;
+        if (pin >= 0 && static_cast<uint8_t>(pin) < capacity && _eligibleCaps(intent, pin) &&
+            _pool.claimExternal(pin)) {
+            return pin;
+        }
+        // Falls through to Auto below.
+    }
+
+    // A capability preference (e.g. an opt-in low-power controller) wins
+    // over an equally-eligible controller that lacks it -- the resolver's
+    // own preferred-capability pass, mirrored here so a claim and a managed
+    // bus resolve the same intent the same way. Only meaningful for a
+    // non-uniform kind, where controllerCaps() is a real per-controller value.
+    if (intent.prefer != 0 && !_kind.uniformControllers()) {
+        for (uint8_t c = 0; c < capacity; ++c) {
+            if (_eligibleCaps(intent, static_cast<int8_t>(c)) &&
+                (_kind.controllerCaps(static_cast<int8_t>(c)) & intent.prefer) == intent.prefer &&
+                _pool.claimExternal(static_cast<int8_t>(c))) {
+                return static_cast<int8_t>(c);
+            }
+        }
+    }
+
+    // Auto: lowest-numbered eligible free controller. Try-claim per
+    // candidate (rather than pre-checking isLeased then claiming) so the
+    // scan/claim stays a single pool operation per index.
+    for (uint8_t c = 0; c < capacity; ++c) {
+        if (!_eligibleCaps(intent, static_cast<int8_t>(c))) {
+            continue;
+        }
+        if (_pool.claimExternal(static_cast<int8_t>(c))) {
+            return static_cast<int8_t>(c);
+        }
+    }
+    return m5::stl::make_unexpected(m5::hal::v2::error::error_t::OUT_OF_RESOURCE);
+}
+
+result_t<void> AllocationCore::releaseClaimedController(int8_t controller)
+{
+    SerialGuard serial{_serial_mutex};
+    // releaseExternal checks-and-clears under one pool lock and reports the
+    // authoritative outcome: false means "not an external claim" (never
+    // leased, already released, or an ordinary resolver lease), which is a
+    // caller error here -- an ordinary lease is NOT freed by this path.
+    if (!_pool.releaseExternal(controller)) {
+        return m5::stl::make_unexpected(m5::hal::v2::error::error_t::INVALID_ARGUMENT);
+    }
+    return {};
 }
 
 int AllocationCore::allocTier(const types::AllocationIntent& a)

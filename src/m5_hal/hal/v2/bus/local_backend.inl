@@ -58,6 +58,32 @@ uint8_t LocalBackend::hardwareInUse(types::bus_kind_t kind) const
     return core != nullptr ? core->hardwareInUse() : 0;
 }
 
+result_t<int8_t> LocalBackend::claimController(types::bus_kind_t kind, const types::AllocationIntent& intent)
+{
+    auto& slot = _slots[kindIndex(kind)];
+    if (!slot.adapter) {
+        return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
+    }
+    auto* core = slot.adapter->allocationCore();
+    if (!core) {
+        return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
+    }
+    return core->claimController(intent);
+}
+
+result_t<void> LocalBackend::releaseClaimedController(types::bus_kind_t kind, int8_t controller)
+{
+    auto& slot = _slots[kindIndex(kind)];
+    if (!slot.adapter) {
+        return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
+    }
+    auto* core = slot.adapter->allocationCore();
+    if (!core) {
+        return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
+    }
+    return core->releaseClaimedController(controller);
+}
+
 size_t LocalBackend::kindIndex(types::bus_kind_t k)
 {
     switch (k) {

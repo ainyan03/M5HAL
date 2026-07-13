@@ -15,9 +15,12 @@
 | 日本語 / 概念 | 英語 (推奨) | 備考 |
 |---|---|---|
 | 通信バス | bus | コード上 `Bus` |
-| バス所有レジストリ | bus registry | `M5_Hal` が全 kind のバスを配線 (identity) で intern・所有 ([design/bus_accessor.md](../design/bus_accessor.md)) |
-| 借用 (取得) | borrow (acquire) | 基本ルール: `M5_Hal.<kind>.acquire(cfg)` が共有ハンドル (`shared_ptr<IBus>`) を返す。直接構築はエスケープ |
+| バスインターンレジストリ | bus registry | `M5_Hal` が全 kind の bus を配線 (identity) で intern する weak registry。寿命は返された strong owner が決める ([design/bus_accessor.md](../design/bus_accessor.md)) |
+| 共有取得 | shared acquisition / acquire | `M5_Hal.<kind>.acquire(cfg)` が所有権を持つ共有ハンドル (`shared_ptr<IBus>`) を返す。直接構築はエスケープ |
 | 共同所有 | co-own | `shared_ptr` からアクセサを構築するとアクセサがバスの生存を共有保持する (`Accessor dev{handle, cfg}`) |
+| 明示解放 | explicit release / consuming close | `result_t<void> release(std::shared_ptr<IBus>& bus)`。exact instance + sole owner のときだけ成功し、caller の handle を消費する |
+| 自然解放 | natural release / final-holder destruction | 最後の strong owner が消えたときの bus dtor 起点の解放 |
+| 隔離済み墓標 | quarantined tombstone | 外部解放を確認できず、identity / remote bus ID の再利用を止める registry 状態 |
 | バス種別 | bus kind | v2 では識別子も `bus_kind_t` / `BusKind` / `getBusKind()` で統一済 (旧 `bus_type_t` 等は v0 のみ) |
 | 通信相手 / アクセス対象 | accessor | コード上 `Accessor`、 固有名詞扱い |
 | 通信本体 (atomic I/O) | transfer | 動詞・名詞共通 |
@@ -34,6 +37,7 @@
 | タイムアウト (lock 取得待ち) | acquisition timeout | lock 系 API の `timeout_ms` 引数 (省略 = `types::TIMEOUT_FOREVER` = 無限待ち、 0 = 即時 try-lock) |
 | runtime 設備 (time / mutex) | runtime kind | `m5::hal::v2::runtime` ([design/runtime.md](../design/runtime.md))。 bus 構造を持たない設備 kind |
 | 非再帰 (mutex) | non-recursive | 保有タスク自身の再 lock も timeout まで待って失敗 |
+| セッションゲート | session gate / operation gate | 1 `RemoteSession` の complete RPC を直列化する canonical mutex。bus/channel → session の順で取得 |
 
 ## Source / Sink (stream I/O)
 
@@ -123,7 +127,7 @@
 | 日本語 / 概念 | 英語 (推奨) | 備考 |
 |---|---|---|
 | v0 / v2 | v0 / v2 (= API generation) | small letters |
-| inline namespace 切替 | inline namespace switch | `M5HAL_INLINE_V0` / `M5HAL_INLINE_V2` |
+| inline namespace 切替 | inline namespace switch | 利用者設定は`M5HAL_V0_INLINE` / `M5HAL_V2_INLINE`。展開用の`M5HAL_INLINE_V0` / `M5HAL_INLINE_V2`は内部macro |
 | 上書き (override) | override | C++ override と意味同じ |
 | 下位互換 | backward compatibility | v0 API の継続提供 |
 

@@ -8,8 +8,19 @@
 
 #include "backend_master_write_buffer.inl"
 
+#include <driver/gpio.h>
 #include <esp_attr.h>
 #include <esp_err.h>
+#include <freertos/FreeRTOS.h>
+// ensureDevice()'s scl_wait_us clamp branches on CONFIG_IDF_TARGET_ESP32;
+// FreeRTOS.h pulls sdkconfig.h in every known IDF, but make it explicit so
+// the branch never silently evaluates false on an exotic include order.
+#if __has_include(<sdkconfig.h>)
+#include <sdkconfig.h>
+#endif
+
+#include <climits>
+#include <cstdint>
 
 #include "../../../freertos/hal/runtime/time.hpp"
 
@@ -29,8 +40,17 @@ error::error_t mapEspErr(::esp_err_t err)
         case ESP_OK:
             return error::error_t::OK;
         case ESP_ERR_INVALID_ARG:
-        case ESP_ERR_INVALID_STATE:
             return error::error_t::INVALID_ARGUMENT;
+        case ESP_ERR_INVALID_STATE:
+            // The gen5 sync driver returns this for ANY transaction that did
+            // not reach DONE: on v5.x that folds NACK, SCL timeout,
+            // arbitration loss and abort-recovery into one code (v6.0+ splits
+            // the NACK case out as ESP_ERR_INVALID_RESPONSE below). These are
+            // wire-level failures, not caller errors -- mapping them to
+            // INVALID_ARGUMENT sent a real-bus diagnosis chasing argument
+            // validation. I2C_BUS_ERROR is the closest truthful class the
+            // return code allows.
+            return error::error_t::I2C_BUS_ERROR;
         case ESP_ERR_TIMEOUT:
             return error::error_t::TIMEOUT_ERROR;
         case ESP_ERR_NO_MEM:
@@ -64,6 +84,36 @@ error::error_t mapEspErr(::esp_err_t err)
 bool isValidAddress(const i2c::MasterAccessConfig& cfg)
 {
     return cfg.address_is_10bit ? (cfg.i2c_addr <= 0x03FFu) : (cfg.i2c_addr <= 0x007Fu);
+}
+
+// The IDF blocking API's xfer_timeout argument is a whole-transaction budget,
+// raced against the wire by a tick-quantized FreeRTOS wait (i2c_master.c:
+// pdMS_TO_TICKS + xQueueReceive). Passing wire_timeout_ms straight through
+// made that budget expire MID-TRANSFER on healthy wires whenever the transfer
+// straddled a tick boundary -- at a 100 Hz tick, 10 ms is one tick, and a
+// one-tick wait ends at the next tick interrupt after 0..10 ms of real time;
+// the driver's error path then FSM-resets the peripheral mid-byte (measured
+// abort rate = wire_time / tick_period). wire_timeout_ms is specified as a
+// bound on wire-level *progress* (i2c.hpp), not on total transfer duration,
+// so hand IDF the expected wire time plus that progress allowance plus two
+// tick periods (an N-tick wait guarantees only N-1 full tick periods of real
+// time).
+int transactionTimeoutMs(uint32_t wire_timeout_ms, uint64_t total_bytes, uint32_t freq_hz)
+{
+    if (wire_timeout_ms == types::TIMEOUT_FOREVER) {
+        return -1;  // IDF blocking API: wait forever
+    }
+    // A Sink-driven read may legitimately request SIZE_MAX ("drain the sink");
+    // saturate before the bit math below can wrap uint64.
+    constexpr uint64_t kMaxCountedBytes = (UINT64_MAX / (9u * 1000u)) - 4u;
+    if (total_bytes > kMaxCountedBytes) {
+        return INT_MAX;
+    }
+    // 9 SCL cycles per byte (8 data + ACK); +4 bytes covers the address
+    // byte(s) and START/RESTART/STOP framing across both phases.
+    const uint64_t wire_ms = ((total_bytes + 4u) * 9u * 1000u) / (freq_hz != 0 ? freq_hz : 1u) + 1u;
+    const uint64_t total   = wire_ms + wire_timeout_ms + 2u * portTICK_PERIOD_MS;
+    return static_cast<int>(total > static_cast<uint64_t>(INT_MAX) ? INT_MAX : total);
 }
 
 }  // namespace impl_espidf_gen5
@@ -133,7 +183,8 @@ result_t<void> Bus_espidf::init(const BusConfig_espidf& config)
         _bus_handle = nullptr;
         return m5::stl::make_unexpected(mapped);
     }
-    _owns_bus = true;
+    _owns_bus        = true;
+    _rebuild_pending = false;
     return {};
 }
 
@@ -159,12 +210,14 @@ result_t<void> Bus_espidf::release(void)
         if (error::isError(mapped)) {
             return m5::stl::make_unexpected(mapped);
         }
-        _bus_handle = nullptr;
-        _owns_bus   = false;
+        _bus_handle      = nullptr;
+        _owns_bus        = false;
+        _rebuild_pending = false;
         return {};
     }
-    _bus_handle = nullptr;
-    _owns_bus   = false;
+    _bus_handle      = nullptr;
+    _owns_bus        = false;
+    _rebuild_pending = false;
     return {};
 }
 
@@ -194,6 +247,94 @@ result_t<void> Bus_espidf::removeDevice(void)
     return {};
 }
 
+// A wire-level fault (SCL-stretch timeout / bus error; NACK excluded, the
+// driver drives a STOP for that case on its own) leaves residue in three
+// places, each needing its own recovery step:
+//  1. The wire may hold an unterminated transaction: the gen5 software-timeout
+//     path only marks driver state and defers the FSM reset / clear-bus to the
+//     *next* transaction, during which a listening slave keeps shifting in
+//     whatever appears on the wire as continued transaction data. Reset (STOP +
+//     clear pulses) immediately instead of leaving that window open.
+//  2. i2c_master_bus_reset() is a hardware-FSM reset only -- the driver's
+//     software state survives it. On SOC_I2C_STOP_INDEPENDENT targets (classic
+//     ESP32) the gen5 driver never clears its contains_read flag once a read
+//     ran, so after a fault burst every completion interrupt still re-enters
+//     the driver's receive handler, which dereferences the current operation's
+//     data pointer without a NULL guard -- measured on hardware as a
+//     deterministic StoreProhibited (EXCVADDR=0) when a stretch-timeout burst
+//     races transaction teardown. Rebuilding the bus is the only
+//     application-level way to reset that state, so escalate to a full
+//     rebuild when this backend owns the bus.
+//  3. The slave that caused the fault is typically still stretching SCL;
+//     issuing the next transaction while it holds the bus walks straight back
+//     into the same fault path. Wait for both lines to release, then give the
+//     slave a short settle before the caller can retry. This wait is wire
+//     work, so it shares the caller's declared wire tolerance: it is capped
+//     by wire_timeout_ms (a 0 / tight budget skips it) on top of the fixed
+//     ceiling below, keeping probe/scan latency bounds intact.
+void Bus_espidf::recoverBusAfterWireFault(error::error_t mapped, uint32_t wire_timeout_ms)
+{
+    if (mapped != error::error_t::TIMEOUT_ERROR && mapped != error::error_t::I2C_BUS_ERROR) {
+        return;
+    }
+    if (_bus_handle == nullptr) {
+        return;
+    }
+    (void)::i2c_master_bus_reset(_bus_handle);
+
+    if (_owns_bus) {
+        // Explicit release-then-init: init()'s internal release ignores a
+        // delete failure and would create a second bus on the same port on
+        // top of the leaked one.
+        BusConfig_espidf config;
+        config.pin_scl  = _config.pin_scl;
+        config.pin_sda  = _config.pin_sda;
+        config.i2c_port = _controller_port;
+        if (!release().has_value()) {
+            // Keep the old handle: it was FSM-reset above, so it stays usable
+            // even though the driver-internal soft state could not be cleared.
+            M5_LIB_LOGW("I2C wire-fault recovery: rebuild skipped (release failed); continuing on reset bus");
+        } else if (!init(config).has_value()) {
+            // A transient failure (e.g. NO_MEM) must not permanently kill an
+            // owned bus: transfer() retries the rebuild lazily on the next
+            // call instead of reporting the null handle as caller misuse.
+            _rebuild_pending = true;
+            M5_LIB_LOGW("I2C wire-fault recovery could not rebuild the bus; will retry on next transfer");
+            return;
+        }
+    }
+
+    constexpr uint32_t kIdlePollStepUs = 50;
+    // Just past the classic ESP32 SCL-timeout register ceiling (13.1 ms, see
+    // ensureDevice): the longest stretch the peripheral itself would have
+    // tolerated before declaring the fault we are recovering from.
+    constexpr uint32_t kIdleWaitBudgetUs = 15000;
+    // Settle pacing of this magnitude is what field reports on the same fault
+    // class found effective (esp-idf issue 18105).
+    constexpr uint32_t kSettleUs = 2000;
+    // timeoutMsToUsecU32 saturates (TIMEOUT_FOREVER included), so the fixed
+    // ceilings below still bound the forever case.
+    const uint32_t caller_budget_us = ::m5::hal::v2::detail::timeoutMsToUsecU32(wire_timeout_ms);
+    const uint32_t idle_budget_us   = caller_budget_us < kIdleWaitBudgetUs ? caller_budget_us : kIdleWaitBudgetUs;
+    if (_config.pin_scl >= 0 && _config.pin_sda >= 0) {
+        for (uint32_t waited = 0; waited < idle_budget_us; waited += kIdlePollStepUs) {
+            if (::gpio_get_level(static_cast<::gpio_num_t>(_config.pin_scl)) != 0 &&
+                ::gpio_get_level(static_cast<::gpio_num_t>(_config.pin_sda)) != 0) {
+                break;
+            }
+            // delayUs busy-waits on ESP-IDF; yield each step so equal-priority
+            // tasks are not starved while the accessor still holds the bus.
+            runtime::yield();
+            runtime::delayUs(kIdlePollStepUs);
+        }
+    }
+    const uint32_t settle_us = caller_budget_us < kSettleUs ? caller_budget_us : kSettleUs;
+    for (uint32_t settled = 0; settled < settle_us; settled += 100) {
+        runtime::yield();
+        runtime::delayUs(100);
+    }
+}
+
 result_t<void> Bus_espidf::ensureDevice(const i2c::MasterAccessConfig& cfg)
 {
 #if !SOC_I2C_SUPPORT_10BIT_ADDR
@@ -202,9 +343,19 @@ result_t<void> Bus_espidf::ensureDevice(const i2c::MasterAccessConfig& cfg)
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
 #endif
-    bool clamped               = false;
-    const uint32_t freq        = clampMasterClockHz(cfg.freq, &clamped);
-    const uint32_t scl_wait_us = ::m5::hal::v2::detail::timeoutMsToUsecU32(cfg.wire_timeout_ms);
+    bool clamped         = false;
+    const uint32_t freq  = clampMasterClockHz(cfg.freq, &clamped);
+    uint32_t scl_wait_us = ::m5::hal::v2::detail::timeoutMsToUsecU32(cfg.wire_timeout_ms);
+#if defined(CONFIG_IDF_TARGET_ESP32)
+    // Classic ESP32: the SCL-timeout register is 20 bits of APB (80 MHz)
+    // cycles and the LL conversion does not clamp -- past ~13.1 ms the value
+    // silently TRUNCATES mod 2^20 (the 1000 ms default wrapped to an
+    // effective ~3.9 ms). Saturate at the register ceiling instead.
+    constexpr uint32_t kMaxSclWaitUs = 13107;
+    if (scl_wait_us > kMaxSclWaitUs) {
+        scl_wait_us = kMaxSclWaitUs;
+    }
+#endif
     if (_dev_handle != nullptr && _dev_addr == cfg.i2c_addr && _dev_freq == freq && _dev_scl_wait_us == scl_wait_us &&
         _dev_address_is_10bit == cfg.address_is_10bit) {
         return {};
@@ -331,7 +482,19 @@ result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const i2c::MasterAcce
         return m5::stl::make_unexpected(waited.error());
     }
     if (_bus_handle == nullptr) {
-        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+        if (!_rebuild_pending) {
+            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+        }
+        // Deferred wire-fault recovery (see recoverBusAfterWireFault): retry
+        // the rebuild here; if it keeps failing, report the bus as faulted
+        // rather than as caller misuse.
+        BusConfig_espidf config;
+        config.pin_scl  = _config.pin_scl;
+        config.pin_sda  = _config.pin_sda;
+        config.i2c_port = _controller_port;
+        if (!init(config).has_value()) {
+            return m5::stl::make_unexpected(error::error_t::I2C_BUS_ERROR);
+        }
     }
     if (cfg.freq == 0 || !impl_espidf_gen5::isValidAddress(cfg)) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
@@ -345,7 +508,9 @@ result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const i2c::MasterAcce
 
     const bool have_tx = !write_bytes.empty();
     const bool have_rx = (dst != nullptr && rx_len > 0);
-    const int timeout  = static_cast<int>(cfg.wire_timeout_ms);
+    const int timeout  = impl_espidf_gen5::transactionTimeoutMs(
+        cfg.wire_timeout_ms, static_cast<uint64_t>(write_bytes.size()) + (have_rx ? rx_len : 0),
+        clampMasterClockHz(cfg.freq));
 
     if (!have_tx && !have_rx) {
         if (cfg.address_is_10bit) {
@@ -374,6 +539,7 @@ result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const i2c::MasterAcce
         auto err    = ::i2c_master_probe(_bus_handle, cfg.i2c_addr, timeout);
         auto mapped = impl_espidf_gen5::mapEspErr(err);
         if (error::isError(mapped)) {
+            recoverBusAfterWireFault(mapped, cfg.wire_timeout_ms);
             return m5::stl::make_unexpected(mapped);
         }
         return {};
@@ -392,6 +558,7 @@ result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const i2c::MasterAcce
     auto finish = [&](::esp_err_t result) -> result_t<void> {
         auto result_map = impl_espidf_gen5::mapEspErr(result);
         if (error::isError(result_map)) {
+            recoverBusAfterWireFault(result_map, cfg.wire_timeout_ms);
             return m5::stl::make_unexpected(result_map);
         }
         _transfer_totals.tx += total - received;
@@ -523,7 +690,9 @@ result_t<bus::TransferTotals> Bus_espidf::waitTransfer(bus::IAccessor* owner, co
         return m5::stl::make_unexpected(error::error_t::BUSY);
     }
     while (_transfer_active && !_transfer_done && !error::isError(_transfer_callback_status)) {
-        auto result = serviceTransfer(service::ServiceContext{service::fastTick()});
+        // serviceTransfer ignores the context (completion checks only, no
+        // timing) — a default-constructed one is sufficient here.
+        auto result = serviceTransfer(service::ServiceContext{});
         if (result == service::ServiceResult::Error) {
             break;
         }

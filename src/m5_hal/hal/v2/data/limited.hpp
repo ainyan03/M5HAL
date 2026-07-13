@@ -74,14 +74,20 @@ public:
     m5::hal::v2::result_t<void> advance(size_t N) override
     {
         size_t step = std::min(N, _remaining);
-        _remaining -= step;
-        if (step == 0) {
+        if (step == 0 || _base == nullptr) {
+            _remaining -= step;
             return {};
         }
-        if (_base == nullptr) {
-            return {};
+        auto r = _base->advance(step);
+        // Charge the cap only when the base accepted the advance: charging
+        // up front would bill the budget again on a caller's retry after a
+        // base error, silently shrinking the window by bytes that were
+        // never consumed. Post-error cursor state is the base's own
+        // documented contract; the decorator adds no consumption of its own.
+        if (r.has_value()) {
+            _remaining -= step;
         }
-        return _base->advance(step);
+        return r;
     }
 
     /*! @brief True when the local cap is exhausted, or when the base
@@ -142,14 +148,25 @@ public:
     m5::hal::v2::result_t<void> commit(size_t N) override
     {
         size_t step = std::min(N, _remaining);
-        _remaining -= step;
-        if (step == 0) {
+        if (step == 0 || _base == nullptr) {
+            _remaining -= step;
             return {};
         }
-        if (_base == nullptr) {
-            return {};
-        }
-        return _base->commit(step);
+        auto r = _base->commit(step);
+        // Charge the budget by what the base actually took: a partially
+        // accepting base (StreamSink) may flush a prefix before failing,
+        // and charging the full step would leak budget for bytes that
+        // never went through.
+        _remaining -= r.has_value() ? step : partialCommitAccepted();
+        return r;
+    }
+
+    size_t partialCommitAccepted() const override
+    {
+        // Forward the base's accepted prefix so a caller driving this
+        // decorator (e.g. remote::detail::drainToSink) advances its
+        // upstream by what actually reached the base sink.
+        return _base != nullptr ? _base->partialCommitAccepted() : 0;
     }
 
     bool closed() const override

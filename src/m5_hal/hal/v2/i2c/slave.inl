@@ -60,6 +60,18 @@ result_t<size_t> SlaveStreamAccessor::read(data::DataSpan dst)
             return m5::stl::make_unexpected(complete.error());
         }
         if (complete.value()) {
+            // TOCTOU guard (same race as the serve() loops): the STOP ISR can
+            // deliver the final FIFO bytes into the ring between the
+            // readableBytes()==0 above and this complete check. Re-check before
+            // reporting end-of-transaction, so a caller treating 0 as EOF does
+            // not discard the tail.
+            auto readable_after = getBus().readableBytes(this);
+            if (!readable_after.has_value()) {
+                return m5::stl::make_unexpected(readable_after.error());
+            }
+            if (readable_after.value() != 0) {
+                return getBus().read(this, dst);
+            }
             return size_t{0};
         }
         if (timeout_ms == 0 || (timeout_ms != types::TIMEOUT_FOREVER && runtime::millis() - start_ms >= timeout_ms)) {
@@ -229,15 +241,60 @@ result_t<size_t> SlaveStreamAccessor::serve(data::Source *src, data::Sink *dst, 
                 break;
             }
             if (complete.value()) {
-                break;
+                // TOCTOU guard: the STOP ISR can land between this pass's
+                // readableBytes()==0 (the no-progress verdict above) and this
+                // complete check, delivering the write's final FIFO bytes into
+                // the ring together with the flag. Breaking here would return
+                // with those bytes unread (a silent short count -- seen on HW as
+                // a 65-byte write surfacing as 64 at 400 kHz, no overflow, with
+                // everything downstream desyncing). Re-check before declaring done.
+                // (Only when a drain target exists: with a null Sink and no escape
+                // the top of the loop cannot consume the tail anyway.)
+                bool tail_pending = false;
+                if (dst != nullptr || escaping) {
+                    auto readable_after = readableBytes();
+                    if (!readable_after.has_value()) {
+                        err    = readable_after.error();
+                        failed = true;
+                        break;
+                    }
+                    tail_pending = readable_after.value() > 0;
+                }
+                if (!tail_pending) {
+                    break;
+                }
+                // Tail present. Do NOT `continue` here: a full-but-open Sink
+                // (reserve()==0, closed()==false) also lands on this branch, and
+                // an unconditional retry would spin hot forever, unreachable by
+                // the finite-timeout stall escape below. Fall THROUGH to the
+                // shared stall/deadline/wait logic instead: an expired finite
+                // deadline escapes to `discard` (preserving the documented stall
+                // contract), otherwise the activity wait paces the retry and the
+                // next pass drains the tail normally.
             }
             // Stall escape: a finite timeout_ms bounds how long we hold the master
             // with no progress (a full / null Sink). Past that deadline, abandon the
             // transaction -- flip to discard mode so the next passes drain the ring,
             // the backend lifts the stretch, and the master finishes; we then return
             // TIMEOUT_ERROR. TIMEOUT_FOREVER never sets has_deadline, so it holds.
-            if (has_deadline && !escaping && (runtime::millis() - last_progress_ms) >= timeout_ms) {
+            if (has_deadline && (runtime::millis() - last_progress_ms) >= timeout_ms) {
+                if (escaping) {
+                    // Second no-progress deadline WHILE escaping: the discard drain
+                    // assumes the master finishes once the stretch lifts, but nothing
+                    // arrived for another full deadline -- the master itself went
+                    // inactive (died / aborted with no visible STOP). Waiting on
+                    // transactionComplete() would hang forever; abandon outright.
+                    // Bus-safe: no-progress means the ring is empty, so no RX_FULL
+                    // hold is pending, and a TX-side hold self-heals via the
+                    // responder task's stretch budget (fill-byte fallback).
+                    break;
+                }
                 escaping = true;
+                // Fresh deadline for the escape drain: without this reset the very
+                // next no-progress pass would see the stale timer already expired
+                // and abandon almost immediately -- the documented contract grants
+                // the drain one more full deadline to reach the master's STOP.
+                last_progress_ms = runtime::millis();
                 continue;
             }
             // Event-driven wait: the backend wakes us on the next RX/TX/STOP ISR
@@ -274,6 +331,55 @@ result_t<size_t> SlaveStreamAccessor::serve(data::Source *src, data::Sink *dst, 
 
 result_t<void> SlaveRegMapAccessor::serve(uint32_t timeout_ms)
 {
+    if (_isr_bound) {
+        // Fast path: the backend's own ISR already ingested writes and composed
+        // reads directly against reg_file/onRead/onWrite (see
+        // ISlaveBus::bindIsrRegMap). Nothing here needs beginExchange/ingest/
+        // composeReply -- just open the transaction and wait for the backend to
+        // report it complete (the master's STOP).
+        auto begin = _stream.beginTransaction(timeout_ms);
+        if (!begin.has_value()) {
+            return begin;
+        }
+
+        // No-progress deadline, the fast-path counterpart of the task-context
+        // stall escape below: the ISR is what progresses this transaction, so an
+        // expired finite deadline can only mean the master went inactive without
+        // a STOP. There is nothing to drain/discard here (the ISR never handed
+        // anything to this task) -- just abandon the wait and close the
+        // transaction, like the task-context path's stall abandon. Matches the
+        // documented contract (an in-transaction NO-PROGRESS stall, not a
+        // wall-clock total): every CONFIRMED waitForActivity() wake (an RX/TX/
+        // STOP ISR pass) refreshes the deadline, so a master that keeps the ISR
+        // busy past timeout_ms is not mistaken for a stalled one.
+        const bool has_deadline   = (timeout_ms != types::TIMEOUT_FOREVER);
+        uint32_t last_progress_ms = runtime::millis();
+        bool stalled              = false;
+        for (;;) {
+            auto complete = _stream.transactionComplete();
+            if (!complete.has_value()) {
+                (void)_stream.endTransaction();
+                return m5::stl::make_unexpected(complete.error());
+            }
+            if (complete.value()) {
+                break;
+            }
+            if (has_deadline && (runtime::millis() - last_progress_ms) >= timeout_ms) {
+                stalled = true;
+                break;
+            }
+            auto activity = _stream.waitForActivity(4);
+            if (activity.has_value() && activity.value()) {
+                last_progress_ms = runtime::millis();
+            }
+        }
+        auto ended = _stream.endTransaction();
+        if (stalled) {
+            return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+        }
+        return ended;
+    }
+
     auto begin = _stream.beginTransaction(timeout_ms);
     if (!begin.has_value()) {
         return begin;
@@ -283,6 +389,22 @@ result_t<void> SlaveRegMapAccessor::serve(uint32_t timeout_ms)
 
     error::error_t err = error::error_t::OK;
     bool failed        = false;
+
+    // Stall escape (finite timeout only), the regmap counterpart of
+    // SlaveStreamAccessor::serve()'s no-progress deadline (same documented
+    // contract; not a wall-clock total). The regmap consumer always progresses
+    // while the wire moves -- RX drains straight into the register file and the
+    // reply pump is bounded by the tx ring -- so an expired deadline can only
+    // mean the MASTER went inactive mid-transaction (died / aborted with no
+    // visible STOP), never local back-pressure. There is thus no discard-drain
+    // phase here (the stream escape's job): abandon the exchange outright.
+    // Register writes ingested before the stall stay applied, like a real
+    // register device cut off mid-write. Bus-safe for the same reason as the
+    // stream abandon: an empty ring means no RX_FULL hold is pending, and a
+    // TX-side hold self-heals via the responder task's stretch budget.
+    const bool has_deadline   = (timeout_ms != types::TIMEOUT_FOREVER);
+    uint32_t last_progress_ms = runtime::millis();
+    bool stalled              = false;
 
     // 1. Non-blocking read of whatever has arrived: the register byte plus
     //    any early write data. A pure read (SPLIT's 2nd transaction) has
@@ -313,15 +435,29 @@ result_t<void> SlaveRegMapAccessor::serve(uint32_t timeout_ms)
         }
 
         // 2. Compose the read reply from the register pointer and queue it.
-        //    Writing it lets the backend release a held read stretch promptly;
-        //    for a write-only transaction the master never reads it (harmless,
-        //    it expires at STOP).
+        //    Writing the first chunk lets the backend release a held read
+        //    stretch promptly; for a write-only transaction the master never
+        //    reads it (harmless, it expires at STOP). The reply STREAMS: when
+        //    the master reads past a chunk the tx ring drains, the pump in the
+        //    loop below composes the next chunk from the advancing offset
+        //    (8-bit wrap), and the backend's TX_EMPTY refill keeps the read
+        //    going -- a single read is not capped at one window (matches the
+        //    ESP32_I2C_slave_example reference, which refills from the
+        //    register file in-ISR). Composed-but-unaccepted bytes are retried
+        //    verbatim, never re-composed, so onRead fires at most once per
+        //    streamed byte (at most one chunk ahead of the wire).
         uint8_t tx[kReplyWindowBytes];
-        composeReply(data::DataSpan{tx, sizeof(tx)});
-        auto wrote = _stream.write(data::ConstDataSpan{tx, sizeof(tx)});
-        if (!wrote.has_value()) {
-            err    = wrote.error();
-            failed = true;
+        size_t tx_have  = composeReply(data::DataSpan{tx, sizeof(tx)});
+        size_t tx_sent  = 0;
+        size_t resp_off = tx_have;  // next register offset to compose
+        {
+            auto wrote = _stream.write(data::ConstDataSpan{tx, tx_have});
+            if (!wrote.has_value()) {
+                err    = wrote.error();
+                failed = true;
+            } else {
+                tx_sent = wrote.value();
+            }
         }
 
         // Apply the remaining bytes of the initial read as write data.
@@ -329,11 +465,12 @@ result_t<void> SlaveRegMapAccessor::serve(uint32_t timeout_ms)
             ingest(data::ConstDataSpan{buf + 1, n0 - 1});
         }
 
-        // 3. Drain the rest of the write phase until the master STOPs. Drain
-        //    everything available BEFORE checking complete: the final write
-        //    bytes are pushed into the rx queue by the STOP interrupt, so they
-        //    become readable at the same moment transactionComplete() turns
-        //    true. Checking complete first would leave that tail unread.
+        // 3. Drain the rest of the write phase until the master STOPs, and keep
+        //    the read reply pumped. Drain everything available BEFORE checking
+        //    complete: the final write bytes are pushed into the rx queue by
+        //    the STOP interrupt, so they become readable at the same moment
+        //    transactionComplete() turns true. Checking complete first would
+        //    leave that tail unread.
         while (!failed) {
             auto more = _stream.readableBytes();
             if (!more.has_value()) {
@@ -350,6 +487,7 @@ result_t<void> SlaveRegMapAccessor::serve(uint32_t timeout_ms)
                 }
                 if (got.value() > 0) {
                     ingest(data::ConstDataSpan{buf, got.value()});
+                    last_progress_ms = runtime::millis();
                     continue;
                 }
             }
@@ -360,6 +498,54 @@ result_t<void> SlaveRegMapAccessor::serve(uint32_t timeout_ms)
                 break;
             }
             if (complete.value()) {
+                // TOCTOU guard (same race as SlaveStreamAccessor::serve): the STOP
+                // ISR can deliver the final write bytes into the ring between the
+                // readableBytes()==0 above and this complete check; breaking now
+                // would drop that tail. Re-check and drain it first.
+                auto readable_after = _stream.readableBytes();
+                if (!readable_after.has_value()) {
+                    err    = readable_after.error();
+                    failed = true;
+                    break;
+                }
+                if (readable_after.value() > 0) {
+                    continue;
+                }
+                break;
+            }
+            // Reply pump: top the tx ring back up while it has room (the ring
+            // frees as the master clocks the reply out). write() is
+            // partial-accept, so this composes at most one chunk beyond what
+            // the ring can hold and then stands down until the next wake.
+            while (!failed) {
+                if (tx_sent == tx_have) {
+                    tx_have = composeReply(data::DataSpan{tx, sizeof(tx)}, resp_off);
+                    tx_sent = 0;
+                    resp_off += tx_have;
+                }
+                auto wrote = _stream.write(data::ConstDataSpan{tx + tx_sent, tx_have - tx_sent});
+                if (!wrote.has_value()) {
+                    err    = wrote.error();
+                    failed = true;
+                    break;
+                }
+                if (wrote.value() > 0) {
+                    // The ring accepted bytes, which means the master clocked some
+                    // of the reply out since the last pass -- wire progress.
+                    last_progress_ms = runtime::millis();
+                }
+                tx_sent += wrote.value();
+                if (tx_sent < tx_have) {
+                    break;  // ring full for now; retry after the next activity
+                }
+            }
+            if (failed) {
+                break;
+            }
+            // No-progress deadline (see the header comment above): the master went
+            // inactive mid-transaction. Abandon the exchange and report the stall.
+            if (has_deadline && (runtime::millis() - last_progress_ms) >= timeout_ms) {
+                stalled = true;
                 break;
             }
             // Event-driven drain: wake on the next RX/STOP ISR (short safety
@@ -376,6 +562,13 @@ result_t<void> SlaveRegMapAccessor::serve(uint32_t timeout_ms)
     auto ended = _stream.endTransaction();
     if (failed) {
         return m5::stl::make_unexpected(err);
+    }
+    if (stalled) {
+        // Report the stall even if the close also failed: like `failed` above,
+        // the policy is "first abnormality wins" (the stall was detected before
+        // the close was attempted). Matches SlaveStreamAccessor::serve(), whose
+        // escape return likewise takes priority over the endTransaction result.
+        return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
     }
     return ended;
 }
@@ -403,13 +596,13 @@ void SlaveRegMapAccessor::ingest(data::ConstDataSpan src)
     }
 }
 
-size_t SlaveRegMapAccessor::composeReply(data::DataSpan dst)
+size_t SlaveRegMapAccessor::composeReply(data::DataSpan dst, size_t offset)
 {
     if (dst.data == nullptr) {
         return 0;
     }
     for (size_t i = 0; i < dst.size; ++i) {
-        dst.data[i] = readByte(static_cast<uint8_t>(_pointer + i));
+        dst.data[i] = readByte(static_cast<uint8_t>(_pointer + offset + i));
     }
     return dst.size;
 }
@@ -421,20 +614,12 @@ SlaveStreamAccessor &SlaveRegMapAccessor::stream(void)
 
 uint8_t SlaveRegMapAccessor::readByte(uint8_t reg) const
 {
-    if (_on_read != nullptr) {
-        return _on_read(reg, _on_read_ctx);
-    }
-    return (_reg_file.data != nullptr && reg < _reg_file.size) ? _reg_file.data[reg] : uint8_t{0};
+    return regMapReadByte(_reg_file, reg, _on_read, _on_read_ctx);
 }
 
 void SlaveRegMapAccessor::writeByte(uint8_t reg, uint8_t value)
 {
-    if (_reg_file.data != nullptr && reg < _reg_file.size) {
-        _reg_file.data[reg] = value;
-    }
-    if (_on_write != nullptr) {
-        _on_write(reg, value, _on_write_ctx);
-    }
+    regMapWriteByte(_reg_file, reg, value, _on_write, _on_write_ctx);
 }
 
 result_t<void> ScopedSlaveServiceRegistration::registerTo(service::ServiceRunner &runner, ISlaveBus &driver)
@@ -624,6 +809,9 @@ service::ServicePoll SlaveBus_software::serviceImpl(const service::ServiceContex
     if (_lines == nullptr) {
         return service::ServiceResult::Idle;
     }
+    // Private virtual timeline for the stretch budget; gap-drop only makes
+    // the stretch last longer (slave keeps waiting), which is the safe side.
+    _svc_now += ctx.elapsed;
 
     const bool scl = _lines->readScl();
     const bool sda = _lines->readSda();
@@ -635,7 +823,7 @@ service::ServicePoll SlaveBus_software::serviceImpl(const service::ServiceContex
     }
 
     if (_state == State::WaitTx) {
-        if (txAvailableForCurrent() || stretchExpired(ctx.now_tick)) {
+        if (txAvailableForCurrent() || stretchExpired(_svc_now)) {
             _lines->pullSclLow(false);
             _state     = State::Transmit;
             _bit_count = 0;
@@ -683,7 +871,7 @@ service::ServicePoll SlaveBus_software::serviceImpl(const service::ServiceContex
         if (_master_ack) {
             _bit_count = 0;
             if (_config.tx_underrun == TxUnderrun::Stretch && !txAvailableForCurrent()) {
-                beginStretch(ctx.now_tick);
+                beginStretch(_svc_now);
             } else {
                 _state = State::Transmit;
                 driveTxBit();
@@ -703,7 +891,7 @@ service::ServicePoll SlaveBus_software::serviceImpl(const service::ServiceContex
         _bit_count = 0;
         if (_matched && _read_phase) {
             if (_config.tx_underrun == TxUnderrun::Stretch && !txAvailableForCurrent()) {
-                beginStretch(ctx.now_tick);
+                beginStretch(_svc_now);
             } else {
                 _state = State::Transmit;
                 driveTxBit();
@@ -902,10 +1090,16 @@ void SlaveBus_software::driveTxBit()
 
 void SlaveBus_software::beginStretch(service::fast_tick_t now_tick)
 {
-    _state          = State::WaitTx;
-    _stretching     = true;
-    _stretch_start  = now_tick;
-    _stretch_budget = _config.stretch_timeout_ms * uint32_t{1000};
+    _state         = State::WaitTx;
+    _stretching    = true;
+    _stretch_start = now_tick;
+    // stretch_timeout_ms is a duration in milliseconds; fastTick() ticks are
+    // CPU cycles on ESP32 (not microseconds), so convert through the
+    // frequency-aware helper instead of assuming a 1 MHz tick rate.
+    const uint64_t nsec    = static_cast<uint64_t>(_config.stretch_timeout_ms) * uint64_t{1000000};
+    const uint32_t clamped = nsec > static_cast<uint64_t>(UINT32_MAX) ? UINT32_MAX : static_cast<uint32_t>(nsec);
+    _stretch_budget =
+        service::nsecToFastTickCeil(static_cast<service::tick_nsec_t>(clamped), service::fastTickFrequencyHz());
     _lines->pullSclLow(true);
     _lines->pullSdaLow(false);
 }

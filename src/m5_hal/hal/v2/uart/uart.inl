@@ -251,11 +251,13 @@ result_t<size_t> RxAccessor::readableBytes(void)
 
 Accessor::Accessor(IBus& bus, const AccessConfig& access_config) : _tx{bus, access_config}, _rx{bus, access_config}
 {
+    wireLockPeers();
 }
 
 Accessor::Accessor(std::shared_ptr<IBus> bus, const AccessConfig& access_config)
     : _tx{bus, access_config}, _rx{std::move(bus), access_config}
 {
+    wireLockPeers();
 }
 
 IBus& Accessor::getBus(void) const
@@ -482,7 +484,8 @@ result_t<void> IBus::lockChannel(bus::IAccessor* owner, Channel ch, uint32_t tim
         if (!_tx_mutex.lock(timeout_ms)) {
             return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
         }
-        _tx_lock_owner = owner;
+        _tx_lock_owner.store(owner, std::memory_order_relaxed);
+        _tx_lock_task.store(runtime::currentTaskId(), std::memory_order_relaxed);
     }
     if (hasChannel(ch, Channel::Rx)) {
         // The composite (txrx) lock spends what is left of the budget on
@@ -495,12 +498,14 @@ result_t<void> IBus::lockChannel(bus::IAccessor* owner, Channel ch, uint32_t tim
         }
         if (!_rx_mutex.lock(remaining)) {
             if (hasChannel(ch, Channel::Tx)) {
-                _tx_lock_owner = nullptr;
+                _tx_lock_owner.store(nullptr, std::memory_order_relaxed);
+                _tx_lock_task.store(nullptr, std::memory_order_relaxed);
                 _tx_mutex.unlock();
             }
             return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
         }
-        _rx_lock_owner = owner;
+        _rx_lock_owner.store(owner, std::memory_order_relaxed);
+        _rx_lock_task.store(runtime::currentTaskId(), std::memory_order_relaxed);
     }
     return {};
 }
@@ -510,22 +515,84 @@ result_t<void> IBus::unlockChannel(bus::IAccessor* owner, Channel ch)
     if (owner == nullptr || (!hasChannel(ch, Channel::Tx) && !hasChannel(ch, Channel::Rx))) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
-    if (hasChannel(ch, Channel::Tx) && _tx_lock_owner != owner) {
+    if (hasChannel(ch, Channel::Tx) && _tx_lock_owner.load(std::memory_order_relaxed) != owner) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
-    if (hasChannel(ch, Channel::Rx) && _rx_lock_owner != owner) {
+    if (hasChannel(ch, Channel::Rx) && _rx_lock_owner.load(std::memory_order_relaxed) != owner) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
 
     if (hasChannel(ch, Channel::Tx)) {
-        _tx_lock_owner = nullptr;  // cleared while the mutex is still held
+        _tx_lock_owner.store(nullptr, std::memory_order_relaxed);  // cleared while the mutex is still held
+        _tx_lock_task.store(nullptr, std::memory_order_relaxed);
         _tx_mutex.unlock();
     }
     if (hasChannel(ch, Channel::Rx)) {
-        _rx_lock_owner = nullptr;
+        _rx_lock_owner.store(nullptr, std::memory_order_relaxed);
+        _rx_lock_task.store(nullptr, std::memory_order_relaxed);
         _rx_mutex.unlock();
     }
     return {};
+}
+
+QuiescenceGrant IBus::tryAcquireOppositeChannel(bus::IAccessor* owner, Channel entered)
+{
+    QuiescenceGrant grant{};
+    if (owner == nullptr) {
+        return grant;  // not granted
+    }
+    Channel opposite;
+    if (entered == Channel::Tx) {
+        opposite = Channel::Rx;
+    } else if (entered == Channel::Rx) {
+        opposite = Channel::Tx;
+    } else {
+        return grant;  // Channel::TxRx / Channel::None: not granted
+    }
+    grant.opposite = opposite;
+
+    const bool opposite_is_tx                               = (opposite == Channel::Tx);
+    const std::atomic<bus::IAccessor*>& opposite_owner_slot = opposite_is_tx ? _tx_lock_owner : _rx_lock_owner;
+    const std::atomic<void*>& opposite_task_slot            = opposite_is_tx ? _tx_lock_task : _rx_lock_task;
+
+    // Step 1 (MUST run before step 3 -- see the doc comment on this method):
+    // self/peer hold, i.e. `owner` (or its combined-accessor lock peer)
+    // already holds the opposite channel. Nothing to unlock in that case.
+    bus::IAccessor* const opposite_owner = opposite_owner_slot.load(std::memory_order_relaxed);
+    if (opposite_owner == owner || (owner->lockPeer() != nullptr && opposite_owner == owner->lockPeer())) {
+        grant.granted     = true;
+        grant.must_unlock = false;
+        return grant;
+    }
+
+    // Step 2 (same-task guard, new): some OTHER, unrelated accessor on this
+    // same task holds the opposite channel. Do not try-lock: the task id
+    // loaded here can only be THIS calling task's own id (a different task
+    // can never have written it, and we are not mid-unlockChannel), so it
+    // is never stale, and issuing a try_lock against a mutex the calling
+    // thread already holds is undefined behavior on POSIX
+    // std::timed_mutex. Busy either way: the opposite channel is genuinely
+    // in use from this caller's point of view.
+    if (opposite_task_slot.load(std::memory_order_relaxed) == runtime::currentTaskId()) {
+        return grant;  // not granted
+    }
+
+    // Step 3: non-blocking attempt on the opposite channel -- safe here
+    // because step 2 already ruled out a same-task self-hold.
+    if (lockChannel(owner, opposite, 0).has_value()) {
+        grant.granted     = true;
+        grant.must_unlock = true;
+        return grant;
+    }
+    return grant;  // not granted
+}
+
+void IBus::releaseOppositeChannel(bus::IAccessor* owner, const QuiescenceGrant& grant)
+{
+    if (!grant.must_unlock) {
+        return;
+    }
+    (void)unlockChannel(owner, grant.opposite);
 }
 
 }  // namespace m5::hal::v2::uart

@@ -67,7 +67,7 @@ public:
         data::Source* src,
         data::Sink*   dst) = 0;
 
-    // 簡易 probe sugar (spec_polish A2)。
+    // 簡易 probe sugar。
     // Accessor を構築せず単一 device の存在確認ができる短縮 API。
     // 内部で stack-allocated な MasterAccessor を sentinel として組み立て、
     // 同じ probe path を呼ぶ。 default `timeout_ms = 50` は I2C scan 用途を
@@ -103,6 +103,20 @@ STOP
 - `desc.prefix_len == 0` かつ `src == nullptr` かつ `dst == nullptr` の **全空** = **probe path** として扱う (下記)
 - 成功時の戻り値は **caller data phase の転送量**。`read` / `readRegister` は `dst` Sink に入った受信バイト数、`write` / `writeRegister` は `src` Source から送った書き込みバイト数を `result_t<size_t>` で返す。 write 系は full-or-fail なので成功時の値は要求 `len` と一致する。 `desc.prefix` は数えない (SPI の command/address 相と同じ分離。`readRegister(reg, buf, 4)` の成功は受信した 4 を返す)
 - `MasterAccessConfig::wire_timeout_ms` は **転送 1 回のワイヤ進行の全体上限** (espidf の per-transfer 意味に全 backend を統一)。software はクロックストレッチ個別上限に加えて転送全体デッドラインを持ち、arduino は `Wire::setTimeOut` へ遅延適用する。bus-lock の取得待ちはここに含まれない (`beginAccess` の呼び出し引数)
+- **master 側の終端責務**: master がバスを放棄するとき (timeout / abort) は、可能な限り
+  速やかに定義された終端 (STOP、または stuck な SDA からの回復パルス列 + STOP) を打って
+  からエラーを返す契約とする。slave 側はこれを in-band で正確に判定する手段を持たないため、
+  master 異常を推測しない (任意長の mid-transaction 静止は合法であり、推測はヒューリス
+  ティクスにしかならない)。ESP-IDF gen5 driver は自身の回復を次の取引開始まで遅延させるため、
+  backend は `TIMEOUT_ERROR` / `I2C_BUS_ERROR` を返す直前に `i2c_master_bus_reset()` を
+  挟んで即時化する (NACK による `I2C_NO_ACK` は driver が既に STOP まで面倒を見るため対象外)。
+  legacy (gen4) driver は `i2c_master_cmd_begin` 内部で同型の回復を同期的に行うため追加対応
+  不要。software (bit-bang) backend は個別フェーズ・全体デッドラインの両方のエラー経路で
+  STOP を試みる。他社製 master と共存する M5HAL slave にはこの契約の外側 (M5HAL 以外の
+  master がこの契約を守らない場合) の暴露が残ることは既知の限界とする。espidf gen5 driver
+  自体の ISR/timeout レース (upstream の既知バグと同系統) に起因して slave 側 SoC が
+  SW 再初期化でも回復しない状態に陥りうる既知の制約もある — 詳細・実用推奨は
+  [i2c_slave.md](i2c_slave.md) §backend 実装参照。
 
 ### probe path
 
@@ -131,10 +145,10 @@ STOP
 ```cpp
 auto sp = m5::hal::v2::M5_Hal.I2C.acquire(i2c::BusConfig{i2c::Scl{22}, i2c::Sda{21}});
 if (!sp) { /* INVALID_ARGUMENT (pin 未設定) / backend init 失敗 / OUT_OF_RESOURCE (満杯) */ }
-i2c::MasterAccessor dev{*sp.value(), acc_cfg};  // accessor は bus を非所有で持つ
+i2c::MasterAccessor dev{sp.value(), acc_cfg};  // shared_ptr直渡しでaccessorがbusをco-own
 ```
 
-### intent 駆動の HW 割当 (ADR 034)
+### intent 駆動の HW 割当
 
 `acquire<CfgT>(cfg)` は **config の型で backend を固定**する (= 明示指名)。これとは別に
 `acquire(LogicalBusConfig)` は **配線 (ピン) と「意図」だけ**を述べ、HW コントローラの割当はファクトリに
@@ -153,7 +167,8 @@ auto r = M5_Hal.I2C.commitBuses();                    // 一括解決: HW を優
 - **意図ヘルパー** ([i2c](../../src/m5_hal/hal/v2/i2c/i2c.hpp)、いずれも `AllocationIntent` を返す):
   `requireHardware()` (HW 必須、取れなければ commit でエラー) / `preferHardware()` (空きがあれば HW、無ければ
   software へ降格) / `automatic()` (既定、余れば HW) / `software()` (常に bit-bang、HW を他へ譲る) /
-  `requireController(n)` (特定コントローラ必須) / `preferController(n)` (特定コントローラ優先、満杯なら他 HW)。
+  `requireController(n)` (特定コントローラ必須) / `preferController(n)` (特定コントローラ優先、満杯なら他 HW) /
+  `requireLowPower()` (低電力domainのHW必須) / `preferLowPower()` (低電力domainを優先し通常のHWへfallback)。
   内部表現は `AllocationIntent{require, prefer, forbid, controller_id, mode}` で、`HARDWARE` 等は capability
   ビット (software = `HARDWARE` を持たない backend)。`require` と `forbid` が衝突する intent は commit が
   `INVALID_ARGUMENT` で弾く。
@@ -180,7 +195,26 @@ auto r = M5_Hal.I2C.commitBuses();                    // 一括解決: HW を優
   (`requireHardware()` / `requireController()`) は `OUT_OF_RESOURCE`。intent パスは「同型のまま HW⇔software を
   runtime 選択」する仕組みなので、ビルドに
   HW variant がある (espidf) かどうかで自然に振る舞いが決まる。
-- backend 選択の機構詳細・段階化は [bus_accessor.md](bus_accessor.md) §Bus の保持 / ADR 034 を参照。
+- backend 選択の機構詳細・段階化は [bus_accessor.md](bus_accessor.md) §Bus の保持 を参照。
+
+### ESP-IDF LP_I2C
+
+LP controllerはopt-inであり、`automatic()`とplain `requireHardware()`では選ばれない。
+`requireLowPower()` / `preferLowPower()`でLOW_POWER能力を明示するか、`requireController(n)` /
+`preferController(n)`でLP controllerを名指しした場合だけ候補になる。`requireLowPower()`はLPを必須とし、
+`preferLowPower()`はLPを優先して通常のHW controllerへfallbackする。どちらもHW自体は必須なので、
+利用可能なHWが無ければ`commitBuses()`は`OUT_OF_RESOURCE`を返す。
+
+- **C5/C6型の固定IOMUX**: local ESP-IDF acquireで`requireLowPower()`を指定し、SCL/SDAを両方省略した
+  場合だけSoC固定pinを補完する。片方だけの省略または固定pin以外は`INVALID_ARGUMENT`。
+  `preferLowPower()`とremote acquireは補完しない
+- **P4型のLP GPIO matrix**: pinを補完しない。SCL/SDA双方にRTC/LP GPIOを明示し、非対応pinまたは
+  pin省略は`INVALID_ARGUMENT`
+- **公開gate**: modern bus-device driver、`SOC_LP_I2C_SUPPORTED`、ESP-IDF 5.4以上を全て満たす場合だけ
+  LP controllerをpoolへ公開する。LP GPIO matrixを使うP4型はESP-IDF 5.5以上が必要。legacy backendと
+  gate外buildはHP controllerだけを公開する
+- **周波数上限**: LP backendの`maxFrequency()`は400kHz。SoC/driverがより低いfail-safe上限を返す場合は
+  その値を使う
 
 ## MasterAccessor (Accessor)
 
@@ -192,7 +226,7 @@ public:
     MasterAccessor(IBus& bus, const MasterAccessConfig& cfg);
     inline IBus& getBus() const noexcept;
 
-    // 通信パラメータ差し替え (spec_polish A2)。
+    // 通信パラメータ差し替え。
     // 「同じ Accessor を使い回して address だけ変えていく」 scan パターン用 sugar。
     // 排他制御中 (`inAccess() == true`) は INVALID_STATE で reject する。
     result_t<void> setConfig(const MasterAccessConfig& cfg);
@@ -209,7 +243,7 @@ public:
     result_t<size_t> write(data::ConstDataSpan src);
     result_t<size_t> read(data::DataSpan dst);
 
-    // raw pointer overload (spec_polish A3): C 配列を直接渡す用途。
+    // raw pointer overload: C 配列を直接渡す用途。
     result_t<size_t> write(const uint8_t* src, size_t len);
     result_t<size_t> read(uint8_t* dst, size_t len);
 
@@ -234,6 +268,25 @@ private:
 }
 ```
 
+### transaction 中のエラー
+
+transaction 内の segment 群は 1 個の論理操作を成す (register pointer 書き込み →
+repeated start → 読み出し、のような依存チェーン)。したがって **segment の失敗は
+種別を問わず transaction に latch される** — `IBus::transfer` の同期エラー
+(pre-flight 拒否) も、`waitTransfer` で表面化する wire 失敗も同じ扱い。latch 後は
+同一 transaction 内の後続 transfer が同じエラーで reject され、`endTransaction` も
+同じエラーを報告する。復帰は新しい transaction の開始 (`beginTransaction` が latch を
+クリアする) = チェーン先頭からのやり直し。
+
+- 「失敗した segment を飛ばして続行」「同一 segment のその場リトライ」は許可しない。
+  segment 間に依存が無い操作は、そもそも別 transaction に分ける。
+- backend (IBus 実装者) の義務: 同期エラーを返す場合は**ワイヤに触れる前に拒否する**。
+  これは transaction の latch 意味論とは独立に、wire 状態の整合を保証するための契約。
+- 不採用案 — pre-flight 拒否は transaction を汚さない (何も起きていないので継続可能とする)
+  案は、segment 単位の戻り値を確認しない呼び出し元に「segment が抜けたのに end は成功」
+  という silent break を許すため退けた。一時的失敗のその場リトライを失うが、
+  チェーン全体の再実行の方が常に意味的に安全。
+
 ### register sugar の挙動
 
 `writeRegister` / `readRegister` は内部で `TransferDesc` を組み立てて `transfer` に委譲する。 **アドレス幅の決定源は `MasterAccessConfig::register_address_bytes` のみ** (`0`/`1` = 1 byte、`2` = 2 byte、2 byte は big-endian = MSB first)。 register 番号は値であり、 **引数の C++ 型は wire 幅に影響しない** (`readRegister(0x00)` も `static constexpr uint8_t REG = 0xD0;` も同じ経路)。 アドレス幅はデバイス固有の固定属性なので accessor 設定時に一度決める。 register address 組み立て規則・`TransferDesc` ctor 制約は [transfer_desc.md](transfer_desc.md) を参照。
@@ -242,7 +295,7 @@ private:
 - **2-byte address のデバイス (一部 EEPROM / sensor) は `register_address_bytes = 2` を設定する**。 多数派は 1-byte default。 型駆動・呼び出しごとの幅は無いので、 **幅が無言で誤る/呼び出しスタイル間で食い違うことは起きない** (旧 API の「型 sizeof 経路 vs config 経路」フットガンを解消)。
 - value 側のサイズ・バイト順は呼び出し側責任 (`ConstDataSpan`/`DataSpan` または `Source`/`Sink`)。 big/little-endian の value helper は M5UU 層 (`M5UnitComponent`) の役割。
 
-### raw pointer overload の位置付け (spec_polish A3)
+### raw pointer overload の位置付け
 
 `write` / `read` / `writeRegister` / `readRegister` には `data::*Span` 版に加えて `(const uint8_t* src, size_t len)` / `(uint8_t* dst, size_t len)` の raw pointer overload を備える。 内部実装は Span overload に転送するだけ。 `uint8_t*` と `data::*Span` は別型なので overload 解決の曖昧性は出ない。
 
@@ -255,13 +308,15 @@ SPI には `writeCommand` / `writeCommandAddress` / `writeCommandData` がある
 
 SPI 由来で `writeCommand` を探した場合は `write` / `writeRegister` を見る。 register/command の前置と value の分離は `transfer(TransferDesc{…}, src, dst)` の `desc.prefix` が担う (SPI の command/address 相と同じ分離。 [§transfer の wire semantics](#transfer-の-wire-semantics))。
 
-### setConfig の位置付け (spec_polish A2)
+### setConfig の位置付け
 
 `setConfig(cfg)` は I2C scan のように「同じ Accessor で address だけを差し替えていく」 用途のための sugar。 通常は Accessor を都度再構築すれば足りるが、 scan loop で 112 個の Accessor を構築 → 1 個 + 112 回の setConfig に集約できる。 `inAccess() == true` の状態で呼ぶと transfer 途中の cfg が未定義状態になるため `INVALID_STATE` で reject する。 caller は ScopedAccess の外側で呼ぶこと。
 
 ## software I2C variant の実装方針
 
-`variants::frameworks::software` の I2C master は、 GPIO `Pin` を open-drain 相当で駆動する bit-bang 実装として扱う。 実装は START / STOP / byte write / byte read / transaction を小さな service に分け、 同期 runner から比較可能な 32-bit tick (`ServiceContext::now_tick`) を渡して進める。 通常の同期 transfer path では `fastTick()` を使い、 `MasterAccessConfig::freq` から得た half period を fast tick 単位へ変換する。 これにより `micros()` / `esp_timer_get_time()` の呼び出しコストを hot path から外す。 `now_tick` の単位は runner が選ぶ (同期 path = 生 `fastTick()`、 native test = 素の数値)。 service は due 値を同じ単位で持ち、 加算と mod 2^32 比較しかしない。
+`variants::frameworks::software` の I2C master は、 GPIO `Pin` を open-drain 相当で駆動する bit-bang 実装として扱う。 実装は START / STOP / byte write / byte read / transaction を小さな service に分け、 呼び出し元が測った経過 (`ServiceContext::elapsed`、 [service.md](service.md) §時間契約) で **service private の仮想時計**を進めて駆動する。 detail service 群は仮想時計上の 32-bit tick を受け取り、 due 値を同じ単位で持ち、 加算と mod 2^32 比較しかしない (絶対 `fastTick()` を保存・比較しない)。 `MasterAccessConfig::freq` から得た half period は fast tick 単位へ変換して使い、 `micros()` / `esp_timer_get_time()` の呼び出しコストを hot path から外す。 native test は仮想時計を素の数値で直接進められる。
+
+**転送全体デッドライン (`wire_timeout_ms`) の測定クロック**: 仮想時計は gap-drop ([service.md](service.md)) で実時間より遅れうるため、 デッドラインには使わない。 コア間共有の単調クロック (`service::sharedNowUs()`) で開始時刻との差分により判定し、 読みコスト (~100+ cycles) を抑えるため**ポール回数で償却** (初回 + 256 ポールごと) する。 したがってタイムアウトの発火精度は償却量子ぶん粗くなる (クロックストレッチ個別上限は従来どおり仮想時計上で毎回判定)。
 
 write buffer は頻出経路なので、 `MasterTransactionService` 側に fast path を持つ。 具体的には `Operation::WriteBuffer` の dispatch を先頭で処理し、 byte write service を直接呼び、 2 byte 目以降は同じ line driver / timing を保持したまま byte state だけを restart する。 これは service 概念を維持したまま、 byte 列送信中の呼び出し層と分岐を減らすための最適化である。
 

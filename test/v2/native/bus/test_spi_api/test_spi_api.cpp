@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include <M5HAL_v2.hpp>
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -59,9 +60,14 @@ public:
         return {};
     }
 
+    bool fail_transfer = false;
+
     result_t<void> transfer(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg, const spi::TransferDesc& desc,
                             data::Source* tx, size_t tx_len, data::Sink* rx, size_t rx_len) override
     {
+        if (fail_transfer) {
+            return m5::stl::make_unexpected(m5::hal::v2::error::error_t::IO_ERROR);
+        }
         Call call;
         call.owner = owner;
         call.cfg   = cfg;
@@ -119,11 +125,22 @@ public:
 
     result_t<bus::TransferTotals> waitTransfer(bus::IAccessor*, const spi::MasterAccessConfig&) override
     {
+        if (fail_wait) {
+            return m5::stl::make_unexpected(m5::hal::v2::error::error_t::IO_ERROR);
+        }
         auto totals = last_totals;
         last_totals.clear();
         has_wait_totals = false;
         return totals;
     }
+
+    bool transferBusy(bus::IAccessor*) override
+    {
+        return busy;
+    }
+
+    bool fail_wait = false;
+    bool busy      = false;
 
     std::vector<Call> calls;
     std::vector<const bus::IAccessor*> transaction_owners;
@@ -449,6 +466,87 @@ TEST(MasterAccessor, ExplicitTransactionSpansNestedTransfers)
     ASSERT_EQ(bus.calls.size(), 2u);
     EXPECT_EQ(bus.begin_transaction_count, 1u);
     EXPECT_EQ(bus.end_transaction_count, 1u);
+}
+
+TEST(MasterAccessor, AsyncWaitFailurePoisonsTransaction)
+{
+    // Sticky-error contract, wire side: a segment failure surfacing via
+    // waitTransfer() latches into the transaction — every later transfer
+    // is rejected with the same error and endTransaction() reports it.
+    StubIBus bus;
+    ASSERT_TRUE(bus.init(spi::IBusConfig{}).has_value());
+
+    spi::MasterAccessor accessor{bus, spi::MasterAccessConfig{}};
+    const uint8_t byte[] = {0x12};
+    const data::ConstDataSpan tx{byte, sizeof(byte)};
+
+    ASSERT_TRUE(accessor.beginTransaction().has_value());
+    bus.busy = true;  // segment stays pending; its failure surfaces later
+    ASSERT_TRUE(accessor.transfer(spi::TransferDesc{}, tx, data::DataSpan{}).has_value());
+    ASSERT_EQ(bus.calls.size(), 1u);
+
+    bus.fail_wait = true;  // the pending segment failed on the wire
+    auto second   = accessor.transfer(spi::TransferDesc{}, tx, data::DataSpan{});
+    ASSERT_FALSE(second.has_value());
+    EXPECT_EQ(second.error(), error::error_t::IO_ERROR);
+    EXPECT_EQ(bus.calls.size(), 1u);
+
+    // The latch, not the bus, must reject from now on: were the third
+    // attempt to reach the (now healthy) bus, calls would grow to 2.
+    bus.fail_wait = false;
+    auto third    = accessor.transfer(spi::TransferDesc{}, tx, data::DataSpan{});
+    ASSERT_FALSE(third.has_value());
+    EXPECT_EQ(third.error(), error::error_t::IO_ERROR);
+    EXPECT_EQ(bus.calls.size(), 1u);
+
+    auto ended = accessor.endTransaction();
+    ASSERT_FALSE(ended.has_value());
+    EXPECT_EQ(ended.error(), error::error_t::IO_ERROR);
+
+    // A fresh transaction starts clean.
+    bus.busy = false;
+    ASSERT_TRUE(accessor.beginTransaction().has_value());
+    EXPECT_TRUE(accessor.transfer(spi::TransferDesc{}, tx, data::DataSpan{}).has_value());
+    EXPECT_TRUE(accessor.endTransaction().has_value());
+    EXPECT_EQ(bus.calls.size(), 2u);
+}
+
+TEST(MasterAccessor, SyncPreflightRejectionAlsoPoisonsTransaction)
+{
+    // Sticky-error contract, pre-flight side: transaction segments form
+    // one logical operation, so even a synchronous rejection that never
+    // touched the wire invalidates the rest of the transaction — later
+    // transfers are rejected and endTransaction() reports the error.
+    StubIBus bus;
+    ASSERT_TRUE(bus.init(spi::IBusConfig{}).has_value());
+
+    spi::MasterAccessor accessor{bus, spi::MasterAccessConfig{}};
+    const uint8_t byte[] = {0x12};
+    const data::ConstDataSpan tx{byte, sizeof(byte)};
+
+    ASSERT_TRUE(accessor.beginTransaction().has_value());
+    bus.fail_transfer = true;
+    auto first        = accessor.transfer(spi::TransferDesc{}, tx, data::DataSpan{});
+    ASSERT_FALSE(first.has_value());
+    EXPECT_EQ(first.error(), error::error_t::IO_ERROR);
+    EXPECT_TRUE(bus.calls.empty());
+
+    // Even though the bus would now succeed, the transaction is poisoned.
+    bus.fail_transfer = false;
+    auto second = accessor.transfer(spi::TransferDesc{}, tx, data::DataSpan{});
+    ASSERT_FALSE(second.has_value());
+    EXPECT_EQ(second.error(), error::error_t::IO_ERROR);
+    EXPECT_TRUE(bus.calls.empty());  // the second segment never reached the bus
+
+    auto ended = accessor.endTransaction();
+    ASSERT_FALSE(ended.has_value());
+    EXPECT_EQ(ended.error(), error::error_t::IO_ERROR);
+
+    // A fresh transaction starts clean.
+    ASSERT_TRUE(accessor.beginTransaction().has_value());
+    EXPECT_TRUE(accessor.transfer(spi::TransferDesc{}, tx, data::DataSpan{}).has_value());
+    EXPECT_EQ(bus.calls.size(), 1u);
+    EXPECT_TRUE(accessor.endTransaction().has_value());
 }
 
 TEST(MasterAccessor, WriteCommandDataSplitsDcLevel)
@@ -825,7 +923,10 @@ TEST(SoftwareIBus, UnimplementedDataModesAreRejected)
         auto end = accessor.endTransaction();
         ASSERT_FALSE(result.has_value());
         EXPECT_EQ(result.error(), error::error_t::NOT_IMPLEMENTED);
-        ASSERT_TRUE(end.has_value());
+        // The rejected segment poisons the transaction (unified latch
+        // contract, spec/design/spi.md §transaction 中のエラー).
+        ASSERT_FALSE(end.has_value());
+        EXPECT_EQ(end.error(), error::error_t::NOT_IMPLEMENTED);
     }
 
     // Half-duplex one-directional write: still works.
@@ -1040,10 +1141,11 @@ TEST(SoftwareIBus, CoreTransferRunsInServiceRunnerUntilEndTransaction)
     EXPECT_TRUE(accessor.transferBusy());
     EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), 1u);
 
-    auto now = service::fastTick();
+    // SPI paces edges by spinning on the live counter, so local_tick must be
+    // real-fastTick-derived (see the ServiceContext field notes); the fixed
+    // per-pass elapsed advances the service's virtual schedule.
     for (size_t i = 0; i < 200 && m5::hal::v2::M5_Hal.Services.size() != 0; ++i) {
-        (void)m5::hal::v2::M5_Hal.Services.runOnce(
-            static_cast<service::fast_tick_t>(now + static_cast<service::fast_tick_t>((i + 1) * 10)));
+        (void)m5::hal::v2::M5_Hal.Services.runOnce(service::ServiceContext{10, service::fastTick()});
     }
     EXPECT_FALSE(accessor.transferBusy());
     EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), 0u);
@@ -1077,10 +1179,11 @@ TEST(SoftwareIBus, CoreTransferFailsWhenServiceRunnerIsFull)
     EXPECT_EQ(started.error(), error::error_t::OUT_OF_RESOURCE);
     EXPECT_FALSE(accessor.transferBusy());
 
-    auto totals = accessor.endTransaction();
-    ASSERT_TRUE(totals.has_value());
-    EXPECT_EQ(totals->tx, size_t{0});
-    EXPECT_EQ(totals->rx, size_t{0});
+    // The failed segment poisons the transaction (unified latch contract,
+    // spec/design/spi.md §transaction 中のエラー).
+    auto ended = accessor.endTransaction();
+    ASSERT_FALSE(ended.has_value());
+    EXPECT_EQ(ended.error(), error::error_t::OUT_OF_RESOURCE);
     EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), service::ServiceRunner::kMaxServices);
     (void)fillers;
 }
@@ -1160,10 +1263,8 @@ TEST(SoftwareIBus, MultipleBusesProgressTogetherInServiceRunner)
     EXPECT_TRUE(accessor_b.transferBusy());
     EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), 2u);
 
-    auto now = service::fastTick();
     for (size_t i = 0; i < 300 && (accessor_a.transferBusy() || accessor_b.transferBusy()); ++i) {
-        (void)m5::hal::v2::M5_Hal.Services.runOnce(
-            static_cast<service::fast_tick_t>(now + static_cast<service::fast_tick_t>((i + 1) * 10)));
+        (void)m5::hal::v2::M5_Hal.Services.runOnce(service::ServiceContext{10, service::fastTick()});
     }
 
     EXPECT_FALSE(accessor_a.transferBusy());
@@ -1183,5 +1284,6 @@ TEST(SoftwareIBus, MultipleBusesProgressTogetherInServiceRunner)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

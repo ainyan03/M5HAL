@@ -2,6 +2,7 @@
 #include "../../build_check/build_check.hpp"
 
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 
 TEST(BuildCheck, CommonApiSurfaceRunsOnDummyBuses)
 {
@@ -12,5 +13,6 @@ TEST(BuildCheck, CommonApiSurfaceRunsOnDummyBuses)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

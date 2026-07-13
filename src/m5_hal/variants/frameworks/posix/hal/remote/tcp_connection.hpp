@@ -44,7 +44,9 @@ public:
     ~PosixTcpConnection() override
     {
         M5HAL_DIAG("tcp connection teardown");
-        delete _gpio;
+        if (_session_handle != nullptr) {
+            _session_handle->close();
+        }
         destroyBackend();
         destroySession();
     }
@@ -52,6 +54,11 @@ public:
     m5hal::remote::RemoteSession& session() override
     {
         return *sessPtr();
+    }
+
+    std::shared_ptr<m5hal::remote::RemoteSessionHandle> sessionHandle() override
+    {
+        return _session_handle;
     }
 
     m5hal::remote::RemoteBackend& backend() override
@@ -66,7 +73,13 @@ public:
 
     const m5hal::gpio::IGPIO* gpio() const override
     {
-        return _gpio;
+        return _gpio_owner != nullptr ? _gpio_owner->gpio() : nullptr;
+    }
+
+    std::unique_ptr<m5hal::remote::RemoteGpioOwner> releaseGpioOwnership() override
+    {
+        _gpio = nullptr;
+        return std::move(_gpio_owner);
     }
 
     m5hal::service::IService* service() override
@@ -154,6 +167,11 @@ private:
                 return m5::stl::make_unexpected(m5hal::error::error_t::INVALID_ARGUMENT);
             }
             p = p * 10 + static_cast<unsigned long>(*s - '0');
+            // Reject overflow digit-by-digit: a long digit string could
+            // otherwise wrap unsigned long and pass the final range check.
+            if (p > 65535) {
+                return m5::stl::make_unexpected(m5hal::error::error_t::INVALID_ARGUMENT);
+            }
         }
         if (p == 0 || p > 65535) {
             return m5::stl::make_unexpected(m5hal::error::error_t::INVALID_ARGUMENT);
@@ -174,12 +192,14 @@ private:
         m5hal::remote::RemoteSession::Config sess_cfg;
         sess_cfg.response_timeout_ms = cfg.response_timeout_ms;
         p->setConfig(sess_cfg);
-        _sess_ok = true;
+        _sess_ok        = true;
+        _session_handle = p->sharedHandle();
     }
 
     void destroySession()
     {
         if (_sess_ok) {
+            _session_handle->close();
             sessPtr()->~RemoteSession();
             _sess_ok = false;
         }
@@ -188,7 +208,7 @@ private:
     void constructBackend()
     {
         destroyBackend();
-        _backend_ptr = new (_backend_storage) m5hal::remote::RemoteBackend{*sessPtr()};
+        _backend_ptr = new (_backend_storage) m5hal::remote::RemoteBackend{_session_handle};
         _backend_ptr->setCapabilities(_caps);
         _backend_ok = true;
     }
@@ -207,14 +227,17 @@ private:
         if (!_caps.has_gpio || _caps.gpio_port_count == 0) {
             return;
         }
-        _gpio =
-            new (std::nothrow) m5hal::remote::RemoteGPIO{*sessPtr(), 0, _caps.gpio_port_count, _caps.gpio_pin_count};
-        if (_gpio == nullptr) {
+        using Owner = m5hal::remote::RemoteGpioOwnerModel<m5hal::remote::RemoteGPIO>;
+        auto* owner = new (std::nothrow) Owner{_session_handle, static_cast<m5hal::types::gpio_slot_t>(0),
+                                               _caps.gpio_port_count, _caps.gpio_pin_count};
+        if (owner == nullptr) {
             return;
         }
+        _gpio_owner.reset(owner);
+        _gpio     = &owner->value();
         auto seed = _gpio->seedCache();
         if (!seed.has_value()) {
-            delete _gpio;
+            _gpio_owner.reset();
             _gpio = nullptr;
             return;
         }
@@ -222,7 +245,7 @@ private:
         auto sub = _gpio->subscribeAll();
         if (!sub.has_value()) {
             sessPtr()->setEventHandler(nullptr, nullptr);
-            delete _gpio;
+            _gpio_owner.reset();
             _gpio = nullptr;
             return;
         }
@@ -230,6 +253,7 @@ private:
 
     m5hal::service::ServicePoll serviceImpl(const m5hal::service::ServiceContext& ctx) override
     {
+        (void)ctx;
         if (!_sess_ok) {
             return {m5hal::service::ServiceResult::Idle};
         }
@@ -237,9 +261,9 @@ private:
         if (!r.has_value()) {
             return {m5hal::service::ServiceResult::Error};
         }
-        auto due = static_cast<m5hal::service::fast_tick_t>(
-            ctx.now_tick + m5hal::service::nsecToFastTickCeil(1000000, m5hal::service::fastTickFrequencyHz()));
-        return {r.value() != 0 ? m5hal::service::ServiceResult::Progress : m5hal::service::ServiceResult::Idle, due};
+        // Relative hint: poll again no sooner than ~1 ms from now.
+        const auto delta = m5hal::service::nsecToFastTickCeil(1000000, m5hal::service::fastTickFrequencyHz());
+        return {r.value() != 0 ? m5hal::service::ServiceResult::Progress : m5hal::service::ServiceResult::Idle, delta};
     }
 
     tcp::TcpStream _stream;
@@ -261,6 +285,8 @@ private:
     bool _backend_ok                           = false;
     m5hal::remote::Capabilities _caps;
     m5hal::remote::RemoteGPIO* _gpio = nullptr;
+    std::unique_ptr<m5hal::remote::RemoteGpioOwner> _gpio_owner;
+    std::shared_ptr<m5hal::remote::RemoteSessionHandle> _session_handle;
 };
 
 }  // namespace m5::variants::frameworks::posix::hal::v2::remote

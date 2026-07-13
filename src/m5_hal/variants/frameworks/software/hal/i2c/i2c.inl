@@ -9,6 +9,7 @@
 #include "i2c.hpp"
 #include <M5Utility.hpp>
 
+#include <cstdint>
 #include <new>
 
 namespace m5::variants::frameworks::software::hal::v2::i2c::detail {
@@ -68,7 +69,7 @@ void StartConditionService::begin(MasterLineDriver& lines, const MasterTiming& t
     _clock.reset(now_tick);
 }
 
-::m5::hal::v2::service::ServiceResult StartConditionService::service(const ::m5::hal::v2::service::ServiceContext& ctx)
+::m5::hal::v2::service::ServiceResult StartConditionService::service(::m5::hal::v2::service::fast_tick_t now_tick)
 {
     using ::m5::hal::v2::service::hasReached;
     if (_lines == nullptr || _state == State::Idle) {
@@ -80,7 +81,7 @@ void StartConditionService::begin(MasterLineDriver& lines, const MasterTiming& t
     if (_state == State::Timeout) {
         return ::m5::hal::v2::service::ServiceResult::Error;
     }
-    if (!hasReached(ctx.now_tick, _clock.dueTick())) {
+    if (!hasReached(now_tick, _clock.dueTick())) {
         return ::m5::hal::v2::service::ServiceResult::Idle;
     }
 
@@ -88,15 +89,15 @@ void StartConditionService::begin(MasterLineDriver& lines, const MasterTiming& t
         case State::ReleaseScl:
             _lines->writeSclHigh();
             if (_lines->readScl()) {
-                _clock.scheduleAfterHalfFromNow(_timing, ctx.now_tick, _state, State::PullSdaLow);
+                _clock.scheduleAfterHalfFromNow(_timing, now_tick, _state, State::PullSdaLow);
             } else {
-                _clock.beginClockStretch(ctx.now_tick, _state, State::WaitClockHigh);
+                _clock.beginClockStretch(now_tick, _state, State::WaitClockHigh);
             }
             break;
         case State::WaitClockHigh:
-            switch (_clock.waitClockHigh(*_lines, _timing, ctx.now_tick)) {
+            switch (_clock.waitClockHigh(*_lines, _timing, now_tick)) {
                 case MasterServiceTiming::ClockWaitResult::Released:
-                    _clock.scheduleAfterHalfFromNow(_timing, ctx.now_tick, _state, State::PullSdaLow);
+                    _clock.scheduleAfterHalfFromNow(_timing, now_tick, _state, State::PullSdaLow);
                     break;
                 case MasterServiceTiming::ClockWaitResult::Timeout:
                     _error = ::m5::hal::v2::error::error_t::TIMEOUT_ERROR;
@@ -108,7 +109,7 @@ void StartConditionService::begin(MasterLineDriver& lines, const MasterTiming& t
             break;
         case State::PullSdaLow:
             _lines->writeSda(false);
-            _clock.scheduleAfterHalfFromNow(_timing, ctx.now_tick, _state, State::PullSclLow);
+            _clock.scheduleAfterHalfFromNow(_timing, now_tick, _state, State::PullSclLow);
             break;
         case State::PullSclLow:
             _lines->writeSclLow();
@@ -169,7 +170,7 @@ void WriteByteService::restart(uint8_t byte, ::m5::hal::v2::service::fast_tick_t
     _clock.scheduleAfterHalfFromNow(_timing, now_tick, _state, State::RaiseClock);
 }
 
-::m5::hal::v2::service::ServiceResult WriteByteService::service(const ::m5::hal::v2::service::ServiceContext& ctx)
+::m5::hal::v2::service::ServiceResult WriteByteService::service(::m5::hal::v2::service::fast_tick_t now_tick)
 {
     using ::m5::hal::v2::service::hasReached;
     if (_lines == nullptr) {
@@ -180,13 +181,13 @@ void WriteByteService::restart(uint8_t byte, ::m5::hal::v2::service::fast_tick_t
     if (state_value & kTerminalStateMask) {
         return terminalStateResult(state_value);
     }
-    if (!hasReached(ctx.now_tick, _clock.dueTick())) {
+    if (!hasReached(now_tick, _clock.dueTick())) {
         return ::m5::hal::v2::service::ServiceResult::Idle;
     }
 
     if (_state == State::RaiseClock) {
         _lines->writeSclHigh();
-        waitClockHighOrSchedule(ctx.now_tick, State::LowerClock);
+        waitClockHighOrSchedule(now_tick, State::LowerClock);
         return ::m5::hal::v2::service::ServiceResult::Progress;
     }
     if (_state == State::LowerClock) {
@@ -195,10 +196,10 @@ void WriteByteService::restart(uint8_t byte, ::m5::hal::v2::service::fast_tick_t
         if (_bit_mask != 0) {
             ++_bit_index;
             _lines->writeSda(bitValue());
-            scheduleAfterHalf(ctx.now_tick, State::RaiseClock);
+            scheduleAfterHalf(now_tick, State::RaiseClock);
         } else {
             _lines->writeSda(true);
-            scheduleAfterHalf(ctx.now_tick, State::RaiseAckClock);
+            scheduleAfterHalf(now_tick, State::RaiseAckClock);
         }
         return ::m5::hal::v2::service::ServiceResult::Progress;
     }
@@ -209,12 +210,12 @@ void WriteByteService::restart(uint8_t byte, ::m5::hal::v2::service::fast_tick_t
             break;
         case State::RaiseAckClock:
             _lines->writeSclHigh();
-            waitClockHighOrSchedule(ctx.now_tick, State::SampleAck);
+            waitClockHighOrSchedule(now_tick, State::SampleAck);
             return ::m5::hal::v2::service::ServiceResult::Progress;
         case State::WaitClockHigh:
-            switch (_clock.waitClockHigh(*_lines, _timing, ctx.now_tick)) {
+            switch (_clock.waitClockHigh(*_lines, _timing, now_tick)) {
                 case MasterServiceTiming::ClockWaitResult::Released:
-                    scheduleAfterHalfFromNow(ctx.now_tick, _after_stretch);
+                    scheduleAfterHalfFromNow(now_tick, _after_stretch);
                     return ::m5::hal::v2::service::ServiceResult::Progress;
                 case MasterServiceTiming::ClockWaitResult::Timeout:
                     _error = ::m5::hal::v2::error::error_t::TIMEOUT_ERROR;
@@ -317,7 +318,7 @@ void StopConditionService::begin(MasterLineDriver& lines, const MasterTiming& ti
     _clock.reset(now_tick);
 }
 
-::m5::hal::v2::service::ServiceResult StopConditionService::service(const ::m5::hal::v2::service::ServiceContext& ctx)
+::m5::hal::v2::service::ServiceResult StopConditionService::service(::m5::hal::v2::service::fast_tick_t now_tick)
 {
     using ::m5::hal::v2::service::hasReached;
     if (_lines == nullptr || _state == State::Idle) {
@@ -329,23 +330,23 @@ void StopConditionService::begin(MasterLineDriver& lines, const MasterTiming& ti
     if (_state == State::BusError || _state == State::Timeout) {
         return ::m5::hal::v2::service::ServiceResult::Error;
     }
-    if (!hasReached(ctx.now_tick, _clock.dueTick())) {
+    if (!hasReached(now_tick, _clock.dueTick())) {
         return ::m5::hal::v2::service::ServiceResult::Idle;
     }
 
     switch (_state) {
         case State::PullSdaLow:
             _lines->writeSda(false);
-            scheduleAfterHalf(ctx.now_tick, State::RaiseClock);
+            scheduleAfterHalf(now_tick, State::RaiseClock);
             break;
         case State::RaiseClock:
             _lines->writeSclHigh();
-            waitClockHighOrSchedule(ctx.now_tick, State::ReleaseSda);
+            waitClockHighOrSchedule(now_tick, State::ReleaseSda);
             break;
         case State::WaitClockHigh:
-            switch (_clock.waitClockHigh(*_lines, _timing, ctx.now_tick)) {
+            switch (_clock.waitClockHigh(*_lines, _timing, now_tick)) {
                 case MasterServiceTiming::ClockWaitResult::Released:
-                    scheduleAfterHalf(ctx.now_tick, _after_stretch);
+                    scheduleAfterHalf(now_tick, _after_stretch);
                     break;
                 case MasterServiceTiming::ClockWaitResult::Timeout:
                     _error = ::m5::hal::v2::error::error_t::TIMEOUT_ERROR;
@@ -357,7 +358,7 @@ void StopConditionService::begin(MasterLineDriver& lines, const MasterTiming& ti
             break;
         case State::ReleaseSda:
             _lines->writeSda(true);
-            scheduleAfterHalf(ctx.now_tick, State::VerifySdaHigh);
+            scheduleAfterHalf(now_tick, State::VerifySdaHigh);
             break;
         case State::VerifySdaHigh:
             if (_lines->readSda()) {
@@ -437,7 +438,7 @@ void ReadByteService::restart(bool ack_after_read, ::m5::hal::v2::service::fast_
     _clock.reset(now_tick);
 }
 
-::m5::hal::v2::service::ServiceResult ReadByteService::service(const ::m5::hal::v2::service::ServiceContext& ctx)
+::m5::hal::v2::service::ServiceResult ReadByteService::service(::m5::hal::v2::service::fast_tick_t now_tick)
 {
     using ::m5::hal::v2::service::hasReached;
     if (_lines == nullptr || _state == State::Idle) {
@@ -447,13 +448,13 @@ void ReadByteService::restart(bool ack_after_read, ::m5::hal::v2::service::fast_
     if (state_value & kTerminalStateMask) {
         return terminalStateResult(state_value);
     }
-    if (!hasReached(ctx.now_tick, _clock.dueTick())) {
+    if (!hasReached(now_tick, _clock.dueTick())) {
         return ::m5::hal::v2::service::ServiceResult::Idle;
     }
 
     if (_state == State::RaiseClock) {
         _lines->writeSclHigh();
-        waitClockHighOrSchedule(ctx.now_tick, State::SampleBit);
+        waitClockHighOrSchedule(now_tick, State::SampleBit);
         return ::m5::hal::v2::service::ServiceResult::Progress;
     }
     if (_state == State::SampleBit) {
@@ -464,10 +465,10 @@ void ReadByteService::restart(bool ack_after_read, ::m5::hal::v2::service::fast_
         _bit_mask >>= 1;
         if (_bit_mask == 0) {
             _lines->writeSda(!_ack_after_read);
-            scheduleAfterHalf(ctx.now_tick, State::RaiseAckClock);
+            scheduleAfterHalf(now_tick, State::RaiseAckClock);
         } else {
             ++_bit_index;
-            scheduleAfterHalf(ctx.now_tick, State::RaiseClock);
+            scheduleAfterHalf(now_tick, State::RaiseClock);
         }
         return ::m5::hal::v2::service::ServiceResult::Progress;
     }
@@ -475,14 +476,14 @@ void ReadByteService::restart(bool ack_after_read, ::m5::hal::v2::service::fast_
     switch (_state) {
         case State::ReleaseSda:
             _lines->writeSda(true);
-            scheduleAfterHalfFromNow(ctx.now_tick, State::RaiseClock);
+            scheduleAfterHalfFromNow(now_tick, State::RaiseClock);
             break;
         case State::RaiseClock:
             break;
         case State::WaitClockHigh:
-            switch (_clock.waitClockHigh(*_lines, _timing, ctx.now_tick)) {
+            switch (_clock.waitClockHigh(*_lines, _timing, now_tick)) {
                 case MasterServiceTiming::ClockWaitResult::Released:
-                    scheduleAfterHalfFromNow(ctx.now_tick, _after_stretch);
+                    scheduleAfterHalfFromNow(now_tick, _after_stretch);
                     break;
                 case MasterServiceTiming::ClockWaitResult::Timeout:
                     _error = ::m5::hal::v2::error::error_t::TIMEOUT_ERROR;
@@ -496,7 +497,7 @@ void ReadByteService::restart(bool ack_after_read, ::m5::hal::v2::service::fast_
             break;
         case State::RaiseAckClock:
             _lines->writeSclHigh();
-            waitClockHighOrSchedule(ctx.now_tick, State::LowerAckClock);
+            waitClockHighOrSchedule(now_tick, State::LowerAckClock);
             break;
         case State::LowerAckClock:
             _lines->writeSclLow();
@@ -649,27 +650,26 @@ void MasterTransactionService::beginReadBuffer(MasterLineDriver& lines, const Ma
     _read.begin(lines, timing, ackAfterRead(0), now_tick);
 }
 
-::m5::hal::v2::service::ServiceResult MasterTransactionService::service(
-    const ::m5::hal::v2::service::ServiceContext& ctx)
+::m5::hal::v2::service::ServiceResult MasterTransactionService::service(::m5::hal::v2::service::fast_tick_t now_tick)
 {
     if (_operation == Operation::WriteBuffer) {
-        return serviceWriteBuffer(ctx);
+        return serviceWriteBuffer(now_tick);
     }
     if (_operation == Operation::ReadBuffer) {
-        return serviceReadBuffer(ctx);
+        return serviceReadBuffer(now_tick);
     }
 
     switch (_operation) {
         case Operation::Start:
-            return serviceActive(_start, ctx);
+            return serviceActive(_start, now_tick);
         case Operation::WriteByte:
-            return serviceActive(_write, ctx);
+            return serviceActive(_write, now_tick);
         case Operation::ReadByte:
-            return serviceActive(_read, ctx);
+            return serviceActive(_read, now_tick);
         case Operation::Stop:
-            return serviceActive(_stop, ctx);
+            return serviceActive(_stop, now_tick);
         case Operation::Address:
-            return serviceAddress(ctx);
+            return serviceAddress(now_tick);
         case Operation::WriteBuffer:
             break;
         case Operation::ReadBuffer:
@@ -734,19 +734,19 @@ bool MasterTransactionService::ackAfterRead(size_t index) const
 }
 
 ::m5::hal::v2::service::ServiceResult MasterTransactionService::serviceAddress(
-    const ::m5::hal::v2::service::ServiceContext& ctx)
+    ::m5::hal::v2::service::fast_tick_t now_tick)
 {
     if (_phase == Phase::Start) {
-        auto result = serviceComposite(_start, ctx);
+        auto result = serviceComposite(_start, now_tick);
         if (result != ::m5::hal::v2::service::ServiceResult::Done) {
             return result;
         }
         _phase = Phase::Write;
-        _write.begin(*_lines, *_timing, _byte, ctx.now_tick);
+        _write.begin(*_lines, *_timing, _byte, now_tick);
         return ::m5::hal::v2::service::ServiceResult::Progress;
     }
 
-    auto result = serviceComposite(_write, ctx);
+    auto result = serviceComposite(_write, now_tick);
     if (result == ::m5::hal::v2::service::ServiceResult::Done) {
         _operation = Operation::Idle;
         _phase     = Phase::Idle;
@@ -755,9 +755,9 @@ bool MasterTransactionService::ackAfterRead(size_t index) const
 }
 
 ::m5::hal::v2::service::ServiceResult MasterTransactionService::serviceWriteBuffer(
-    const ::m5::hal::v2::service::ServiceContext& ctx)
+    ::m5::hal::v2::service::fast_tick_t now_tick)
 {
-    auto result = _write.service(ctx);
+    auto result = _write.service(now_tick);
     if (result == ::m5::hal::v2::service::ServiceResult::Error) {
         _error     = _write.error();
         _operation = Operation::Idle;
@@ -774,14 +774,14 @@ bool MasterTransactionService::ackAfterRead(size_t index) const
         _phase     = Phase::Idle;
         return ::m5::hal::v2::service::ServiceResult::Done;
     }
-    _write.restart(_tx_data[_index], ctx.now_tick);
+    _write.restart(_tx_data[_index], now_tick);
     return ::m5::hal::v2::service::ServiceResult::Progress;
 }
 
 ::m5::hal::v2::service::ServiceResult MasterTransactionService::serviceReadBuffer(
-    const ::m5::hal::v2::service::ServiceContext& ctx)
+    ::m5::hal::v2::service::fast_tick_t now_tick)
 {
-    auto result = _read.service(ctx);
+    auto result = _read.service(now_tick);
     if (result == ::m5::hal::v2::service::ServiceResult::Error) {
         _error     = _read.error();
         _operation = Operation::Idle;
@@ -799,7 +799,7 @@ bool MasterTransactionService::ackAfterRead(size_t index) const
         _phase     = Phase::Idle;
         return ::m5::hal::v2::service::ServiceResult::Done;
     }
-    _read.restart(ackAfterRead(_index), ctx.now_tick);
+    _read.restart(ackAfterRead(_index), now_tick);
     return ::m5::hal::v2::service::ServiceResult::Progress;
 }
 
@@ -895,7 +895,7 @@ public:
 
     TransferState(gpio::Pin& scl, gpio::Pin& sda, const i2c::MasterAccessConfig& cfg, const i2c::TransferDesc& desc,
                   data::Source* src, size_t tx_len, data::Sink* dst, size_t rx_len, const detail::MasterTiming& timing,
-                  service::fast_tick_t deadline_tick)
+                  uint64_t deadline_budget_us)
         : _lines{scl, sda},
           _cfg{cfg},
           _header{desc.prefix, desc.prefix_len},
@@ -904,19 +904,44 @@ public:
           _tx_remaining{tx_len},
           _rx_remaining{rx_len},
           _timing{timing},
-          _deadline_tick{deadline_tick}
+          _deadline_start_us{service::sharedNowUs()},
+          _deadline_budget_us{deadline_budget_us}
     {
     }
 
     service::ServiceResult service(const service::ServiceContext& ctx)
     {
+        // Private virtual timeline: all due/stretch math below runs on it
+        // unchanged (the wrap-safe helpers keep working); only caller-vouched
+        // elapsed advances it, so no cross-core absolute ticks ever meet.
+        _svc_now += ctx.elapsed;
+        const service::fast_tick_t now_tick = _svc_now;
+        // Whole-transfer deadline on the SHARED clock, NOT the virtual
+        // timeline: gap-drops make virtual time run late, which is safe for
+        // edge pacing but would delay the wire timeout. Reading the shared
+        // clock costs ~100+ cycles, so amortize by POLL COUNT (first poll,
+        // then every kDeadlinePollStride) — a poll-count stride is immune to
+        // gap-drops, unlike a virtual-time stride. The timeout fires with up
+        // to one stride of slack.
+        const bool deadline_expired = !_stop_after_error && deadlineExpired();
         if (_phase == Phase::Idle) {
-            startInitial(ctx.now_tick);
+            startInitial(now_tick);
         }
         for (;;) {
-            if (service::hasReached(ctx.now_tick, _deadline_tick)) {
-                fail(error::error_t::TIMEOUT_ERROR);
-                return service::ServiceResult::Error;
+            // Once a STOP-after-error is underway, let it run to completion
+            // on the sub-transaction's own timing instead of re-checking the
+            // overall deadline: the deadline is already exceeded at that
+            // point, so an unconditional check here would re-trigger on the
+            // very next iteration and fail before the STOP sub-transaction
+            // (driven by _transaction.service() under Phase::Stop) gets a
+            // chance to run -- silently discarding the recovery this branch
+            // exists to perform.
+            if (!_stop_after_error && deadline_expired) {
+                if (_phase == Phase::Stop) {
+                    fail(error::error_t::TIMEOUT_ERROR);
+                    return service::ServiceResult::Error;
+                }
+                return beginStopAfterError(error::error_t::TIMEOUT_ERROR, now_tick);
             }
             switch (_phase) {
                 case Phase::AddressWrite:
@@ -926,25 +951,25 @@ public:
                 case Phase::AddressRead:
                 case Phase::Rx:
                 case Phase::Stop: {
-                    auto r = _transaction.service(ctx);
+                    auto r = _transaction.service(now_tick);
                     if (r == service::ServiceResult::Error) {
                         if (_phase == Phase::Stop) {
                             fail(_stop_after_error ? _error : _transaction.error());
                             return service::ServiceResult::Error;
                         }
-                        return beginStopAfterError(_transaction.error(), ctx.now_tick);
+                        return beginStopAfterError(_transaction.error(), now_tick);
                     }
                     if (r != service::ServiceResult::Done) {
                         return r;
                     }
-                    auto advanced = advanceAfterDone(ctx.now_tick);
+                    auto advanced = advanceAfterDone(now_tick);
                     if (advanced != service::ServiceResult::Progress) {
                         return advanced;
                     }
                     continue;
                 }
                 case Phase::RxReserve:
-                    return beginReadChunk(ctx.now_tick);
+                    return beginReadChunk(now_tick);
                 case Phase::Done:
                     return service::ServiceResult::Done;
                 case Phase::Error:
@@ -1112,10 +1137,22 @@ private:
             beginStop(now_tick);
             return service::ServiceResult::Progress;
         }
-        _rx_remaining  = span.size;
-        _active_rx_len = span.size;
-        _phase         = Phase::Rx;
-        _transaction.beginReadBuffer(_lines, _timing, span.data, span.size, true, now_tick);
+        // `_rx_remaining` tracks the total unread byte count across
+        // chunks; only advanceAfterDone()'s Phase::Rx case decrements it
+        // (by `_active_rx_len`). A short `reserve()` (e.g. a ring buffer
+        // near wrap) must not shrink the total, or the re-chunk loop
+        // below `_rx_remaining > 0` can never trigger and the read is
+        // silently truncated. NACK only the chunk that exhausts
+        // `_rx_remaining` -- a mid-stream chunk must ACK so the slave
+        // keeps sending. `_rx_remaining == SIZE_MAX` is the established
+        // "no explicit cap, take whatever the Sink offers" sentinel
+        // (mirrors slave.inl's `peek(SIZE_MAX)` use): there is no real
+        // total to chunk toward, so the single `reserve()` above already
+        // defines the whole read and must NACK its last byte.
+        _active_rx_len       = span.size;
+        const bool last_nack = (span.size == _rx_remaining) || (_rx_remaining == SIZE_MAX);
+        _phase               = Phase::Rx;
+        _transaction.beginReadBuffer(_lines, _timing, span.data, span.size, last_nack, now_tick);
         return service::ServiceResult::Progress;
     }
     service::ServiceResult beginStopAfterError(error::error_t err, service::fast_tick_t now_tick)
@@ -1135,8 +1172,24 @@ private:
     size_t _rx_remaining  = 0;
     size_t _active_tx_len = 0;
     size_t _active_rx_len = 0;
+    // Amortized shared-clock deadline (see service()): difference-based
+    // comparison against the saved start stays valid even if the shared
+    // clock's backing counter is narrower than 64 bits.
+    static constexpr uint16_t kDeadlinePollStride = 256;
+    bool deadlineExpired()
+    {
+        if (--_deadline_poll_countdown != 0) {
+            return false;
+        }
+        _deadline_poll_countdown = kDeadlinePollStride;
+        return (service::sharedNowUs() - _deadline_start_us) >= _deadline_budget_us;
+    }
+
     detail::MasterTiming _timing;
-    service::fast_tick_t _deadline_tick = 0;
+    uint64_t _deadline_start_us       = 0;
+    uint64_t _deadline_budget_us      = 0;
+    uint16_t _deadline_poll_countdown = 1;  // first poll checks, then every stride
+    service::fast_tick_t _svc_now     = 0;  // private virtual clock (ctx.elapsed accumulation)
     detail::MasterTransactionService _transaction;
     bus::TransferTotals _totals{};
     error::error_t _error  = error::error_t::OK;
@@ -1149,6 +1202,7 @@ private:
 
 result_t<void> Bus_software::init(const BusConfig_software& config)
 {
+    clearTransferState();
     _config = config;
 
     // BusConfig_software uses the single gpio_number_t path. Resolve through
@@ -1179,6 +1233,17 @@ result_t<void> Bus_software::init(const BusConfig_software& config)
     return {};
 }
 
+Bus_software::~Bus_software()
+{
+    clearTransferState();
+}
+
+result_t<void> Bus_software::release(void)
+{
+    clearTransferState();
+    return {};
+}
+
 service::ServicePoll Bus_software::serviceImpl(const service::ServiceContext& ctx)
 {
     return serviceTransfer(ctx);
@@ -1186,42 +1251,49 @@ service::ServicePoll Bus_software::serviceImpl(const service::ServiceContext& ct
 
 void Bus_software::unregisterTransferService(void)
 {
-    if (_transfer_registered) {
+    if (_transfer_registered.exchange(false, std::memory_order_relaxed)) {
         (void)M5_Hal.Services.remove(*this);
-        _transfer_registered = false;
     }
 }
 
 void Bus_software::clearTransferState(void)
 {
     unregisterTransferService();
+    // The gate publishes visibility, not lifetime: deleting the state is
+    // safe only after unregisterTransferService() (synchronous
+    // ServiceRunner::remove()) guarantees no further serviceImpl call.
     delete static_cast<impl_software::TransferState*>(_transfer_state);
-    _transfer_state  = nullptr;
-    _transfer_owner  = nullptr;
-    _transfer_active = false;
-    _transfer_done   = true;
-    _transfer_error  = error::error_t::OK;
+    _transfer_state = nullptr;
+    _transfer_owner = nullptr;
+    _transfer_error = error::error_t::OK;
+    _transfer_totals.clear();
+    _transfer_gate.reset();
 }
 
 service::ServiceResult Bus_software::serviceTransfer(const service::ServiceContext& ctx)
 {
-    auto* state = static_cast<impl_software::TransferState*>(_transfer_state);
-    if (!_transfer_active || _transfer_done) {
+    using GateState = service::CompletionGate::State;
+    auto* state     = static_cast<impl_software::TransferState*>(_transfer_state);
+    const auto gate = _transfer_gate.state();
+    if (gate != GateState::Busy) {
         unregisterTransferService();
-        return service::ServiceResult::Done;
-    }
-    if (error::isError(_transfer_error)) {
-        unregisterTransferService();
-        return service::ServiceResult::Error;
+        return gate == GateState::Error ? service::ServiceResult::Error : service::ServiceResult::Done;
     }
 
     auto result = state->service(ctx);
+    // Terminal order matters: finish() must precede unregisterTransferService().
+    // Once _transfer_registered is cleared, a concurrent teardown
+    // (release()/dtor/init) skips the synchronous remove() and may delete the
+    // state and reset the gate -- a finish() issued after that would write
+    // freed/cleared storage. Publishing first keeps every write to this object
+    // inside the window the teardown's remove() still waits for.
     if (result == service::ServiceResult::Error) {
         _transfer_error = state->error();
+        _transfer_gate.finish(GateState::Error);
         unregisterTransferService();
     } else if (result == service::ServiceResult::Done || state->done()) {
         _transfer_totals = state->totals();
-        _transfer_done   = true;
+        _transfer_gate.finish(GateState::Done);
         unregisterTransferService();
         return service::ServiceResult::Done;
     }
@@ -1254,22 +1326,25 @@ result_t<void> Bus_software::transfer(bus::IAccessor* owner, const i2c::MasterAc
     }
     const auto service_timing = impl_software::serviceTimingToTicks(*timing);
     // Whole-transfer deadline: cfg.wire_timeout_ms bounds this entire transfer
-    // (espidf-equivalent per-transfer semantics). The per-stretch
-    // timeout inside MasterServiceTiming still applies on top.
-    const auto deadline_tick = impl_software::serviceNowTick() + service_timing.timeout;
+    // (espidf-equivalent per-transfer semantics), measured on the shared
+    // cross-core clock inside TransferState. The per-stretch timeout inside
+    // MasterServiceTiming still applies on top (virtual-timeline ticks).
+    const uint64_t deadline_budget_us = static_cast<uint64_t>(cfg.wire_timeout_ms) * 1000u;
 
-    _transfer_state = new (std::nothrow)
-        impl_software::TransferState{*scl, *sda, cfg, desc, src, tx_len, dst, rx_len, service_timing, deadline_tick};
+    _transfer_state = new (std::nothrow) impl_software::TransferState{
+        *scl, *sda, cfg, desc, src, tx_len, dst, rx_len, service_timing, deadline_budget_us};
     if (_transfer_state == nullptr) {
         return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
     }
-    _transfer_owner  = owner;
-    _transfer_active = true;
-    _transfer_done   = false;
-    _transfer_error  = error::error_t::OK;
+    _transfer_owner = owner;
+    _transfer_error = error::error_t::OK;
     _transfer_totals.clear();
+    _transfer_gate.arm();
 
-    auto first = serviceTransfer(service::ServiceContext{impl_software::serviceNowTick()});
+    // First poll: a fresh stream has no previous reading to vouch for, so
+    // elapsed starts at 0; local_tick anchors any intra-call spin (none in
+    // this backend, but the contract is uniform).
+    auto first = serviceTransfer(service::ServiceContext{0, impl_software::serviceNowTick()});
     if (first == service::ServiceResult::Error) {
         const auto err = _transfer_error;
         clearTransferState();
@@ -1282,10 +1357,9 @@ result_t<void> Bus_software::transfer(bus::IAccessor* owner, const i2c::MasterAc
         }
         return {};
     }
-    if (!_transfer_done) {
-        if (M5_Hal.Services.add(*this)) {
-            _transfer_registered = true;
-        } else {
+    if (_transfer_gate.busy()) {
+        _transfer_registered.store(true, std::memory_order_relaxed);
+        if (!M5_Hal.Services.add(*this)) {
             clearTransferState();
             return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
         }
@@ -1296,33 +1370,55 @@ result_t<void> Bus_software::transfer(bus::IAccessor* owner, const i2c::MasterAc
 result_t<bus::TransferTotals> Bus_software::waitTransfer(bus::IAccessor* owner, const i2c::MasterAccessConfig& cfg)
 {
     (void)cfg;
-    if (_transfer_active && _transfer_owner != owner) {
+    using GateState = service::CompletionGate::State;
+    if (_transfer_gate.state() != GateState::Idle && _transfer_owner != owner) {
         return m5::stl::make_unexpected(error::error_t::BUSY);
     }
-    while (_transfer_active && !_transfer_done && _transfer_error == error::error_t::OK) {
-        if (_transfer_registered && M5_Hal.Services.autoRunActive()) {
-            runtime::yield();
+    // Yield budget sized to outlast a typical transfer: the sleep phase
+    // quantizes completion latency to the FreeRTOS tick (10 ms at the
+    // IDF-default 100 Hz), so it must stay the priority-inversion liveness
+    // backstop, not the expected path (measured: a short yield
+    // phase doubled the 256-byte exchange median on a 100 Hz-tick build).
+    service::SpinBackoff backoff{50000};
+    // Sole-pumper poll stream: measured per iteration so a task that
+    // migrates cores mid-wait gap-drops (elapsed=0) instead of comparing
+    // ticks from two different cycle counters.
+    service::TickStream pump_stream;
+    while (_transfer_gate.busy()) {
+        if (_transfer_registered.load(std::memory_order_relaxed)) {
+            // Runner-owned state: pump only through runOnce()'s try-lock so
+            // this thread can never poll the same TransferState concurrently
+            // with the runner task (double-pump window at auto-run start).
+            // The wait must eventually BLOCK, not merely yield: taskYIELD()
+            // only yields to READY tasks of the SAME priority.
+            if (M5_Hal.Services.autoRunActive() || !M5_Hal.Services.runOnce()) {
+                backoff.step();
+            } else {
+                backoff.reset();
+            }
         } else {
-            auto result = serviceTransfer(service::ServiceContext{impl_software::serviceNowTick()});
-            if (result == service::ServiceResult::Error) {
+            // Unpublished state: this thread is the sole pumper; spin at full
+            // speed to honor the bit-bang half-period schedule (no backoff).
+            const auto s = service::sampleTickWithDomain();
+            if (serviceTransfer(service::ServiceContext{pump_stream.step(s.tick, s.domain), s.tick}) ==
+                service::ServiceResult::Error) {
                 break;
             }
         }
     }
-    if (error::isError(_transfer_error)) {
+    if (_transfer_gate.state() == GateState::Error) {
         const auto err = _transfer_error;
         clearTransferState();
         return m5::stl::make_unexpected(err);
     }
     const auto totals = _transfer_totals;
-    _transfer_totals.clear();
     clearTransferState();
     return totals;
 }
 
 bool Bus_software::transferBusy(bus::IAccessor* owner)
 {
-    return _transfer_active && _transfer_owner == owner && !_transfer_done && _transfer_error == error::error_t::OK;
+    return _transfer_gate.busy() && _transfer_owner == owner;
 }
 
 }  // namespace m5::hal::v2::i2c

@@ -56,11 +56,17 @@ result_t<void> SpiSlaveBus_espidf::init(const spi::SlaveBusConfig& cfg)
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
 
-    if (_initialized) {
-        (void)release();
+    ::spi_host_device_t host = SPI2_HOST;
+    if (!detail_espidf_spi::hostForSlaveController(cfg.controller, host)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+
+    auto released = release();
+    if (!released.has_value()) {
+        return m5::stl::make_unexpected(released.error());
     }
     _config = cfg;
-    _host   = (cfg.host >= 0) ? static_cast<::spi_host_device_t>(cfg.host) : SPI2_HOST;
+    _host   = host;
 
     // DMA-capable, word-aligned bounce buffers. spi_slave_transmit requires DMA-able
     // buffers when a DMA channel is selected; heap_caps_malloc(MALLOC_CAP_DMA)
@@ -106,6 +112,10 @@ result_t<void> SpiSlaveBus_espidf::release(void)
         }
         _initialized = false;
     }
+    // spi_slave_free() discards the driver's transaction queue, so any queued
+    // descriptor is gone; drop the pending flag so a later init()+serve() starts
+    // a fresh transaction instead of trying to collect a stale one.
+    _trans_pending = false;
     if (_tx_bounce != nullptr) {
         ::heap_caps_free(_tx_bounce);
         _tx_bounce = nullptr;
@@ -127,67 +137,99 @@ result_t<size_t> SpiSlaveBus_espidf::serve(bus::IAccessor* owner, data::Source* 
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
 
-    // Clamp the exchange to the bounce-buffer capacity: SPI is full-duplex, so one
-    // len bounds BOTH directions (the shared clock-cycle count).
-    if (len > kBounceCapacity) {
-        len = kBounceCapacity;
-    }
-    if (len == 0) {
-        return static_cast<size_t>(0);
+    // Queue a fresh transaction only when none is outstanding. If a previous
+    // serve() queued a descriptor and then timed out waiting for the master to
+    // clock it, that descriptor is still owned by the driver (the ISR may still
+    // write into &_trans/_rx_bounce). We must NOT re-fill or re-queue in that
+    // window -- we skip straight to collection below and let the late exchange
+    // complete against the already-queued buffers. The bytes for that exchange
+    // came from the earlier call's tx Source; this call's tx is read only when we
+    // queue a new transaction.
+    if (!_trans_pending) {
+        // Clamp the exchange to the bounce-buffer capacity: SPI is full-duplex, so
+        // one len bounds BOTH directions (the shared clock-cycle count).
+        if (len > kBounceCapacity) {
+            len = kBounceCapacity;
+        }
+        if (len == 0) {
+            return static_cast<size_t>(0);
+        }
+
+        // Pull up to `len` bytes of MISO data from the tx Source into the TX
+        // bounce. Any bytes the Source cannot supply (short Source, or tx == null)
+        // are filled with cfg.tx_fill_byte so the master always clocks a defined
+        // MISO level.
+        size_t filled = 0;
+        while (tx != nullptr && !tx->eof() && filled < len) {
+            auto span = tx->peek(len - filled);
+            if (!span.has_value()) {
+                return m5::stl::make_unexpected(span.error());
+            }
+            if (span.value().size == 0) {
+                break;
+            }
+            ::memcpy(_tx_bounce + filled, span.value().data, span.value().size);
+            auto advanced = tx->advance(span.value().size);
+            if (!advanced.has_value()) {
+                return m5::stl::make_unexpected(advanced.error());
+            }
+            filled += span.value().size;
+        }
+        if (filled < len) {
+            ::memset(_tx_bounce + filled, _config.tx_fill_byte, len - filled);
+        }
+        // Clear the RX bounce so a short transaction leaves no stale bytes past
+        // trans_len (only the actually-clocked prefix is committed below).
+        ::memset(_rx_bounce, 0, len);
+
+        _trans           = {};
+        _trans.length    = len * 8;  // bits
+        _trans.tx_buffer = _tx_bounce;
+        _trans.rx_buffer = _rx_bounce;
+
+        // Queue without blocking: pending management keeps at most one transaction
+        // outstanding, so the driver queue (queue_size 3) always has room. Only on
+        // a successful enqueue do we mark it pending -- a failed enqueue leaves no
+        // descriptor with the driver.
+        esp_err_t qe = ::spi_slave_queue_trans(_host, &_trans, 0);
+        if (qe != ESP_OK) {
+            return m5::stl::make_unexpected(impl_espidf_slave::mapEspErr(qe));
+        }
+        _trans_pending = true;
     }
 
-    // Pull up to `len` bytes of MISO data from the tx Source into the TX bounce.
-    // Any bytes the Source cannot supply (short Source, or tx == null) are filled
-    // with cfg.tx_fill_byte so the master always clocks a defined MISO level.
-    size_t filled = 0;
-    while (tx != nullptr && !tx->eof() && filled < len) {
-        auto span = tx->peek(len - filled);
-        if (!span.has_value()) {
-            return m5::stl::make_unexpected(span.error());
-        }
-        if (span.value().size == 0) {
-            break;
-        }
-        ::memcpy(_tx_bounce + filled, span.value().data, span.value().size);
-        auto advanced = tx->advance(span.value().size);
-        if (!advanced.has_value()) {
-            return m5::stl::make_unexpected(advanced.error());
-        }
-        filled += span.value().size;
-    }
-    if (filled < len) {
-        ::memset(_tx_bounce + filled, _config.tx_fill_byte, len - filled);
-    }
-    // Clear the RX bounce so a short transaction leaves no stale bytes past
-    // trans_len (only the actually-clocked prefix is committed below).
-    ::memset(_rx_bounce, 0, len);
-
-    ::spi_slave_transaction_t t = {};
-    t.length                    = len * 8;  // bits
-    t.tx_buffer                 = _tx_bounce;
-    t.rx_buffer                 = _rx_bounce;
-
+    // Collect the outstanding transaction. This is where the master-clocked
+    // exchange is awaited; on a fresh queue it is the same transaction we just
+    // enqueued, on a re-entry it is the one a prior timed-out call left pending.
+    //
     // NOTE (HW spike observation): the very first transaction after init can come
     // back shifted by one bit on some boards/wiring. No correction mechanism is
     // built in here -- the application/bench decides on real hardware whether a
     // priming transaction or a wiring fix is needed. serve() reports trans_len as
     // delivered by the driver.
-    esp_err_t e = ::spi_slave_transmit(_host, &t, impl_espidf_slave::ticks(timeout_ms));
+    ::spi_slave_transaction_t* ret = nullptr;
+    esp_err_t e                    = ::spi_slave_get_trans_result(_host, &ret, impl_espidf_slave::ticks(timeout_ms));
     if (e != ESP_OK) {
-        // A timeout means the master never clocked a transaction in the window:
-        // report zero exchanged rather than an error (matches the serve() contract
-        // of returning empty on no transaction).
+        // A timeout means the master never clocked the queued transaction in the
+        // window: report zero exchanged rather than an error (matches the serve()
+        // contract of returning empty on no transaction). Keep _trans_pending set
+        // so the queued descriptor survives and the next serve() collects it
+        // instead of dangling it.
         if (e == ESP_ERR_TIMEOUT) {
             return static_cast<size_t>(0);
         }
         return m5::stl::make_unexpected(impl_espidf_slave::mapEspErr(e));
     }
+    _trans_pending = false;
 
-    // Bytes actually clocked (the master may clock fewer than len, ending early on
-    // CS deassert). trans_len is in bits; round down to whole bytes.
-    size_t got = static_cast<size_t>(t.trans_len) / 8;
-    if (got > len) {
-        got = len;
+    // Bytes actually clocked (the master may clock fewer than the queued length,
+    // ending early on CS deassert). trans_len is in bits; round down to whole
+    // bytes and clamp against the queued length (_trans.length), which may differ
+    // from this call's `len` on a re-entry collection.
+    size_t got = static_cast<size_t>(_trans.trans_len) / 8;
+    size_t cap = static_cast<size_t>(_trans.length) / 8;
+    if (got > cap) {
+        got = cap;
     }
 
     // Commit the captured MOSI bytes to the rx Sink (a null Sink discards them).

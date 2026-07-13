@@ -11,8 +11,25 @@ M5HAL v2 API の全体構造と設計原則を示す。 個別の設計は [desi
 - **宣言と実装の分離** — ヘッダは宣言を中心に置き、 重い実装は `.inl` 等に分離する
 - **同期 API を正本とする** — 非同期は将来拡張として扱う
 - **テストで契約を担保する** — 抽象基底の契約はユニットテストで検証する
-- **ゼロコピー指向** — 大きなデータ転送で不要なコピーを避ける
+- **無駄を省く最適化は迷わず行う** — 不要なコピーや不要な状態を省けば、 実装は単純になり速度も上がる (§最適化の判断)
+- **汎用性や単純さを犠牲にする最適化は、 要件を満たせないと実測で示せたときだけ** (§最適化の判断)
 - **先行整備をしすぎない** — 実需が見えていない抽象は導入しない
+
+## 最適化の判断
+
+1. **無駄を省く** (不要なコピー・不要な状態) — 単純さと速さは両立する。 迷わず行う。
+2. **汎用性や単純さを犠牲にして速くする** — 要件を満たせないことを実測で示せたときだけ行う。
+   「その方が速いから」は理由にならない。
+3. **どちらの場合も、 API の形に出る選択は理由をここか design/ に書く。** API の形に出た選択は、
+   利用者のコードがそれに合わせて書かれるため、 あとから消せない。
+
+例:
+
+- `data::Source::peek` が借用 Span を返すのは **1**。 RAM / ROM に既にあるデータを無駄に複製せず、
+  ストリームのデータも同じ型で扱える。 ただし借用の lifetime 規則は API の形に出るため **3** が要る
+  ([design/data_io.md](design/data_io.md) §Source の契約)
+- `PinBackup` の IO_MUX 配列 weak シンボル化は実装の内側に閉じる。 利用者のコードは変わらないので
+  **3** は不要 — 明日ふつうの配列に戻しても誰も気づかない
 
 ## 層構成
 
@@ -43,7 +60,16 @@ variants      層を横断するメタ機構                                    
 
 **v2 caller の正本入口は `m5::hal::v2::M5_Hal` object** (`m5::hal::v2::Hal&` 型)。 `m5::hal::v2::Hal` はローカルとリモートで共通の public facade で、 sub-object (`Gpio` / `I2C` / `SPI` / `UART` / `I2S` / `Services` / `Memory`) を束ねる。
 
-リモート `Hal` は接続確立後に同型 API を提供する: `Hal remote; remote.connect(endpoint)` で接続する (endpoint = `"uart:<path>"` / `"tcp:<host>:<port>"`。 typed API `remote.initUart(port)` / `remote.initTcp("host:port")` も存続)。 以降は同じ `remote.I2C.acquire(cfg)` / `remote.SPI.acquire(cfg)` の形で proxy bus を取得でき、 ローカル `Hal` と同一のコード面で使える。 詳細は [design/remote.md](design/remote.md) を参照。 `M5HALCore` はローカル backend を所有する内部シングルトン (caller は直接使わない)。 caller は `m5::hal::v2::M5_Hal.Gpio.*` のように各 sub-object にアクセスする。
+リモート `Hal` は接続確立後に同型 API を提供する: `Hal remote; remote.connect(endpoint)` で接続する
+(endpoint = `"uart:<path>"` / `"tcp:<host>:<port>"`。typed API `remote.initUart(port)` /
+`remote.initTcp("host:port")` も存続)。以降は同じ `remote.I2C.acquire(cfg)` /
+`remote.SPI.acquire(cfg)` の形で proxy bus を取得でき、ローカル `Hal` と同一のコード面で使える。
+1 `Hal` は 1 接続先に束縛され、reconnect は旧 session を失効させる。旧 proxy は connection を
+延命せず `CLOSED` を返し、同一 session の RPC は session gate で直列化される。明示 release は
+exact-instance の唯一所有 handle を消費する。詳細は [design/remote.md](design/remote.md) と
+[design/bus_accessor.md](design/bus_accessor.md) を参照。`M5HALCore` はローカル backend を所有する
+内部シングルトン (caller は直接使わない)。caller は `m5::hal::v2::M5_Hal.Gpio.*` のように各
+sub-object にアクセスする。
 
 `m5::hal::v2::<kind>::*` 配下の勝者バインドされた関数 (例: `gpio::getGPIO()`) は `M5HALCore` ctor が bootstrap seam として内部利用するため、 caller が直接呼ぶ必要はない (詳細は [design/gpio.md](design/gpio.md) §caller 向け唯一の entry point)。
 
@@ -55,11 +81,12 @@ namespace-scope initializer や他ライブラリの global ctor から触る場
 
 - HAL の範疇は `m5::hal::*` 配下に置く (runtime 設備も `m5::hal::v2::runtime` の 1 kind)
 - core (予約層) は `m5::*` 直下の別 namespace に置く
-- cross-cutting な型 (`error_t` 等) は `m5::hal::` 直下に置く
+- cross-cuttingな型もAPI世代に属する間は`m5::hal::vN::*`配下に置く。現行`error_t`は
+  `m5::hal::v2::error::*`で、世代非依存の`m5::hal::*`直下へはまだ置かない
 - variant 機構は `m5::variants::*` に置く
 
-v0/v2 共存による物理 namespace (`m5::hal::v2::<kind>` 等) と inline 展開の詳細は
-詳細は [design/v0_v2_coexistence.md](design/v0_v2_coexistence.md) §namespace 配置 を参照。
+v0/v2共存による物理namespace (`m5::hal::v2::<kind>`等) とinline展開の詳細は
+[design/v0_v2_coexistence.md](design/v0_v2_coexistence.md) §namespace 配置 を参照。
 
 ### ディレクトリ配置
 

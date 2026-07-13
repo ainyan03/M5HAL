@@ -105,6 +105,9 @@ pin フィールドを一切読まないため、タグ構築が「完成した 
 `IBus` は `Channel::Tx` と `Channel::Rx` を**別々に lock する**（チャネルごとに `runtime::Mutex` を 1 本持つ）。
 `TxAccessor` は TX channel のみ、`RxAccessor` は RX channel のみを開く。
 これにより **write と read は同時に進められる**（full-duplex）。
+remote proxy でも TX/RX channel の所有権は独立だが、標準 `RemoteSession` は 1 in-flight のため、
+個々の wire RPC は共通 session gate で直列化される。1 RPC 内の全二重は複合 transfer が担う
+([remote.md](remote.md) §SEQ)。
 
 lock の取得待ちは以下の呼び出し引数で制御する（config には置かない）:
 - `TxAccessor::beginAccess(timeout_ms)` — TX channel
@@ -127,6 +130,40 @@ split accessor は最小ストリーム I/O インタフェース (`data::Stream
 消費できる（frame codec ([frame.md](frame.md)) 等の Source/Sink consumer との接続点。契約は
 [data_io.md](data_io.md) §Stream アダプタ）。
 
+## state mutex と再設定
+
+TX / RX チャネルロックとは別に、各 variant backend (`Bus_espidf` / `Bus_posix` / `Bus_arduino`) は
+config・coalesce 状態を保護する内部 leaf mutex (`runtime::Mutex`) を持つ。ロック取得順序は
+**channel lock → state mutex の一方向のみ**。唯一の公認例外は `uart::IBus::tryAcquireOppositeChannel`
+(非ブロッキングの反対チャネル静止ゲート) — state mutex 保持中に反対チャネルの mutex を
+timeout 0 で試すだけなので、デッドロックし得ない。
+
+再設定 (`applyConfig` に渡された `AccessConfig` が適用済みのものと異なる場合) の意味論:
+
+- **初回適用**（そのバスでまだ何も適用されていない）はゲート不要で、どちらのチャネル入口
+  (write / read / readableBytes) から来ても即座に適用する。
+- **再設定**は**両チャネルが静止しているときのみ**適用する。反対チャネルが使用中で静止を
+  確認できない場合は**適用せず現行設定のまま転送を続行**し、診断カウンタ (`reconfigSkips()`)
+  を増やす（相手の転送中に線路設定を書き換えないための安全策）。
+  - **静止 (quiescent) の定義**: 反対チャネルが未保持、または保持者が呼び出し元自身か、
+    その combined accessor の相方 (`bus::IAccessor::lockPeer` — `uart::Accessor` の
+    TX/RX 子同士を指す)。**同一スレッドの無関係な accessor が保持している場合も busy
+    として skip する** — 自スレッドが既に保持している mutex への try-lock は POSIX
+    `std::timed_mutex` 上で未定義動作となるため構造的に試行できず、また意味論上も
+    「反対チャネル使用中」に変わりはないため。
+
+state mutex は `init` / `release` / `attach` と raw I/O の生存期間競合までは守らない —
+それは既存の managed facade 契約（アクセスウィンドウ外でのみ再 init / release / attach する）
+の管轄で、本節の対象外。
+
+POSIX variant の write coalescing (`tx_coalesce_bytes`) は state mutex 下でバッファに
+まとめ書きし、RX 側の `read` / `readableBytes` が呼ばれた際に flush する。flush は
+state mutex を保持したまま行うため、TX 側が未 flush のバイトを溜めている間に RX 側が
+呼ばれると、その flush が完了するまで（最大 `write_timeout_ms`、既定 1000 ms — この
+timeout は flush を要求した RX 側の `AccessConfig::write_timeout_ms` が効く）待たされる。
+これは意図したトレードオフである（flush をロック外で行うと TX の write と RX 起点の flush が
+同時に raw write することになり、かえって危険なため）。
+
 ## read semantics
 
 `read(dst, len)` は最大 `len` byte を `Sink` に書き込む。最初の byte を
@@ -140,8 +177,7 @@ dst, max_len)` を使う (facade にも転送あり)。1 つの RX チャネル�
 byte が delimiter か」だけで完結行と部分行が区別できる（Arduino の
 `readBytesUntil` が delimiter を捨てて両者を区別不能にする不満への回答）。
 timeout は部分行（0 を含む短い戻り）で表れ、エラーではない。中核ロジックは
-`data::readUntil(StreamReader&, delim, DataSpan)` にあり、UART 以外の
-`StreamReader` にも同じ契約で使える ([data_io.md](data_io.md))。
+`data::readUntil(StreamReader&, delim, DataSpan)` にあり、UART以外の`StreamReader`にも同じ契約で使える。
 
 ## write semantics
 
@@ -172,6 +208,12 @@ timeout は部分行（0 を含む短い戻り）で表れ、エラーではな�
   あるため、`port_num` から `Serial` を内部解決しない。variant 固有の
   `uart::BusConfig` に caller-owned `HardwareSerial*` を明示して渡す。
   `attach(HardwareSerial&)` でも同じく caller-owned serial を利用できる。
+  **plain `Stream` 束縛の例外** (`attach(Stream&)` / `setSerial(Stream&)` —
+  HWCDC / USBCDC もここに入る): 既に構成済みの byte stream を採用する経路であり、
+  線路フォーマット (baud / parity / stop bits / invert) は適用も検証もしない
+  (CDC には線路の概念が無く、物理 UART を `Stream` として渡した場合は外部構成が正)。
+  per-access 設定で適用されるのは `first_byte_timeout_ms` のみ。線路フォーマットの
+  適用・検証契約 (未対応値の `INVALID_ARGUMENT` を含む) は `HardwareSerial` 束縛時のみ有効。
 - `variants::frameworks::espidf` は ESP-IDF UART driver
   (`uart_driver_install`, `uart_read_bytes`, `uart_write_bytes`) に委譲する。
   variant 固有の `uart::BusConfig` は `port_num` を持ち、負値の場合は

@@ -154,6 +154,38 @@ using Task = ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v2::runtime::Task;
 #endif  // M5HAL_VARIANT_CURRENT_HAS_HAL_RUNTIME_TASK_
 
 // ---------------------------------------------------------------------
+// runtime::Event (sub-kind)
+// ---------------------------------------------------------------------
+#if defined(M5HAL_VARIANT_CURRENT_HAS_HAL_RUNTIME_EVENT_) && M5HAL_VARIANT_CURRENT_HAS_HAL_RUNTIME_EVENT_
+
+#  ifndef M5HAL_V2_SELECTED_VARIANT_RUNTIME_EVENT
+#    if M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V2_VARIANT_ID_PLATFORM_ESP32
+#      define M5HAL_V2_SELECTED_VARIANT_RUNTIME_EVENT M5HAL_V2_VARIANT_ID_PLATFORM_ESP32
+#    elif M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V2_VARIANT_ID_FRAMEWORK_FREERTOS
+#      define M5HAL_V2_SELECTED_VARIANT_RUNTIME_EVENT M5HAL_V2_VARIANT_ID_FRAMEWORK_FREERTOS
+#    elif M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V2_VARIANT_ID_FRAMEWORK_ARDUINO
+#      define M5HAL_V2_SELECTED_VARIANT_RUNTIME_EVENT M5HAL_V2_VARIANT_ID_FRAMEWORK_ARDUINO
+#    elif M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V2_VARIANT_ID_FRAMEWORK_ESPIDF
+#      define M5HAL_V2_SELECTED_VARIANT_RUNTIME_EVENT M5HAL_V2_VARIANT_ID_FRAMEWORK_ESPIDF
+#    elif M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V2_VARIANT_ID_FRAMEWORK_POSIX
+#      define M5HAL_V2_SELECTED_VARIANT_RUNTIME_EVENT M5HAL_V2_VARIANT_ID_FRAMEWORK_POSIX
+#    elif M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V2_VARIANT_ID_FRAMEWORK_SOFTWARE
+#      define M5HAL_V2_SELECTED_VARIANT_RUNTIME_EVENT M5HAL_V2_VARIANT_ID_FRAMEWORK_SOFTWARE
+#    elif M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V2_VARIANT_ID_FRAMEWORK_REMOTE
+#      define M5HAL_V2_SELECTED_VARIANT_RUNTIME_EVENT M5HAL_V2_VARIANT_ID_FRAMEWORK_REMOTE
+#    elif M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V2_VARIANT_ID_FRAMEWORK_STUB
+#      define M5HAL_V2_SELECTED_VARIANT_RUNTIME_EVENT M5HAL_V2_VARIANT_ID_FRAMEWORK_STUB
+#    else
+#      error "offer_all.inl: M5HAL_VARIANT_CURRENT_ID_ missing from the runtime_event selected-marker chain"
+#    endif
+namespace m5 { namespace hal { namespace v2 { namespace runtime {
+using Event = ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v2::runtime::Event;
+} } } }
+#  endif
+
+#endif  // M5HAL_VARIANT_CURRENT_HAS_HAL_RUNTIME_EVENT_
+
+// ---------------------------------------------------------------------
 // hal/gpio
 // ---------------------------------------------------------------------
 #if defined(M5HAL_VARIANT_CURRENT_HAS_HAL_GPIO_) && M5HAL_VARIANT_CURRENT_HAS_HAL_GPIO_
@@ -200,7 +232,7 @@ using Task = ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v2::runtime::Task;
 #  define M5HAL_OFFER_KIND_NS_ i2c
 #  ifndef M5HAL_V2_SELECTED_VARIANT_I2C
 #    define M5HAL_OFFER_KIND_EMIT_FLAT_ 1
-#    define M5HAL_OFFER_KIND_FACADE_ 1  // i2c::Bus is a runtime facade (ADR 034); emit only BusConfig alias
+#    define M5HAL_OFFER_KIND_FACADE_ 1  // i2c::Bus is a runtime facade; emit only BusConfig alias
 #    if M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V2_VARIANT_ID_PLATFORM_ESP32
 #      define M5HAL_V2_SELECTED_VARIANT_I2C M5HAL_V2_VARIANT_ID_PLATFORM_ESP32
 #    elif M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V2_VARIANT_ID_FRAMEWORK_ARDUINO
@@ -233,7 +265,7 @@ using Task = ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v2::runtime::Task;
 #  define M5HAL_OFFER_KIND_NS_ spi
 #  ifndef M5HAL_V2_SELECTED_VARIANT_SPI
 #    define M5HAL_OFFER_KIND_EMIT_FLAT_ 1
-#    define M5HAL_OFFER_KIND_FACADE_ 1  // spi::Bus is a runtime facade (ADR 034); emit only BusConfig alias
+#    define M5HAL_OFFER_KIND_FACADE_ 1  // spi::Bus is a runtime facade; emit only BusConfig alias
 #    if M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V2_VARIANT_ID_PLATFORM_ESP32
 #      define M5HAL_V2_SELECTED_VARIANT_SPI M5HAL_V2_VARIANT_ID_PLATFORM_ESP32
 #    elif M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V2_VARIANT_ID_FRAMEWORK_ARDUINO
@@ -266,7 +298,7 @@ using Task = ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v2::runtime::Task;
 #  define M5HAL_OFFER_KIND_NS_ i2s
 #  ifndef M5HAL_V2_SELECTED_VARIANT_I2S
 #    define M5HAL_OFFER_KIND_EMIT_FLAT_ 1
-#    define M5HAL_OFFER_KIND_FACADE_ 1  // i2s::Bus is a runtime facade (ADR 034); emit only BusConfig alias
+#    define M5HAL_OFFER_KIND_FACADE_ 1  // i2s::Bus is a runtime facade; emit only BusConfig alias
 #    if M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V2_VARIANT_ID_PLATFORM_ESP32
 #      define M5HAL_V2_SELECTED_VARIANT_I2S M5HAL_V2_VARIANT_ID_PLATFORM_ESP32
 #    elif M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V2_VARIANT_ID_FRAMEWORK_ARDUINO
@@ -299,7 +331,7 @@ using Task = ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v2::runtime::Task;
 #  define M5HAL_OFFER_KIND_NS_ uart
 #  ifndef M5HAL_V2_SELECTED_VARIANT_UART
 #    define M5HAL_OFFER_KIND_EMIT_FLAT_ 1
-#    define M5HAL_OFFER_KIND_FACADE_ 1  // uart::Bus is a runtime facade (ADR 034); emit only BusConfig alias
+#    define M5HAL_OFFER_KIND_FACADE_ 1  // uart::Bus is a runtime facade; emit only BusConfig alias
 #    if M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V2_VARIANT_ID_PLATFORM_ESP32
 #      define M5HAL_V2_SELECTED_VARIANT_UART M5HAL_V2_VARIANT_ID_PLATFORM_ESP32
 #    elif M5HAL_VARIANT_CURRENT_ID_ == M5HAL_V2_VARIANT_ID_FRAMEWORK_ARDUINO
@@ -354,4 +386,7 @@ using Task = ::m5::M5HAL_VARIANT_CURRENT_BASE_NS_::hal::v2::runtime::Task;
 #endif
 #ifdef M5HAL_VARIANT_CURRENT_HAS_HAL_RUNTIME_TASK_
 #  undef M5HAL_VARIANT_CURRENT_HAS_HAL_RUNTIME_TASK_
+#endif
+#ifdef M5HAL_VARIANT_CURRENT_HAS_HAL_RUNTIME_EVENT_
+#  undef M5HAL_VARIANT_CURRENT_HAS_HAL_RUNTIME_EVENT_
 #endif

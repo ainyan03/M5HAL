@@ -43,6 +43,7 @@ src/
         runtime/runtime.hpp
         bus/allocation_core.{hpp,inl}
         bus/bus.{hpp,inl}
+        bus/bus_view.hpp
         bus/hal_backend.hpp
         bus/hw_pool.hpp
         bus/local_backend.{hpp,inl}
@@ -76,13 +77,16 @@ src/
         remote/credit_notifier.hpp
         remote/remote.hpp
         remote/remote_connection.{hpp,inl}
+        remote/session_handle.hpp
         remote/server.{hpp,inl}
         remote/server_adapter.{hpp,inl}
         remote/server_bus_pool.{hpp,inl}
         remote/server_connection_wiring.{hpp,inl}
         remote/server_handler.{hpp,inl}
+        remote/wire_drain.hpp
         memory/allocator.{hpp,inl}
         memory/pool.{hpp,inl}
+        service/completion_gate.hpp
         service/service.{hpp,inl}
         types.hpp
         error.hpp
@@ -103,6 +107,7 @@ src/
         remote/
           _offer.hpp
           backend.{hpp,inl}
+          bus_lease.hpp
           detail_helpers.hpp
           hal.hpp
           hal/gpio/gpio.{hpp,inl}
@@ -187,7 +192,7 @@ variant の内部構造 (`_offer.hpp` + `hal.hpp` + `hal.inl` の hub 構成) �
 詳細は [../design/variants.md](../design/variants.md) §走査順 (`M5HAL_v2.hpp` 内) を参照。本 kind 固有の差分のみ以下に示す。
 
 - `src/m5_hal/variants/frameworks/_checker.hpp` — `M5HAL_FRAMEWORK_HAS_<NAME>` 系
-- `src/m5_hal/variants/platforms/_checker.hpp` — `M5HAL_V2_TARGET_PLATFORM_VARIANT_ID` / `_PATH` の検出 (識別番号の正本は `variants/ids.hpp`。 無印は凍結 v0 が所有)
+- `src/m5_hal/variants/platforms/_checker.hpp` — `M5HAL_V2_TARGET_PLATFORM_VARIANT_ID` / `_PATH` の検出 (識別番号の正本は `variants/ids.hpp`。 無印は変更不可の v0 が所有)
 
 ## 関連
 

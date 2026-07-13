@@ -30,6 +30,23 @@ jobs:
             run_native_test: "true"
           - name: arduino checks
             envs: -e v0_check_esp32_arduino -e v0_check_esp32s3_arduino -e v2_check_esp32_arduino -e v2_check_esp32s3_arduino
+          # Non-ESP32 Arduino cores (build-check only; no HIL rig for either
+          # — see _checker.hpp's variant allowlist and spec/design/variants.md
+          # §arduino variant の対応コア). v0 stays arduino-esp32-only and is
+          # excluded from these envs' build.
+          #
+          # KNOWN GAP: this lane needs a matching M5Utility fix
+          # (compatibility_feature.cpp / log/library_log.*, the <thread>/
+          # <chrono> non-ESP32-Arduino fallback, platform_detect.hpp) that is
+          # NOT YET landed on m5stack/M5Utility's develop branch. The
+          # "Determine M5Utility repo" step below prefers the same-owner
+          # fork's develop branch when it exists (mirroring M5Unified's
+          # M5GFX resolution), so this lane is green on forks that carry the
+          # patch (e.g. ainyan03/M5Utility). Runs against the upstream
+          # m5stack/M5HAL repo still pull unpatched m5stack/M5Utility develop
+          # and fail until the fix is upstreamed there too.
+          - name: multi-platform arduino checks
+            envs: -e v2_check_rp2040_arduino -e v2_check_samd51_arduino -e v2_check_stm32f4_arduino -e v2_check_nrf52840_arduino -e v2_check_esp8266_arduino -e v2_check_native_nochrono
           - name: ESP-IDF 5 checks
             envs: -e v0_check_esp32_espidf -e v0_check_esp32s3_espidf -e v2_check_esp32_espidf -e v2_check_esp32s3_espidf
           - name: ESP-IDF 4 compatibility checks
@@ -60,10 +77,25 @@ jobs:
         with:
           path: M5HAL
 
+      # Prefer the same-owner fork's develop branch when it exists (e.g. a
+      # patch not yet landed upstream), falling back to m5stack/M5Utility.
+      # Mirrors M5Unified's "Determine M5GFX repo and branch" step.
+      - name: Determine M5Utility repo
+        id: m5utility
+        run: |
+          OWNER="${{ github.repository_owner }}"
+          if git ls-remote --heads "https://github.com/$OWNER/M5Utility.git" develop 2>/dev/null | grep -q .; then
+            REPO="$OWNER/M5Utility"
+          else
+            REPO="m5stack/M5Utility"
+          fi
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+          echo "Using $REPO@develop"
+
       - name: Checkout M5Utility (parallel)
         uses: actions/checkout@v6
         with:
-          repository: m5stack/M5Utility
+          repository: ${{ steps.m5utility.outputs.repo }}
           ref: develop
           path: M5Utility
 

@@ -30,6 +30,7 @@ void RingFIFO::reset()
     _head.store(0, std::memory_order_relaxed);
     _tail.store(0, std::memory_order_relaxed);
     _buffered.store(0, std::memory_order_relaxed);
+    _sink.clearReserved();
 }
 
 void RingFIFO::setBuf(uint8_t* buf, size_t cap)
@@ -70,6 +71,12 @@ m5::hal::v2::result_t<ConstDataSpan> RingFIFO::SourceView::peek(size_t max_len)
 
 m5::hal::v2::result_t<void> RingFIFO::SourceView::advance(size_t N)
 {
+    // N == 0 must return before the modulo below: an unbound ring
+    // (capacity 0) would otherwise reach `% 0`. Any N > 0 on an unbound
+    // ring is rejected by the buffered check (buffered is always 0).
+    if (N == 0) {
+        return {};
+    }
     const size_t buf = _owner._buffered.load(std::memory_order_relaxed);
     if (N > buf) {
         return m5::stl::make_unexpected(m5::hal::v2::error::error_t::INVALID_ARGUMENT);
@@ -111,6 +118,14 @@ m5::hal::v2::result_t<DataSpan> RingFIFO::SinkView::reserve(size_t max_len)
 
 m5::hal::v2::result_t<void> RingFIFO::SinkView::commit(size_t N)
 {
+    // N == 0 ("wrote nothing") must return before the modulo below: an
+    // unbound ring (capacity 0) would otherwise reach `% 0`. Any N > 0
+    // on an unbound ring is rejected by the _reserved check (reserve()
+    // never lends bytes while unbound).
+    if (N == 0) {
+        _reserved = 0;
+        return {};
+    }
     const size_t buf = _owner._buffered.load(std::memory_order_relaxed);
     if (N > _reserved || N > (_owner._capacity - buf)) {
         return m5::stl::make_unexpected(m5::hal::v2::error::error_t::BUFFER_OVERFLOW);

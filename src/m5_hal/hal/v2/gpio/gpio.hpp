@@ -27,6 +27,19 @@ public:
         return portForPin(pin_index)->getPin(pin_index);
     }
 
+    /*!
+      @brief True when this IGPIO's pin states are fed by push events
+             (`GPIOGroup::notifyPinStateChanged`) instead of polling.
+
+      GPIOGroup's watch poll pass skips push-fed entries entirely: each
+      (slot, port) has exactly ONE state source (poll or push), which is
+      what makes the shadow-XOR edge detection race-free.
+     */
+    virtual bool hasPushEvents() const
+    {
+        return false;
+    }
+
 protected:
     ~IGPIO() = default;
 };

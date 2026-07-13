@@ -12,6 +12,10 @@ namespace m5::hal::v2::i2c {
 
 result_t<void> Bus_remote::init(const BusConfig_remote& config)
 {
+    bus::BusLifecycle::Operation operation{*_lifecycle};
+    if (!operation) {
+        return m5::stl::make_unexpected(operation.error());
+    }
     (void)config;
     if (_session == nullptr) {
         return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
@@ -19,39 +23,24 @@ result_t<void> Bus_remote::init(const BusConfig_remote& config)
     return {};
 }
 
-result_t<void> Bus_remote::lock(bus::IAccessor* owner, uint32_t timeout_ms)
-{
-    (void)timeout_ms;
-    if (owner == nullptr) {
-        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-    }
-    if (_locked && _lock_owner != owner) {
-        return m5::stl::make_unexpected(error::error_t::BUSY);
-    }
-    _locked     = true;
-    _lock_owner = owner;
-    return {};
-}
-
-result_t<void> Bus_remote::unlock(bus::IAccessor* owner)
-{
-    if (!_locked || owner == nullptr || owner != _lock_owner) {
-        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-    }
-    _locked     = false;
-    _lock_owner = nullptr;
-    return {};
-}
-
 result_t<void> Bus_remote::transfer(bus::IAccessor* owner, const i2c::MasterAccessConfig& cfg,
                                     const i2c::TransferDesc& desc, data::Source* src, size_t tx_len, data::Sink* dst,
                                     size_t rx_len)
 {
+    bus::BusLifecycle::Operation operation{*_lifecycle};
+    if (!operation) {
+        return m5::stl::make_unexpected(operation.error());
+    }
     (void)owner;
     if (_session == nullptr) {
         return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
     }
     if ((tx_len != 0 && src == nullptr) || (rx_len != 0 && dst == nullptr)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+    // meta_buf only reserves PREFIX_CAPACITY bytes for the prefix; reject an
+    // over-length prefix instead of overflowing the stack buffer in encodeI2cMeta.
+    if (desc.prefix_len > i2c::TransferDesc::PREFIX_CAPACITY) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
 
@@ -72,6 +61,10 @@ result_t<void> Bus_remote::transfer(bus::IAccessor* owner, const i2c::MasterAcce
 
 result_t<bus::TransferTotals> Bus_remote::waitTransfer(bus::IAccessor* owner, const i2c::MasterAccessConfig& cfg)
 {
+    bus::BusLifecycle::Operation operation{*_lifecycle};
+    if (!operation) {
+        return m5::stl::make_unexpected(operation.error());
+    }
     (void)owner;
     (void)cfg;
     auto out    = _has_totals ? _last_totals : bus::TransferTotals{};
@@ -82,6 +75,10 @@ result_t<bus::TransferTotals> Bus_remote::waitTransfer(bus::IAccessor* owner, co
 
 bool Bus_remote::transferBusy(bus::IAccessor* owner)
 {
+    bus::BusLifecycle::Operation operation{*_lifecycle, 0};
+    if (!operation) {
+        return false;
+    }
     (void)owner;
     return false;
 }

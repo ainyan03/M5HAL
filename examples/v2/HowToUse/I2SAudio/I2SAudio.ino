@@ -6,9 +6,9 @@
 // built-in speaker. Only M5HAL v2 is used (no M5Unified dependency).
 //
 // Supported boards:
-//   - M5Stack Core2 V2.1 (ESP32): AXP2101 PMIC speaker enable over external I2C.
+//   - M5Stack Core2 V1.1 (ESP32): AXP2101 PMIC speaker enable over external I2C.
 //                                  Verified on hardware.
-//                                  NOTE: Core2 V2.0 (AXP192) is NOT supported here.
+//                                  NOTE: Core2 V1.0 (AXP192) is NOT supported here.
 //                                  (AXP192 uses a different register map.)
 //   - M5Stack CoreS3  (ESP32-S3): AW9523 + AW88298 amplifier over internal I2C.
 //                                  NOTE: currently UNVERIFIED on hardware (no sound
@@ -20,7 +20,7 @@
 //   - CoreS3: line 2211-2221 (spk_cfg), lines 415-488 (aw88298 / aw9523 init)
 //             internal I2C: line 78 SCL=GPIO11, SDA=GPIO12
 //             I2S: BCK=GPIO34, WS=GPIO33, DOUT=GPIO13
-//   - Core2 V2.1: line 2483-2490 (spk_cfg BCK=GPIO12, WS=GPIO0, DOUT=GPIO2)
+//   - Core2 V1.1: line 2483-2490 (spk_cfg BCK=GPIO12, WS=GPIO0, DOUT=GPIO2)
 //             speaker enable via AXP2101 ALDO3 = 3300 mV (line 447-448)
 //             external I2C: line 125 SCL=GPIO22, SDA=GPIO21
 //
@@ -81,25 +81,25 @@ static constexpr uint8_t AW88298_ADDR = 0x36;
 #define BOARD_NAME "CoreS3"
 
 #elif defined(CONFIG_IDF_TARGET_ESP32)
-// ---- Core2 V2.1 (AXP2101) ----
-// Core2 V2.0 (AXP192) is NOT supported here (see file header).
+// ---- Core2 V1.1 (AXP2101) ----
+// Core2 V1.0 (AXP192) is NOT supported here (see file header).
 static constexpr int PIN_I2C_SCL      = 22;  // external I2C shared with PMIC
 static constexpr int PIN_I2C_SDA      = 21;
 static constexpr int PIN_I2S_BCK      = 12;
 static constexpr int PIN_I2S_WS       = 0;
 static constexpr int PIN_I2S_DOUT     = 2;
 static constexpr uint8_t AXP2101_ADDR = 0x34;
-#define BOARD_NAME "Core2 V2.1"
+#define BOARD_NAME "Core2 V1.1"
 
 #else
-#error "I2SAudio: unsupported target. Build for esp32 (Core2 V2.1) or esp32s3 (CoreS3)."
+#error "I2SAudio: unsupported target. Build for esp32 (Core2 V1.1) or esp32s3 (CoreS3)."
 #endif
 
 // ---------------------------------------------------------------------------
 // Globals
 // ---------------------------------------------------------------------------
 
-// I2S bus: borrowed from M5_Hal (espidf variant via IDF gen5 driver). The
+// I2S bus: acquired as a shared owner (espidf variant via IDF gen5 driver). The
 // handle pins the bus for the lifetime of playback. (I2C is needed only to
 // bring up the speaker amplifier; it stays local to initAmplifier below.)
 static std::shared_ptr<m5hal::i2s::IBus> i2s_bus;
@@ -166,7 +166,7 @@ static void initAmplifier(const std::shared_ptr<m5hal::i2c::IBus>& i2c)
 
 #elif defined(CONFIG_IDF_TARGET_ESP32)
 
-// Core2 V2.1 amplifier init: AXP2101 ALDO3 → 3300 mV to power the speaker.
+// Core2 V1.1 amplifier init: AXP2101 ALDO3 → 3300 mV to power the speaker.
 // Source: M5Unified.cpp (AXP2101_Class::_set_LDO(2, 3300)): reg 0x94 =
 // (3300 - 500) / 100 = 0x1C, reg 0x90 bit 2 = ALDO3 enable.
 static void initAmplifier(const std::shared_ptr<m5hal::i2c::IBus>& i2c)
@@ -229,7 +229,7 @@ static void i2sAudioInit(void)
 #endif
     LOG_PRINTLN("M5HAL HowToUseI2SAudio — board: " BOARD_NAME);
 
-    // ---- Amplifier init (borrow I2C just for the bring-up, then let go) ----
+    // ---- Amplifier init (acquire I2C just for bring-up, then let go) ----
 #ifdef ARDUINO
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
     m5hal::i2c::BusConfig_arduino i2c_bus_cfg{m5hal::i2c::Scl{PIN_I2C_SCL}, m5hal::i2c::Sda{PIN_I2C_SDA}};

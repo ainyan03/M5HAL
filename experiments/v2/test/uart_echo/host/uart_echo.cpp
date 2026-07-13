@@ -50,7 +50,7 @@ protected:
 
     // Concrete POSIX backend (not the runtime facade uart::Bus): the host opens
     // a serial port via the backend-specific open()/nativeHandle() that the
-    // facade does not expose (ADR 034 phase-1 follow-up). The Tx/RxAccessors
+    // facade does not expose (follow-up). The Tx/RxAccessors
     // below still bind to it as a uart::IBus.
     uart::Bus_posix bus_;
     uint32_t baud_ = 115200;

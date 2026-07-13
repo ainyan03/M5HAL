@@ -12,11 +12,6 @@ namespace m5::hal::v2::remote {
 result_t<std::shared_ptr<bus::IBus>> RemoteBackend::acquireBusTyped(types::bus_kind_t kind, const bus::IdentityKey& id,
                                                                     const bus::IBusConfig& cfg)
 {
-    if (auto existing = busRegistry().findByIdentity(kind, id)) {
-        if (!sameBaseConfig(kind, existing->getConfig(), cfg)) {
-            return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
-        }
-    }
     uint8_t pin_buf[16];
     auto pin_r = extractPinConfig(kind, cfg, pin_buf, sizeof(pin_buf));
     if (!pin_r.has_value()) {
@@ -24,7 +19,14 @@ result_t<std::shared_ptr<bus::IBus>> RemoteBackend::acquireBusTyped(types::bus_k
     }
     data::ConstDataSpan pin_config{pin_buf, pin_r.value()};
     return busRegistry().acquireOrFind(
-        kind, id, [&]() -> result_t<std::shared_ptr<bus::IBus>> { return createRemoteBus(kind, pin_config, cfg); });
+        kind, id,
+        [&](const std::shared_ptr<bus::IBus>& existing) -> result_t<void> {
+            if (!sameBaseConfig(kind, existing->getConfig(), cfg)) {
+                return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+            }
+            return {};
+        },
+        [&]() -> result_t<std::shared_ptr<bus::IBus>> { return createRemoteBus(kind, pin_config, cfg); });
 }
 
 result_t<std::shared_ptr<bus::IBus>> RemoteBackend::acquireBusLogical(types::bus_kind_t kind,
@@ -49,21 +51,61 @@ result_t<void> RemoteBackend::commitBuses(types::bus_kind_t kind, uint32_t timeo
     return {};
 }
 
-result_t<void> RemoteBackend::releaseBus(types::bus_kind_t kind, const bus::IdentityKey& id)
+result_t<void> RemoteBackend::releaseBus(types::bus_kind_t kind, const bus::IdentityKey& id,
+                                         const std::shared_ptr<bus::IBus>& expected)
 {
-    auto bus = busRegistry().findByIdentity(kind, id);
-    if (!bus) {
-        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    auto ticket = busRegistry().beginRelease(kind, id, expected);
+    if (!ticket.has_value()) {
+        return m5::stl::make_unexpected(ticket.error());
     }
-    const uint8_t remote_bus_id = extractBusId(kind, bus);
+    const uint8_t remote_bus_id                  = extractBusId(kind, expected);
+    auto lease                                   = extractBusLease(kind, expected);
+    std::shared_ptr<bus::BusLifecycle> lifecycle = lease ? lease->lifecycle() : expected->lifecycleHandle();
+    if (!lifecycle) {
+        (void)busRegistry().cancelRelease(ticket.value());
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    bus::BusLifecycle::Close closing{*lifecycle};
+    if (!closing) {
+        (void)busRegistry().cancelRelease(ticket.value());
+        return m5::stl::make_unexpected(closing.error());
+    }
     if (remote_bus_id != 0xFF) {
         auto sent = sendReleaseBus(kind, remote_bus_id);
         if (!sent.has_value()) {
+            closing.rollback();
+            (void)busRegistry().cancelRelease(ticket.value());
             return m5::stl::make_unexpected(sent.error());
         }
+    }
+    closing.commit();
+    if (lease) {
+        lease->disarm();
+    } else if (remote_bus_id != 0xFF) {
         freeBusId(kind, remote_bus_id);
     }
-    return IHalBackend::releaseBus(kind, id);
+    auto committed = busRegistry().commitRelease(ticket.value());
+    if (!committed.has_value()) {
+        return m5::stl::make_unexpected(committed.error());
+    }
+    return {};
+}
+
+std::shared_ptr<RemoteBusLease> RemoteBackend::extractBusLease(types::bus_kind_t kind,
+                                                               const std::shared_ptr<bus::IBus>& bus)
+{
+    switch (kind) {
+        case types::bus_kind_t::I2C:
+            return static_cast<i2c::Bus_remote*>(bus.get())->remoteBusLease();
+        case types::bus_kind_t::SPI:
+            return static_cast<spi::Bus_remote*>(bus.get())->remoteBusLease();
+        case types::bus_kind_t::UART:
+            return static_cast<uart::Bus_remote*>(bus.get())->remoteBusLease();
+        case types::bus_kind_t::I2S:
+            return static_cast<i2s::Bus_remote*>(bus.get())->remoteBusLease();
+        default:
+            return {};
+    }
 }
 
 uint8_t RemoteBackend::extractBusId(types::bus_kind_t kind, const std::shared_ptr<bus::IBus>& bus)
@@ -128,13 +170,21 @@ result_t<void> RemoteBackend::sendReleaseBus(types::bus_kind_t kind, uint8_t bus
     if (!r.has_value()) {
         return m5::stl::make_unexpected(r.error());
     }
-    auto req = _session->request({script_buf, script.written()});
+    if (!_session) {
+        return m5::stl::make_unexpected(error::error_t::CLOSED);
+    }
+    RemoteSessionHandle::Lease lease{*_session};
+    if (!lease) {
+        return m5::stl::make_unexpected(lease.error());
+    }
+    auto& session = lease.session();
+    auto req      = session.request({script_buf, script.written()});
     if (!req.has_value()) {
         return m5::stl::make_unexpected(req.error());
     }
     bytecode::BytecodeRunner runner{memory::defaultAllocator()};
     runner.setReceiveOnly(true);
-    auto resp = _session->lastResponse();
+    auto resp = session.lastResponse();
     auto run  = runner.run(resp);
     if (!run.has_value()) {
         return m5::stl::make_unexpected(run.error());
@@ -156,12 +206,21 @@ result_t<std::shared_ptr<bus::IBus>> RemoteBackend::createRemoteBus(types::bus_k
     if (bus_id == 0xFF) {
         return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
     }
+    auto bus_lease = std::make_shared<RemoteBusLease>(_session, _bus_ids, kind, bus_id);
+    if (!bus_lease) {
+        freeBusId(kind, bus_id);
+        return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+    }
+    auto proxy = makeProxyBus(kind, bus_id, cfg, bus_lease);
+    if (!proxy.has_value()) {
+        return m5::stl::make_unexpected(proxy.error());
+    }
+    bus_lease->arm();
     auto r = sendCreateBus(kind, bus_id, pin_config);
     if (!r.has_value()) {
         return m5::stl::make_unexpected(r.error());
     }
-    commitBusId(kind, bus_id);
-    return makeProxyBus(kind, bus_id, cfg);
+    return proxy;
 }
 
 result_t<std::shared_ptr<bus::IBus>> RemoteBackend::createRemoteBusFromLogical(types::bus_kind_t kind,
@@ -171,12 +230,21 @@ result_t<std::shared_ptr<bus::IBus>> RemoteBackend::createRemoteBusFromLogical(t
     if (bus_id == 0xFF) {
         return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
     }
+    auto bus_lease = std::make_shared<RemoteBusLease>(_session, _bus_ids, kind, bus_id);
+    if (!bus_lease) {
+        freeBusId(kind, bus_id);
+        return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+    }
+    auto proxy = makeProxyBusFromPinConfig(kind, bus_id, pin_config, bus_lease);
+    if (!proxy.has_value()) {
+        return m5::stl::make_unexpected(proxy.error());
+    }
+    bus_lease->arm();
     auto r = sendCreateBus(kind, bus_id, pin_config);
     if (!r.has_value()) {
         return m5::stl::make_unexpected(r.error());
     }
-    commitBusId(kind, bus_id);
-    return makeProxyBusFromPinConfig(kind, bus_id, pin_config);
+    return proxy;
 }
 
 result_t<void> RemoteBackend::sendCreateBus(types::bus_kind_t kind, uint8_t bus_id, data::ConstDataSpan pin_config)
@@ -191,13 +259,21 @@ result_t<void> RemoteBackend::sendCreateBus(types::bus_kind_t kind, uint8_t bus_
     if (!r.has_value()) {
         return m5::stl::make_unexpected(r.error());
     }
-    auto req = _session->request({script_buf, script.written()});
+    if (!_session) {
+        return m5::stl::make_unexpected(error::error_t::CLOSED);
+    }
+    RemoteSessionHandle::Lease lease{*_session};
+    if (!lease) {
+        return m5::stl::make_unexpected(lease.error());
+    }
+    auto& session = lease.session();
+    auto req      = session.request({script_buf, script.written()});
     if (!req.has_value()) {
         return m5::stl::make_unexpected(req.error());
     }
     bytecode::BytecodeRunner runner{memory::defaultAllocator()};
     runner.setReceiveOnly(true);
-    auto resp = _session->lastResponse();
+    auto resp = session.lastResponse();
     auto run  = runner.run(resp);
     if (!run.has_value()) {
         return m5::stl::make_unexpected(run.error());
@@ -212,32 +288,37 @@ result_t<void> RemoteBackend::sendCreateBus(types::bus_kind_t kind, uint8_t bus_
 }
 
 result_t<std::shared_ptr<bus::IBus>> RemoteBackend::makeProxyBus(types::bus_kind_t kind, uint8_t bus_id,
-                                                                 const bus::IBusConfig& cfg)
+                                                                 const bus::IBusConfig& cfg,
+                                                                 const std::shared_ptr<RemoteBusLease>& bus_lease)
 {
     switch (kind) {
         case types::bus_kind_t::I2C: {
-            auto p = std::make_shared<i2c::Bus_remote>(*_session, bus_id, static_cast<const i2c::IBusConfig&>(cfg));
+            auto p = std::make_shared<i2c::Bus_remote>(_session, bus_id, static_cast<const i2c::IBusConfig&>(cfg),
+                                                       bus_lease);
             if (!p) {
                 return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
             }
             return std::shared_ptr<bus::IBus>{p};
         }
         case types::bus_kind_t::SPI: {
-            auto p = std::make_shared<spi::Bus_remote>(*_session, bus_id, static_cast<const spi::IBusConfig&>(cfg));
+            auto p = std::make_shared<spi::Bus_remote>(_session, bus_id, static_cast<const spi::IBusConfig&>(cfg),
+                                                       bus_lease);
             if (!p) {
                 return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
             }
             return std::shared_ptr<bus::IBus>{p};
         }
         case types::bus_kind_t::UART: {
-            auto p = std::make_shared<uart::Bus_remote>(*_session, bus_id, static_cast<const uart::IBusConfig&>(cfg));
+            auto p = std::make_shared<uart::Bus_remote>(_session, bus_id, static_cast<const uart::IBusConfig&>(cfg),
+                                                        bus_lease);
             if (!p) {
                 return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
             }
             return std::shared_ptr<bus::IBus>{p};
         }
         case types::bus_kind_t::I2S: {
-            auto p = std::make_shared<i2s::Bus_remote>(*_session, bus_id, static_cast<const i2s::IBusConfig&>(cfg));
+            auto p = std::make_shared<i2s::Bus_remote>(_session, bus_id, static_cast<const i2s::IBusConfig&>(cfg),
+                                                       bus_lease);
             if (!p) {
                 return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
             }
@@ -248,8 +329,9 @@ result_t<std::shared_ptr<bus::IBus>> RemoteBackend::makeProxyBus(types::bus_kind
     }
 }
 
-result_t<std::shared_ptr<bus::IBus>> RemoteBackend::makeProxyBusFromPinConfig(types::bus_kind_t kind, uint8_t bus_id,
-                                                                              data::ConstDataSpan pin_config)
+result_t<std::shared_ptr<bus::IBus>> RemoteBackend::makeProxyBusFromPinConfig(
+    types::bus_kind_t kind, uint8_t bus_id, data::ConstDataSpan pin_config,
+    const std::shared_ptr<RemoteBusLease>& bus_lease)
 {
     switch (kind) {
         case types::bus_kind_t::I2C: {
@@ -259,7 +341,7 @@ result_t<std::shared_ptr<bus::IBus>> RemoteBackend::makeProxyBusFromPinConfig(ty
             i2c::IBusConfig cfg;
             cfg.pin_scl = readI16LE(pin_config.data);
             cfg.pin_sda = readI16LE(pin_config.data + 2);
-            auto p      = std::make_shared<i2c::Bus_remote>(*_session, bus_id, cfg);
+            auto p      = std::make_shared<i2c::Bus_remote>(_session, bus_id, cfg, bus_lease);
             if (!p) {
                 return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
             }
@@ -273,7 +355,7 @@ result_t<std::shared_ptr<bus::IBus>> RemoteBackend::makeProxyBusFromPinConfig(ty
             cfg.pin_clk  = readI16LE(pin_config.data);
             cfg.pin_mosi = readI16LE(pin_config.data + 2);
             cfg.pin_miso = readI16LE(pin_config.data + 4);
-            auto p       = std::make_shared<spi::Bus_remote>(*_session, bus_id, cfg);
+            auto p       = std::make_shared<spi::Bus_remote>(_session, bus_id, cfg, bus_lease);
             if (!p) {
                 return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
             }
@@ -288,7 +370,7 @@ result_t<std::shared_ptr<bus::IBus>> RemoteBackend::makeProxyBusFromPinConfig(ty
             cfg.pin_rx         = readI16LE(pin_config.data + 2);
             cfg.rx_buffer_size = static_cast<size_t>(pin_config.data[5]) * 256;
             cfg.tx_buffer_size = static_cast<size_t>(pin_config.data[6]) * 256;
-            auto p             = std::make_shared<uart::Bus_remote>(*_session, bus_id, cfg);
+            auto p             = std::make_shared<uart::Bus_remote>(_session, bus_id, cfg, bus_lease);
             if (!p) {
                 return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
             }
@@ -306,7 +388,7 @@ result_t<std::shared_ptr<bus::IBus>> RemoteBackend::makeProxyBusFromPinConfig(ty
             cfg.role           = pin_config.data[8] != 0 ? i2s::IBusConfig::Role::Slave : i2s::IBusConfig::Role::Master;
             cfg.tx_buffer_size = static_cast<size_t>(pin_config.data[9]) * 1024;
             cfg.rx_buffer_size = static_cast<size_t>(pin_config.data[10]) * 1024;
-            auto p             = std::make_shared<i2s::Bus_remote>(*_session, bus_id, cfg);
+            auto p             = std::make_shared<i2s::Bus_remote>(_session, bus_id, cfg, bus_lease);
             if (!p) {
                 return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
             }
@@ -433,31 +515,13 @@ result_t<size_t> RemoteBackend::extractPinConfigFromLogical(types::bus_kind_t ki
 
 uint8_t RemoteBackend::allocateBusId(types::bus_kind_t kind)
 {
-    const uint8_t idx = detail::remoteKindIndex(kind);
-    if (idx >= 4) {
-        return 0xFF;
-    }
-    for (uint8_t i = 0; i < bytecode::kMaxBusBindings; ++i) {
-        if (!(_bus_id_used[idx] & (1u << i))) {
-            return i;
-        }
-    }
-    return 0xFF;
-}
-
-void RemoteBackend::commitBusId(types::bus_kind_t kind, uint8_t bus_id)
-{
-    const uint8_t idx = detail::remoteKindIndex(kind);
-    if (idx < 4 && bus_id < bytecode::kMaxBusBindings) {
-        _bus_id_used[idx] |= static_cast<uint8_t>(1u << bus_id);
-    }
+    return _bus_ids ? _bus_ids->reserve(kind) : 0xFF;
 }
 
 void RemoteBackend::freeBusId(types::bus_kind_t kind, uint8_t bus_id)
 {
-    const uint8_t idx = detail::remoteKindIndex(kind);
-    if (idx < 4 && bus_id < bytecode::kMaxBusBindings) {
-        _bus_id_used[idx] &= static_cast<uint8_t>(~(1u << bus_id));
+    if (_bus_ids) {
+        _bus_ids->release(kind, bus_id);
     }
 }
 

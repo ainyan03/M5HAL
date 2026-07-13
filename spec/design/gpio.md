@@ -141,6 +141,11 @@ public:
     // Pin factory (default 実装: portForPin → IPort::getPin)
     virtual Pin getPin(types::gpio_local_pin_t local_pin) const;
 
+    // GPIOGroup の watch poll pass が対象を判定するための申告
+    // (default = false = poll 対象。true を返す IGPIO は poll pass が
+    // 完全にスキップし、状態は notifyPinStateChanged 経由でのみ届く)
+    virtual bool hasPushEvents() const;
+
 protected:
     ~IGPIO() = default;   // protected non-virtual
 };
@@ -166,6 +171,7 @@ protected:
 - **`getPortCount()`** — 内蔵 Port 数
 - **`isValid(local_pin)`** — default は `local_pin < getPinCount()` (`gpio_local_pin_t` は unsigned なので下限チェック不要)。 IGPIO 自身の **ローカル空間内** での判定のみを担う (グローバル空間判定は `GPIOGroup::isValid` の責務)
 - **`getPin(local_pin)`** — default は `portForPin(local_pin)->getPin(local_pin)`。 IGPIO はローカル空間 (0〜pin_count-1) を扱う、 グローバル `gpio_number_t` 解決は `GPIOGroup` 経由
+- **`hasPushEvents()`** — default `false`。 `GPIOGroup` の watch poll pass がこの IGPIO を対象にするかの申告。 `true` を返す IGPIO (remote GPIO 等) は poll pass が完全にスキップし、 状態は `GPIOGroup::notifyPinStateChanged` 経由でのみ届く (単一ソース規約、 §GPIOGroup の watcher API を参照)
 - **protected non-virtual dtor** — IPort と同じ
 
 ### variant 注入の構図
@@ -201,25 +207,17 @@ class GPIOGroup {
 public:
     static constexpr size_t kSlotCount     = 128;  // slot 番号空間の上限 (番号は 0〜127)
     static constexpr size_t kMaxEntries    = 16;   // 物理ストレージ容量 (同時登録できる IGPIO 数)
-    static constexpr size_t kMaxWatchers   = 16;
-    static constexpr size_t kMaxWatchEvents = 32;
 
-    using watch_id_t = uint16_t;
+    static constexpr uint32_t kDefaultWatchIntervalUs = 1000;
 
     enum class Edge : uint8_t {
         Rising,
         Falling,
-        Change,
     };
 
-    using WatchCallback = void (*)(void* ctx, types::gpio_number_t pin, bool level, Edge edge);
+    using WatchSink = void (*)(void* ctx, types::gpio_number_t pin, bool level, Edge edge);
 
-    struct WatchConfig {
-        uint32_t poll_interval_us = 1000;
-        uint32_t debounce_us      = 0;
-    };
-
-    GPIOGroup() noexcept = default;
+    GPIOGroup() noexcept;
     explicit GPIOGroup(const IGPIO* mcu_gpio) noexcept;     // mcu_gpio を slot 0 に load
 
     // 非コピー / 非ムーブ
@@ -234,14 +232,11 @@ public:
 
     void bindServiceRunner(service::ServiceRunner* runner);
 
-    [[nodiscard]] result_t<watch_id_t>
-    watch(types::gpio_number_t gpio_num, Edge edge, WatchCallback callback);
-    [[nodiscard]] result_t<watch_id_t>
-    watch(types::gpio_number_t gpio_num, Edge edge, WatchCallback callback, void* ctx);
-    [[nodiscard]] result_t<watch_id_t>
-    watch(types::gpio_number_t gpio_num, Edge edge, WatchCallback callback, void* ctx, const WatchConfig& cfg);
+    [[nodiscard]] result_t<void>
+    setWatchSink(WatchSink sink, void* ctx, uint32_t poll_interval_us = kDefaultWatchIntervalUs);
 
-    bool unwatch(watch_id_t id);
+    [[nodiscard]] result_t<void> watch(types::gpio_number_t gpio_num);
+    result_t<void> unwatch(types::gpio_number_t gpio_num);
     void clearWatchers();
 
     [[nodiscard]] result_t<void>
@@ -293,7 +288,7 @@ private:
 - **最大 `kMaxEntries`(=16) エントリの密配列** — slot 番号空間 0〜127 (`kSlotCount = 128`) を維持しつつ物理 storage は密配列で持つ (sparse key / dense storage)。 128 全 slot を物理確保する疎配列ではなくメモリ削減を優先
 - **MCU GPIO は ctor で slot 0 に load**
 - **slot の `IGPIO*` は `const IGPIO*`**
-- **watcher API** — `bindServiceRunner` で service runner に接続し、`watch` / `unwatch` / `clearWatchers` / `notifyPinStateChanged` で poll 型の GPIO 変化通知を扱う。remote GPIO push event はこの watch 基盤を使う
+- **watcher API** — `bindServiceRunner` で service runner に接続し、`setWatchSink` / `watch` / `unwatch` / `clearWatchers` / `notifyPinStateChanged` で GPIO 変化通知を扱う (§watcher API 参照)。remote GPIO push event はこの watch 基盤を使う
 - **deny mask** — `setDenyMask(slot, port_index, mask)` が port ごとの禁止 bit を登録する。`isValid` / `tryGetPin` と port 一括操作は deny bit を公開不可 pin として扱う
 - **PortAccess** — `getPort(slot, port_index)` は `IPort*` と `deny_mask` をまとめて返し、remote の `GpioPortRead` / `GpioPortWrite` がポート一括操作時に deny mask を適用できるようにする
 
@@ -322,11 +317,53 @@ private:
 
 `GPIOGroup` の `addGPIO` に別 `GPIOGroup` をぶら下げる多層構造はサポートしない。
 
+### watcher API (port mask 方式)
+
+`watch` / `unwatch` はピン単位の atomic ポートマスクへの RMW で実装され、ロックフリー・任意
+スレッドから並行呼び出し可能。コールバックはグループ**単一** sink (`setWatchSink` で登録・
+差し替え・解除) で受け、per-pin コールバック・per-pin edge filter・イベントキューは持たない
+(旧 `watch_id_t` / `WatchConfig` / per-pin edge filter / event queue は削除済み)。
+
+- **単一ソース規約**: 各 (slot, port) の状態源は poll (ServiceRunner 経由のポーリング) か push
+  (`notifyPinStateChanged`) の**どちらか一方**。`IGPIO::hasPushEvents()` が push 側を申告し、
+  poll pass は該当 entry を完全にスキップする。これにより shadow (直前値のスナップショット) の
+  書き手がポート単位で一系統になり、edge 検出 (XOR による変化ビット抽出) がレースフリーになる。
+  `notifyPinStateChanged` は `hasPushEvents() == true` の IGPIO 専用 (poll 対象 pin へ呼ぶと
+  単一ソース規約が崩れ、動作は未定義)
+- **sink はグループ単一**: 登録・差し替え・解除は `setWatchSink` に一本化。並行する
+  `setWatchSink` 同士は未サポート (結果未定義)。`watch` / `unwatch` は任意スレッドから
+  `setWatchSink` と並行して呼べる。sink 解除 (`setWatchSink(nullptr, ...)` / `clearWatchers`)
+  が戻った時点で以後 sink は呼ばれない。ただし sink コールバック自身から自己解除した場合は
+  自分の in-flight 完了を待たずに戻る (再入可能。コールバックは短時間・非ブロッキングで、
+  `notifyPinStateChanged` / `runOnce` / bus・remote トランザクション開始を呼んではならない)
+- **`setWatchSink` の失敗セマンティクス**: `OUT_OF_RESOURCE` (service runner のテーブル満杯)
+  で失敗した場合の状態は決定的 — sink 未登録・poll service 未登録。差し替えの失敗でも
+  旧 sink は復元されない (旧 service は解除済みで、再登録が同様に失敗しうるため復元は
+  保証できない)。呼び出し側はリトライ可
+- **`unwatch` は in-flight 完了を待たない**: 呼び出しが戻った直後にも、当該ピンの飛行中
+  イベントが 1 回届きうる (待つのは sink 解除のみ)
+- **監視可能 pin は port 0/1 (local pin 0..63)**: それを超える pin、または deny mask 対象 pin
+  の `watch()` は `INVALID_ARGUMENT`
+- **poll 周期はグループ単一** (`setWatchSink` の `poll_interval_us`、 0 は `kDefaultWatchIntervalUs`
+  に丸める)。per-pin 周期・debounce は提供しない (必要なら sink 側 / 上層で実装する)
+- **`watch()` の検出保証**: 呼び出しが戻った時点以降の遷移を検出する。呼び出し中に跨いだ
+  遷移は初回イベントに畳まれうる
+
 ### thread safety / lifetime 規約
 
 - **規約**: `addGPIO` / `removeGPIO` は startup 時のみ、 以降 immutable
 - runtime には read-only access と watcher dispatch が走る。`addGPIO` / `removeGPIO` / `setDenyMask` は startup 時に確定させる
 - 規約違反 (runtime register / 走査中 register / 走査中 mask 変更) の動作は未定義
+- **Hal 管理 remote slot の例外**: `Hal::connect` / `initUart` / `initTcp` は watcher と connection
+  service を外した切替区間で remote `IGPIO` を内部的に remove/add する。caller が runtime に
+  `GPIOGroup::removeGPIO` してよいという意味ではない。切替前に取得済みの `Pin` / `PortAccess` は
+  raw `IPort*` を含むため、旧 remote port storage はその `Hal` の破棄まで保持される。旧 handle は
+  close 済みなので新 peer へ付け替わらず、read は最終 cache、write / mode 変更は no-op となる
+  ([remote.md](remote.md) §Hal facade)
+- watcher API 自体の並行性契約は上の §watcher API (port mask 方式) を参照
+- watch サービスは `ServiceRunner` に登録して駆動される。sink コールバックの実行コンテキスト・
+  再入可否・ロック外呼び出しの一般契約は [service.md](service.md) の R6 (コールバック契約) /
+  R7 (ロック階層) を参照 (上記の watcher 固有規約はその具体化)
 
 ## IBusConfig との関係
 

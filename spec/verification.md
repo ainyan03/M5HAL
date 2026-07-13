@@ -10,9 +10,11 @@ M5HAL v2 開発で使う検証コマンドとその運用詳細を示す。
 
 | カテゴリ | 用途 | コマンド |
 |---|---|---|
-| native 単体 | gtest による v2 core / GPIO / I2C / SPI / UART / Memory / Source/Sink / frame codec / bytecode の単体テスト | `pio test -e test_native` |
-| remote mux 単体 | `RemoteSession` / `RemoteServerHandler` / data stream / GPIO event の狭い回帰確認。fire-and-forget frame (`requestNoResponse` / reset `Control`) が TX coalescing transport でも滞留しないことを含む | `pio test -e test_native -f v2/native/remote/test_mux_remote` |
+| native 単体 | gtest による v2 core / GPIO / I2C / SPI / UART / Memory / Source/Sink / frame codec / bytecode の単体テスト。BusRegistry の exact-instance consuming release、co-owner `BUSY`、release/acquire 直列化、weak 復活時の lifecycle close も含む | `pio test -e test_native` |
+| remote mux 単体 | `RemoteSession` / `RemoteServerHandler` / data stream / GPIO event の狭い回帰確認。fire-and-forget drain に加え、session 全経路の RPC 直列化、closed handle の旧 proxy `CLOSED`、明示・自然 BusRelease と ID 隔離を含む | `pio test -e test_native -f v2/native/remote/test_mux_remote` |
+| remote TCP E2E | 実物の TCP connection/server 経路。Hal reconnect 後も旧 GPIO `Pin` storage が有効で、新 peer と分離され、最終 cache/no-op 契約になることを含む | `pio test -e test_native -f v2/native/remote/test_tcp_remote_server` |
 | SPI API 単体 | SPI Accessor API skeleton の狭い確認 | `pio test -e test_native -f v2/native/bus/test_spi_api` |
+| ThreadSanitizer | posix runtime の並行性契約 (`service::ServiceRunner` auto-run、[design/service.md](design/service.md) §R1-R8) と remote session/proxy/release の並行回帰を `-fsanitize=thread` つきで検証。`test_native` と同じスイートを別ビルドで走らせる (低頻度・時間がかかるため常用の CI には含めない) | `pio test -e test_native_tsan` |
 | クロスチェック v0 | v0 公開 entry の native + ESP32/S3/C3/C6 Arduino/ESP-IDF build fence | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v0/check.ini.cli pio run -e v0_check_native -e v0_check_esp32_arduino -e v0_check_esp32_espidf -e v0_check_esp32_espidf4 -e v0_check_esp32_espidf6 -e v0_check_esp32s3_arduino -e v0_check_esp32s3_espidf -e v0_check_esp32s3_espidf6 -e v0_check_esp32c3_arduino -e v0_check_esp32c3_espidf -e v0_check_esp32c6_espidf` |
 | クロスチェック v2 | v2 公開 entry と主要 API surface の native + ESP32/S3/C3/C6 Arduino/ESP-IDF build fence | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v2/check.ini.cli pio run -e v2_check_native -e v2_check_esp32_arduino -e v2_check_esp32_espidf -e v2_check_esp32_espidf4 -e v2_check_esp32_espidf6 -e v2_check_esp32s3_arduino -e v2_check_esp32s3_espidf -e v2_check_esp32s3_espidf6 -e v2_check_esp32c3_arduino -e v2_check_esp32c3_espidf -e v2_check_esp32c6_espidf` |
 | v2 inline flip fence | `m5::hal::*` が v2 に resolve される構成の確認 | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v2/check.ini.cli pio run -e v2_check_native_inline` |
@@ -87,7 +89,10 @@ command/address/dummy/data phase の意味を低速 capture で確認する。
 
 software I2C の protocol-level native test は `test/v2/native/bus/test_software_i2c/` にある。 slave 側は `SlaveBus_software` + `SlaveStreamAccessor` (トランザクション窓モデル) と `VirtualOpenDrainBus` の組み合わせで検証する。 probe ACK、write、read-only、write-then-read、address NACK、data NACK、clock stretch timeout、STOP 時 SDA stuck-low、read 最終 byte の master NACK 観測に加え、 窓の分離・Tx 自動消滅・underrun fill を固定している。 slave モデルの詳細は [design/i2c.md](design/i2c.md) §I2C slave を参照。
 
-`est kHz` の解釈や pull-up・bus capacitance 条件による実測周波数の頭打ちについては、詳細は [design/i2c.md](design/i2c.md) §timing と物理層の注意 を参照。 要点: この sketch の `est kHz` は synthetic line driver 上の内部推定であり wire 実測値ではない。実機の wire 品質 (pull-up 強度・配線長・接続 device 数) を別途確認すること。
+`est kHz` の解釈やpull-up・bus capacitance条件による実測周波数の頭打ちについては、詳細は
+[design/i2c.md](design/i2c.md) §timing と物理層の注意 を参照。要点: software I2C native testの
+`est kHz`はsynthetic line driver上の内部推定でありwire実測値ではない。実機のwire品質
+(pull-up強度・配線長・接続device数)を別途確認すること。
 
 ## software SPI 実機 wire self-test 方針
 

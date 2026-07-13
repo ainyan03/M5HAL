@@ -4,6 +4,8 @@
 
 #include "session.hpp"
 
+#include "../../../hal/v2/remote/wire_drain.hpp"
+
 #include <M5Utility.hpp>
 
 #include <cstring>
@@ -12,21 +14,49 @@ namespace m5::hal::v2::remote {
 
 RemoteSession::RemoteSession(data::MuxFrameEncoder& enc, data::MuxFrameDecoder& dec, data::Source& wire_rx,
                              data::Sink& wire_tx)
-    : _enc{&enc}, _dec{&dec}, _wire_rx{&wire_rx}, _wire_tx{&wire_tx}
+    : _enc{&enc},
+      _dec{&dec},
+      _wire_rx{&wire_rx},
+      _wire_tx{&wire_tx},
+      _session_handle{std::make_shared<RemoteSessionHandle>()}
 {
+    if (_session_handle) {
+        _session_handle->bind(*this);
+    }
     _dec->setFrameHandler(frameHandlerThunk, this);
+    _dec->setStaleDataObserver(staleDataThunk, this);
+}
+
+RemoteSession::~RemoteSession()
+{
+    if (_session_handle) {
+        _session_handle->close();
+    }
 }
 
 result_t<void> RemoteSession::request(data::ConstDataSpan script)
+{
+    return request(script, nullptr);
+}
+
+result_t<void> RemoteSession::request(data::ConstDataSpan script, uint8_t* out_seq)
 {
     if (script.size > frame::kMaxPayload) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
     uint8_t seq = nextSeq();
+    if (out_seq != nullptr) {
+        *out_seq = seq;
+    }
+    _last_request_enqueued = false;
     if (!_enc->writeFrame(frame::Kind::Request, seq, script)) {
         return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
     }
-    flushTx();
+    _last_request_enqueued = true;
+    auto flushed           = flushTx();
+    if (!flushed.has_value()) {
+        return m5::stl::make_unexpected(flushed.error());
+    }
     return awaitResponse(seq, frame::Kind::Response);
 }
 
@@ -45,8 +75,7 @@ result_t<void> RemoteSession::requestNoResponse(data::ConstDataSpan script)
     // bare flushTx() can leave these bytes sitting in that buffer
     // indefinitely. Pump once to force the same flush-before-read the
     // read path already performs.
-    pumpWire();
-    return {};
+    return pumpWire();
 }
 
 result_t<void> RemoteSession::hello()
@@ -56,8 +85,17 @@ result_t<void> RemoteSession::hello()
         return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
     }
     ++_config_generation;
-    flushTx();
-    return awaitResponse(seq, frame::Kind::HelloResp);
+    auto flushed = flushTx();
+    if (!flushed.has_value()) {
+        return m5::stl::make_unexpected(flushed.error());
+    }
+    auto resp = awaitResponse(seq, frame::Kind::HelloResp);
+    if (resp.has_value()) {
+        // A fresh session handshake supersedes any in-flight timeout
+        // resync state from the previous connection.
+        clearAllQuarantine();
+    }
+    return resp;
 }
 
 result_t<void> RemoteSession::ping()
@@ -66,7 +104,10 @@ result_t<void> RemoteSession::ping()
     if (!_enc->writeFrame(frame::Kind::Ping, seq, {})) {
         return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
     }
-    flushTx();
+    auto flushed = flushTx();
+    if (!flushed.has_value()) {
+        return m5::stl::make_unexpected(flushed.error());
+    }
     return awaitResponse(seq, frame::Kind::Pong);
 }
 
@@ -76,20 +117,31 @@ result_t<void> RemoteSession::reset()
     if (!_enc->writeFrame(frame::Kind::Control, seq, {})) {
         return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
     }
-    // Reset is fire-and-forget too, so force coalescing transports to
-    // drain just like requestNoResponse().
-    pumpWire();
-    return {};
+    // Reset is fire-and-forget: the host API does not wait for the
+    // device's reset Response (spec/design/remote.md §Control), so a
+    // successful pumpWire() here only proves the local reset frame left
+    // the encoder queue — it says nothing about whether the device has
+    // received it, let alone finished any transfer that was still active.
+    // Quarantine entries are therefore left untouched; they can only be
+    // released by their own terminal-frame match, insurance timer, or a
+    // subsequent successful hello() (see quarantineStream()).
+    return pumpWire();
 }
 
 result_t<size_t> RemoteSession::poll(size_t max_msgs)
 {
     (void)max_msgs;
-    pumpWire();
+    auto pumped = pumpWire();
+    if (!pumped.has_value()) {
+        return m5::stl::make_unexpected(pumped.error());
+    }
     if (_peer_poll != nullptr) {
         _peer_poll(_peer_ctx);
     }
-    pumpWire();
+    pumped = pumpWire();
+    if (!pumped.has_value()) {
+        return m5::stl::make_unexpected(pumped.error());
+    }
     return _rx_count;
 }
 
@@ -116,13 +168,31 @@ void RemoteSession::detachStream(uint8_t stream_id)
     _enc->detach(stream_id);
     _dec->clearSink(stream_id);
     _stream_used &= ~(1u << stream_id);
+    _stream_quarantined &= ~(1u << stream_id);
+}
+
+void RemoteSession::quarantineStream(uint8_t stream_id, uint8_t seq)
+{
+    if (stream_id >= kMaxStreams) {
+        return;
+    }
+    _enc->detach(stream_id);
+    _dec->clearSink(stream_id);
+    // _stream_used stays set — the id remains unavailable to
+    // allocateStreamId() until this entry is released.
+    _stream_quarantined |= (1u << stream_id);
+    _quarantine[stream_id].seq      = seq;
+    _quarantine[stream_id].start_ms = static_cast<uint32_t>(m5::utility::millis());
 }
 
 result_t<void> RemoteSession::checkResponse()
 {
     auto resp = lastResponse();
+    // A response must carry a terminal Report (ReportComplete/ReportError). An
+    // empty payload or a script that never reports is a protocol violation, not
+    // success — matches detail::decodeResponseStatus's contract.
     if (resp.size == 0) {
-        return {};
+        return m5::stl::make_unexpected(error::error_t::PROTOCOL_ERROR);
     }
     bytecode::BytecodeRunner runner{memory::defaultAllocator()};
     runner.setReceiveOnly(true);
@@ -130,7 +200,10 @@ result_t<void> RemoteSession::checkResponse()
     if (!run.has_value()) {
         return m5::stl::make_unexpected(run.error());
     }
-    if (runner.statusReported() && error::isError(runner.reportedStatus())) {
+    if (!runner.statusReported()) {
+        return m5::stl::make_unexpected(error::error_t::PROTOCOL_ERROR);
+    }
+    if (error::isError(runner.reportedStatus())) {
         return m5::stl::make_unexpected(runner.reportedStatus());
     }
     return {};
@@ -138,6 +211,7 @@ result_t<void> RemoteSession::checkResponse()
 
 uint8_t RemoteSession::allocateStreamId()
 {
+    sweepExpiredQuarantine();
     for (uint8_t i = 0; i < kMaxStreams; ++i) {
         if ((_stream_used & (1u << i)) == 0) {
             _stream_used |= (1u << i);
@@ -147,40 +221,66 @@ uint8_t RemoteSession::allocateStreamId()
     return 0xFF;
 }
 
-void RemoteSession::pumpWire()
+void RemoteSession::releaseQuarantineForSeq(uint8_t seq)
 {
-    drainTx();
-    _rx_count = _dec->pump(*_wire_rx);
-    sendCreditIfChanged();
-    flushTx();
+    for (uint8_t i = 0; i < kMaxStreams; ++i) {
+        if ((_stream_quarantined & (1u << i)) != 0 && _quarantine[i].seq == seq) {
+            _stream_quarantined &= ~(1u << i);
+            _stream_used &= ~(1u << i);
+        }
+    }
 }
 
-void RemoteSession::flushTx()
+void RemoteSession::sweepExpiredQuarantine()
 {
-    _enc->pump();
+    if (_stream_quarantined == 0) {
+        return;
+    }
+    const uint32_t now = static_cast<uint32_t>(m5::utility::millis());
+    for (uint8_t i = 0; i < kMaxStreams; ++i) {
+        if ((_stream_quarantined & (1u << i)) == 0) {
+            continue;
+        }
+        // Same wraparound-safe unsigned-subtraction idiom as
+        // awaitResponse()'s timeout check.
+        if (static_cast<uint32_t>(now - _quarantine[i].start_ms) >= _config.stream_quarantine_ms) {
+            _stream_quarantined &= ~(1u << i);
+            _stream_used &= ~(1u << i);
+        }
+    }
+}
+
+void RemoteSession::clearAllQuarantine()
+{
+    _stream_used &= ~_stream_quarantined;
+    _stream_quarantined = 0;
+}
+
+result_t<void> RemoteSession::pumpWire()
+{
     drainTx();
+    auto decoded = _dec->pump(*_wire_rx);
+    if (!decoded.has_value()) {
+        return m5::stl::make_unexpected(decoded.error());
+    }
+    _rx_count = decoded.value();
+    sendCreditIfChanged();
+    return flushTx();
+}
+
+result_t<void> RemoteSession::flushTx()
+{
+    auto encoded = _enc->pump();
+    if (!encoded.has_value()) {
+        return m5::stl::make_unexpected(encoded.error());
+    }
+    drainTx();
+    return {};
 }
 
 void RemoteSession::drainTx()
 {
-    auto& out = _enc->output();
-    while (!out.eof()) {
-        auto p = out.peek(4096);
-        if (!p.has_value() || p.value().size == 0) {
-            break;
-        }
-        auto rsv = _wire_tx->reserve(p.value().size);
-        if (!rsv.has_value() || rsv.value().size == 0) {
-            break;
-        }
-        size_t n = rsv.value().size < p.value().size ? rsv.value().size : p.value().size;
-        ::memcpy(rsv.value().data, p.value().data, n);
-        auto c = _wire_tx->commit(n);
-        if (!c.has_value()) {
-            break;
-        }
-        (void)out.advance(n);
-    }
+    detail::drainToSink(_enc->output(), *_wire_tx);
 }
 
 void RemoteSession::sendCreditIfChanged()
@@ -199,11 +299,17 @@ result_t<void> RemoteSession::awaitResponse(uint8_t seq, frame::Kind want_kind)
         if (static_cast<uint32_t>(m5::utility::millis()) - start > _config.response_timeout_ms) {
             return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
         }
-        pumpWire();
+        auto pumped = pumpWire();
+        if (!pumped.has_value()) {
+            return m5::stl::make_unexpected(pumped.error());
+        }
         if (_peer_poll != nullptr) {
             _peer_poll(_peer_ctx);
         }
-        pumpWire();
+        pumped = pumpWire();
+        if (!pumped.has_value()) {
+            return m5::stl::make_unexpected(pumped.error());
+        }
         if (_got_response) {
             return {};
         }
@@ -218,8 +324,39 @@ void RemoteSession::frameHandlerThunk(void* ctx, const frame::View& view)
     static_cast<RemoteSession*>(ctx)->onFrame(view);
 }
 
+void RemoteSession::staleDataThunk(void* ctx, uint8_t stream_id)
+{
+    static_cast<RemoteSession*>(ctx)->onStaleData(stream_id);
+}
+
+void RemoteSession::onStaleData(uint8_t stream_id)
+{
+    // Only meaningful for a stream_id currently in quarantine — a Data
+    // frame the decoder had nowhere to route for any other id (e.g. a
+    // tx-only transfer's rx side, which legitimately has no Sink) is not
+    // evidence of anything and must not perturb the quarantine table.
+    if (stream_id >= kMaxStreams || (_stream_quarantined & (1u << stream_id)) == 0) {
+        return;
+    }
+    // Mirrors the server's own inactivity semantics (see
+    // Config::stream_quarantine_ms): the peer is still producing for this
+    // id, so the insurance timer must not expire out from under it.
+    _quarantine[stream_id].start_ms = static_cast<uint32_t>(m5::utility::millis());
+}
+
 void RemoteSession::onFrame(const frame::View& view)
 {
+    // A quarantined stream_id is released by the first Response/Control
+    // this session observes that carries the same seq as the request that
+    // triggered the quarantine (the wire is FIFO, so no more Data for that
+    // id can still be in flight once its terminal frame has arrived). This
+    // must fire regardless of whether `view` matches the *current*
+    // awaitResponse() target — both a mismatched frame seen while awaiting
+    // a later request, and a frame seen only via poll() with no pending
+    // await, are valid release points.
+    if (_stream_quarantined != 0 && (view.kind == frame::Kind::Response || view.kind == frame::Kind::Control)) {
+        releaseQuarantineForSeq(view.b3);
+    }
     switch (view.kind) {
         case frame::Kind::Response:
         case frame::Kind::HelloResp:

@@ -9,6 +9,7 @@
 // share one program without an ODR clash.)
 
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 #include <M5HAL_v2.hpp>
 
 #include <cstdint>
@@ -38,5 +39,6 @@ TEST(MasterClockLimitDisabled, AnyFrequencyPassesThrough)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

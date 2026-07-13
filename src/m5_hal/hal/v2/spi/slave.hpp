@@ -19,7 +19,7 @@ namespace m5::hal::v2::spi {
 
   SPI slave is master-clocked, so there is no clock rate here (the master owns
   SCLK): only the four wires, the SPI mode, the bit order, and an optional
-  controller (host) index. `timeout_ms` is the default cap serve() waits for a
+  controller index. `timeout_ms` is the default cap serve() waits for a
   master transaction before returning empty.
  */
 struct SlaveBusConfig : public bus::IBusConfig {
@@ -27,11 +27,15 @@ struct SlaveBusConfig : public bus::IBusConfig {
     types::gpio_number_t pin_mosi = -1;
     types::gpio_number_t pin_miso = -1;
     types::gpio_number_t pin_cs   = -1;
-    uint8_t spi_mode              = 0;                       ///< SPI mode 0..3.
-    uint8_t spi_order             = 0;                       ///< 0 = MSB first.
-    int8_t host                   = -1;                      ///< Controller index; -1 = backend default.
-    uint8_t tx_fill_byte          = 0x00;                    ///< MISO byte clocked once `tx` is exhausted.
-    uint32_t timeout_ms           = types::TIMEOUT_FOREVER;  ///< Default serve() wait for a transaction.
+    uint8_t spi_mode              = 0;  ///< SPI mode 0..3.
+    uint8_t spi_order             = 0;  ///< 0 = MSB first.
+    // Zero-based hardware controller index, e.g. the value returned by
+    // `bus::BusView::claimController` on the SPI BusView. -1 (default) means
+    // the backend's default SPI2 host outside the controller pool ledger; the
+    // caller is solely responsible for avoiding collisions in that mode.
+    int8_t controller    = -1;
+    uint8_t tx_fill_byte = 0x00;                    ///< MISO byte clocked once `tx` is exhausted.
+    uint32_t timeout_ms  = types::TIMEOUT_FOREVER;  ///< Default serve() wait for a transaction.
 
     constexpr SlaveBusConfig(void) : bus::IBusConfig{types::bus_kind_t::SPI}
     {

@@ -163,14 +163,30 @@ size_t FixedBlockPool<BlockSize, BlockCount>::largestFreeRun() const
 template <size_t BlockSize, size_t BlockCount>
 void FixedBlockPool<BlockSize, BlockCount>::lockPool() const
 {
+#if defined(ARDUINO_ARCH_RP2040)
+    noInterrupts();
+    while (_lock) {
+        interrupts();
+        noInterrupts();
+    }
+    _lock = true;
+    interrupts();
+#else
     while (_lock.test_and_set(std::memory_order_acquire)) {
     }
+#endif
 }
 
 template <size_t BlockSize, size_t BlockCount>
 void FixedBlockPool<BlockSize, BlockCount>::unlockPool() const
 {
+#if defined(ARDUINO_ARCH_RP2040)
+    noInterrupts();
+    _lock = false;
+    interrupts();
+#else
     _lock.clear(std::memory_order_release);
+#endif
 }
 
 template <size_t BlockSize, size_t BlockCount>

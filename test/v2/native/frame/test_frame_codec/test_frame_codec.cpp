@@ -7,6 +7,7 @@
 //   delimiter:     [0x00][0x55]
 
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 #include <M5HAL_v2.hpp>
 
 #include <algorithm>
@@ -67,6 +68,29 @@ public:
 
     size_t accept_limit = static_cast<size_t>(-1);
     std::vector<uint8_t> written;
+};
+
+class ErrorAfterPeekSource : public m5::hal::v2::data::Source {
+public:
+    result_t<ConstDataSpan> peek(size_t max_len) override
+    {
+        (void)max_len;
+        return ConstDataSpan{_byte, sizeof(_byte)};
+    }
+
+    result_t<void> advance(size_t N) override
+    {
+        (void)N;
+        return m5::stl::make_unexpected(error_t::IO_ERROR);
+    }
+
+    bool eof() const override
+    {
+        return false;
+    }
+
+private:
+    uint8_t _byte[1] = {0x42};
 };
 
 // ============================================================================
@@ -383,8 +407,9 @@ TEST(BuildDataFrame, BasicSourceToBlock)
     MemorySource src{data, sizeof(data)};
     std::array<uint8_t, 256> block{};
 
-    size_t frame_size = frame::buildDataFrame(block.data(), 5, src);
-    ASSERT_EQ(frame_size, frame::kHeaderSize + sizeof(data));
+    auto frame_size = frame::buildDataFrame(block.data(), 5, src);
+    ASSERT_TRUE(frame_size.has_value());
+    ASSERT_EQ(frame_size.value(), frame::kHeaderSize + sizeof(data));
     EXPECT_EQ(block[0], frame::kMinCheckedLen + sizeof(data));     // LEN
     EXPECT_EQ(block[1], static_cast<uint8_t>(frame::Kind::Data));  // KIND
     EXPECT_EQ(block[2], frame::check8(block[0], block[1]));        // CHECK8
@@ -398,8 +423,9 @@ TEST(BuildDataFrame, EmptySourceReturnsZero)
     MemorySource src{nullptr, 0};
     std::array<uint8_t, 256> block{};
 
-    size_t frame_size = frame::buildDataFrame(block.data(), 0, src);
-    EXPECT_EQ(frame_size, 0u);
+    auto frame_size = frame::buildDataFrame(block.data(), 0, src);
+    ASSERT_TRUE(frame_size.has_value());
+    EXPECT_EQ(frame_size.value(), 0u);
 }
 
 TEST(BuildDataFrame, MaxPayloadFillsBlock)
@@ -411,8 +437,9 @@ TEST(BuildDataFrame, MaxPayloadFillsBlock)
     MemorySource src{data.data(), data.size()};
     std::array<uint8_t, 256> block{};
 
-    size_t frame_size = frame::buildDataFrame(block.data(), 0xFF, src);
-    EXPECT_EQ(frame_size, 256u);
+    auto frame_size = frame::buildDataFrame(block.data(), 0xFF, src);
+    ASSERT_TRUE(frame_size.has_value());
+    EXPECT_EQ(frame_size.value(), 256u);
     EXPECT_EQ(block[0], 254);  // LEN = 2 + 252
     EXPECT_EQ(block[3], 0xFF);
     EXPECT_EQ(std::memcmp(block.data() + 4, data.data(), data.size()), 0);
@@ -428,8 +455,9 @@ TEST(BuildDataFrame, LargeSourceStopsAt252)
     MemorySource src{data.data(), data.size()};
     std::array<uint8_t, 256> block{};
 
-    size_t frame_size = frame::buildDataFrame(block.data(), 1, src);
-    EXPECT_EQ(frame_size, 256u);
+    auto frame_size = frame::buildDataFrame(block.data(), 1, src);
+    ASSERT_TRUE(frame_size.has_value());
+    EXPECT_EQ(frame_size.value(), 256u);
     EXPECT_EQ(std::memcmp(block.data() + 4, data.data(), 252), 0);
     EXPECT_FALSE(src.eof());
 }
@@ -440,11 +468,12 @@ TEST(BuildDataFrame, ResultDecodesCorrectly)
     MemorySource src{data, sizeof(data)};
     std::array<uint8_t, 256> block{};
 
-    size_t frame_size = frame::buildDataFrame(block.data(), 42, src);
-    ASSERT_GT(frame_size, 0u);
+    auto frame_size = frame::buildDataFrame(block.data(), 42, src);
+    ASSERT_TRUE(frame_size.has_value());
+    ASSERT_GT(frame_size.value(), 0u);
 
     frame::View view;
-    auto result = frame::decode({block.data(), frame_size}, view);
+    auto result = frame::decode({block.data(), frame_size.value()}, view);
     ASSERT_EQ(result.status, frame::DecodeStatus::Ok);
     EXPECT_EQ(view.kind, frame::Kind::Data);
     EXPECT_EQ(view.b3, 42);
@@ -464,9 +493,20 @@ TEST(BuildDataFrame, DivisibleByThree)
     MemorySource src{rgb.data(), rgb.size()};
     std::array<uint8_t, 256> block{};
 
-    size_t frame_size = frame::buildDataFrame(block.data(), 0, src);
-    EXPECT_EQ(frame_size, 256u);
+    auto frame_size = frame::buildDataFrame(block.data(), 0, src);
+    ASSERT_TRUE(frame_size.has_value());
+    EXPECT_EQ(frame_size.value(), 256u);
     EXPECT_TRUE(src.eof());
+}
+
+TEST(BuildDataFrame, AdvanceErrorPropagates)
+{
+    ErrorAfterPeekSource src;
+    std::array<uint8_t, 256> block{};
+
+    auto frame_size = frame::buildDataFrame(block.data(), 0, src);
+    ASSERT_FALSE(frame_size.has_value());
+    EXPECT_EQ(frame_size.error(), error_t::IO_ERROR);
 }
 
 // ============================================================================
@@ -605,7 +645,7 @@ TEST(FrameReader, SkipsPaddingAndSurfacesInvalidThenRecovers)
     EXPECT_EQ(view.b3, 2);
 }
 
-TEST(FrameReader, TimeoutPassesThroughAndViewSurvivesUntilNextCall)
+TEST(FrameReader, EmptyOpenSourceReturnsNeedMoreThenDecodes)
 {
     std::array<uint8_t, 32> buf{};
     const uint8_t payload[] = {0x55, 0x66};
@@ -619,8 +659,8 @@ TEST(FrameReader, TimeoutPassesThroughAndViewSurvivesUntilNextCall)
     frame::View view;
 
     auto result = reader.next(view);
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), error_t::TIMEOUT_ERROR);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value().status, frame::DecodeStatus::NeedMore);
 
     stream.feed(buf.data(), written.value());
     result = reader.next(view);
@@ -710,5 +750,6 @@ TEST(FrameWriter, SinkTooSmallIsBufferOverflow)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

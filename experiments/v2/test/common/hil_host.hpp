@@ -109,7 +109,7 @@ inline void drain(uart::RxAccessor& dev)
 // the test that uses it. Takes the concrete POSIX backend (not the runtime
 // facade `uart::Bus`) because the host needs the backend-specific `open()` /
 // `nativeHandle()` -- the facade exposes only the kind-generic surface
-// (ADR 034 phase-1 follow-up; HIL hosts always run on the POSIX serial backend).
+// (follow-up; HIL hosts always run on the POSIX serial backend).
 inline bool openSynced(uart::Bus_posix& bus, const char* port, uint32_t baud)
 {
     if (bus.open(port, baud) != error::error_t::OK) {

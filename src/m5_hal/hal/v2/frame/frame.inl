@@ -136,14 +136,17 @@ DecodeResult decode(data::ConstDataSpan src, View& view)
     return {DecodeStatus::Ok, full_size};
 }
 
-size_t buildDataFrame(uint8_t* block, uint8_t stream_id, data::Source& src)
+m5::hal::v2::result_t<size_t> buildDataFrame(uint8_t* block, uint8_t stream_id, data::Source& src)
 {
     size_t payload_len = 0;
     uint8_t* payload   = block + kPayloadOffset;
 
     while (payload_len < kMaxPayload) {
         auto peeked = src.peek(kMaxPayload - payload_len);
-        if (!peeked.has_value() || peeked.value().size == 0) {
+        if (!peeked.has_value()) {
+            return m5::stl::make_unexpected(peeked.error());
+        }
+        if (peeked.value().size == 0) {
             break;
         }
         size_t take = peeked.value().size;
@@ -151,12 +154,15 @@ size_t buildDataFrame(uint8_t* block, uint8_t stream_id, data::Source& src)
             take = kMaxPayload - payload_len;
         }
         ::memcpy(payload + payload_len, peeked.value().data, take);
-        (void)src.advance(take);
+        auto advanced = src.advance(take);
+        if (!advanced.has_value()) {
+            return m5::stl::make_unexpected(advanced.error());
+        }
         payload_len += take;
     }
 
     if (payload_len == 0) {
-        return 0;
+        return size_t{0};
     }
 
     const auto len = static_cast<uint8_t>(kMinCheckedLen + payload_len);
@@ -184,11 +190,8 @@ result_t<DecodeResult> FrameReader::next(View& view)
             return m5::stl::make_unexpected(head.error());
         }
         if (head.value().size == 0) {
-            M5HAL_DIAG("wire closed (end of stream)");
-            return m5::stl::make_unexpected(error_t::END_OF_STREAM);
-        }
-        if (head.value().size < 1) {
             if (_source->closed()) {
+                M5HAL_DIAG("wire closed (end of stream)");
                 return m5::stl::make_unexpected(error_t::END_OF_STREAM);
             }
             return DecodeResult{DecodeStatus::NeedMore, 0};

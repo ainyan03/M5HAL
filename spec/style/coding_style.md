@@ -139,7 +139,7 @@ RAII 型:
 
 `.inl` は `src/M5HAL_v2.cpp` (variant 側は各 `hal.inl` hub 経由) から**単一 TU で 1 回だけ
 コンパイル**される実装ファイルであり、ヘッダに実装を置くことは「全 includer での再コンパイル +
-inline 展開」を意味する。基準 (2026-07-02 制定、構造リファクタで全面適用):
+inline 展開」を意味する。基準:
 
 - **`.hpp` に置いてよい実装**: ①テンプレート本体 (定義可視性が必要) ②おおむね 10 行以下の
   trivial なアクセサ・constexpr ヘルパ ③inline 化に性能上の実利がある明示的なホットパス
@@ -161,7 +161,7 @@ inline 展開」を意味する。基準 (2026-07-02 制定、構造リファク
 
 M5HAL のマクロは用途で 2 系統に分かれる (実態に基づく規約):
 
-- **機能・設定マクロは `M5HAL_` プレフィックス** (アンダースコアなし) + UPPER_SNAKE_CASE — 機能フラグ・外部定義の上書き・assert 等。 例: `M5HAL_FRAMEWORK_HAS_*`, `M5HAL_V2_VARIANT_ID_*`, `M5HAL_VARIANT_CURRENT_*`, `M5HAL_ASSERT`。 世代間で値が異なり得るものは `M5HAL_V2_` で世代分離する (無印は凍結 v0 が所有。 [../design/v0_v2_coexistence.md](../design/v0_v2_coexistence.md) §v2 実装者が破ってはならない唯一の不変条件)
+- **機能・設定マクロは `M5HAL_` プレフィックス** (アンダースコアなし) + UPPER_SNAKE_CASE — 機能フラグ・外部定義の上書き・assert 等。 例: `M5HAL_FRAMEWORK_HAS_*`, `M5HAL_V2_VARIANT_ID_*`, `M5HAL_VARIANT_CURRENT_*`, `M5HAL_ASSERT`。 世代間で値が異なり得るものは `M5HAL_V2_` で世代分離する (無印は変更不可の v0 が所有。 [../design/v0_v2_coexistence.md](../design/v0_v2_coexistence.md) §v2 実装者が破ってはならない唯一の不変条件)
 - **ヘッダガードは `M5_HAL_<PATH>_HPP` プレフィックス** (`M5_HAL_` = アンダースコアあり、 ファイルパスベース) — 機能マクロの `M5HAL_` と区別する。 例: `M5_HAL_TYPES_HPP`, `M5_HAL_GPIO_GROUP_HPP_`, `M5_HAL_ASSERT_HPP`
 - 内部用途のマクロは末尾アンダースコアを付けて区別する (例: `M5HAL_VARIANT_CURRENT_*_`)
 

@@ -19,12 +19,14 @@
 | ストリームのフレーム化を知る | [design/frame.md](design/frame.md), [design/data_io.md](design/data_io.md) §Stream アダプタ |
 | HAL 操作の bytecode 化を知る | [design/bytecode.md](design/bytecode.md) |
 | リモートバス機構を知る | [design/remote.md](design/remote.md) (下層: frame / bytecode / data_io) |
-| I2C / SPI / UART / I2S を実装・レビューする | [design/i2c.md](design/i2c.md), [design/spi.md](design/spi.md), [design/uart.md](design/uart.md), [design/i2s.md](design/i2s.md), [verification.md](verification.md) |
+| I2C / I2C slave / SPI / UART / I2S を実装・レビューする | [design/i2c.md](design/i2c.md), [design/i2c_slave.md](design/i2c_slave.md), [design/spi.md](design/spi.md), [design/uart.md](design/uart.md), [design/i2s.md](design/i2s.md), [verification.md](verification.md) |
 | 新しい variant を追加する (ポーティング) | [porting_guide/](porting_guide/README.md) (手順レシピ), [design/variants.md](design/variants.md) (設計仕様) |
 | GPIO / variant を実装・レビューする | [design/gpio.md](design/gpio.md), [design/variants.md](design/variants.md), [reference/directory-layout.md](reference/directory-layout.md) |
-| runtime 設備 (time / mutex) と Bus 排他の意味論を知る | [design/runtime.md](design/runtime.md), [design/bus_accessor.md](design/bus_accessor.md) §排他制御の意味論 |
+| runtime 設備 (time / mutex / task) と Bus 排他の意味論を知る | [design/runtime.md](design/runtime.md), [design/bus_accessor.md](design/bus_accessor.md) §排他制御の意味論 |
+| バックグラウンド実行 (auto-run) の並行性契約を知る | [design/service.md](design/service.md) |
 | ビルド時の挙動を設定する (`M5HAL_CONFIG_*`) | [design/configuration.md](design/configuration.md) |
 | エラーコードの意味と対処を調べる | [design/errors.md](design/errors.md) |
+| 一時メモリpoolとallocatorを実装・レビューする | [design/memory.md](design/memory.md) |
 | ディレクトリ・名前空間の 1:1 規約を確認する | [reference/directory-layout.md](reference/directory-layout.md) |
 | プロジェクト全体の方針を確認する | [goals.md](goals.md), [architecture.md](architecture.md) |
 
@@ -47,7 +49,7 @@
 各文書は冒頭の `> **読者**:` ラベルで枠を明示する。ラベルは 3 種 — 「利用者向け」/
 「実装者・レビュー向け（設計仕様）」/「メンテナ向け（ビルド・運用・規約）」で、後 2 者が
 メンテナ・コントリビュータ枠に属する。メンテナ枠の設計文書は「なぜこの形か・何を不採用に
-したか」を **§設計判断** 節に現在形で持つ (→ 運用ルール)。
+したか」を**根拠節** (`## 採用しない要素` / `## なぜ〜か`) に現在形で持つ (→ 運用ルール)。
 
 ## ファイルマップ
 
@@ -55,6 +57,7 @@
 |---|---|
 | [goals.md](goals.md) | 上位方針、スコープ、成功条件 |
 | [architecture.md](architecture.md) | 全体構造、層構成、配置原則 |
+| [stability.md](stability.md) | API 安定度 (experimental / unstable / stable) と変更不可の範囲 |
 | [design/](design/) | kind / 機構ごとの確定仕様 |
 | [reference/directory-layout.md](reference/directory-layout.md) | 配置規約などの補助リファレンス |
 | [porting_guide/](porting_guide/) | variant 追加のレシピ (framework / platform) |
@@ -68,5 +71,6 @@
 - **時系列・人名・検討プロセス** (いつ誰がどう決めたか、巻き戻しの顛末) は `spec/` の
   本文に書かない
 - ただし**現在形で書ける設計判断の根拠** (なぜこの形か・何を不採用にしたか) は仕様の
-  一部であり、各設計文書の **§設計判断** 節に数行で置く。判断が改定されたら節を
-  in-place で書き換える (訂正の追記を積み増さない)
+  一部であり、各設計文書の**根拠節**に数行で置く。節名は内容に合わせる —
+  不採用案の要約なら `## 採用しない要素`、形の理由なら `## なぜ〜か`。判断が改定されたら
+  節を in-place で書き換える (訂正の追記を積み増さない)

@@ -10,6 +10,8 @@
 
 #include <esp_err.h>
 
+#include <cstdint>
+
 #include "../../../freertos/hal/runtime/time.hpp"
 
 namespace m5::hal::v2::i2c {
@@ -46,9 +48,36 @@ bool isValidAddress(const i2c::MasterAccessConfig& cfg)
     return !cfg.address_is_10bit && cfg.i2c_addr <= 0x007Fu;
 }
 
-::TickType_t timeoutTicks(uint32_t timeout_ms)
+// Whole-command budget for the legacy blocking API. i2c_master_cmd_begin's
+// ticks_to_wait bounds the WHOLE queued command chain (driver/i2c.c takes
+// cmd_mux and waits each event against the same deadline), so passing
+// wire_timeout_ms straight through expires mid-transfer on healthy wires once
+// the transfer straddles a tick boundary -- the same tick-quantization race
+// measured and fixed on the gen5 driver (see backend_master_gen5.inl's
+// transactionTimeoutMs). Budget = expected wire time + the configured
+// progress allowance + two tick periods (an N-tick wait guarantees only N-1
+// full tick periods of real time).
+::TickType_t transactionTimeoutTicks(uint32_t wire_timeout_ms, uint64_t total_bytes, uint32_t freq_hz)
 {
-    return ::m5::hal::v2::detail::timeoutMsToTicks(timeout_ms);
+    if (wire_timeout_ms == types::TIMEOUT_FOREVER) {
+        return portMAX_DELAY;
+    }
+    // A Sink-driven read may legitimately request SIZE_MAX ("drain the sink");
+    // saturate before the bit math below can wrap uint64.
+    constexpr uint64_t kMaxCountedBytes = (UINT64_MAX / (9u * 1000u)) - 4u;
+    uint64_t total_ms;
+    if (total_bytes > kMaxCountedBytes) {
+        total_ms = 0xFFFFFFFEu;
+    } else {
+        // 9 SCL cycles per byte (8 data + ACK); +4 bytes covers the address
+        // byte(s) and START/RESTART/STOP framing across both phases.
+        const uint64_t wire_ms = ((total_bytes + 4u) * 9u * 1000u) / (freq_hz != 0 ? freq_hz : 1u) + 1u;
+        total_ms               = wire_ms + wire_timeout_ms + 2u * portTICK_PERIOD_MS;
+        if (total_ms > 0xFFFFFFFEu) {
+            total_ms = 0xFFFFFFFEu;  // stay below the TIMEOUT_FOREVER sentinel
+        }
+    }
+    return ::m5::hal::v2::detail::timeoutMsToTicks(static_cast<uint32_t>(total_ms));
 }
 
 }  // namespace impl_espidf_gen4
@@ -109,6 +138,11 @@ result_t<void> Bus_espidf::release(void)
     return {};
 }
 
+// Unlike the gen5 driver, the legacy `i2c_master_cmd_begin` timeout paths
+// (both the queue-receive timeout branch and the I2C_STATUS_TIMEOUT branch)
+// call `i2c_hw_fsm_reset()` -- which folds in a clear-bus -- synchronously,
+// before returning ESP_ERR_TIMEOUT. So this backend already returns with the
+// bus terminated on a timeout; no additional recovery call is needed here.
 result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const i2c::MasterAccessConfig& cfg,
                                     const i2c::TransferDesc& desc, data::Source* src, size_t tx_len, data::Sink* dst,
                                     size_t rx_len)
@@ -155,7 +189,8 @@ result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const i2c::MasterAcce
 
     const bool have_tx = !write_bytes.empty();
     const bool have_rx = (dst != nullptr && rx_len > 0);
-    const auto ticks   = impl_espidf_gen4::timeoutTicks(cfg.wire_timeout_ms);
+    const auto ticks   = impl_espidf_gen4::transactionTimeoutTicks(
+        cfg.wire_timeout_ms, static_cast<uint64_t>(write_bytes.size()) + (have_rx ? rx_len : 0), freq);
 
     if (!have_tx && !have_rx) {
         auto cmd = ::i2c_cmd_link_create();

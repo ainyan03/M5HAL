@@ -18,18 +18,18 @@
 
 /*!
   @namespace m5::hal::v2::bus
-  @brief Kind-neutral runtime bus facades (ADR 034 phase D/E).
+  @brief Kind-neutral runtime bus facades.
 
   Every kind's runtime `Bus` shares a `unique_ptr`-held swappable backend, a
   templated `init`, a `release`, and the lock-free backend-query mirror. That
-  shared spine lives in the phase-1/2 base all four kinds (i2c / spi / uart /
+  shared spine lives in the base all four kinds (i2c / spi / uart /
   i2s) derive from:
 
   - `FacadeCore<Traits>` — the shared `Bus` spine: backend ownership + `init` +
     `release` + the query mirror. It only needs a Traits with `IBus`,
     `IBusConfig`, and `BackendFor`.
 
-  The master kinds (i2c / spi) extend the facade with the phase-3 intent +
+  The master kinds (i2c / spi) extend the facade with the intent +
   hot-swap surface:
 
   - `ManagedBusFacade<Traits>` — `FacadeCore<Traits>` plus `IManagedBus` (the
@@ -88,7 +88,7 @@ namespace m5::hal::v2::bus {
  */
 
 /*!
-  @brief Shared phase-1/2 spine for every kind's runtime `Bus`.
+  @brief Shared spine for every kind's runtime `Bus`.
 
   Inherits the kind's concrete `IBus` (so it owns the mutex + lock/unlock + the
   covariant `getConfig` reading the protected `_config`). It holds the concrete
@@ -112,7 +112,7 @@ namespace m5::hal::v2::bus {
 
   A kind with no data-path beyond the base (none today) could derive `Bus`
   directly; uart / i2s derive it and add only their kind data-path overrides,
-  while i2c / spi go through `ManagedBusFacade` for the phase-3 surface.
+  while i2c / spi go through `ManagedBusFacade` for the intent + hot-swap surface.
  */
 template <class Traits>
 struct FacadeCore : public Traits::IBus {
@@ -139,7 +139,7 @@ struct FacadeCore : public Traits::IBus {
       `OUT_OF_RESOURCE`. On success the facade adopts the backend and caches
       the pin config for `getConfig`/`probe`.
 
-      Lifecycle note (D1/F8): `init`/`release` are NOT synchronized with access
+      Lifecycle note: `init`/`release` are NOT synchronized with access
       windows. The supported paths never race: a typed `acquire<CfgT>` interns a
       fresh facade and first-inits it (no accessor exists yet), the managed
       hot-swap path replaces the backend under the bus lock (`swapBackendWith`),
@@ -174,7 +174,7 @@ struct FacadeCore : public Traits::IBus {
     /*!
       @brief Release and drop the backend (startup/shutdown only).
 
-      See the `init` lifecycle note (D1/F8): not synchronized with access
+      See the `init` lifecycle note: not synchronized with access
       windows. Call only when no accessor on this bus is in an access window.
      */
     result_t<void> release(void) override
@@ -191,7 +191,7 @@ struct FacadeCore : public Traits::IBus {
         return {};
     }
 
-    // Backend query API (ADR 034). To stay safe when another task commits and
+    // Backend query API. To stay safe when another task commits and
     // hot-swaps the backend, the metadata is mirrored into facade-owned atomics
     // (refreshed inside the swap, under the bus lock) so the query path never
     // dereferences the live `_backend`. Reads are lock-free; the per-field
@@ -256,7 +256,7 @@ protected:
         }
     }
 
-    std::unique_ptr<IBus> _backend;        // the swappable backend (Phase 3 hot-swap seam)
+    std::unique_ptr<IBus> _backend;        // the swappable backend (hot-swap seam)
     std::atomic<uint32_t> _generation{0};  // bumped on every backend swap (poll baseline)
 
 private:
@@ -267,7 +267,7 @@ private:
 };
 
 /*!
-  @brief Master runtime facade with the phase-3 intent + hot-swap surface.
+  @brief Master runtime facade with the intent + hot-swap surface.
 
   Extends `FacadeCore<Traits>` (the shared backend spine) with `bus::IManagedBus`
   (the intent + hot-swap surface the resolver touches). `bus::IManagedBus` does
@@ -277,7 +277,7 @@ private:
   The concrete backend lives behind `FacadeCore`'s `unique_ptr`; `transfer` is
   forwarded to it while every lock/accessor-binding stays on THIS object. That
   is the hot-swap seam: a later commit can replace the backend under the facade
-  lock without rebinding accessors (ADR 034). The backend the swap touches is
+  lock without rebinding accessors. The backend the swap touches is
   the inherited `FacadeCore` member, reached through `this->_backend` /
   `this->_cacheBackendMeta()` / `this->_generation` (dependent-base names need
   the `this->` qualification under two-phase lookup).
@@ -307,7 +307,7 @@ struct ManagedBusFacade : public FacadeCore<Traits>, public IManagedBus {
     /*!
       @brief Adopt a ready (already-`init`-ed) backend for a logical acquire.
 
-      Backs the phase-3 logical path (`BusView::acquire(LogicalBusConfig)`):
+      Backs the logical acquire path (`BusView::acquire(LogicalBusConfig)`):
       the view builds the backend through a factory and hands it here, where
       the facade caches the wiring (for `getConfig`/`probe`) and records the
       acquire intent for the commit-time resolver. Marks the bus as
@@ -374,58 +374,107 @@ struct ManagedBusFacade : public FacadeCore<Traits>, public IManagedBus {
     }
 
     /*!
-      @brief Build (under the lock) and adopt a backend via a factory (ADR 034 hot-swap).
+      @brief Release the old backend, then build (under the lock) and adopt a
+             new one via a factory, with a rollback factory for a failed
+             build (hot-swap).
 
       Takes the facade's lock -- the same one accessors contend on -- through a
       stack sentinel, so a swap waits for any in-flight transfer to finish and,
       with a finite `timeout_ms`, returns `TIMEOUT_ERROR` instead of wedging
-      when the bus stays busy. `make()` runs INSIDE the lock, so the new
-      backend's `init()` (which drives pins / installs a driver) cannot race an
-      in-flight transfer on the old backend (D1/F1: the hardware-visible part of
-      the swap is now guarded by the same ownership the swap claims). The old
-      backend is `release`-d before the new one is adopted; a release failure
-      ABORTS the swap with the old backend kept and the error propagated (D1/F7)
-      rather than silently dropped, so the controller pool never reclaims an
-      unreleased resource. The query metadata is refreshed and the generation
-      counter is bumped LAST so a poller that sees the new generation reads
-      settled metadata.
+      when the bus stays busy. Processing order, all under the lock:
 
-      `make()` returns a raw `bus::IBus*`; it is always this kind's `IBus` (this
-      kind's factory made it), so it is downcast to the typed backend the facade
-      owns. A null result is `OUT_OF_RESOURCE` unless `allow_null` (the
-      software-less "pending" detach path).
+       1. The OLD backend (if any) is `release`-d and dropped FIRST, before the
+          new one is built. A release failure (other than `NOT_IMPLEMENTED`,
+          the base default for a backend with nothing to free) ABORTS the swap
+          immediately: the old backend is left untouched (never reset),
+          `make()`/`rollback()` never run, and the error propagates, so the
+          controller pool never reclaims an unreleased resource.
+       2. `make()` runs to build the new backend; its `init()` (which drives
+          pins / installs a driver) is guarded by the same lock accessors
+          contend on, so it cannot race an in-flight transfer.
+       3. A null `make()` result (unless `allow_null`, the software-less
+          "pending" path) means the new backend could not be built with the
+          old one already released: `rollback()` is invoked to try to
+          reconstruct the old configuration (a fresh backend for the same
+          kind/controller the old one had). Whatever `rollback()` returns is
+          adopted -- a real backend on success, or null ("pending") if it
+          also fails -- and `OUT_OF_RESOURCE` is returned either way (a
+          degraded bus is never left silent).
+
+      Releasing before building (rather than the reverse) removes two hazards
+      a build-first order has: two initialized backends never coexist on the
+      same pins (a new backend's `init()` racing the old backend's
+      not-yet-run `release()`), and an aborted swap never leaves an
+      initialized-but-unused backend for a `unique_ptr` to destroy (whose
+      dtor would run its own `release()` and disturb the pins the "kept" old
+      backend still owns). The cost is that `rollback()` is a best-effort
+      re-`init()`, not a guarantee (a driver re-install can fail for the
+      same reason the build did, e.g. OOM) -- callers must still check the
+      returned `result_t`.
+
+      The query metadata is refreshed and the generation counter is bumped
+      LAST in every adopted outcome (success, or the null/rollback fallback)
+      so a poller that sees the new generation reads settled metadata.
+
+      `make()`/`rollback()` return a raw `bus::IBus*`; it is always this
+      kind's `IBus` (this kind's factory made it), so it is downcast to the
+      typed backend the facade owns.
      */
-    template <class MakeBackend>
-    result_t<void> swapBackendWith(uint32_t timeout_ms, bool allow_null, MakeBackend&& make)
+    template <class MakeBackend, class RollbackBackend>
+    result_t<void> swapBackendWith(uint32_t timeout_ms, bool allow_null, MakeBackend&& make, RollbackBackend&& rollback)
     {
         MasterAccessConfig sentinel_cfg;
         MasterAccessor sentinel{*this, sentinel_cfg};
         return bus::guarded(
             [&] { return sentinel.beginAccess(timeout_ms); },
             [&]() -> result_t<void> {
-                bus::IBus* raw = make();  // init() runs here, under the lock (F1)
-                if (raw == nullptr && !allow_null) {
-                    return m5::stl::make_unexpected(m5::hal::v2::error::error_t::OUT_OF_RESOURCE);
-                }
-                std::unique_ptr<IBus> typed{static_cast<IBus*>(raw)};
                 if (this->_backend) {
                     auto rel = this->_backend->release();
-                    // Propagate a GENUINE release failure (F7): abort the swap
-                    // with the old backend kept, so the controller pool never
-                    // reclaims an unreleased resource. NOT_IMPLEMENTED is the
-                    // base default ("nothing to free" -- a backend that does not
-                    // override release), which is not a failure, so the swap
-                    // proceeds.
+                    // Propagate a GENUINE release failure: abort the swap
+                    // with the old backend kept (it is never reset below),
+                    // so the controller pool never reclaims an unreleased
+                    // resource. NOT_IMPLEMENTED is the base default
+                    // ("nothing to free" -- a backend that does not
+                    // override release), which is not a failure, so the
+                    // swap proceeds.
                     if (!rel.has_value() && rel.error() != m5::hal::v2::error::error_t::NOT_IMPLEMENTED) {
                         return rel;
                     }
+                    this->_backend.reset();
                 }
-                this->_backend = std::move(typed);
+                bus::IBus* raw = make();  // init() runs here, under the lock, old backend already gone
+                if (raw == nullptr && !allow_null) {
+                    // The new backend could not be built and the old one is
+                    // already released: try to reconstruct it instead of
+                    // leaving the bus backend-less.
+                    this->_backend.reset(static_cast<IBus*>(rollback()));
+                    this->_cacheBackendMeta();
+                    this->_generation.fetch_add(1, std::memory_order_release);
+                    return m5::stl::make_unexpected(m5::hal::v2::error::error_t::OUT_OF_RESOURCE);
+                }
+                this->_backend.reset(static_cast<IBus*>(raw));
                 this->_cacheBackendMeta();
                 this->_generation.fetch_add(1, std::memory_order_release);
                 return {};
             },
             [&] { return sentinel.endAccess(); });
+    }
+
+    /*!
+      @brief `swapBackendWith` without a rollback factory.
+
+      A failed `make()` detaches to null ("pending") instead of reconstructing
+      the old backend -- equivalent to a rollback factory that always returns
+      null. Used by the strict non-null (`swapBackend`) and the software-less
+      pending-detach (`swapPending`) paths, where `make()` cannot fail for a
+      reason a real rollback would help with (their own docs), and by callers
+      (e.g. tests) that have no old configuration worth reconstructing.
+     */
+    template <class MakeBackend>
+    result_t<void> swapBackendWith(uint32_t timeout_ms, bool allow_null, MakeBackend&& make)
+    {
+        return swapBackendWith(timeout_ms, allow_null, std::forward<MakeBackend>(make),
+                               []() -> bus::IBus* { return nullptr; });
     }
 
     /*!
@@ -435,6 +484,15 @@ struct ManagedBusFacade : public FacadeCore<Traits>, public IManagedBus {
       `IAllocationKind::commitHardware` so `init()` happens under the lock; this
       overload remains for callers that already hold an initialized backend
       (e.g. tests). Release errors propagate as in `swapBackendWith`.
+
+      WEAKER GUARANTEE than the factory path: the caller's backend is already
+      initialized before the old one is released, so the two coexist until the
+      swap completes, and a release-failure abort destroys the provided
+      backend while its dtor's own release() runs beside the kept old one.
+      Do not use this overload to swap backends that share a physical
+      resource (pins / controller) with the current backend -- build those
+      through a factory (`swapBackendWith`) so init() happens after the old
+      release.
      */
     result_t<void> swapBackend(std::unique_ptr<bus::IBus> new_backend,
                                uint32_t timeout_ms = types::TIMEOUT_FOREVER) override
@@ -464,7 +522,7 @@ struct ManagedBusFacade : public FacadeCore<Traits>, public IManagedBus {
     }
 
 private:
-    // Phase-3 acquire intent, recorded for the commit-time resolver (ADR 034).
+    // Acquire intent, recorded for the commit-time resolver.
     types::AllocationIntent _intent{};  // capability-based allocation request
     bool _managed = false;              // true => commitBuses() may reassign (logical acquire only)
 };

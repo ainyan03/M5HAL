@@ -13,9 +13,26 @@ opt-in — include `<M5HAL_v2.hpp>` explicitly to try it.
 
 - An ESP32-family board. The published packages target the `espressif32`
   platform (Arduino-ESP32 or ESP-IDF >= 4.4).
+- A compiler with C++17 support.
 - [M5Utility](https://github.com/m5stack/M5Utility) — PlatformIO and the
   ESP-IDF component manager pull it in automatically; in the Arduino IDE,
   install it alongside M5HAL.
+
+## Installation
+
+- **Arduino IDE**: install "M5HAL" from the Library Manager, plus
+  "M5Utility" alongside it.
+- **PlatformIO**: add to `platformio.ini`:
+  ```ini
+  lib_deps =
+      m5stack/M5HAL
+  ```
+  M5Utility resolves automatically as a declared dependency.
+- **ESP-IDF component manager**: add to your project's `idf_component.yml`:
+  ```yaml
+  dependencies:
+    m5stack/M5HAL: "*"
+  ```
 
 ## Documentation
 
@@ -48,17 +65,20 @@ The current v2 bus API is centered on:
 - **Source / Sink** — streaming-friendly data input/output abstractions;
   span and raw pointer overloads are available
 
-**M5_Hal owns the buses; you borrow them**: v2 has no hidden singleton bus,
-but `M5_Hal` does keep a per-kind owning registry. The recommended path is to
-BORROW a bus by its wiring — `M5_Hal.I2C.acquire(cfg)` returns a shared handle
+**Acquire one shared bus per wiring**: v2 has no hidden singleton bus and
+`M5_Hal` does not keep buses alive. Its per-kind registry interns weak references.
+The recommended path is to acquire a bus by its wiring —
+`M5_Hal.I2C.acquire(cfg)` returns a shared owner
 interned by its pins, so a board-support layer and user code that name the same
 pins get the *same* instance — one physical bus, one lock — instead of fighting
 over the wire. Build an accessor straight from the handle and it co-owns the
-bus. `M5_Hal` bundles the GPIO/bus registries and the service runner.
+bus. The bus remains alive until the last returned handle or co-owning accessor
+is destroyed; then its backend is released and the weak registry entry becomes
+reclaimable. `M5_Hal` bundles the GPIO/bus registries and the service runner.
 
 Escape hatch: when you want to own a bus yourself, construct it directly
 (`i2c::Bus bus; bus.init(cfg);`) and hand it to accessors by reference —
-borrowing is just the recommended default. See
+registry acquisition is just the recommended default. See
 [`spec/design/bus_accessor.md`](spec/design/bus_accessor.md) for the
 bus-ownership model and
 [`examples/v2/HowToUse/I2CRegistry`](examples/v2/HowToUse/I2CRegistry/)
@@ -86,7 +106,7 @@ Minimal I2C shape (**Arduino framework**):
 
 namespace m5hal = m5::hal::v2;
 
-std::shared_ptr<m5hal::i2c::IBus> i2c_bus;  // a borrowed handle
+std::shared_ptr<m5hal::i2c::IBus> i2c_bus;  // a shared owner
 
 void setup()
 {
@@ -94,7 +114,7 @@ void setup()
     m5hal::i2c::BusConfig bus_cfg{m5hal::i2c::Scl{22}, m5hal::i2c::Sda{21}};
     bus_cfg.wire = &Wire;
 
-    // Borrow the bus from M5_Hal (it owns the instance; you hold a shared handle).
+    // Acquire the interned bus; this shared_ptr owns its lifetime.
     auto acquired = m5hal::M5_Hal.I2C.acquire(bus_cfg);
     if (!acquired) return;
     i2c_bus = acquired.value();
@@ -108,7 +128,7 @@ void setup()
     dev_cfg.wire_timeout_ms = 100;
     // dev_cfg.register_address_bytes = 2;  // only for 2-byte register-address devices
 
-    m5hal::i2c::MasterAccessor dev{i2c_bus, dev_cfg};  // co-owns the borrowed bus
+    m5hal::i2c::MasterAccessor dev{i2c_bus, dev_cfg};  // co-owns the acquired bus
 
     // Every transfer returns result_t<T> — unwrap it, don't assign directly.
     auto id = dev.readRegister(0x00);   // result_t<uint8_t>, NOT uint8_t
@@ -202,6 +222,19 @@ facade entry point,
 [`examples/v2/RemoteServerTCP`](examples/v2/RemoteServerTCP/) exposes a
 device over TCP, and [`examples/v2/RemoteTest`](examples/v2/RemoteTest/)
 is the host-side protocol test harness.
+
+A remote `Hal` owns one connection session and one RPC serialization gate;
+every bus, GPIO proxy, compatibility session view, and backend operation for
+that connection uses that same gate. Reconnecting closes the old session:
+pre-reconnect bus proxies then return `CLOSED` and are never rebound to the new
+peer. Retained GPIO objects remain memory-safe only while their owning `Hal`
+lives; after reconnect they expose their final cache and ignore writes/mode
+changes. Explicit `BusView::release(shared_ptr&)` requires the caller to be the
+sole owner (destroy accessors and aliases first), consumes and clears the handle
+on success, and leaves it intact on failure. See
+[`spec/design/remote.md`](spec/design/remote.md) and
+[`spec/design/bus_accessor.md`](spec/design/bus_accessor.md) for the complete
+lifetime, callback, and quarantine contracts.
 
 [`examples/v2/HowToUse/Bytecode`](examples/v2/HowToUse/Bytecode/) drives
 GPIO, I2C, and SPI from bytecode scripts written out as plain byte arrays

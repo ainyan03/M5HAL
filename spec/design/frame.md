@@ -56,7 +56,7 @@ Delimiter     : [0x00][0x55]
 
 codec が意味解釈するのは `Data` の stream_id 規則と Padding / Delimiter のみ。その他 kind のフレームも CHECK8 検証と透過運搬は行う (B3 / payload は解釈しない)。各 kind の意味論・B3 の詳細は上位層 ([remote.md](remote.md)) が定める。
 
-`Data` の stream_id (B3) の割当規約 (リモートメッセージチャネル = 0x00 等) は [remote.md](remote.md) §stream_id レジストリが定める。
+`Data` の stream_id (B3) の割当規約 (0..15 全てデータストリーム、 予約チャネルなし) は [remote.md](remote.md) §stream_id レジストリが定める。
 
 ## decode の意味論
 
@@ -107,7 +107,7 @@ auto r = reader.next(view);   // expected<DecodeResult, error_t>
 
 - **Ok 時の advance は次回 `next()` 呼び出しまで遅延する**。`View` は Source の借用 span を指しており、借用 Span の lifetime (次の peek/advance まで有効) と整合させるため。よって **View の有効期間は次の `next()` 呼び出しまで**
 - Padding / Delimiter は内部で読み飛ばす。`Invalid*` は該当バイトを advance 済みの状態で status として返す (caller が resync 事象を計数・記録できる)
-- Source のエラーは素通しする: `StreamSource` の `TIMEOUT_ERROR` は「まだ来ていない、再試行可」。Source が EOF (空 span) を返したら `END_OF_STREAM`
+- Source のエラーは素通しする。Source が空 span を返し、かつ `closed()` なら `END_OF_STREAM`、未 close なら `NeedMore`
 - **取得は二段階**: LEN byte を peek してフレーム実寸 (= 2 + LEN) を確定し、その寸法だけを要求する。バッファ済みのフレームは待たずに即 decode され、`StreamSource` がブロックする (timeout まで) のはフレームが本当に未完のときだけ
 - **要件: Source は各フレームの wire 実寸を一度の `peek` で貸せること** (最大寸フレームには `kMaxFrameSize` = 256。`StreamSource` の scratch を 256 byte にしておけば常に十分)。貸出上限を超えるフレームは `NeedMore` から進まない
 
@@ -115,8 +115,8 @@ auto r = reader.next(view);   // expected<DecodeResult, error_t>
 
 ## 互換性と版管理
 
-- 本フォーマット (M5HAL frame v1) は**実験段階**であり、公開リリースノートで凍結を宣言するまでは非互換変更があり得る
-- 凍結後に wire 非互換の変更が必要になった場合は **v2 として別フォーマット名**を与え、v1 と混在させない
+- 本フォーマット (M5HAL frame v1) の段は **`experimental`** ([../stability.md](../stability.md))。`stable` を宣言するまでは非互換変更があり得る
+- `stable` 宣言後に wire 非互換の変更が必要になった場合は **v2 として別フォーマット名**を与え、v1 と混在させない
 - 予約済みの kind 値は将来の版でも再利用しない (衝突防止のための予約)
 
 ## 採用しない要素

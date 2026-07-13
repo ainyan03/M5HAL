@@ -4,10 +4,13 @@
 #include <M5HAL_v2.hpp>
 #include <m5_hal/hal/v2/bus/local_backend.hpp>
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 
 #include <new>
+#include <string>
+#include <vector>
 
-// ADR 034 phase 3 — intent-driven hardware allocation. These tests drive the
+// intent-driven hardware allocation. These tests drive the
 // resolver (i2c::BusView::commitBuses) over a LOCAL registry with injected fake
 // factories + a 2-controller silicon budget, reproducing the M5StickC
 // three-bus case (internal / PortA / HAT) without real hardware. The assertions
@@ -231,6 +234,105 @@ TEST(I2cBusIntent, DeterministicTieBreakLowestController)
 {
     I2cIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
     v2::test::bus_contract::expectDeterministicTieBreakLowestController(h.view, &reqByIndex);
+}
+
+// --- External claim x commitBuses (a caller outside the intent resolver,
+// e.g. a standalone slave, claims a controller through
+// AllocationCore::claimController -- the resolver must treat it as occupied
+// across commits, exactly like an unmanaged hardware bus's controller). ---
+
+TEST(I2cBusIntent, ExternalClaimSurvivesCommitAndMasterAutoAvoidsIt)
+{
+    I2cIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
+    auto* core = h.adapter.allocationCore();
+    auto claim = core->claimController(v2::bus::automatic());
+    ASSERT_TRUE(claim.has_value()) << "err=" << v2::error::toString(claim.error());
+    EXPECT_EQ(claim.value(), 0);  // Auto: lowest free controller
+
+    auto bus = h.view.acquire(reqByIndex(0, v2::bus::automatic()));
+    ASSERT_TRUE(bus.has_value()) << "err=" << v2::error::toString(bus.error());
+    ASSERT_TRUE(h.view.commitBuses().has_value());
+    // The claim must survive commitBuses()'s pool rebuild (_syncPoolFromLive
+    // -> releaseAll) and keep the master's automatic request off controller 0.
+    EXPECT_EQ(bus.value()->backendKind(), kHw);
+    EXPECT_EQ(bus.value()->controllerId(), 1);
+}
+
+TEST(I2cBusIntent, MasterRequireClaimedControllerFailsOutOfResource)
+{
+    I2cIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
+    auto* core = h.adapter.allocationCore();
+    auto claim = core->claimController(v2::bus::automatic());
+    ASSERT_TRUE(claim.has_value()) << "err=" << v2::error::toString(claim.error());
+    ASSERT_EQ(claim.value(), 0);
+
+    auto bus = h.view.acquire(reqByIndex(0, v2::i2c::requireController(0)));
+    ASSERT_TRUE(bus.has_value()) << "err=" << v2::error::toString(bus.error());
+    auto res = h.view.commitBuses();
+    ASSERT_FALSE(res.has_value());
+    EXPECT_EQ(res.error(), v2::error::error_t::OUT_OF_RESOURCE);
+}
+
+TEST(I2cBusIntent, BusViewClaimControllerSurfaceRoundTrips)
+{
+    // Exercises the public BusView::claimController/releaseClaimedController
+    // surface (BusViewCore -> IHalBackend -> LocalBackend -> AllocationCore)
+    // rather than reaching into AllocationCore directly, matching how a real
+    // consumer (e.g. a standalone slave) would call it.
+    I2cIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
+    auto claim = h.view.claimController();  // omitted intent = Auto
+    ASSERT_TRUE(claim.has_value()) << "err=" << v2::error::toString(claim.error());
+    EXPECT_EQ(claim.value(), 0);
+
+    auto claim2 = h.view.claimController();
+    ASSERT_TRUE(claim2.has_value()) << "err=" << v2::error::toString(claim2.error());
+    EXPECT_EQ(claim2.value(), 1);
+
+    // Pool exhausted: a third Auto claim fails.
+    auto claim3 = h.view.claimController();
+    ASSERT_FALSE(claim3.has_value());
+    EXPECT_EQ(claim3.error(), v2::error::error_t::OUT_OF_RESOURCE);
+
+    ASSERT_TRUE(h.view.releaseClaimedController(claim.value()).has_value());
+    auto claim4 = h.view.claimController();
+    ASSERT_TRUE(claim4.has_value()) << "err=" << v2::error::toString(claim4.error());
+    EXPECT_EQ(claim4.value(), 0);  // freed index reused
+}
+
+TEST(I2cBusIntent, ReleaseClaimedControllerAllowsMasterToUseIt)
+{
+    I2cIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
+    auto* core = h.adapter.allocationCore();
+    auto claim = core->claimController(v2::bus::automatic());
+    ASSERT_TRUE(claim.has_value()) << "err=" << v2::error::toString(claim.error());
+    ASSERT_EQ(claim.value(), 0);
+    ASSERT_TRUE(core->releaseClaimedController(claim.value()).has_value());
+
+    auto bus = h.view.acquire(reqByIndex(0, v2::i2c::requireController(0)));
+    ASSERT_TRUE(bus.has_value()) << "err=" << v2::error::toString(bus.error());
+    ASSERT_TRUE(h.view.commitBuses().has_value());
+    EXPECT_EQ(bus.value()->backendKind(), kHw);
+    EXPECT_EQ(bus.value()->controllerId(), 0);
+}
+
+TEST(I2cBusIntent, ClaimControllerRequireSeparatesConfigErrorFromShortage)
+{
+    // Require(id) error taxonomy: naming a controller that does not exist is
+    // a configuration error (INVALID_ARGUMENT), while naming one that exists
+    // but is already held is a resource shortage (OUT_OF_RESOURCE).
+    I2cIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
+    auto* core = h.adapter.allocationCore();
+
+    auto oor = core->claimController(v2::i2c::requireController(2));  // capacity is 2: ids are 0..1
+    ASSERT_FALSE(oor.has_value());
+    EXPECT_EQ(oor.error(), v2::error::error_t::INVALID_ARGUMENT);
+
+    auto first = core->claimController(v2::i2c::requireController(1));
+    ASSERT_TRUE(first.has_value()) << "err=" << v2::error::toString(first.error());
+    EXPECT_EQ(first.value(), 1);
+    auto busy = core->claimController(v2::i2c::requireController(1));
+    ASSERT_FALSE(busy.has_value());
+    EXPECT_EQ(busy.error(), v2::error::error_t::OUT_OF_RESOURCE);
 }
 
 // --- Shared-core seam paths that i2c never reaches (Phase B) ------------------
@@ -941,8 +1043,244 @@ TEST(I2cBusIntent, NonLowPowerLogicalAcquireStillRequiresExplicitPins)
     EXPECT_EQ(bus.error(), v2::error::error_t::INVALID_ARGUMENT);
 }
 
+TEST(I2cBusIntent, AutoClaimAvoidsOptInLowPowerController)
+{
+    // Same opt-in exclusion rule claimController shares with the resolver's
+    // _eligible: an Auto claim must never land on a controller that offers
+    // an opt-in-only capability (LOW_POWER) unless the intent names it.
+    I2cLpHarness h;
+    auto claim = h.adapter.allocationCore()->claimController(v2::types::AllocationIntent{});
+    ASSERT_TRUE(claim.has_value()) << "err=" << v2::error::toString(claim.error());
+    EXPECT_EQ(claim.value(), 0);  // controller 1 is the opt-in LOW_POWER port
+}
+
+TEST(I2cBusIntent, ClaimControllerHonorsCapabilityPreference)
+{
+    // The resolver's preferred-capability pass, mirrored by claimController:
+    // preferLowPower() lands on the LP controller while it is free, and
+    // falls back to a plain HP controller once it is taken (a preference,
+    // unlike a require, may go unmet).
+    I2cLpHarness h;
+    auto* core = h.adapter.allocationCore();
+    auto lp    = core->claimController(v2::bus::preferLowPower());
+    ASSERT_TRUE(lp.has_value()) << "err=" << v2::error::toString(lp.error());
+    EXPECT_EQ(lp.value(), 1);  // controller 1 is the opt-in LOW_POWER port
+
+    auto fallback = core->claimController(v2::bus::preferLowPower());
+    ASSERT_TRUE(fallback.has_value()) << "err=" << v2::error::toString(fallback.error());
+    EXPECT_EQ(fallback.value(), 0);
+}
+
+// --- Backend hot-swap order + rollback (release-before-make) ----------------
+// Exercises the REAL LocalKindAdapter<Traits>::commitPlaceholder /
+// commitHardware (managed_facade.hpp's swapBackendWith rollback overload),
+// unlike the AllocationCoreSeam fakes above (FakeSwlessKind / FakeOptInKind
+// implement their own commitPlaceholder/commitHardware and never call
+// swapBackendWith). LocalKindAdapter's SwFactory/HwFactory are plain
+// function pointers (no captures), so the order log and one-shot failure
+// injection a test wants the factories to see live behind a namespace-scope
+// pointer; ScopedFakeState installs it on construction and clears it on
+// destruction (including on an early ASSERT_* return), so a failing
+// assertion in one test can never leave a dangling pointer for the next.
+namespace {
+
+// A fake backend that records "make"/"release" events (tagged by kind and
+// controller) into a shared log and performs no real I/O.
+class OrderedFakeBackend : public v2::i2c::IBus {
+public:
+    OrderedFakeBackend(std::vector<std::string>* log, v2::types::backend_kind_t kind, int8_t controller)
+        : _log{log}, _kind{kind}, _controller{controller}
+    {
+        if (_log != nullptr) {
+            _log->push_back(_tag("make"));
+        }
+    }
+    v2::types::backend_kind_t backendKind(void) const override
+    {
+        return _kind;
+    }
+    int8_t controllerId(void) const override
+    {
+        return _kind == v2::types::backend_kind_t::Hardware ? _controller : static_cast<int8_t>(-1);
+    }
+    v2::result_t<void> release(void) override
+    {
+        if (_log != nullptr) {
+            _log->push_back(_tag("release"));
+        }
+        return {};
+    }
+
+private:
+    std::string _tag(const char* verb) const
+    {
+        std::string s = verb;
+        s += _kind == v2::types::backend_kind_t::Hardware ? (":hw" + std::to_string(_controller)) : ":sw";
+        return s;
+    }
+    std::vector<std::string>* _log;
+    v2::types::backend_kind_t _kind;
+    int8_t _controller;
+};
+
+struct FakeState {
+    std::vector<std::string> log;
+    bool fail_next_sw = false;  // next placeholder build returns null (consumed on use)
+    bool fail_next_hw = false;  // next hardware build returns null (consumed on use)
+};
+FakeState* g_state = nullptr;
+
+struct ScopedFakeState {
+    FakeState state;
+    ScopedFakeState(void)
+    {
+        g_state = &state;
+    }
+    ~ScopedFakeState(void)
+    {
+        g_state = nullptr;
+    }
+    ScopedFakeState(const ScopedFakeState&)            = delete;
+    ScopedFakeState& operator=(const ScopedFakeState&) = delete;
+};
+
+v2::i2c::IBus* orderedSwFactory(const v2::i2c::LogicalBusConfig&)
+{
+    if (g_state->fail_next_sw) {
+        g_state->fail_next_sw = false;
+        return nullptr;
+    }
+    return new (std::nothrow) OrderedFakeBackend(&g_state->log, v2::types::backend_kind_t::Software, -1);
+}
+v2::i2c::IBus* orderedHwFactory(const v2::i2c::LogicalBusConfig&, int8_t controller)
+{
+    if (g_state->fail_next_hw) {
+        g_state->fail_next_hw = false;
+        return nullptr;
+    }
+    return new (std::nothrow) OrderedFakeBackend(&g_state->log, v2::types::backend_kind_t::Hardware, controller);
+}
+
+}  // namespace
+
+TEST(I2cBusIntentSwapRollback, DemoteReleasesOldHardwareBeforeBuildingPlaceholder)
+{
+    // guard is declared before h so its dtor (clearing g_state) runs AFTER
+    // h's dtor -- g_state stays valid for every backend h creates/destroys.
+    ScopedFakeState guard;
+    // hw_capacity=1 forces a full demote (nowhere to hop) rather than a
+    // demote immediately followed by a same-pass re-promote elsewhere.
+    I2cIntentHarness h{&orderedSwFactory, &orderedHwFactory, /*hw_capacity=*/1};
+
+    auto a = h.view.acquire(reqByIndex(0, v2::bus::automatic()));
+    ASSERT_TRUE(a.has_value()) << "err=" << v2::error::toString(a.error());
+    ASSERT_TRUE(h.view.commitBuses().has_value());
+    EXPECT_EQ(a.value()->backendKind(), kHw);
+    EXPECT_EQ(a.value()->controllerId(), 0);
+
+    // B requires controller 0: with hw_capacity=1, A has nowhere to hop and
+    // must fully demote to its software placeholder.
+    auto b = h.view.acquire(reqByIndex(1, v2::i2c::requireController(0)));
+    ASSERT_TRUE(b.has_value()) << "err=" << v2::error::toString(b.error());
+    // Clear AFTER acquiring B: acquire itself builds B's initial software
+    // backend ("make:sw"), which is not part of the swap under test.
+    guard.state.log.clear();
+    ASSERT_TRUE(h.view.commitBuses().has_value());
+    EXPECT_EQ(b.value()->backendKind(), kHw);
+    EXPECT_EQ(b.value()->controllerId(), 0);
+    EXPECT_EQ(a.value()->backendKind(), kSw);
+
+    ASSERT_GE(guard.state.log.size(), 2u);
+    EXPECT_EQ(guard.state.log[0], "release:hw0");  // A's old hardware released FIRST
+    EXPECT_EQ(guard.state.log[1], "make:sw");      // ... then the placeholder is built
+}
+
+TEST(I2cBusIntentSwapRollback, DemoteFailureRollsBackToSameHardwareController)
+{
+    ScopedFakeState guard;
+    I2cIntentHarness h{&orderedSwFactory, &orderedHwFactory, /*hw_capacity=*/1};
+
+    auto a = h.view.acquire(reqByIndex(0, v2::bus::automatic()));
+    ASSERT_TRUE(a.has_value()) << "err=" << v2::error::toString(a.error());
+    ASSERT_TRUE(h.view.commitBuses().has_value());
+    ASSERT_EQ(a.value()->controllerId(), 0);
+
+    auto b = h.view.acquire(reqByIndex(1, v2::i2c::requireController(0)));
+    ASSERT_TRUE(b.has_value()) << "err=" << v2::error::toString(b.error());
+
+    // A's demote needs a placeholder build; make it fail once. swapBackendWith
+    // rolls back to a freshly-made hardware backend on the SAME controller
+    // instead of leaving A without a backend.
+    guard.state.fail_next_sw = true;
+    auto res                 = h.view.commitBuses();
+    ASSERT_FALSE(res.has_value());
+    EXPECT_EQ(res.error(), v2::error::error_t::OUT_OF_RESOURCE);
+    EXPECT_EQ(a.value()->backendKind(), kHw);
+    EXPECT_EQ(a.value()->controllerId(), 0);  // rolled back onto the same controller
+
+    // B never got promoted: the resolver's demote step (still holding
+    // controller 0 in its pool bookkeeping because the release-on-failure
+    // path is skipped for a failed demote) leaves no free controller for
+    // B's promote this pass -- not a double lease, just no controller freed.
+    EXPECT_EQ(b.value()->backendKind(), kSw);
+    EXPECT_EQ(h.adapter.allocationCore()->hardwareInUse(), 1u);  // only A's controller 0
+}
+
+TEST(I2cBusIntentSwapRollback, PromoteFailureKeepsPlaceholderAndControllerIsNotLeaked)
+{
+    ScopedFakeState guard;
+    I2cIntentHarness h{&orderedSwFactory, &orderedHwFactory, /*hw_capacity=*/1};
+
+    auto x = h.view.acquire(reqByIndex(0, v2::bus::automatic()));
+    ASSERT_TRUE(x.has_value()) << "err=" << v2::error::toString(x.error());
+    EXPECT_EQ(x.value()->backendKind(), kSw);  // software until commit
+
+    // The hardware build the promote needs fails once. swapBackendWith
+    // rolls back to a freshly-made placeholder instead of leaving X without
+    // a backend, and the resolver returns the claimed controller to the pool.
+    guard.state.fail_next_hw = true;
+    auto res                 = h.view.commitBuses();
+    ASSERT_FALSE(res.has_value());
+    EXPECT_EQ(res.error(), v2::error::error_t::OUT_OF_RESOURCE);
+    EXPECT_EQ(x.value()->backendKind(), kSw);
+    EXPECT_EQ(x.value()->controllerId(), -1);
+    EXPECT_EQ(h.adapter.allocationCore()->hardwareInUse(), 0u);  // controller 0 not leaked
+
+    // The controller is obtainable on a later commit once the build works.
+    ASSERT_TRUE(h.view.commitBuses().has_value());
+    EXPECT_EQ(x.value()->backendKind(), kHw);
+    EXPECT_EQ(x.value()->controllerId(), 0);
+}
+
+TEST(I2cBusIntentSwapRollback, PromoteRollbackAlsoFailingLeavesPendingWithLoudError)
+{
+    ScopedFakeState guard;
+    I2cIntentHarness h{&orderedSwFactory, &orderedHwFactory, /*hw_capacity=*/1};
+
+    auto x = h.view.acquire(reqByIndex(0, v2::bus::automatic()));
+    ASSERT_TRUE(x.has_value()) << "err=" << v2::error::toString(x.error());
+
+    // Both the hardware build AND the placeholder rollback fail on the same
+    // swap: swapBackendWith's fallback adopts null ("pending") rather than
+    // leaving a stale pointer, and the failure is still reported.
+    guard.state.fail_next_hw = true;
+    guard.state.fail_next_sw = true;
+    auto res                 = h.view.commitBuses();
+    ASSERT_FALSE(res.has_value());
+    EXPECT_EQ(res.error(), v2::error::error_t::OUT_OF_RESOURCE);
+    EXPECT_EQ(x.value()->backendKind(), kSw);  // safe default query answer for "no backend"
+    EXPECT_EQ(x.value()->controllerId(), -1);
+    EXPECT_EQ(h.adapter.allocationCore()->hardwareInUse(), 0u);
+
+    // The next commit (both factories healthy again) recovers normally.
+    ASSERT_TRUE(h.view.commitBuses().has_value());
+    EXPECT_EQ(x.value()->backendKind(), kHw);
+    EXPECT_EQ(x.value()->controllerId(), 0);
+}
+
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

@@ -127,7 +127,7 @@ DecodeResult decode(data::ConstDataSpan src, View& view);
 
 // ---- Source-driven frame builder --------------------------------------------
 
-size_t buildDataFrame(uint8_t* block, uint8_t stream_id, data::Source& src);
+m5::hal::v2::result_t<size_t> buildDataFrame(uint8_t* block, uint8_t stream_id, data::Source& src);
 
 // ---- Source / Sink integration ----------------------------------------------
 

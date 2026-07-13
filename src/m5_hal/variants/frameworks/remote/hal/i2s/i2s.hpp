@@ -3,6 +3,7 @@
 #define M5_HAL_VARIANTS_FRAMEWORKS_REMOTE_HAL_I2S_I2S_HPP
 
 #include "../../../../../hal/v2/i2s/i2s.hpp"
+#include "../../bus_lease.hpp"
 #include "../../remote_transfer.hpp"
 
 #include <cstddef>
@@ -28,7 +29,17 @@ public:
     {
     }
 
-    Bus_remote(RemoteSession& session, uint8_t bus_id, const i2s::IBusConfig& cfg) : _session{&session}, _bus_id{bus_id}
+    Bus_remote(RemoteSession& session, uint8_t bus_id, const i2s::IBusConfig& cfg)
+        : Bus_remote{remote::makeBorrowedSessionHandle(session), bus_id, cfg}
+    {
+    }
+
+    Bus_remote(std::shared_ptr<remote::RemoteSessionHandle> session, uint8_t bus_id, const i2s::IBusConfig& cfg,
+               std::shared_ptr<remote::RemoteBusLease> bus_lease = {})
+        : _session{std::move(session)},
+          _bus_id{bus_id},
+          _lifecycle{bus_lease ? bus_lease->lifecycle() : std::make_shared<bus::BusLifecycle>()},
+          _bus_lease{std::move(bus_lease)}
     {
         _config = cfg;
     }
@@ -38,6 +49,15 @@ public:
     uint8_t busId(void) const
     {
         return _bus_id;
+    }
+
+    std::shared_ptr<remote::RemoteBusLease> remoteBusLease() const
+    {
+        return _bus_lease;
+    }
+    std::shared_ptr<bus::BusLifecycle> lifecycleHandle(void) const override
+    {
+        return _lifecycle;
     }
 
     result_t<size_t> write(bus::IAccessor* owner, const i2s::AccessConfig& cfg, data::Source* src, size_t len) override;
@@ -50,8 +70,10 @@ public:
 private:
     static constexpr uint32_t kTransferTimeoutMs = 10000;
 
-    RemoteSession* _session = nullptr;
-    uint8_t _bus_id         = 0;
+    std::shared_ptr<remote::RemoteSessionHandle> _session;
+    uint8_t _bus_id                               = 0;
+    std::shared_ptr<bus::BusLifecycle> _lifecycle = std::make_shared<bus::BusLifecycle>();
+    std::shared_ptr<remote::RemoteBusLease> _bus_lease;
     remote::RemoteConfigCache _config_cache;
 };
 

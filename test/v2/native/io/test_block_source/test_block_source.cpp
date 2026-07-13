@@ -2,6 +2,7 @@
 // Native gtest for BlockSource (data/block.hpp).
 
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 #include <M5HAL_v2.hpp>
 
 #include <array>
@@ -202,16 +203,17 @@ TEST(BlockSource, BuildDataFrameRoundtrip)
     auto* block = static_cast<uint8_t*>(alloc.allocate(256, mem::usage_t::Temp));
     ASSERT_NE(block, nullptr);
 
-    size_t frame_size = frame::buildDataFrame(block, 7, src);
-    ASSERT_GT(frame_size, 0u);
+    auto frame_size = frame::buildDataFrame(block, 7, src);
+    ASSERT_TRUE(frame_size.has_value());
+    ASSERT_GT(frame_size.value(), 0u);
     EXPECT_TRUE(src.eof());
 
     data::BlockSource bs{alloc};
-    ASSERT_TRUE(bs.addBlock(block, frame_size));
+    ASSERT_TRUE(bs.addBlock(block, frame_size.value()));
 
     auto peeked = bs.peek(256);
     ASSERT_TRUE(peeked.has_value());
-    ASSERT_EQ(peeked.value().size, frame_size);
+    ASSERT_EQ(peeked.value().size, frame_size.value());
 
     frame::View view;
     auto result = frame::decode(peeked.value(), view);
@@ -238,13 +240,14 @@ TEST(BlockSource, MultiFrameRoundtrip)
     while (!src.eof()) {
         auto* block = static_cast<uint8_t*>(alloc.allocate(256, mem::usage_t::Temp));
         ASSERT_NE(block, nullptr);
-        size_t frame_size = frame::buildDataFrame(block, 1, src);
-        if (frame_size == 0) {
+        auto frame_size = frame::buildDataFrame(block, 1, src);
+        ASSERT_TRUE(frame_size.has_value());
+        if (frame_size.value() == 0) {
             alloc.deallocate(block);
             break;
         }
-        ASSERT_TRUE(bs.addBlock(block, frame_size));
-        total_payload += frame_size - frame::kHeaderSize;
+        ASSERT_TRUE(bs.addBlock(block, frame_size.value()));
+        total_payload += frame_size.value() - frame::kHeaderSize;
     }
 
     EXPECT_EQ(total_payload, big.size());
@@ -281,5 +284,6 @@ TEST(BlockSource, MultiFrameRoundtrip)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

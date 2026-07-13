@@ -19,9 +19,9 @@ I2S の最も重要な契約 — Audio 層実装者が最初に必要とする�
 - **underrun はエラーにしない**: DMA が枯れたら無音を出力し、次の write から再開する。
   エラー扱いにしない理由は、連続再生では「途切れたら静かに継続」が常に正しい縮退であり、
   呼び出し側に回復処理を強いる価値がないため。
-- `writableBytes()` は「いま write してもブロックしない量」。送信側のフロー制御の源泉で、
-  リモートバス搬送 ([remote.md](remote.md) §stream credit) は backend の DMA 消費追跡を
-  そのまま credit に使う。
+- `writableBytes()` は「いま write してもブロックしない量」。送信側のフロー制御の源泉。
+  リモートバス搬送のワイヤ上 flow control (credit 通知) は backend の write/read とは別に、
+  [remote.md](remote.md) §Transport 層 — frame mux 多重化 が受信側バッファ空きを追跡して行う。
 - **戻り値の切れ目契約**:
   - 受理量は **サンプル境界 (`bits_per_sample / 8` byte の倍数) で切れる**。espidf
     backend はこれを能動的に保証する — DMA 満杯間際の non-blocking 受理は奇数バイトで
@@ -55,14 +55,14 @@ I2S は DMA 駆動の連続ストリームであり、I2C / SPI のような「�
 
 ```cpp
 struct IBus : bus::IBus {
-    virtual expected<size_t, error_t> write(Accessor* owner, const AccessConfig& cfg,
+    virtual expected<size_t, error_t> write(bus::IAccessor* owner, const AccessConfig& cfg,
                                             data::Source* tx, size_t len);
-    virtual expected<size_t, error_t> writableBytes(Accessor* owner, const AccessConfig& cfg);
-    virtual expected<size_t, error_t> read(Accessor* owner, const AccessConfig& cfg,
+    virtual expected<size_t, error_t> writableBytes(bus::IAccessor* owner, const AccessConfig& cfg);
+    virtual expected<size_t, error_t> read(bus::IAccessor* owner, const AccessConfig& cfg,
                                            data::Sink* rx, size_t len);
-    virtual expected<size_t, error_t> readableBytes(Accessor* owner, const AccessConfig& cfg);
+    virtual expected<size_t, error_t> readableBytes(bus::IAccessor* owner, const AccessConfig& cfg);
     // 独立 TX/RX チャネルロック (uart 同型)。lock/unlock は TxRx 合成。
-    result_t<void> lockChannel(Accessor* owner, Channel ch, uint32_t timeout_ms);
+    result_t<void> lockChannel(bus::IAccessor* owner, Channel ch, uint32_t timeout_ms);
 };
 struct TxAccessor : bus::IAccessor, data::StreamWriter;  // 再生 = StreamWriter
 struct RxAccessor : bus::IAccessor, data::StreamReader;  // 録音 = StreamReader
@@ -74,6 +74,9 @@ struct Accessor;  // TX + RX 束ね (全二重を 1 つで)
 - **独立 2-mutex** (uart 同型): TX と RX は別チャネルロックを握るため、全二重バスでは
   片方が write 中でももう片方が read できる (単一ロックなら直列化される)。`Accessor` (束ね)
   は両チャネルを TX→RX 順で取る。`readUntil` は連続ストリームの I2S には無い (uart 専用)。
+  remote proxy の channel 所有権も同じだが、標準 `RemoteSession` の個々の wire RPC は共通
+  session gate で直列化される。1 RPC 内の全二重は複合 transfer が担う
+  ([remote.md](remote.md) §SEQ)。
 
 ## Bus の入手
 
@@ -99,6 +102,13 @@ struct Accessor;  // TX + RX 束ね (全二重を 1 つで)
 再構成する (明示的な start / stop API は置かない。DMA channel は最初の write / read で
 遅延開始し、停止は release / 再構成で行う)。
 
+**既知の制約 — 全二重 reconfigure 境界の bus-level quiesce**: IDF に drain API が無いため、
+reconfigure (sample rate / channels 変更) の境界で in-flight バッファはそのまま切れる。
+定常状態のデータは常にクリーンだが、reconfigure 直後は slave 側の再同期に ESP32-S3 で
+1-2 フレーム、classic ESP32 で最大 ~40 フレームのズレが生じ得る。実行中に頻繁に
+reconfigure するユースケースでのみ顕在化するため、既知トレードオフとして受容する
+(fix にはプロトコルレベルの事前通知機構が要り、変更の割に効果が薄いと判断)。
+
 コア配線ピンは **タグ型 ctor** で与えられる: `BusConfig{i2s::Bclk{34}, i2s::Ws{33}, i2s::Dout{13}}`
 (TX-only の標準形)。i2c / spi / uart と同じく順序取り違えがコンパイルエラーになる。**チャネルは
 pin 駆動**: `pin_dout` 設定で TX、`pin_din` 設定で RX、両方で全二重。`pin_din` (RX) / `pin_mclk` /
@@ -119,13 +129,18 @@ variant config は `using IBusConfig::IBusConfig;` でこのタグ ctor を継�
   生成 (同一 chan_cfg・BCLK/WS/slot 形式を共有)。`role` は `I2S_CHANNEL_DEFAULT_CONFIG` の
   `I2S_ROLE_MASTER`/`SLAVE` に渡すだけで、別クラスは不要。`readableBytes` の源泉は **取込済み未排出
   バイト数の直接追跡**: `on_recv` で加算 (容量クランプ)、read で減算 (`writableBytes` の鏡像)。
+  **release のピン後始末は backend が担う**: `i2s_del_channel` は GPIO matrix 経路と
+  peripheral 制御の output enable を残置するため、削除後もコアピンが凍結レベルを能動駆動し
+  続ける (ESP32 / ESP32-S3 実測 — 外部 pull を無視する)。SPI (`gpio_reset_pin`) /
+  I2C (`gpio_output_disable`) の vendor 後始末と揃え、チャネル破棄時に設定済みピンを
+  `gpio_reset_pin` で chip default (high-Z + pull-up) へ戻す。
 - **arduino**: 専用 variant は置かない。arduino-esp32 3.x は IDF 5.x を内包するため
   espidf variant を直接使う (2.x = IDF 4.4 は legacy ドライバのため対象外。ヘッダ検出に
   より自動的に無効となる)。
 
 ## リモートバス搬送
 
-詳細は [remote.md](remote.md) §データチャネル / §stream credit を参照。remote I2S の TX/RX は
+詳細は [remote.md](remote.md) §データチャネル / §Transport 層 — frame mux 多重化 (credit 通知) を参照。remote I2S の TX/RX は
 `BusStreamTransfer` + `Data` frame stream で搬送する。remote proxy は stream request の前に
 同じ bytecode script 内で `BusConfigure` を送るため、`AccessConfig` の sample rate / bit depth /
 channel count / timeout は転送ごとに server 側 accessor へ反映される。

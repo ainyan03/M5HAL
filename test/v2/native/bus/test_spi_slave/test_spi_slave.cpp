@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include <M5HAL_v2.hpp>
+#include <m5_hal/variants/frameworks/espidf/hal/spi/spi.hpp>
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 
 #include <vector>
 
@@ -111,8 +113,64 @@ TEST(SpiSlaveBusConfig, DefaultCtorSetsSpiKindAndPins)
     EXPECT_EQ(cfg.pin_miso, -1);
     EXPECT_EQ(cfg.pin_cs, -1);
     EXPECT_EQ(cfg.spi_mode, 0u);
+    EXPECT_EQ(cfg.controller, -1);
     EXPECT_EQ(cfg.tx_fill_byte, 0x00u);
     EXPECT_EQ(cfg.timeout_ms, m5::hal::v2::types::TIMEOUT_FOREVER);
+}
+
+TEST(EspidfSpiControllerMap, ControllerAndHostOrdinalsRoundTrip)
+{
+    namespace detail         = m5::hal::v2::spi::detail_espidf_spi;
+    constexpr uint8_t count  = 2;
+    constexpr int first_host = 1;  // SPI2 follows the reserved SPI1 ordinal.
+
+    int host = -1;
+    EXPECT_TRUE(detail::hostOrdinalForController(0, count, first_host, host));
+    EXPECT_EQ(host, 1);
+    EXPECT_TRUE(detail::hostOrdinalForController(1, count, first_host, host));
+    EXPECT_EQ(host, 2);
+    EXPECT_FALSE(detail::hostOrdinalForController(-1, count, first_host, host));
+    EXPECT_FALSE(detail::hostOrdinalForController(2, count, first_host, host));
+
+    int8_t controller = -1;
+    EXPECT_TRUE(detail::controllerForHostOrdinal(1, count, first_host, controller));
+    EXPECT_EQ(controller, 0);
+    EXPECT_TRUE(detail::controllerForHostOrdinal(2, count, first_host, controller));
+    EXPECT_EQ(controller, 1);
+    EXPECT_FALSE(detail::controllerForHostOrdinal(0, count, first_host, controller));
+    EXPECT_FALSE(detail::controllerForHostOrdinal(3, count, first_host, controller));
+}
+
+TEST(EspidfSpiControllerMap, SlaveDefaultAndInvalidControllersAreDistinct)
+{
+    namespace detail         = m5::hal::v2::spi::detail_espidf_spi;
+    constexpr uint8_t count  = 2;
+    constexpr int first_host = 1;
+
+    int host = -1;
+    EXPECT_TRUE(detail::slaveHostOrdinal(-1, count, first_host, host));
+    EXPECT_EQ(host, first_host);
+    EXPECT_TRUE(detail::slaveHostOrdinal(0, count, first_host, host));
+    EXPECT_EQ(host, first_host);
+    EXPECT_TRUE(detail::slaveHostOrdinal(1, count, first_host, host));
+    EXPECT_EQ(host, first_host + 1);
+    EXPECT_FALSE(detail::slaveHostOrdinal(-2, count, first_host, host));
+    EXPECT_FALSE(detail::slaveHostOrdinal(2, count, first_host, host));
+    EXPECT_FALSE(detail::slaveHostOrdinal(-1, 0, first_host, host));
+}
+
+TEST(EspidfSpiControllerMap, AttachRequiresMatchingGeneralPurposeController)
+{
+    namespace detail         = m5::hal::v2::spi::detail_espidf_spi;
+    constexpr uint8_t count  = 2;
+    constexpr int first_host = 1;
+
+    EXPECT_TRUE(detail::attachedControllerMatches(1, 0, count, first_host));
+    EXPECT_TRUE(detail::attachedControllerMatches(2, 1, count, first_host));
+    EXPECT_FALSE(detail::attachedControllerMatches(0, 0, count, first_host));  // SPI1 is reserved.
+    EXPECT_FALSE(detail::attachedControllerMatches(1, 1, count, first_host));  // Host/index mismatch.
+    EXPECT_FALSE(detail::attachedControllerMatches(3, 2, count, first_host));  // Host outside the SoC budget.
+    EXPECT_FALSE(detail::attachedControllerMatches(1, -1, count, first_host));
 }
 
 // -------------------------------------------------------------------------
@@ -243,5 +301,6 @@ TEST(SpiSlaveAccessor, ServeNullSinkDiscardsRx)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

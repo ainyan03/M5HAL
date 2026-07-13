@@ -2,8 +2,8 @@
 // =============================================================================
 // M5HAL — HowToUseI2CRegistry
 //
-// HowToUse/I2C shows the basic borrow (M5_Hal.I2C.acquire(cfg) -> one accessor).
-// This sketch layers the two ADR 034 features that borrowing unlocks:
+// HowToUse/I2C shows basic shared acquisition (acquire(cfg) -> one accessor).
+// This sketch layers the two features that registry interning unlocks:
 //
 //  1. M5_Hal.I2C.acquire(cfg): get a bus by its WIRING (pins). The same pins
 //     always return the SAME shared instance -- one physical bus, one lock --

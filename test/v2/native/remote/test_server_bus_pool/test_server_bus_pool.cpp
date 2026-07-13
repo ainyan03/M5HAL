@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 #include <M5HAL_v2.hpp>
 #include <m5_hal/hal/v2/remote/server_bus_pool.hpp>
 
@@ -212,5 +213,6 @@ TEST_F(ServerBusPoolPhysicalSharing, ReleaseAllOnlyDropsThisConnectionReference)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

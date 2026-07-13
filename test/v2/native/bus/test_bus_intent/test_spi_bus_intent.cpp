@@ -7,7 +7,7 @@
 
 #include <new>
 
-// ADR 034 phase 3 — intent-driven hardware allocation for SPI. These tests
+// intent-driven hardware allocation for SPI. These tests
 // drive the resolver (spi::BusView::commitBuses) over a LOCAL registry with
 // injected fake factories + a 2-controller silicon budget, mirroring the i2c
 // intent tests (test_bus_intent.cpp). The fakes perform no I/O and never touch
@@ -233,6 +233,72 @@ TEST(SpiBusIntent, DeterministicTieBreakLowestController)
 {
     SpiIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
     v2::test::bus_contract::expectDeterministicTieBreakLowestController(h.view, &reqByIndex);
+}
+
+TEST(SpiBusIntent, BusViewClaimControllerSurfaceRoundTrips)
+{
+    SpiIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
+    auto first = h.view.claimController();
+    ASSERT_TRUE(first.has_value()) << "err=" << v2::error::toString(first.error());
+    EXPECT_EQ(first.value(), 0);
+
+    auto second = h.view.claimController();
+    ASSERT_TRUE(second.has_value()) << "err=" << v2::error::toString(second.error());
+    EXPECT_EQ(second.value(), 1);
+
+    auto exhausted = h.view.claimController();
+    ASSERT_FALSE(exhausted.has_value());
+    EXPECT_EQ(exhausted.error(), v2::error::error_t::OUT_OF_RESOURCE);
+
+    auto released = h.view.releaseClaimedController(first.value());
+    ASSERT_TRUE(released.has_value()) << "err=" << v2::error::toString(released.error());
+    auto reused = h.view.claimController();
+    ASSERT_TRUE(reused.has_value()) << "err=" << v2::error::toString(reused.error());
+    EXPECT_EQ(reused.value(), 0);
+}
+
+TEST(SpiBusIntent, ExternalClaimSurvivesCommitAndMasterAutoAvoidsIt)
+{
+    SpiIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
+    auto claim = h.view.claimController();
+    ASSERT_TRUE(claim.has_value()) << "err=" << v2::error::toString(claim.error());
+    ASSERT_EQ(claim.value(), 0);
+
+    auto bus = h.view.acquire(reqByIndex(0, v2::spi::automatic()));
+    ASSERT_TRUE(bus.has_value()) << "err=" << v2::error::toString(bus.error());
+    auto committed = h.view.commitBuses();
+    ASSERT_TRUE(committed.has_value()) << "err=" << v2::error::toString(committed.error());
+    EXPECT_EQ(bus.value()->backendKind(), kHw);
+    EXPECT_EQ(bus.value()->controllerId(), 1);
+}
+
+TEST(SpiBusIntent, MasterRequireClaimedControllerFailsOutOfResource)
+{
+    SpiIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
+    auto claim = h.view.claimController(v2::spi::requireController(0));
+    ASSERT_TRUE(claim.has_value()) << "err=" << v2::error::toString(claim.error());
+
+    auto bus = h.view.acquire(reqByIndex(0, v2::spi::requireController(0)));
+    ASSERT_TRUE(bus.has_value()) << "err=" << v2::error::toString(bus.error());
+    auto committed = h.view.commitBuses();
+    ASSERT_FALSE(committed.has_value());
+    EXPECT_EQ(committed.error(), v2::error::error_t::OUT_OF_RESOURCE);
+}
+
+TEST(SpiBusIntent, ReleaseClaimedControllerAllowsMasterToUseIt)
+{
+    SpiIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
+    auto claim = h.view.claimController(v2::spi::requireController(0));
+    ASSERT_TRUE(claim.has_value()) << "err=" << v2::error::toString(claim.error());
+    auto released = h.view.releaseClaimedController(claim.value());
+    ASSERT_TRUE(released.has_value()) << "err=" << v2::error::toString(released.error());
+
+    auto bus = h.view.acquire(reqByIndex(0, v2::spi::requireController(0)));
+    ASSERT_TRUE(bus.has_value()) << "err=" << v2::error::toString(bus.error());
+    auto committed = h.view.commitBuses();
+    ASSERT_TRUE(committed.has_value()) << "err=" << v2::error::toString(committed.error());
+    EXPECT_EQ(bus.value()->backendKind(), kHw);
+    EXPECT_EQ(bus.value()->controllerId(), 0);
 }
 
 TEST(SpiBusIntent, MisoLessWiringIsValidIdentity)

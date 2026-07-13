@@ -33,7 +33,11 @@ inline void delayUs(uint32_t us)
 }
 inline void yield(void)
 {
+#if defined(ESP_PLATFORM)
     taskYIELD();
+#else
+    ::yield();  // portable Arduino API; not a FreeRTOS environment here
+#endif
 }
 
 }  // namespace m5::variants::frameworks::arduino::hal::v2::runtime

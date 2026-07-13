@@ -3,6 +3,7 @@
 #define M5_HAL_VARIANTS_FRAMEWORKS_REMOTE_HAL_SPI_SPI_HPP
 
 #include "../../../../../hal/v2/spi/spi.hpp"
+#include "../../bus_lease.hpp"
 #include "../../remote_transfer.hpp"
 
 #include <cstddef>
@@ -28,7 +29,17 @@ public:
     {
     }
 
-    Bus_remote(RemoteSession& session, uint8_t bus_id, const spi::IBusConfig& cfg) : _session{&session}, _bus_id{bus_id}
+    Bus_remote(RemoteSession& session, uint8_t bus_id, const spi::IBusConfig& cfg)
+        : Bus_remote{remote::makeBorrowedSessionHandle(session), bus_id, cfg}
+    {
+    }
+
+    Bus_remote(std::shared_ptr<remote::RemoteSessionHandle> session, uint8_t bus_id, const spi::IBusConfig& cfg,
+               std::shared_ptr<remote::RemoteBusLease> bus_lease = {})
+        : _session{std::move(session)},
+          _bus_id{bus_id},
+          _lifecycle{bus_lease ? bus_lease->lifecycle() : std::make_shared<bus::BusLifecycle>()},
+          _bus_lease{std::move(bus_lease)}
     {
         _config = cfg;
     }
@@ -38,6 +49,15 @@ public:
     uint8_t busId(void) const
     {
         return _bus_id;
+    }
+
+    std::shared_ptr<remote::RemoteBusLease> remoteBusLease() const
+    {
+        return _bus_lease;
+    }
+    std::shared_ptr<bus::BusLifecycle> lifecycleHandle(void) const override
+    {
+        return _lifecycle;
     }
 
     result_t<void> beginTransaction(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg) override;
@@ -52,8 +72,10 @@ private:
 
     static data::ConstDataSpan encodeSpiMeta(uint8_t* buf, const spi::TransferDesc& desc);
 
-    RemoteSession* _session = nullptr;
-    uint8_t _bus_id         = 0;
+    std::shared_ptr<remote::RemoteSessionHandle> _session;
+    uint8_t _bus_id                               = 0;
+    std::shared_ptr<bus::BusLifecycle> _lifecycle = std::make_shared<bus::BusLifecycle>();
+    std::shared_ptr<remote::RemoteBusLease> _bus_lease;
     bus::TransferTotals _last_totals;
     bool _in_transaction = false;
     remote::RemoteConfigCache _config_cache;

@@ -4,6 +4,8 @@
 #if defined(ESP_PLATFORM) && defined(SOC_USB_OTG_SUPPORTED) && SOC_USB_OTG_SUPPORTED && \
     defined(CONFIG_TINYUSB_CDC_ENABLED) && CONFIG_TINYUSB_CDC_ENABLED && __has_include(<tinyusb.h>)
 
+#include <freertos/task.h>
+
 // esp_tinyusb v2 uses tusb_cdc_acm_init/deinit; v2 renamed to tinyusb_cdcacm_init/deinit.
 #ifndef tinyusb_cdcacm_init
 #define tinyusb_cdcacm_init(cfg) tusb_cdc_acm_init(cfg)
@@ -26,14 +28,59 @@ struct BusUsbCdcRxBridge {
 }  // namespace detail
 
 namespace {
-Bus_espidf_usb_cdc* s_usb_cdc_instances[TINYUSB_CDC_ACM_MAX] = {};
+Bus_espidf_usb_cdc* s_usb_cdc_instances[TINYUSB_CDC_ACM_MAX]  = {};
+portMUX_TYPE s_usb_cdc_mux                                    = portMUX_INITIALIZER_UNLOCKED;
+uint32_t s_usb_cdc_rx_callback_in_flight[TINYUSB_CDC_ACM_MAX] = {};
+constexpr uint32_t kReleaseCallbackDrainTimeoutMs             = 100;
+
+bool waitUsbCdcRxCallbacksDrained(int itf)
+{
+    // pdMS_TO_TICKS(1) truncates to 0 at the default 100 Hz tick rate, where
+    // vTaskDelay(0) only yields. Delay a whole tick and bound the wait by
+    // elapsed ticks. The budget itself truncates to 0 below 10 Hz, so floor it
+    // at one tick to keep the wait non-empty at any configTICK_RATE_HZ.
+    const TickType_t start     = xTaskGetTickCount();
+    const TickType_t raw_ticks = pdMS_TO_TICKS(kReleaseCallbackDrainTimeoutMs);
+    const TickType_t budget    = (raw_ticks != 0) ? raw_ticks : 1;
+    for (;;) {
+        uint32_t in_flight = 0;
+        portENTER_CRITICAL_SAFE(&s_usb_cdc_mux);
+        in_flight = s_usb_cdc_rx_callback_in_flight[itf];
+        portEXIT_CRITICAL_SAFE(&s_usb_cdc_mux);
+        if (in_flight == 0) {
+            return true;
+        }
+        if ((xTaskGetTickCount() - start) >= budget) {
+            return false;
+        }
+        vTaskDelay(1);
+    }
+}
 
 void usb_cdc_rx_callback(int itf, cdcacm_event_t* event)
 {
     (void)event;
-    if (itf >= 0 && itf < static_cast<int>(TINYUSB_CDC_ACM_MAX) && s_usb_cdc_instances[itf] != nullptr) {
-        detail::BusUsbCdcRxBridge::onRx(s_usb_cdc_instances[itf]);
+    if (itf < 0 || itf >= static_cast<int>(TINYUSB_CDC_ACM_MAX)) {
+        return;
     }
+
+    Bus_espidf_usb_cdc* instance = nullptr;
+    portENTER_CRITICAL_SAFE(&s_usb_cdc_mux);
+    instance = s_usb_cdc_instances[itf];
+    if (instance != nullptr) {
+        ++s_usb_cdc_rx_callback_in_flight[itf];
+    }
+    portEXIT_CRITICAL_SAFE(&s_usb_cdc_mux);
+
+    if (instance == nullptr) {
+        return;
+    }
+
+    detail::BusUsbCdcRxBridge::onRx(instance);
+
+    portENTER_CRITICAL_SAFE(&s_usb_cdc_mux);
+    --s_usb_cdc_rx_callback_in_flight[itf];
+    portEXIT_CRITICAL_SAFE(&s_usb_cdc_mux);
 }
 }  // namespace
 
@@ -47,7 +94,10 @@ void Bus_espidf_usb_cdc::onRxReady()
 result_t<void> Bus_espidf_usb_cdc::init(tinyusb_cdcacm_itf_t itf)
 {
     if (_installed) {
-        (void)release();
+        auto released = release();
+        if (!released.has_value()) {
+            return m5::stl::make_unexpected(released.error());
+        }
     }
 
     _itf = itf;
@@ -82,20 +132,42 @@ result_t<void> Bus_espidf_usb_cdc::init(tinyusb_cdcacm_itf_t itf)
         return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
     }
 
+    portENTER_CRITICAL_SAFE(&s_usb_cdc_mux);
     s_usb_cdc_instances[static_cast<int>(_itf)] = this;
-    _installed                                  = true;
+    portEXIT_CRITICAL_SAFE(&s_usb_cdc_mux);
+
+    _installed = true;
     return {};
 }
 
+// If release() returns TIMEOUT_ERROR, RX notifications are already stopped and
+// release() must be called again to finish teardown. Resources are deliberately
+// left allocated in that case: leaking a semaphore beats freeing one a callback
+// still holds.
+//
+// The destructor cannot honor that contract — it discards the result, so an
+// in-flight callback that outlives the drain budget still reaches a destroyed
+// object. Clearing the global pointer bounds the exposure to callbacks that had
+// already loaded it; no new callback can enter. Closing the remaining window
+// would require blocking a destructor indefinitely.
 result_t<void> Bus_espidf_usb_cdc::release()
 {
     if (!_installed) {
         return {};
     }
 
-    s_usb_cdc_instances[static_cast<int>(_itf)] = nullptr;
+    const int itf = static_cast<int>(_itf);
+    (void)tinyusb_cdcacm_unregister_callback(_itf, CDC_EVENT_RX);
 
-    tinyusb_cdcacm_deinit(static_cast<int>(_itf));
+    portENTER_CRITICAL_SAFE(&s_usb_cdc_mux);
+    s_usb_cdc_instances[itf] = nullptr;
+    portEXIT_CRITICAL_SAFE(&s_usb_cdc_mux);
+
+    if (!waitUsbCdcRxCallbacksDrained(itf)) {
+        return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+    }
+
+    tinyusb_cdcacm_deinit(itf);
 
     if (_rx_sem != nullptr) {
         vSemaphoreDelete(_rx_sem);
@@ -169,10 +241,7 @@ result_t<size_t> Bus_espidf_usb_cdc::rawReadableBytes()
     if (!_installed) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
-    uint8_t tmp[1];
-    size_t rx_size = 0;
-    (void)tinyusb_cdcacm_read(_itf, tmp, 0, &rx_size);
-    return rx_size > 0 ? static_cast<size_t>(1) : static_cast<size_t>(0);
+    return static_cast<size_t>(tud_cdc_n_available(static_cast<uint8_t>(_itf)));
 }
 
 error::error_t Bus_espidf_usb_cdc::mapEspErr(esp_err_t err)

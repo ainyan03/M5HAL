@@ -16,8 +16,9 @@
 // Build with -DM5HAL_EXAMPLE_FORCE_SOFTWARE_I2C to drive the same pins with the
 // software (bit-bang) backend.
 //
-// Borrow model: M5_Hal owns the buses; you BORROW a shared handle by acquiring
-// with the wiring. Two acquires of the same pins return the SAME instance (one
+// Shared-owner model: acquire() interns the wiring and returns an owning
+// shared_ptr. The registry retains only a weak reference. Two acquires of the
+// same pins return the SAME instance (one
 // physical bus, one lock), so a board-support layer and user code cooperate
 // instead of fighting over the wire. The backend is chosen by the config TYPE
 // passed to acquire (default i2c::BusConfig = the build's winner; _arduino /
@@ -45,7 +46,7 @@ static constexpr uint8_t REG_PROBE_R2 = 0x01;
 #define M5HAL_EXAMPLE_HOWTOUSEI2C_FREQ 100000
 #endif
 
-// Borrowed handle, assigned in setup().
+// Shared owner, assigned in setup().
 std::shared_ptr<m5hal::i2c::IBus> i2c_bus;
 
 // -------------------------------------------------------------------------
@@ -138,7 +139,7 @@ void setup()
     bus_cfg.wire = &Wire;
 #endif
 
-    // Borrow the bus from M5_Hal: it owns the instance, you hold a shared handle.
+    // Acquire the interned bus. This shared handle owns its lifetime.
     auto acquired = m5hal::M5_Hal.I2C.acquire(bus_cfg);
     if (!acquired) {
         printError("Bus acquire", acquired.error());
@@ -157,7 +158,7 @@ void setup()
     acc_cfg.i2c_addr        = addr;
     acc_cfg.freq            = M5HAL_EXAMPLE_HOWTOUSEI2C_FREQ;
     acc_cfg.wire_timeout_ms = 100;
-    m5hal::i2c::MasterAccessor dev{i2c_bus, acc_cfg};  // co-owns the borrowed bus
+    m5hal::i2c::MasterAccessor dev{i2c_bus, acc_cfg};  // co-owns the acquired bus
 
     demoReadRegister(dev);
     demoBurstRead(dev);

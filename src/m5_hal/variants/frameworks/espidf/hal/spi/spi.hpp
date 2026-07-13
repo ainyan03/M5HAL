@@ -6,6 +6,50 @@
 #include "../../../../../hal/v2/bus/bus.hpp"
 #include "../../../../../hal/v2/spi/spi.hpp"
 
+namespace m5::hal::v2::spi::detail_espidf_spi {
+
+// Primitive-only mapping seam kept outside the ESP_PLATFORM guard so native
+// tests can fix the controller/host boundary without faking the ESP-IDF driver.
+constexpr bool hostOrdinalForController(int8_t controller, uint8_t controller_count, int first_host, int& host)
+{
+    if (controller < 0 || static_cast<uint8_t>(controller) >= controller_count) {
+        return false;
+    }
+    host = first_host + controller;
+    return true;
+}
+
+constexpr bool controllerForHostOrdinal(int host, uint8_t controller_count, int first_host, int8_t& controller)
+{
+    const int index = host - first_host;
+    if (index < 0 || index >= static_cast<int>(controller_count)) {
+        return false;
+    }
+    controller = static_cast<int8_t>(index);
+    return true;
+}
+
+constexpr bool slaveHostOrdinal(int8_t controller, uint8_t controller_count, int first_host, int& host)
+{
+    if (controller == -1) {
+        if (controller_count == 0) {
+            return false;
+        }
+        host = first_host;
+        return true;
+    }
+    return hostOrdinalForController(controller, controller_count, first_host, host);
+}
+
+constexpr bool attachedControllerMatches(int host, int8_t claimed_controller, uint8_t controller_count, int first_host)
+{
+    int8_t actual = -1;
+    return claimed_controller >= 0 && controllerForHostOrdinal(host, controller_count, first_host, actual) &&
+           actual == claimed_controller;
+}
+
+}  // namespace m5::hal::v2::spi::detail_espidf_spi
+
 #if defined(ESP_PLATFORM) && M5HAL_ESPIDF_SPI_HAS_MASTER
 
 #include <driver/spi_master.h>
@@ -13,6 +57,50 @@
 #include <freertos/task.h>
 
 namespace m5::hal::v2::spi {
+
+// Silicon budget for general-purpose SPI on this SoC. SOC_SPI_PERIPH_NUM counts
+// every SPI peripheral including SPI1 (the flash/PSRAM controller), which is not
+// a general-purpose host, so the pool budget excludes it (classic ESP32:
+// SOC_SPI_PERIPH_NUM = 3 -> SPI2 + SPI3 = 2). When the headers do not expose the
+// macro a conservative 2 is used.
+inline uint8_t hardwareControllerCountForSPI(void)
+{
+#if defined(SOC_SPI_PERIPH_NUM)
+    return SOC_SPI_PERIPH_NUM > 1 ? static_cast<uint8_t>(SOC_SPI_PERIPH_NUM - 1) : 1;
+#else
+    return 2;
+#endif
+}
+
+namespace detail_espidf_spi {
+
+inline bool hostForController(int8_t controller, ::spi_host_device_t& host)
+{
+    int ordinal = 0;
+    if (!hostOrdinalForController(controller, hardwareControllerCountForSPI(), static_cast<int>(SPI2_HOST), ordinal)) {
+        return false;
+    }
+    host = static_cast<::spi_host_device_t>(ordinal);
+    return true;
+}
+
+inline bool controllerForHost(::spi_host_device_t host, int8_t& controller)
+{
+    return controllerForHostOrdinal(static_cast<int>(host), hardwareControllerCountForSPI(),
+                                    static_cast<int>(SPI2_HOST), controller);
+}
+
+inline bool hostForSlaveController(int8_t controller, ::spi_host_device_t& host)
+{
+    int ordinal = 0;
+    if (!slaveHostOrdinal(controller, hardwareControllerCountForSPI(), static_cast<int>(SPI2_HOST), ordinal)) {
+        return false;
+    }
+    host = static_cast<::spi_host_device_t>(ordinal);
+    return true;
+}
+
+}  // namespace detail_espidf_spi
 
 struct BusConfig_espidf : public spi::IBusConfig {
     // Inherit the tag-pin constructors (Clk / Mosi / Miso); the host is set
@@ -50,9 +138,9 @@ public:
     result_t<bus::TransferTotals> waitTransfer(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg) override;
     bool transferBusy(bus::IAccessor* owner) override;
 
-    // This backend drives a dedicated ESP-IDF SPI host. The phase-3 controller
+    // This backend drives a dedicated ESP-IDF SPI host. The controller
     // pool assigns the host through BusConfig_espidf::host; the query API
-    // reports it (ADR 034) as a zero-based controller index so the resolver's
+    // reports it as a zero-based controller index so the resolver's
     // incumbency check and a holder watching for a downgrade both see the live
     // state. The index axis is the generic-host axis (SPI2_HOST -> 0,
     // SPI3_HOST -> 1), excluding SPI1 (flash), to match the budget reported by
@@ -63,17 +151,24 @@ public:
     }
     int8_t controllerId(void) const override
     {
-        return static_cast<int8_t>(_host - SPI2_HOST);
+        int8_t controller = -1;
+        return detail_espidf_spi::controllerForHost(_host, controller) ? controller : -1;
     }
     uint32_t maxFrequency(void) const override
     {
         // ESP32-family SPI master peripheral ceiling (80 MHz). Declares the
         // capability so a holder can notice a drop after a downgrade to
-        // software (ADR 034), without depending on a SoC-specific macro.
+        // software, without depending on a SoC-specific macro.
         return 80000000u;
     }
 
-    error::error_t attach(::spi_host_device_t host);
+    // Attach to a caller-owned, already initialized host. Before external
+    // spi_bus_initialize(), the caller must claim the matching controller with
+    // SPI.claimController(requireController(index)) and pass the returned index
+    // as claimed_controller. The caller retains both the host and claim: detach
+    // with release(), then call spi_bus_free(), and only then return the claim
+    // with SPI.releaseClaimedController().
+    error::error_t attach(::spi_host_device_t host, int8_t claimed_controller);
     ::spi_host_device_t nativeHost() const
     {
         return _host;
@@ -129,7 +224,7 @@ struct BackendFor<BusConfig_espidf> {
     using type = Bus_espidf;
 };
 
-// Phase-3 hardware backend factory (ADR 034). Builds a Bus_espidf for a logical
+// hardware backend factory. Builds a Bus_espidf for a logical
 // request, binding the leased controller index to an ESP-IDF SPI host. The pool
 // hands out a zero-based index; this is the only code that knows it maps onto
 // the generic hosts (SPI2_HOST + index), so the kind-generic BusView / pool stay
@@ -138,6 +233,10 @@ struct BackendFor<BusConfig_espidf> {
 // provides hardware SPI (M5HAL_SPI_HAS_HW_BACKEND below).
 inline spi::IBus* makeHardwareBackendForSPI(const spi::LogicalBusConfig& logical, int8_t controller)
 {
+    ::spi_host_device_t host;
+    if (!detail_espidf_spi::hostForController(controller, host)) {
+        return nullptr;
+    }
     auto* backend = new (std::nothrow) Bus_espidf();
     if (backend == nullptr) {
         return nullptr;
@@ -146,28 +245,13 @@ inline spi::IBus* makeHardwareBackendForSPI(const spi::LogicalBusConfig& logical
     cfg.pin_clk  = logical.pin_clk;
     cfg.pin_mosi = logical.pin_mosi;
     cfg.pin_miso = logical.pin_miso;
-    cfg.host     = static_cast<::spi_host_device_t>(SPI2_HOST + controller);
+    cfg.host     = host;
     auto r       = backend->init(cfg);
     if (!r.has_value()) {
         delete backend;
         return nullptr;
     }
     return backend;
-}
-
-// Silicon budget for general-purpose SPI on this SoC. SOC_SPI_PERIPH_NUM counts
-// every SPI peripheral including SPI1 (the flash/PSRAM controller), which is not
-// a general-purpose host, so the pool budget excludes it (classic ESP32:
-// SOC_SPI_PERIPH_NUM = 3 -> SPI2 + SPI3 = 2). When the headers do not expose the
-// macro a conservative 2 is used (every ESP32-family chip has at least SPI2 +
-// SPI3, except single-host parts where the subtraction still clamps to >= 1).
-inline uint8_t hardwareControllerCountForSPI(void)
-{
-#if defined(SOC_SPI_PERIPH_NUM)
-    return SOC_SPI_PERIPH_NUM > 1 ? static_cast<uint8_t>(SOC_SPI_PERIPH_NUM - 1) : 1;
-#else
-    return 2;
-#endif
 }
 
 // Tells M5HALCore that this build has a poolable hardware SPI backend, so the

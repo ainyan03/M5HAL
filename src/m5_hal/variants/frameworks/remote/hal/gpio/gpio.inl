@@ -24,13 +24,18 @@ result_t<void> Port_remote::syncRead()
     if (!r.has_value()) {
         return m5::stl::make_unexpected(r.error());
     }
-    auto req = _session->request({script_buf, script.written()});
+    remote::RemoteSessionHandle::Lease lease{*_session};
+    if (!lease) {
+        return m5::stl::make_unexpected(lease.error());
+    }
+    auto& session = lease.session();
+    auto req      = session.request({script_buf, script.written()});
     if (!req.has_value()) {
         return m5::stl::make_unexpected(req.error());
     }
     bytecode::BytecodeRunner runner{memory::defaultAllocator()};
     runner.setReceiveOnly(true);
-    auto resp = _session->lastResponse();
+    auto resp = session.lastResponse();
     auto run  = runner.run(resp);
     if (!run.has_value()) {
         return m5::stl::make_unexpected(run.error());
@@ -45,8 +50,9 @@ result_t<void> Port_remote::syncRead()
     if (stored.size < 4) {
         return m5::stl::make_unexpected(error::error_t::PROTOCOL_ERROR);
     }
-    _cached = static_cast<uint32_t>(stored.data[0]) | (static_cast<uint32_t>(stored.data[1]) << 8) |
-              (static_cast<uint32_t>(stored.data[2]) << 16) | (static_cast<uint32_t>(stored.data[3]) << 24);
+    _cached.store(static_cast<uint32_t>(stored.data[0]) | (static_cast<uint32_t>(stored.data[1]) << 8) |
+                      (static_cast<uint32_t>(stored.data[2]) << 16) | (static_cast<uint32_t>(stored.data[3]) << 24),
+                  std::memory_order_relaxed);
     return {};
 }
 
@@ -71,7 +77,7 @@ void Port_remote::_writePinEncodedLow(uint32_t pin_mask)
 
 bool Port_remote::_readPinEncoded(uint32_t pin_mask)
 {
-    return (_cached & pin_mask) != 0;
+    return (_cached.load(std::memory_order_relaxed) & pin_mask) != 0;
 }
 
 void Port_remote::_setPinModeEncoded(uint32_t pin_mask, types::gpio_mode_t mode)
@@ -92,17 +98,19 @@ void Port_remote::_setPinModeEncoded(uint32_t pin_mask, types::gpio_mode_t mode)
     if (!r.has_value()) {
         return;
     }
-    (void)_session->request({script_buf, script.written()});
+    remote::RemoteSessionHandle::Lease lease{*_session};
+    if (lease) {
+        (void)lease.session().request({script_buf, script.written()});
+    }
 }
 
 uint32_t Port_remote::_readPortAll()
 {
-    return _cached;
+    return _cached.load(std::memory_order_relaxed);
 }
 
 void Port_remote::_writePortMasked(uint32_t set_mask, uint32_t clear_mask)
 {
-    _cached = (_cached | set_mask) & ~clear_mask;
     if (_session == nullptr) {
         return;
     }
@@ -116,7 +124,13 @@ void Port_remote::_writePortMasked(uint32_t set_mask, uint32_t clear_mask)
     if (!r.has_value()) {
         return;
     }
-    (void)_session->requestNoResponse({script_buf, script.written()});
+    remote::RemoteSessionHandle::Lease lease{*_session};
+    if (lease) {
+        uint32_t cached = _cached.load(std::memory_order_relaxed);
+        while (!_cached.compare_exchange_weak(cached, (cached | set_mask) & ~clear_mask, std::memory_order_relaxed)) {
+        }
+        (void)lease.session().requestNoResponse({script_buf, script.written()});
+    }
 }
 
 types::gpio_local_pin_t Port_remote::_toLocalPin(uint32_t pin_mask) const
@@ -137,6 +151,12 @@ uint32_t Port_remote::_fromLocalPin(types::gpio_local_pin_t pin_index) const
 }
 
 GPIO_remote::GPIO_remote(RemoteSession& session, types::gpio_slot_t device_slot, uint8_t port_count, uint16_t pin_count)
+    : GPIO_remote{remote::makeBorrowedSessionHandle(session), device_slot, port_count, pin_count}
+{
+}
+
+GPIO_remote::GPIO_remote(std::shared_ptr<remote::RemoteSessionHandle> session, types::gpio_slot_t device_slot,
+                         uint8_t port_count, uint16_t pin_count)
     : _port_count{port_count > kMaxPorts ? static_cast<uint8_t>(kMaxPorts) : port_count},
       _pin_count{static_cast<uint16_t>(
           pin_count > static_cast<uint16_t>((port_count > kMaxPorts ? kMaxPorts : port_count) * 32u)
@@ -144,7 +164,7 @@ GPIO_remote::GPIO_remote(RemoteSession& session, types::gpio_slot_t device_slot,
               : pin_count)}
 {
     for (uint8_t i = 0; i < _port_count; ++i) {
-        _ports[i].init(&session, device_slot, i);
+        _ports[i].init(session, device_slot, i);
     }
 }
 
@@ -201,11 +221,16 @@ result_t<void> GPIO_remote::subscribeAll()
     if (!r.has_value()) {
         return m5::stl::make_unexpected(r.error());
     }
-    auto req = _ports[0]._session->request({script_buf, script.written()});
+    remote::RemoteSessionHandle::Lease lease{*_ports[0]._session};
+    if (!lease) {
+        return m5::stl::make_unexpected(lease.error());
+    }
+    auto& session = lease.session();
+    auto req      = session.request({script_buf, script.written()});
     if (!req.has_value()) {
         return m5::stl::make_unexpected(req.error());
     }
-    return _ports[0]._session->checkResponse();
+    return session.checkResponse();
 }
 
 void GPIO_remote::onGpioEvent(void* ctx, types::gpio_number_t pin, bool level)

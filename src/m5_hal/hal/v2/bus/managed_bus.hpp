@@ -10,7 +10,7 @@
 
 /*!
   @namespace m5::hal::v2::bus
-  @brief Kind-neutral seams for intent-driven controller allocation (ADR 034).
+  @brief Kind-neutral seams for intent-driven controller allocation.
  */
 namespace m5::hal::v2::bus {
 
@@ -165,9 +165,12 @@ struct IAllocationKind {
       @brief Build the placeholder backend and swap it in UNDER THE BUS LOCK.
 
       `makePlaceholder` + adopt, but the build (and its `init()`) runs inside the
-      bus lock so it cannot race an in-flight transfer on the old backend (ADR
-      034 / D1). A null placeholder detaches the bus to pending (software-less
-      kinds); a non-null one is adopted. Release errors propagate.
+      bus lock so it cannot race an in-flight transfer on the old backend.
+      A null placeholder from a software-less kind is its intentional
+      pending detach; a null from a kind WITH a software factory is a build
+      failure — the swap rolls back to a re-made hardware backend on the
+      controller being given up and returns the error. Release errors
+      propagate.
      */
     virtual result_t<void> commitPlaceholder(IManagedBus& bus, uint32_t timeout_ms) const = 0;
 
@@ -175,8 +178,9 @@ struct IAllocationKind {
       @brief Build the hardware backend for `controller` and swap it in UNDER THE BUS LOCK.
 
       `makeHardware` + adopt, but the build (and its `init()`) runs inside the
-      bus lock (ADR 034 / D1). A null result (no hardware factory) is
-      `OUT_OF_RESOURCE`. Release errors propagate.
+      bus lock. A null result (no hardware factory) is
+      `OUT_OF_RESOURCE`; the swap rolls back to a re-made placeholder
+      (or pending for a software-less kind). Release errors propagate.
      */
     virtual result_t<void> commitHardware(IManagedBus& bus, int8_t controller, uint32_t timeout_ms) const = 0;
 

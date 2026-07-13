@@ -33,13 +33,15 @@ result_t<void> Bus_espidf_usb_jtag::release()
     if (!_installed) {
         return {};
     }
-    const auto err = usb_serial_jtag_driver_uninstall();
-    _installed     = false;
-    clearRxCache();
-    const auto mapped = mapEspErr(err);
+    // Transactional release (matches uart.inl / i2c gen4): clear _installed
+    // only after the ESP-IDF uninstall succeeds. On failure keep _installed
+    // set so the dtor / a retry can uninstall the driver.
+    const auto mapped = mapEspErr(usb_serial_jtag_driver_uninstall());
     if (error::isError(mapped)) {
         return m5::stl::make_unexpected(mapped);
     }
+    _installed = false;
+    clearRxCache();
     return {};
 }
 

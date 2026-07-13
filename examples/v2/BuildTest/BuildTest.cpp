@@ -1104,13 +1104,16 @@ static void checkService()
     (void)m5hal::service::fastTick();
 #endif
 
-    m5hal::service::ServiceContext ctx;
-    ctx.now_tick = 1;
+    m5hal::service::ServiceContext ctx{1, 2};
+    (void)ctx.elapsed;
+    (void)ctx.local_tick;
+    (void)m5hal::service::fastTickDomain();
+    (void)m5hal::service::sharedNowUs();
     m5hal::service::ServicePoll idle;
     m5hal::service::ServicePoll progress{m5hal::service::ServiceResult::Progress};
     m5hal::service::ServicePoll due{m5hal::service::ServiceResult::Idle, 100};
     (void)idle.result;
-    (void)idle.next_due;
+    (void)idle.next_due_delta;
     (void)progress;
     (void)due;
     (void)(idle == m5hal::service::ServiceResult::Idle);
@@ -1122,7 +1125,6 @@ static void checkService()
     (void)runner.autoRunActive();
     if (false) {
         (void)runner.runOnce(ctx);
-        (void)runner.runOnce(ctx.now_tick);
         (void)runner.runOnce();
         (void)runner.startAutoRun();
         runner.stopAutoRun();
@@ -1164,7 +1166,7 @@ static void checkSlaveTypes()
     spi_cfg.pin_cs       = 5;
     spi_cfg.spi_mode     = 0;
     spi_cfg.spi_order    = 0;
-    spi_cfg.host         = -1;
+    spi_cfg.controller   = -1;
     spi_cfg.tx_fill_byte = 0;
     spi_cfg.timeout_ms   = m5hal::types::TIMEOUT_FOREVER;
     (void)spi_cfg.getBusKind();
@@ -1208,6 +1210,11 @@ static void checkSlaveTypes()
         (void)spi_bus->init(spi_cfg);
         (void)spi_bus->release();
         (void)spi_bus->serve(nullptr, &src, &dst, sizeof(buf), 1);
+
+#if defined(ESP_PLATFORM) && M5HAL_ESPIDF_SPI_HAS_MASTER
+        m5hal::spi::Bus_espidf attached_bus;
+        (void)attached_bus.attach(SPI2_HOST, 0);
+#endif
 
         m5hal::spi::SpiSlaveAccessor spi_acc{*spi_bus};
         (void)spi_acc.getConfig();

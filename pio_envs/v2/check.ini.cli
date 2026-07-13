@@ -79,6 +79,46 @@ build_src_filter = +<*> +<../test/v2/stub/build_check_espidf.cpp>
 ; toolchain 選択を c3/c6 のみハードコードしているため未追加。 platform 自体の
 ; アップグレード (例: pioarduino/espressif32) と board file 整備が前提。
 
+; --- Non-ESP32 Arduino cores (build-check only; no HIL rig for either) ------
+; v0 (M5HAL_v0.cpp) stays arduino-esp32-only (frozen legacy layer, see
+; spec/design/v0_v2_coexistence.md); excluded here the same way
+; v2_check_native_inline excludes it for its own reason.
+[env:v2_check_rp2040_arduino]
+extends = common_rp2040dev, common_arduino
+build_src_filter = +<*> -<M5HAL_v0.cpp> +<../test/v2/stub/build_check_arduino.cpp>
+
+[env:v2_check_samd51_arduino]
+extends = common_samd51dev, common_arduino
+build_src_filter = +<*> -<M5HAL_v0.cpp> +<../test/v2/stub/build_check_arduino.cpp>
+
+[env:v2_check_stm32f4_arduino]
+extends = common_stm32f4dev, common_arduino
+build_src_filter = +<*> -<M5HAL_v0.cpp> +<../test/v2/stub/build_check_arduino.cpp>
+
+[env:v2_check_nrf52840_arduino]
+extends = common_nrf52840dev, common_arduino
+build_src_filter = +<*> -<M5HAL_v0.cpp> +<../test/v2/stub/build_check_arduino.cpp>
+
+[env:v2_check_esp8266_arduino]
+extends = common_esp8266dev, common_arduino
+build_src_filter = +<*> -<M5HAL_v0.cpp> +<../test/v2/stub/build_check_arduino.cpp>
+
+; --- M5Utility platform_detect override fence --------------------------------
+; Compiles the M5UTILITY_HAS_USABLE_CHRONO=0 integrator override on host, so
+; the logging path's no-<chrono> branch (custom elapsed_time_t +
+; m5::utility::millis() log clock, log/library_log.*) cannot rot without any
+; embedded toolchain in the loop. Scope note: on native the time source stays
+; CHRONO, so compatibility_feature.cpp still uses <chrono>/<thread> — this env
+; does NOT prove a fully <chrono>-less build (that additionally needs a
+; non-chrono M5UTILITY_TIME_SOURCE, which the auto-detection selects on
+; Arduino cores).
+[env:v2_check_native_nochrono]
+extends = common_native
+build_flags =
+    ${common_native.build_flags}
+    -DM5UTILITY_HAS_USABLE_CHRONO=0
+build_src_filter = +<*> +<../test/v2/stub/build_check_native.cpp>
+
 ; --- v2 inline flip build check ---------------------------------------------
 ; Forces M5HAL_V0_INLINE=0 + M5HAL_V2_INLINE=1 (default は逆) で build。
 ; v2 を inline 化した時に m5::hal::* lookup が壊れないことを CI で fence。

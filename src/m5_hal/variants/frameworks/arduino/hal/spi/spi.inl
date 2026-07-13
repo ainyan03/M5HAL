@@ -15,12 +15,16 @@ namespace m5::hal::v2::spi {
 namespace {
 namespace impl_arduino {
 
-uint8_t spiBitOrder(uint8_t order)
+// Return type deduced: MSBFIRST/LSBFIRST are plain int constants on
+// arduino-esp32 but a `BitOrder` enum on arduino-pico (RP2040) — SPISettings'
+// constructor expects whichever type the core actually declared.
+auto spiBitOrder(uint8_t order)
 {
     return (order == 0) ? MSBFIRST : LSBFIRST;
 }
 
-uint8_t spiDataMode(uint8_t mode)
+// Same rationale as spiBitOrder() above: SPI_MODEn's type varies by core.
+auto spiDataMode(uint8_t mode)
 {
     switch (mode & 0x03) {
         case 0:
@@ -125,6 +129,8 @@ result_t<void> sendDummy(::SPIClass& spi, uint8_t cycles)
 
 result_t<void> transferChunk(::SPIClass& spi, data::ConstDataSpan tx_span, data::DataSpan rx_span)
 {
+#if defined(ESP_PLATFORM)
+    // arduino-esp32 SPIClass extensions: separate tx/rx buffers in one call.
     const size_t common = (tx_span.size < rx_span.size) ? tx_span.size : rx_span.size;
     if (common > 0) {
         spi.transferBytes(tx_span.data, rx_span.data, static_cast<uint32_t>(common));
@@ -135,6 +141,31 @@ result_t<void> transferChunk(::SPIClass& spi, data::ConstDataSpan tx_span, data:
     if (rx_span.size > common) {
         spi.transferBytes(nullptr, rx_span.data + common, static_cast<uint32_t>(rx_span.size - common));
     }
+#else
+    // Portable Arduino SPIClass exposes only transfer(uint8_t) (one byte,
+    // simultaneous tx+rx) and transfer(void*, size_t) (in-place, same
+    // buffer for tx and rx). Neither fits separate/differently-sized tx
+    // and rx spans, so fall back to a byte loop through transferByte().
+    const size_t common = (tx_span.size < rx_span.size) ? tx_span.size : rx_span.size;
+    for (size_t i = 0; i < common; ++i) {
+        auto result = transferByte(spi, tx_span.data[i], &rx_span.data[i]);
+        if (!result.has_value()) {
+            return result;
+        }
+    }
+    for (size_t i = common; i < tx_span.size; ++i) {
+        auto result = transferByte(spi, tx_span.data[i], nullptr);
+        if (!result.has_value()) {
+            return result;
+        }
+    }
+    for (size_t i = common; i < rx_span.size; ++i) {
+        auto result = transferByte(spi, 0xFF, &rx_span.data[i]);
+        if (!result.has_value()) {
+            return result;
+        }
+    }
+#endif
     return {};
 }
 
@@ -159,6 +190,10 @@ result_t<void> Bus_arduino::init(const BusConfig_arduino& config)
     }
     auto* spi = config.spi != nullptr ? config.spi : &SPI;
 
+#if defined(ESP_PLATFORM)
+    // arduino-esp32 SPIClass::begin(sck, miso, mosi, ss) is an Espressif
+    // extension; no other supported Arduino core (see _checker.hpp) has a
+    // matching overload — pins are fixed per SPIClass instance there.
     const int clk  = static_cast<int>(_config.pin_clk);
     const int miso = static_cast<int>(_config.pin_miso);
     const int mosi = static_cast<int>(_config.pin_mosi);
@@ -167,6 +202,11 @@ result_t<void> Bus_arduino::init(const BusConfig_arduino& config)
     } else {
         spi->begin();
     }
+#else
+    // Portable cores fix SCK/MISO/MOSI per SPIClass instance (board variant
+    // file); configured pins cannot be honored here and are ignored.
+    spi->begin();
+#endif
     if (_config.pin_dc >= 0) {
         impl_arduino::setPinOutput(_config.pin_dc, true);
     }

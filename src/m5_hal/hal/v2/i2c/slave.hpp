@@ -22,6 +22,57 @@ namespace m5::hal::v2::i2c {
 
 enum class TxUnderrun : uint8_t { Fill, Stretch };
 
+// ISR-safe register-map hook signatures, shared between SlaveRegMapAccessor and
+// any backend ISR fast path bound directly into it (ISlaveBus::bindIsrRegMap
+// below). Declared at namespace scope, ahead of ISlaveBus, so the interface can
+// reference them before SlaveRegMapAccessor itself is declared.
+using RegMapOnReadFn  = uint8_t (*)(uint8_t reg, void *ctx);
+using RegMapOnWriteFn = void (*)(uint8_t reg, uint8_t value, void *ctx);
+
+// Register-map byte semantics shared between the task-context SlaveRegMapAccessor
+// (below) and an ISR fast path bound via ISlaveBus::bindIsrRegMap: pure (no
+// allocation, no lock, no blocking), so both call sites can use it as-is. IRAM
+// placement is the caller's responsibility -- these are `inline` so a caller in
+// a different translation unit (e.g. an IRAM-attributed backend ISR) pulls the
+// whole body into its own function rather than an out-of-line call that could
+// straddle a flash-cache-disabled window.
+inline uint8_t regMapReadByte(data::DataSpan reg_file, uint8_t reg, RegMapOnReadFn on_read, void *ctx)
+{
+    if (on_read != nullptr) {
+        return on_read(reg, ctx);
+    }
+    return (reg_file.data != nullptr && reg < reg_file.size) ? reg_file.data[reg] : uint8_t{0};
+}
+
+inline void regMapWriteByte(data::DataSpan reg_file, uint8_t reg, uint8_t value, RegMapOnWriteFn on_write, void *ctx)
+{
+    if (reg_file.data != nullptr && reg < reg_file.size) {
+        reg_file.data[reg] = value;
+    }
+    if (on_write != nullptr) {
+        on_write(reg, value, ctx);
+    }
+}
+
+// Shared state for the optional ISR regmap fast path. Owned by the accessor
+// (must outlive the binding; the destructor unbinds); the backend ISR reads
+// and writes it directly, so it must live in ordinary RAM (any static/member
+// storage qualifies -- only code needs IRAM, not data).
+struct IsrRegMapBinding {
+    data::DataSpan reg_file{};
+    RegMapOnReadFn on_read   = nullptr;
+    void *on_read_ctx        = nullptr;
+    RegMapOnWriteFn on_write = nullptr;
+    void *on_write_ctx       = nullptr;
+    // Wire-side register-pointer state, maintained by the backend ISR while
+    // the binding is active. `pointer` persists across transactions (SPLIT /
+    // repeat-read); the per-transaction fields reset at STOP.
+    uint8_t pointer       = 0;
+    bool pointer_received = false;
+    uint32_t write_offset = 0;
+    uint32_t tx_offset    = 0;
+};
+
 struct SlaveBusConfig : public bus::IBusConfig {
     types::gpio_number_t pin_scl = -1;
     types::gpio_number_t pin_sda = -1;
@@ -31,6 +82,12 @@ struct SlaveBusConfig : public bus::IBusConfig {
     TxUnderrun tx_underrun       = TxUnderrun::Fill;
     uint8_t tx_fill_byte         = 0xFF;
     uint32_t stretch_timeout_ms  = 100;
+    // Hardware controller index this slave should occupy, e.g. the value
+    // returned by `bus::BusView::claimController` on the I2C BusView. -1
+    // (default) means "the backend's own default port" -- outside the
+    // controller pool's bookkeeping entirely, so the caller is responsible
+    // for not colliding with a master bus (see spec/design/i2c_slave.md).
+    int8_t controller = -1;
 
     constexpr SlaveBusConfig(void) : bus::IBusConfig{types::bus_kind_t::I2C}
     {
@@ -83,6 +140,37 @@ struct ISlaveBus : public bus::IBus {
         (void)timeout_ms;
         runtime::delayMs(1);
         return false;
+    }
+
+    // Optional ISR fast path for a register-map accessor: on a backend that can
+    // serve WTR-timing register reads from its own ISR (no clock stretch to fall
+    // back on), bind the accessor-owned `binding` directly into the ISR so a
+    // repeated-START read is answered inside the window a task-context serve()
+    // cannot meet. Returns false (no-op) on backends without this path; the
+    // accessor then falls back to the normal task-context serve() loop.
+    // `binding` must outlive the binding (the accessor's destructor unbinds it).
+    //
+    // Ownership: the backend keeps a single mutable slot. A new bind simply
+    // REPLACES whatever was bound before (last-bind-wins) without touching the
+    // superseded binding struct -- the caller that lost the slot keeps believing
+    // it is bound until it calls unbindIsrRegMap, which is then a harmless no-op
+    // (see below). A successful bind resets `binding`'s per-transaction fields
+    // (pointer_received / write_offset / tx_offset) and re-composes the TX
+    // prefill; `binding->pointer` itself is left as the caller set it (bind does
+    // not clobber an already-persisted wire pointer).
+    virtual bool bindIsrRegMap(IsrRegMapBinding *binding)
+    {
+        (void)binding;
+        return false;
+    }
+    // Release a binding made by bindIsrRegMap, but ONLY if `binding` is still the
+    // currently-bound one (ownership check) -- unbinding a `binding` that a later
+    // bindIsrRegMap call already superseded is a no-op, so destroying an older
+    // accessor can never rip out a newer one's fast path. A no-op on backends
+    // that never bound one (the base bindIsrRegMap always returns false).
+    virtual void unbindIsrRegMap(IsrRegMapBinding *binding)
+    {
+        (void)binding;
     }
 
 protected:
@@ -173,7 +261,10 @@ public:
     //     the master finishes, then returns TIMEOUT_ERROR (the bytes that fit are already
     //     in the Sink; the dropped tail is also counted by the backend rxOverflowCount).
     //     Size the Sink to the largest write for zero-loss, or pass a finite timeout to
-    //     fail-and-recover instead of wedging the bus.
+    //     fail-and-recover instead of wedging the bus. The escape drain waits for the
+    //     master's STOP; if the master itself goes inactive during it (aborted, no
+    //     visible STOP), a second no-progress deadline abandons the transaction
+    //     outright, so a finite timeout_ms always returns.
     //   * On the espidf LL backend serve() parks (via waitForActivity) on a DEDICATED
     //     binary semaphore owned by the backend -- NOT the calling task's direct
     //     notification -- so an app may use xTaskNotify on its own task concurrently
@@ -214,11 +305,27 @@ private:
 // validated order.
 class SlaveRegMapAccessor {
 public:
-    using OnReadFn  = uint8_t (*)(uint8_t reg, void *ctx);
-    using OnWriteFn = void (*)(uint8_t reg, uint8_t value, void *ctx);
+    // Compatibility aliases: the byte-semantics function pointer types now live
+    // at namespace scope (RegMapOnReadFn / RegMapOnWriteFn) so ISlaveBus::
+    // bindIsrRegMap can reference them ahead of this class's declaration.
+    using OnReadFn  = RegMapOnReadFn;
+    using OnWriteFn = RegMapOnWriteFn;
 
-    // Composing a full register window per read keeps the held read stretch
-    // short; 64 matches the backend's TX FIFO staging capacity (kTxCapacity).
+    // Reply compose CHUNK, not a per-read cap: serve() streams the reply in
+    // chunks of this size, composing the next chunk (register auto-increment,
+    // 8-bit wrap) as the tx ring drains, so a single read can run past any
+    // length -- the classic regmap-device behavior (reference:
+    // ESP32_I2C_slave_example, whose ISR refills straight from the register
+    // file). The first chunk is what releases the held read stretch, so the
+    // size stays matched to the backend's TX staging capacity (kTxCapacity).
+    // Note: bytes are composed (and onRead fires) AHEAD of what the master
+    // actually clocks out -- by up to the backend's TX queue depth plus one
+    // chunk (the pump keeps one composed chunk staged beyond what the queue
+    // accepted; with the bundled backends a 1-byte read composes two chunks =
+    // 128 bytes, pinned by the OneByteRead native test). Over-composed bytes
+    // expire at STOP (Tx auto-vanish). A read-side-effect register served via
+    // onRead must tolerate this read-ahead (the previous one-window design
+    // already composed a full window regardless of the read length).
     static constexpr size_t kReplyWindowBytes = 64;
     // One read() drains this many bytes at a time; a multi-byte write is drained
     // across several reads in serve()'s loop, so it is not capped by THIS chunk.
@@ -230,9 +337,25 @@ public:
     // behind and a byte was dropped; serve()'s drain loop keeps the backlog small.
     static constexpr size_t kReadChunkBytes = 64;
 
+    // Attempts ISlaveBus::bindIsrRegMap on construction: a backend that supports
+    // the ISR fast path (see the class-level bindIsrRegMap doc) binds right away
+    // (even before setOnRead/setOnWrite -- the initial bind serves raw reg_file
+    // bytes with no hooks; setOnRead/setOnWrite re-bind once hooks are set). A
+    // backend without the fast path leaves _isr_bound false and serve() uses the
+    // normal task-context loop -- no behavior change from before this existed.
     SlaveRegMapAccessor(ISlaveBus &bus, data::DataSpan reg_file) : _stream{bus}, _reg_file{reg_file}
     {
+        _isr_binding.reg_file = _reg_file;
+        _isr_bound            = bus.bindIsrRegMap(&_isr_binding);
     }
+    ~SlaveRegMapAccessor()
+    {
+        if (_isr_bound) {
+            _stream.getBus().unbindIsrRegMap(&_isr_binding);
+        }
+    }
+    SlaveRegMapAccessor(const SlaveRegMapAccessor &)            = delete;
+    SlaveRegMapAccessor &operator=(const SlaveRegMapAccessor &) = delete;
 
     // --- Application-side register access (independent of the wire). ---------
     // getRegister / setRegister read and write the backing store directly; they
@@ -247,9 +370,12 @@ public:
             _reg_file.data[reg] = value;
         }
     }
+    // While the ISR fast path is bound, the wire-side pointer lives in the
+    // shared binding (the backend ISR is what advances it); _pointer below is
+    // only meaningful for the task-context path.
     uint8_t pointer(void) const
     {
-        return _pointer;
+        return _isr_bound ? _isr_binding.pointer : _pointer;
     }
 
     // --- Hooks (function pointer + void* ctx; no std::function, house style). -
@@ -260,11 +386,13 @@ public:
     {
         _on_read     = cb;
         _on_read_ctx = ctx;
+        rebindIsrRegMapIfBound();
     }
     void setOnWrite(OnWriteFn cb, void *ctx)
     {
         _on_write     = cb;
         _on_write_ctx = ctx;
+        rebindIsrRegMapIfBound();
     }
 
     // --- Blocking convenience: serve exactly one transaction. ----------------
@@ -273,6 +401,22 @@ public:
     // transaction, and is returned -- the happy path is unchanged, but a real
     // failure (owner mismatch, bus released) is no longer reported as success. A
     // short read (0 bytes, the normal stream short-read) is not an error.
+    //
+    // A finite `timeout_ms` bounds BOTH the wait for a transaction to start AND
+    // any in-transaction no-progress stall (the same meaning as
+    // SlaveStreamAccessor::serve(); NOT a wall-clock total). The regmap consumer
+    // always progresses while the wire moves, so an in-transaction stall can only
+    // be a master that went inactive without a STOP -- past the deadline serve()
+    // abandons the exchange and returns TIMEOUT_ERROR. Register writes ingested
+    // before the stall stay applied (like a real register device cut off
+    // mid-write). The default TIMEOUT_FOREVER serves to completion.
+    //
+    // ISR fast path (bindIsrRegMap succeeded at construction / the last
+    // setOnRead/setOnWrite): the backend's ISR already ingests writes and
+    // composes reads directly against reg_file/onRead/onWrite (see
+    // ISlaveBus::bindIsrRegMap), so this degenerates to opening the transaction
+    // and waiting for the backend to report it complete (the master's STOP) --
+    // beginExchange/ingest/composeReply below are NOT called in this mode.
     result_t<void> serve(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
 
     // --- Transaction-step API (pure register-map logic; no bus I/O). ---------
@@ -290,10 +434,14 @@ public:
     // reg_file[pointer + offset] (auto-increment) and fires onWrite.
     void ingest(data::ConstDataSpan src);
 
-    // Compose up to dst.size reply bytes from the register pointer window
-    // (auto-increment with 8-bit wrap; onRead overrides per byte). Returns the
-    // number of bytes composed (== dst.size when dst.data is non-null).
-    size_t composeReply(data::DataSpan dst);
+    // Compose up to dst.size reply bytes starting `offset` bytes past the
+    // register pointer (auto-increment with 8-bit wrap; onRead overrides per
+    // byte). Returns the number of bytes composed (== dst.size when dst.data
+    // is non-null). A custom serve loop streams a long read by advancing
+    // `offset` chunk by chunk; offset 0 (the default) is the original
+    // one-window behavior. The pointer itself is NOT advanced -- a new
+    // transaction re-serves from the same base (repeat-read semantics).
+    size_t composeReply(data::DataSpan dst, size_t offset = 0);
 
     // Access to the composed stream accessor (advanced: custom serve loops).
     SlaveStreamAccessor &stream(void);
@@ -302,6 +450,26 @@ private:
     uint8_t readByte(uint8_t reg) const;
 
     void writeByte(uint8_t reg, uint8_t value);
+
+    // Re-bind after a hook changes post-construction, only if a fast path is
+    // already bound (a backend without one leaves _isr_bound false forever, so
+    // this is a cheap no-op there). Unbinds first, THEN updates _isr_binding's
+    // hook fields, THEN re-binds -- so the ISR never observes a half-updated
+    // hook pair (it reads on_read/on_write straight out of the binding). The
+    // backend keeps only the LAST bound hook set, so re-binding on every
+    // setOnRead/setOnWrite call is safe; the brief unbound gap just degrades
+    // that one instant to the task-context path (see bindIsrRegMap's contract).
+    void rebindIsrRegMapIfBound()
+    {
+        if (_isr_bound) {
+            _stream.getBus().unbindIsrRegMap(&_isr_binding);
+            _isr_binding.on_read      = _on_read;
+            _isr_binding.on_read_ctx  = _on_read_ctx;
+            _isr_binding.on_write     = _on_write;
+            _isr_binding.on_write_ctx = _on_write_ctx;
+            _isr_bound                = _stream.getBus().bindIsrRegMap(&_isr_binding);
+        }
+    }
 
     SlaveStreamAccessor _stream;
     data::DataSpan _reg_file;
@@ -312,6 +480,15 @@ private:
     void *_on_read_ctx    = nullptr;
     OnWriteFn _on_write   = nullptr;
     void *_on_write_ctx   = nullptr;
+    // Backend-visible binding for the ISR regmap fast path (see
+    // IsrRegMapBinding); populated at construction and every rebind, valid
+    // (i.e. actually reflected by the backend) only while _isr_bound is true.
+    IsrRegMapBinding _isr_binding{};
+    // True once bindIsrRegMap (constructor or a setOnRead/setOnWrite rebind)
+    // succeeded: the backend's own ISR now serves regmap reads/writes directly,
+    // and serve() below degenerates to waiting for the transaction to close
+    // (see its fast-path branch).
+    bool _isr_bound = false;
 };
 
 class ScopedSlaveTransaction {
@@ -525,6 +702,7 @@ private:
     uint32_t _next_seq                        = 1;
     service::fast_tick_t _stretch_start       = 0;
     service::fast_tick_t _stretch_budget      = 0;
+    service::fast_tick_t _svc_now             = 0;  // private virtual clock (ctx.elapsed accumulation)
 };
 
 }  // namespace m5::hal::v2::i2c

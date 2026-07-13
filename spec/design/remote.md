@@ -122,9 +122,17 @@ refcount が 0 に戻っても解体せず保持する)。
 
 ### SEQ
 
-- 8 bit 循環。host 発のメッセージ (`HelloReq` / `Request` / `Ping` / `Control`(reset)) ごとに採番し、B3 に載せる
+- **7 bit 循環** (`(seq + 1) & 0x7F`、0..127)。B3 の bit7 は NORESP フラグ専用に予約されており、採番カウンタ自体はそこへ溢れない。host 発のメッセージ (`HelloReq` / `Request` / `Ping` / `Control`(reset)) ごとに採番し、B3 の下位 7 bit に載せる
 - device は対応する応答 (`HelloResp` / `Response` / `Pong` / `Control`(error)) に**同じ SEQ を返す**。host は B3 (seq) と期待 KIND の双方が一致する応答のみ受理する
+- **応答順序は要求順を保証しない**。server はstream transferをpendingにしたまま後続Requestを処理できるため、
+  後続の同期応答が先行し得る。clientはSEQと期待KINDで対応付ける。標準`RemoteSession`は現在
+  **1 in-flight**。Hal facade とその proxy は session 単位の operation gate で、SEQ 採番、
+  stream attach/detach、request、response 解釈、config cache 更新までを 1 RPC として直列化する。
+  これは bus/channel mutex とは別の排他境界で、lock 順序は bus/channel → session。
+  UART/I2S の TX/RX を別 task から呼ぶことは安全だが、標準 session での wire RPC は直列に進む。
+  真に 1 RPC 内で全二重転送する場合は複合 `transfer()` を使う。multi-in-flight client は別設計とする
 - NORESP request は seq の bit7 に NORESP フラグを載せる (server 側で `(seq & 0x80) != 0` を判定)
+- stream_id の検疫中 (§timeout / resync) は、host はその検疫エントリが待つ seq を採番から除外する (`RemoteSession::nextSeq()`)。除外しないと 128 循環で同じ seq が別の要求に再割当てられ、その応答が無関係な検疫を誤って解放しうる
 
 ### hello — 最小能力交換
 
@@ -157,6 +165,11 @@ refcount が 0 に戻っても解体せず保持する)。
 ### timeout / resync
 
 - host は応答 timeout (`Config::response_timeout_ms`) 時、`TIMEOUT_ERROR` として呼び出し側に返す。**自動再送は行わない** — リモート操作は非冪等であり得るため、再試行の判断は呼び出し側に委ねる
+- **stream_id 再利用ハザードと検疫**: `Data` フレームには世代も要求 seq も乗らない (B3 = stream_id のみ、§stream_id レジストリ)。host 側の応答 timeout は device がその stream_id への書き込みを止めたことを意味しない (server 側の処理はまだ継続中のことがある)。timeout した stream_id を即座に空きへ戻すと、旧転送の残骸 `Data` が次に同じ id を割り当てられた新しい転送の受信 Sink へ無警告で混入し得る。host はこれを避けるため、timeout した stream_id を**検疫**に置く: encoder/decoder の attach は即座に外す (以降その id 宛の `Data` は宛先を失い無害に破棄される) が、id 自体は `attachStream` の割当対象から外したまま保持する。検疫の解放は次のいずれかで起きる:
+  1. timeout した要求と同じ seq を持つ `Response`/`Control` をその後観測する。wire は FIFO (点対点の TCP/UART) なので、device がその要求に対応する終端フレームを書き終えた時点で、それより前に送出された `Data` は全て通過済みと言い切れる — これが正確な解放点
+  2. `Config::stream_quarantine_ms` の保険タイマー (既定 6000ms、無活動タイマー)。終端フレーム自体が失われる wire ノイズ等のケースを回収する。server 側の pending timeout もチャンク毎に活動時刻を更新する無活動タイマーであり (固定寿命ではない)、host 側もそれに合わせて検疫中の id 宛 `Data` を観測するたびにこのタイマーを更新する — さもないと進行の遅い転送が固定期限より先に切れて再利用ハザードが再発する
+  3. `hello()` の成功。セッション再確立で全検疫を一掃する。**`reset()` は検疫を一掃しない**: host 実装は device のリセット応答を待たない fire-and-forget であり (上記 `Control` の項)、送出できたことは device が旧転送を停止した証拠にならない
+  - 16 本すべてが検疫中の間は `attachStream` が新規割当を拒否し `0xFF` を返す (静かな id 再利用より安全側)
 - 接続喪失の検出は `ping` の失敗、または下層 stream のエラーによる
 - wire 上の破損からの再同期は frame codec の Delimiter / resync が担う ([frame.md](frame.md) §decode の意味論)
 
@@ -172,11 +185,12 @@ refcount が 0 に戻っても解体せず保持する)。
 
 request/response は RTT に律速される。連続データ転送 (I2S ストリーミング等) には `Data` フレームのストリームを直接使う。
 
-UART / I2S の remote proxy は、各 stream transfer request の直前に同じ bytecode script 内で
-`BusConfigure` を送る。したがって server 側の動的バス作成時に置く accessor 初期値は fallback であり、
-実際の baud rate / UART timeout / I2S sample rate・bit depth・channel count・timeout は呼び出し側
-accessor の `AccessConfig` が転送ごとに正本になる。I2C/SPI は既存どおり、転送 metadata または
-transaction 開始時の `BusConfigure` で per-accessor config を運ぶ。
+remote proxyは4 kind共通で、wire正規形にした実効`AccessConfig`が、そのproxyで前回成功確認した
+設定と異なる場合だけ、同じbytecode script内で`BusStreamTransfer`の直前に`BusConfigure`を送る。
+初回transfer、`Hello`後、前回requestがエラーになった場合も送る。設定が同一なら省略するが、
+各transferで渡されるaccessorの`AccessConfig`が実効設定の正本である。server側の動的バス作成時に
+置くaccessor初期値は最初のconfigureまでのfallbackとなる。`TransferDesc`側のmetadataは設定cacheと
+別に毎transfer送る。
 
 ### BusStreamTransfer + attachStream
 
@@ -186,7 +200,9 @@ transaction 開始時の `BusConfigure` で per-accessor config を運ぶ。
 2. host が `BusStreamTransfer` (0x12) opcode を含む Request を送る。payload = `[kind:1][bus_id:1][stream_id:1][meta_size:1][tx_len:u32 LE][rx_len:u32 LE][meta]`
 3. device 側 BytecodeRunner の `BusStreamTransfer` ハンドラ (`_stream_transfer_fn`) が `StreamTransferDesc` を受け、同じ stream_id にバスサービスを紐付ける
 4. 以降、`Data` フレーム (B3 = stream_id) が両端の attach 済み Source/Sink 経由でバスデータの直接パスを提供する。`pump()` がフレーム化と demux を駆動する
-5. 終了時は host が `RemoteSession::detachStream(stream_id)` で encoder/decoder の登録を外す
+5. 終了時は host が `RemoteSession::detachStream(stream_id)` で encoder/decoder の登録を外す。host 側で応答が確定しない終了 (応答 timeout に限らず、enqueue 後の曖昧な失敗全般) は代わりに `RemoteSession::quarantineStream(stream_id, seq)` を使う (即座の再割当ハザード — §timeout / resync)。`seq` はその要求が使った seq そのもの (`request()` の out-param) を渡す
+
+**stream transfer は script の最終命令でなければならない** (`tx_len > 0` または `rx_len > 0` のとき)。転送が pending になると Response は遅延し、遅延 Response は `Report*` のみを運ぶ — 後続命令が response slot へ格納したデータは応答に乗らない。このため device 側 prescan は pending になる stream transfer の後に命令が続く script を実行前に `INVALID_ARGUMENT` で拒否する (`tx_len == rx_len == 0` の inline 実行は対象外)。
 
 旧来のストリーム専用 opcode (`BusWriteStream` / `EvtStreamCredit` 等)・channel-id ベースの `ChannelBind` / `MuxDataPump` は削除された。ストリーミングは `BusStreamTransfer` + `Data` フレーム stream_id に一本化されている。
 
@@ -234,7 +250,7 @@ host の GPIO read は通信せずキャッシュを読む。device 側で購読
   であり、`GpioSetMode` 監視マスクではフィルタしない
 - **通知はベストエフォート**: event は応答確認を持たず、送信失敗時の再送もない
 - **観測対象ピンの入力有効化は利用者の責務**: subscribe / port read はピンの pad 設定を**暗黙に変更しない**
-  (ユーザーが指示していない GPIO モード変更を勝手に行わないという設計方針、2026-07-02 決定)。
+  (ユーザーが指示していない GPIO モード変更を勝手に行わないという設計方針)。
   入力バッファが無効なピン (例: ESP32 は電源投入後 IE=0 がデフォルト) は物理レベルに関わらず
   IN レジスタが常に 0 を返すため、subscribe/watch/ポート読みは**先に該当ピンを入力有効
   (`gpio mode <pin> in` 相当の GpioSetMode) にしてから**行うこと。出力駆動中ピンのループバック観測を
@@ -276,10 +292,27 @@ host の GPIO read は通信せずキャッシュを読む。device 側で購読
 ### 意味論
 
 - **server 側**: `Server::setBusCreateHandler` でアプリ提供のコールバックを登録。コールバック内で物理バスを構築し `registerI2C/SPI/UART/I2S` で binding に追加する。handler 未設定で `BusCreate` が届いた場合は `UNSUPPORTED`
+- **custom handler の identity 契約**: host は応答喪失時に create / release の到達を確定できない。
+  `setBusCreateHandler` の実装は、同一 kind + core pin identity の create を同じ物理bus/lockへ
+  internして参照計数し、存在しないbindingのreleaseを冪等成功にする。標準
+  `ServerPhysicalBusPool` はこの契約を満たす。応答喪失を理由に別の物理busを同じ配線へ作る
+  handlerは非対応である。
 - **hello との関係**: `setBusCreateHandler` 登録済みであれば `HelloResp` の `flags` bit1 が立つ。Hello 時に全動的バスを自動 release する (新規接続は白紙から開始)
 - **bus_id 空間**: kind 別に独立 (I2C bus_id=1 と UART bus_id=1 は無関係)。上限 = `kMaxBusBindings` (4)。超過は `OUT_OF_RESOURCE`
 - **host proxy config**: typed acquire は要求 `IBusConfig` を、logical acquire は送信済み `pin_config` から復元した core pins / buffer / role を proxy の `getConfig()` に保持する。release と同一 identity 再取得時の設定比較はこの proxy config を正本にし、wire に乗るフィールドのみ・wire 単位に正規化して行う。
-- **host 側 explicit release**: `hal.<KIND>.release(bus)` は peer へ `BusRelease` を送り、peer が成功を返した場合だけ host 側 registry slot と bus_id lease を解放する。peer release / transport / protocol error が返った場合は local state を保持して error を呼び出し側へ返す。接続破棄時の best-effort cleanup とは別の、明示 release API の整合性優先規約。
+- **create の曖昧失敗**: host は kind ごとの bus ID を `BusCreate` 送信前に予約し、proxy と
+  lifecycle lease を先に作る。応答喪失など「peer へ届いたか不明」の失敗でも同じ lease が
+  best-effort `BusRelease` を行う。解放成功を確認できない ID は再割当せず隔離するため、遅延した
+  create と新 binding が同じ ID で衝突しない。
+- **host 側 explicit release**: `hal.<KIND>.release(bus)` は [bus_accessor.md](bus_accessor.md) の
+  exact-instance consuming close 規約に従う。alias/Accessor co-own が無いことを確定してから
+  peer へ `BusRelease` を送り、peer 成功時だけ registry slot、bus_id lease、caller の
+  `shared_ptr` をまとめて解放する。peer/transport/protocol error 時は local state と caller
+  ownership を保持する。`BusRelease` は存在しない ID に対しても冪等なため、応答喪失後も
+  同じ ID で再試行でき、成功確定前に ID を再利用しない。最終 holder の自然破棄は
+  session gateへ再帰待ちしない non-blocking best-effort `BusRelease` とする。解放確認に成功した
+  ときだけ bus ID と identity slotを再利用し、確認不能なら `Quarantined` tombstoneとID隔離を
+  connection cleanupまで維持する。接続破棄は server 側の per-connection cleanup が最終安全網となる。
 
 ## 安全境界
 
@@ -303,7 +336,7 @@ host の GPIO read は通信せずキャッシュを読む。device 側で購読
 
 | 要素 | 不採用理由 |
 |---|---|
-| ストリーム専用 opcode (旧 0xB0-B6, 0x61-62) | `BusStreamTransfer` + `Data` フレーム stream_id に一本化。bytecode 層にストリーム状態管理を持たない |
+| ストリーム専用 opcode (旧 `BusWriteStream` / `EvtStreamCredit` 等, 0x61-62) | `BusStreamTransfer` + `Data` フレーム stream_id に一本化。bytecode 層にストリーム状態管理を持たない (`BusBeginTransaction`/`BusEndTransaction` = 0xB4/0xB5 はトランザクション制御用の現役 opcode で対象外) |
 | channel-id ベース mux (旧 CRC16 + credit 管理チャネル) | frame v1 codec の単一フレーム列 (KIND + Data B3 stream_id) で多重化を表現。別系統のフレーム形式を持たない |
 | 既定での自動再送 | リモート操作は非冪等であり得る。再試行の判断は呼び出し側に委ねる |
 | bytecode への認証埋め込み | 層が違う。transport の責務とする |
@@ -312,12 +345,27 @@ host の GPIO read は通信せずキャッシュを読む。device 側で購読
 
 `Hal::initUart(port)` / `Hal::initTcp(endpoint)` で接続を確立し、`hal.I2C.acquire()` 等のローカルと同一の API でリモートバスを操作する。内部で `RemoteBackend` (`IHalBackend` 実装) が `RemoteI2CProxyBus` 等の proxy バスを自動生成し、バス取得から転送までがローカルと同一のコードパスで動く。ユーザーは proxy の存在を意識しない (`Hal.I2C.acquire()` が透過的に返す)。
 
-**接続束縛は排他 — 1 つの `Hal` は 1 デバイスの窓** (2026-07-02 確定): `initUart` / `initTcp` は
+**接続束縛は排他 — 1 つの `Hal` は 1 デバイスの窓**: `initUart` / `initTcp` は
 その `Hal` の全 kind view のバックエンドを接続先へ丸ごと差し替える (旧接続・PC ビルドの
 host-local バスとの同居はしない)。host-local バスとリモートを同時に使う場合は `Hal` を
 もう 1 つ構築する。複数リモートへの同時接続も同様に `Hal` を接続先の数だけ持つ。
 接続に使うトランスポート (UART/TCP) 自体は facade の acquire を通らない variant 内部の
 インフラであり、この排他の対象外。
+
+connection / session の寿命は proxy bus の `shared_ptr` 寿命と分離する。connection は小型の
+shared session handle を backend / GPIO / proxy へ配布し、各 RPC は handle の lease 中だけ
+`RemoteSession` へ触る。再接続・local 復帰・`Hal` 破棄は handle を close し、進行中 RPC の
+完了を待ってから session/transport を破棄する。旧 proxy 自体はメモリ上生存できるが、
+以後の操作は `CLOSED` で失敗し、旧 connection を延命や操作し続けない。
+handle は connection 側が別々に作るのではなく `RemoteSession` が持つ canonical な 1 個であり、
+`RemoteSession&` を受ける低レベル互換 constructor もその handle を取得する。従って同一 session を
+包む proxy 経路の違いで serializer が分裂しない。
+
+`remote::RemoteSession* Hal::session(void)` は低レベル用の**借用 escape hatch**である。戻り値は
+次の `connect` / `initUart` / `initTcp` 呼び出し、またはその `Hal` の破棄までしか有効でない。
+pointer から `RemoteSession` の raw API を直接呼ぶ操作は facade の operation gate を自動取得しないため、
+proxy 操作、`pumpRemote()`、reconnect と caller 自身で直列化する。通常の bus / GPIO 操作には
+`Hal` facade を使う。
 
 `Hal::connect(endpoint, cfg)` は即時確立 API で、endpoint は厳密一致・大文字小文字区別で解釈する。
 `nullptr` / `""` / `"local"` は process-local backend (`M5HALCore` の `LocalBackend`) へ束ねる。
@@ -332,10 +380,19 @@ local へ戻す場合は remote service / GPIO / connection を破棄してか�
 GPIO も接続時に `Hal.Gpio` に自動登録される。`read()` / `readPort()` はホスト側キャッシュを返し、
 接続時の `seedCache` と `GpioSubscribe` 後の `EvtGpioState` push で更新される。物理 wire の値を
 キャッシュから切り分けたい場合は、host 側から `GpioPortRead` を含む bytecode request を発行する。
+reconnect 前に取得した `Pin` / `PortAccess` は新 peer へ付け替えない。raw port pointer の値型契約を
+安全に保つため旧 `Port_remote` のみを `Hal` の寿命まで保持し、旧 connection / transport は延命しない。
+旧 handle close 後は read が最終 cache、void の write / mode 変更が no-op、`syncRead()` が `CLOSED`
+となる。`Hal` 自体の破棄後まで `Pin` / `PortAccess` を使えるという意味ではない。
 host tool は待ち窓や idle loop で `Hal::pumpRemote()` を呼ぶことで remote I/O、keepalive、
 watch callback dispatch を 1 つの入口から進められる。使用例は
 `examples/v2/HowToUse/Remote/`、`examples/v2/HowToUse/RemoteI2S/`、`examples/v2/RemoteServer/`、
 `examples/v2/RemoteServerTCP/`、`examples/v2/RemoteTest/`。
+
+push watch callback は canonical session lease 内で同期 dispatch されるため、同じ session の
+remote transaction、`Hal::pumpRemote()`、その `Hal` の reconnect / 破棄へ再入してはならない。
+通常の proxy `shared_ptr` を callback 内で手放すことは許可され、自然解放は session gate を
+再帰待ちせず、確認不能な bus ID を connection cleanup まで隔離する。
 
 ## 将来拡張 (方向性のみ)
 
@@ -344,8 +401,8 @@ watch callback dispatch を 1 つの入口から進められる。使用例は
 
 ## 互換性と版管理
 
-- 本仕様 (M5HAL remote v1) は**実験段階**であり、公開リリースノートで凍結を宣言するまでは非互換変更があり得る
-- メッセージ層の版は `hello` の `proto_ver` で判別する。凍結後の非互換変更は `proto_ver` を増やし、frame KIND 値の意味は再利用しない
+- 本仕様 (M5HAL remote v1) の段は **`experimental`** ([../stability.md](../stability.md))。`stable` を宣言するまでは非互換変更があり得る
+- メッセージ層の版は `hello` の `proto_ver` で判別する。`stable` 宣言後の非互換変更は `proto_ver` を増やし、frame KIND 値の意味は再利用しない
 - 前方互換の原則: 未知の frame KIND は破棄 ([frame.md](frame.md))、`HelloResp` の末尾拡張は無視、bytecode の未知 opcode は critical bit に従う ([bytecode.md](bytecode.md))
 
 ## 関連

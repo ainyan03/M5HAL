@@ -3,10 +3,11 @@
 
 #include <M5HAL_v2.hpp>
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 
 #include <memory>
 
-// uart::Bus facade (phase 1) + uart::BusView intern (phase 2) tests.
+// uart::Bus facade + uart::BusView intern tests.
 //
 // The real UART backends (arduino / espidf / posix) open a hardware/serial
 // port on init, so a host test uses a TEST-LOCAL fake backend (no public
@@ -47,7 +48,7 @@ namespace {
 namespace v2 = m5::hal::v2;
 }
 
-// ---- uart::Bus facade (phase 1) ----------------------------------------------
+// ---- uart::Bus facade ----------------------------------------------
 
 TEST(UartBusFacade, InitWithFakeBackendSucceeds)
 {
@@ -68,7 +69,7 @@ TEST(UartBusFacade, QueryApiBeforeInitReturnsDefaults)
     EXPECT_EQ(facade.maxFrequency(), 0u);
 }
 
-// ---- uart::BusView intern (phase 2) ------------------------------------------
+// ---- uart::BusView intern ------------------------------------------
 
 TEST(UartBusView, SamePinsReturnSameInstance)
 {
@@ -204,5 +205,6 @@ TEST(UartBusViewCoOwn, AccessorOutlivesAcquireTemporary)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

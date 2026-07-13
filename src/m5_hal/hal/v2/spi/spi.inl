@@ -165,6 +165,12 @@ m5::hal::v2::result_t<void> MasterAccessor::startTransfer(const TransferDesc& de
     auto r = getBus().transfer(this, _access_config, desc, (src != nullptr && tx_len > 0) ? src : nullptr, tx_len,
                                (dst != nullptr && rx_len > 0) ? dst : nullptr, rx_len);
     if (!r.has_value()) {
+        // Latch like waitTransfer(): transaction segments form one logical
+        // operation, so ANY failed segment — including a pre-flight
+        // rejection that never touched the wire — invalidates the rest of
+        // the transaction. Recovery is a fresh transaction. Contract:
+        // spec/design/spi.md §transaction 中のエラー.
+        _transaction_error = r.error();
         return m5::stl::make_unexpected(r.error());
     }
     if (!transferBusy()) {

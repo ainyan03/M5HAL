@@ -29,8 +29,8 @@
 // `Source::peek` is a borrowing API (repeated peeks keep the prefix
 // stable), which requires a scratch buffer the underlying consume-only
 // stream cannot provide. Keeping that buffer (and the non-trivial
-// contract: timeout-vs-eof, skip reservations) in one decorator avoids
-// per-transport re-implementations and keeps accessors buffer-free.
+// contract: no-progress vs EOF, skip reservations) in one decorator
+// avoids per-transport re-implementations and keeps accessors buffer-free.
 namespace m5::hal::v2::data {
 
 /*!
@@ -108,10 +108,8 @@ m5::hal::v2::result_t<size_t> readUntil(StreamReader& reader, uint8_t delim, Dat
     `read` for the missing bytes, bounded by the reader's own timeout
     policy (UART: first-byte / inter-byte timeouts). After the timeout
     the caller gets what did arrive - a short peek - and a still-empty
-    buffer reports `TIMEOUT_ERROR`. That error is a recoverable
-    condition - the caller may simply peek again - and NOT
-    end-of-stream (an empty span would mean EOF per the Source
-    contract, which a serial line never reaches on its own).
+    buffer reports a successful zero-length span. That is a recoverable
+    no-progress state, not end-of-stream.
   - request already buffered: returns immediately without touching the
     reader. Callers that must never block check `readableBytes()`
     first and peek no more than that.
@@ -123,8 +121,9 @@ m5::hal::v2::result_t<size_t> readUntil(StreamReader& reader, uint8_t delim, Dat
 
   `eof()` is true only for a detached adapter (null reader), and
   `closed()` keeps its default (= eof()): an attached stream may always
-  produce more bytes. Stream errors, including timeouts, are reported
-  through the error path and never latch EOF.
+  produce more bytes. Hard stream errors are reported through the error
+  path and never latch EOF; an idle timeout is represented by an empty
+  successful peek.
  */
 class StreamSource : public Source {
 public:
@@ -180,7 +179,11 @@ private:
   repeated calls, capped at `scratch.size`); `commit(N)` pushes the
   first N scratch bytes through `StreamWriter::write`. A short write -
   the writer accepted fewer bytes than committed (write timeout, ...) -
-  is reported as `IO_ERROR`.
+  is reported as `TIMEOUT_ERROR`; the accepted prefix length (which may
+  be 0) is recorded and readable back via `partialCommitAccepted()`, so
+  a caller pumping bytes out of some upstream `Source` can advance that
+  source by exactly the accepted prefix instead of by 0 (re-sending
+  already-written bytes) or by N (silently dropping the remainder).
 
   `closed()` is true only for a detached adapter (null writer);
   committing while detached returns `CLOSED` instead of silently
@@ -197,9 +200,18 @@ public:
 
     bool closed() const override;
 
+    /*! @brief Bytes the underlying writer actually accepted during the
+        most recent `commit()` call (updated on both success and
+        failure; see the class doc for the short-write case). */
+    size_t partialCommitAccepted() const override
+    {
+        return _last_accepted;
+    }
+
 private:
     StreamWriter* _writer = nullptr;
     DataSpan _scratch{};
+    size_t _last_accepted = 0;
 };
 
 }  // namespace m5::hal::v2::data

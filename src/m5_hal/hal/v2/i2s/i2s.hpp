@@ -3,6 +3,7 @@
 #define M5_HAL_I2S_I2S_HPP_
 
 #include "../bus/bus.hpp"
+#include "../bus/bus_view.hpp"
 #include "../bus/hal_backend.hpp"
 #include "../bus/managed_facade.hpp"
 #include "../bus/registry.hpp"
@@ -14,7 +15,6 @@
 #include <stdint.h>
 #include <memory>
 #include <new>
-#include <type_traits>
 
 /*!
   @namespace m5::hal::v2::i2s
@@ -235,7 +235,7 @@ struct IBus;
  */
 struct TxAccessor : public bus::IAccessor, public data::StreamWriter {
     TxAccessor(IBus& bus, const AccessConfig& access_config);
-    /*! @brief Co-owning construction from a borrowed bus (`M5_Hal.I2S.acquire(cfg)`). */
+    /*! @brief Co-owning construction from an acquired shared bus (`M5_Hal.I2S.acquire(cfg)`). */
     TxAccessor(std::shared_ptr<IBus> bus, const AccessConfig& access_config);
 
     /*! @name Unbound construction + typed bind (gate: `beginAccess` on TX channel). @{ */
@@ -300,7 +300,7 @@ private:
  */
 struct RxAccessor : public bus::IAccessor, public data::StreamReader {
     RxAccessor(IBus& bus, const AccessConfig& access_config);
-    /*! @brief Co-owning construction from a borrowed bus (`M5_Hal.I2S.acquire(cfg)`). */
+    /*! @brief Co-owning construction from an acquired shared bus (`M5_Hal.I2S.acquire(cfg)`). */
     RxAccessor(std::shared_ptr<IBus> bus, const AccessConfig& access_config);
 
     /*! @name Unbound construction + typed bind (gate: `beginAccess` on RX channel). @{ */
@@ -361,7 +361,7 @@ private:
 struct Accessor {
     Accessor(IBus& bus, const AccessConfig& access_config);
     /*!
-      @brief Co-owning construction from a borrowed bus. Both channels share
+      @brief Co-owning construction from an acquired shared bus. Both channels share
       ownership of the bus (`M5_Hal.I2S.acquire(cfg)`).
      */
     Accessor(std::shared_ptr<IBus> bus, const AccessConfig& access_config);
@@ -514,11 +514,11 @@ struct Bus;  // the facade, defined just below
 /*!
   @brief Per-kind Traits for the shared `bus::FacadeCore` and BusView.
 
-  I2S's `Bus` shares the phase-1/2 spine (backend ownership + `init` +
+  I2S's `Bus` shares the base spine (backend ownership + `init` +
   `release` + the query mirror). Its plain `BusView` uses the same traits for
   typed acquire identity: concrete kind `IBus`, the bus-level config base, the
   variant selector (`FacadeCore`), the public `BusType`, kind tag, and the 4-pin
-  (BCLK/WS/DOUT/DIN) identity projection. I2S has no phase-3 intent / hot-swap
+  (BCLK/WS/DOUT/DIN) identity projection. I2S has no intent / hot-swap
   surface, so the master-only Traits members are intentionally absent. `Bus` is
   forward-declared at namespace scope so `BusType` names the public `i2s::Bus`,
   not a nested type.
@@ -532,6 +532,10 @@ struct BusTraits {
     using BackendFor = i2s::BackendFor<CfgT>;
 
     static constexpr types::bus_kind_t KIND = types::bus_kind_t::I2S;
+    /*! @brief I2S uses the static-backend policy: `BusView::hardwareInUse()`
+               is always 0 (see spec/design/bus_accessor.md §static-backend
+               policy). */
+    static constexpr bool MANAGED_ALLOCATION = false;
 
     static bus::IdentityKey identityFromConfig(const IBusConfig& cfg)
     {
@@ -561,7 +565,7 @@ struct BusTraits {
   mutexes) are INHERITED from i2s::IBus and stay on THIS facade -- the accessors
   contend on the facade's channel mutexes, the backend's stay dormant. So the
   2-mutex channel model needs no special handling here: only the data path is
-  delegated. Mirrors the uart::Bus design (ADR 034) without the phase-3 intent /
+  delegated. Mirrors the uart::Bus design without the intent /
   hot-swap extensions.
  */
 struct Bus : public bus::FacadeCore<BusTraits> {
@@ -595,7 +599,10 @@ struct Bus : public bus::FacadeCore<BusTraits> {
 /*!
   @brief Typed I2S view delegating registry access to the HAL backend.
 
-  ADR 034 phase 2 parity with i2c::BusView and spi::BusView: I2S buses are
+  Shares the acquire / logical-acquire / commit / release spine with every
+  other kind through `bus::BusViewCore<BusTraits>` (see bus/bus_view.hpp);
+  this derived type adds only the I2S-specific `createBusConfig()` pin
+  overloads. Parity with i2c::BusView and spi::BusView: I2S buses are
   interned by the HAL backend's registry keyed by physical wiring (BCLK,
   WS, DOUT, DIN pins). acquire(cfg) returns the bus for those pins, creating
   it (the facade + the backend selected by cfg's type, via Bus::init) on the
@@ -606,119 +613,9 @@ struct Bus : public bus::FacadeCore<BusTraits> {
   a no-op, while logical acquire reports `NOT_IMPLEMENTED` until I2S grows a
   controller/capability allocation policy.
  */
-class BusView {
+class BusView : public bus::BusViewCore<BusTraits> {
 public:
-    BusView() : _backend{nullptr}
-    {
-    }
-    explicit BusView(bus::IHalBackend* backend) : _backend{backend}
-    {
-    }
-    BusView(const BusView&)            = delete;
-    BusView& operator=(const BusView&) = delete;
-
-    void setBackend(bus::IHalBackend* backend)
-    {
-        _backend = backend;
-    }
-
-    template <class CfgT>
-    result_t<std::shared_ptr<IBus>> acquire(const CfgT& cfg)
-    {
-        static_assert(std::is_base_of<IBusConfig, CfgT>::value,
-                      "BusView::acquire expects a BusConfig of this bus kind");
-        if (_backend == nullptr) {
-            return m5::stl::make_unexpected(error::error_t::NOT_CONNECTED);
-        }
-        bus::IdentityKey id = BusTraits::identityFromConfig(cfg);
-        if (!id.valid()) {
-            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
-        {
-            auto r = _backend->acquireBusTyped(types::bus_kind_t::I2S, id, cfg);
-            if (r.has_value()) {
-                return std::static_pointer_cast<IBus>(r.value());
-            }
-            if (r.error() != error::error_t::NOT_IMPLEMENTED) {
-                return m5::stl::make_unexpected(r.error());
-            }
-        }
-        if (auto existing = _backend->busRegistry().findByIdentity(types::bus_kind_t::I2S, id)) {
-            if (!BusTraits::configCompatible(static_cast<const IBusConfig&>(existing->getConfig()), cfg)) {
-                return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
-            }
-        }
-        auto acquired = _backend->busRegistry().acquireOrFind(
-            types::bus_kind_t::I2S, id, [&cfg]() -> result_t<std::shared_ptr<bus::IBus>> {
-                std::shared_ptr<Bus> facade{new (std::nothrow) Bus()};
-                if (!facade) {
-                    return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
-                }
-                auto r = facade->init(cfg);
-                if (!r.has_value()) {
-                    return m5::stl::make_unexpected(r.error());
-                }
-                return std::shared_ptr<bus::IBus>{facade};
-            });
-        if (!acquired.has_value()) {
-            return m5::stl::make_unexpected(acquired.error());
-        }
-        return std::static_pointer_cast<IBus>(acquired.value());
-    }
-
-    result_t<std::shared_ptr<IBus>> acquire(const LogicalBusConfig& req)
-    {
-        if (_backend == nullptr) {
-            return m5::stl::make_unexpected(error::error_t::NOT_CONNECTED);
-        }
-        bus::IdentityKey id = BusTraits::identityFromLogical(req);
-        if (!id.valid()) {
-            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
-        if (!req.intent.valid()) {
-            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
-        bus::AllocationRequest ar{types::bus_kind_t::I2S, id, req.intent, &req};
-        auto acquired = _backend->acquireBusLogical(types::bus_kind_t::I2S, id, ar);
-        if (!acquired.has_value()) {
-            return m5::stl::make_unexpected(acquired.error());
-        }
-        return std::static_pointer_cast<IBus>(acquired.value());
-    }
-
-    result_t<void> commitBuses(uint32_t timeout_ms = types::TIMEOUT_FOREVER)
-    {
-        if (_backend == nullptr) {
-            return m5::stl::make_unexpected(error::error_t::NOT_CONNECTED);
-        }
-        return _backend->commitBuses(types::bus_kind_t::I2S, timeout_ms);
-    }
-
-    /*!
-      @brief Explicitly release a bus acquired via acquire().
-
-      Clears the registry slot for the bus so capacity is reclaimed
-      immediately. For a remote backend this also sends BusRelease to
-      the peer. Pass the `shared_ptr<IBus>` returned by acquire().
-      Returns `INVALID_ARGUMENT` if the bus is null, its config pins
-      are invalid, or no matching slot is found in the registry.
-     */
-    result_t<void> release(const std::shared_ptr<IBus>& bus)
-    {
-        if (_backend == nullptr || !bus) {
-            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
-        bus::IdentityKey id = BusTraits::identityFromConfig(bus->getConfig());
-        if (!id.valid()) {
-            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
-        return _backend->releaseBus(types::bus_kind_t::I2S, id);
-    }
-
-    uint8_t hardwareInUse(void) const
-    {
-        return 0;
-    }
+    using bus::BusViewCore<BusTraits>::BusViewCore;
 
     LogicalBusConfig createBusConfig(Bclk bclk, Ws ws, Dout dout, types::AllocationIntent intent = {}) const
     {
@@ -732,9 +629,6 @@ public:
     {
         return {bclk, ws, dout, din, intent};
     }
-
-private:
-    bus::IHalBackend* _backend;
 };
 
 /*!

@@ -10,6 +10,7 @@
 // through a StreamSource with chunked arrival.
 
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 #include <M5HAL_v2.hpp>
 
 #include <algorithm>
@@ -106,12 +107,16 @@ public:
     {
         auto totals = last_totals;
         last_totals.clear();
+        if (rx_report_override != 0) {
+            totals.rx = rx_report_override;  // model a backend over-reporting rx
+        }
         return totals;
     }
 
-    size_t transfer_count = 0;
-    uint16_t last_addr    = 0;
-    uint32_t last_freq    = 0;
+    size_t transfer_count     = 0;
+    uint16_t last_addr        = 0;
+    uint32_t last_freq        = 0;
+    size_t rx_report_override = 0;
     std::vector<uint8_t> prefix;
     std::vector<uint8_t> tx_bytes;
     std::vector<uint8_t> rx_script;
@@ -413,6 +418,26 @@ TEST(BytecodeRunner, I2CTransferRoundtrip)
     EXPECT_EQ(stored.data[2], 0xC2);
 }
 
+TEST(BytecodeRunner, TransferClampsOverReportedRxToAllocatedStore)
+{
+    // Regression anchor: opBusTransfer recorded the backend's rx claim
+    // verbatim as the store-slot length; an over-reporting backend made a
+    // later StoreData read past the slot's allocation.
+    Rig rig;
+    rig.i2c_bus.rx_script          = {0xC0, 0xC1, 0xC2};
+    rig.i2c_bus.rx_report_override = 100;  // way past the 3-byte allocation
+
+    i2c::TransferDesc desc{uint8_t{0xD0}};
+    uint8_t buf[64] = {};
+    data::MemorySink sink{data::DataSpan{buf, sizeof(buf)}};
+    bytecode::BytecodeEncoder enc{sink};
+    ASSERT_TRUE(enc.transfer(0, desc, data::ConstDataSpan{}, 3, 7).has_value());
+    ASSERT_TRUE(enc.end().has_value());
+
+    ASSERT_TRUE(rig.runner.run(data::ConstDataSpan{buf, sizeof(buf)}).has_value());
+    EXPECT_EQ(rig.runner.storedData(7).size, 3u);  // clamped to the allocation
+}
+
 TEST(BytecodeRunner, SPITransferCarriesDescriptor)
 {
     Rig rig;
@@ -648,6 +673,30 @@ TEST(BytecodeEncoder, RejectsPayloadSizeOverflowBeforeReserve)
     EXPECT_EQ(gpio_overflow.error(), error_t::INVALID_ARGUMENT);
 }
 
+// streamTransfer writes meta.size into a single u8 wire field. A meta span
+// larger than 255 (or an incoherent null-with-size span) must be rejected up
+// front rather than silently truncated into a malformed instruction.
+TEST(BytecodeEncoder, StreamTransferRejectsOversizedOrIncoherentMeta)
+{
+    uint8_t buf[512] = {};
+    data::MemorySink sink{data::DataSpan{buf, sizeof(buf)}};
+    bytecode::BytecodeEncoder enc{sink};
+
+    std::array<uint8_t, 256> meta{};
+    auto oversized =
+        enc.streamTransfer(types::bus_kind_t::I2C, 0, 0, 0, 0, data::ConstDataSpan{meta.data(), meta.size()});
+    ASSERT_FALSE(oversized.has_value());
+    EXPECT_EQ(oversized.error(), error_t::INVALID_ARGUMENT);
+
+    auto null_with_size = enc.streamTransfer(types::bus_kind_t::I2C, 0, 0, 0, 0, data::ConstDataSpan{nullptr, 4});
+    ASSERT_FALSE(null_with_size.has_value());
+    EXPECT_EQ(null_with_size.error(), error_t::INVALID_ARGUMENT);
+
+    // The 255-byte boundary is still accepted.
+    auto ok = enc.streamTransfer(types::bus_kind_t::I2C, 0, 0, 0, 0, data::ConstDataSpan{meta.data(), 255});
+    ASSERT_TRUE(ok.has_value()) << "err=" << error::toString(ok.error());
+}
+
 TEST(BytecodeRunner, TruncationAndTerminator)
 {
     Rig rig;
@@ -859,5 +908,6 @@ TEST(BytecodeRunner, RunEventPreservesRequestState)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include <M5HAL_v2.hpp>
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 
 #include <cstring>
 #include <type_traits>
@@ -116,7 +117,7 @@ TEST(IBusConfig, DefaultCtorSetsUARTKind)
     EXPECT_EQ(cfg.tx_buffer_size, 0u);
 }
 
-// S20: tag-pin constructors. The construction contract is compile-time;
+// Tag-pin constructors. The construction contract is compile-time;
 // the load-bearing parts are pinned with static_asserts.
 static_assert(std::is_constructible<m5::hal::v2::uart::IBusConfig, m5::hal::v2::uart::Tx, m5::hal::v2::uart::Rx>::value,
               "tag ctor (Tx, Rx)");
@@ -492,5 +493,6 @@ TEST(Accessor, FacadeSessionLocksBothChannels)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

@@ -14,7 +14,7 @@
 
 /*!
   @namespace m5::hal::v2::bus
-  @brief Kind-neutral intent-driven controller allocation (ADR 034 phase 3).
+  @brief Kind-neutral intent-driven controller allocation.
  */
 namespace m5::hal::v2::bus {
 
@@ -57,8 +57,35 @@ public:
      */
     result_t<void> commitBuses(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
 
+    /*!
+      @brief Claim a hardware controller OUTSIDE the intent resolver.
+
+      For a caller with no `IManagedBus` of its own (e.g. a standalone
+      slave), not the master `acquire()`/`commitBuses()` path. Resolution
+      mirrors the resolver's own rules, restricted to the bus-independent
+      part (capability + opt-in; there is no bus to run the pin-domain hook
+      against): `Require(id)` claims exactly `id` (`OUT_OF_RESOURCE` if busy,
+      `INVALID_ARGUMENT` if out of range or capability-ineligible);
+      `Prefer(id)` tries `id` first, then falls back to Auto; `Auto` (the
+      default, `intent == {}`) claims the lowest-numbered eligible free
+      controller. `forbid & HARDWARE` or an invalid intent is
+      `INVALID_ARGUMENT` (a claim is defined as hardware occupancy). A
+      claimed controller survives `commitBuses()`'s `releaseAll()` rebuild
+      (see `HwControllerPool::releaseAll`) and is reserved out of the
+      resolver's `used[]` set for the whole commit.
+     */
+    result_t<int8_t> claimController(const types::AllocationIntent& intent);
+
+    /*! @brief Return a controller claimed via `claimController`. */
+    result_t<void> releaseClaimedController(int8_t controller);
+
 private:
     void _syncPoolFromLive(IBus* const* qbus, size_t n);
+
+    // Bus-independent half of _eligible: the capability + opt-in filter,
+    // shared by the commit-time resolver AND claimController (which has no
+    // IManagedBus to run the pin-domain hook against).
+    bool _eligibleCaps(const types::AllocationIntent& want, int8_t controller) const;
 
     // Whether a controller satisfies a bus's capability + pin-domain
     // constraints. The capability check (require/forbid/opt-in) runs for
@@ -75,9 +102,33 @@ private:
     // or a specific controller preferred, 3 = automatic, -1 = software only.
     static int allocTier(const types::AllocationIntent& a);
 
+    // Serializes commitBuses / claimController / releaseClaimedController
+    // against each other. The resolver was designed to drive a whole
+    // bin-packing pass from one task context, but claimController is a
+    // public entry another task may call while a commit is mid-rebuild
+    // (_syncPoolFromLive drops every ordinary lease before re-establishing
+    // them one by one); without this lock a concurrent claim could take a
+    // controller a live bus still occupies. Held across the whole commit;
+    // claims never take a bus lock, so the nesting order (this, then
+    // pool/bus internals) is one-way and cannot deadlock.
+    struct SerialGuard {
+        runtime::Mutex& m;
+        explicit SerialGuard(runtime::Mutex& mtx) : m{mtx}
+        {
+            (void)m.lock(types::TIMEOUT_FOREVER);
+        }
+        ~SerialGuard(void)
+        {
+            m.unlock();
+        }
+        SerialGuard(const SerialGuard&)            = delete;
+        SerialGuard& operator=(const SerialGuard&) = delete;
+    };
+
     BusRegistry& _registry;
     const IAllocationKind& _kind;
     HwControllerPool _pool;
+    runtime::Mutex _serial_mutex;
 };
 
 }  // namespace m5::hal::v2::bus

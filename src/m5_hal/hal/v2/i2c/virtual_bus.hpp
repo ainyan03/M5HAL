@@ -29,9 +29,19 @@ public:
     {
         _runner = runner;
     }
-    void setNowTick(service::fast_tick_t now_tick)
+    // Advance the bus's virtual timeline by `delta` ticks. The next pump
+    // reports the accumulated advance as ctx.elapsed (relative contract);
+    // the timeline value itself doubles as local_tick, which is valid here
+    // because the services on this wire (software I2C master/slave) have no
+    // intra-call spins — see the ServiceContext field notes.
+    // The bound runner must be driven EXCLUSIVELY through this harness (no
+    // auto-run, no concurrent runOnce callers): pump() consumes the
+    // accumulated delta whether or not the pass ran, so a try-lock back-off
+    // would silently drop that elapsed (runOnce's bool means "progressed",
+    // not "ran" — the two are indistinguishable here).
+    void advance(service::fast_tick_t delta)
     {
-        _now_tick = now_tick;
+        _now_v += delta;
     }
 
     void masterWriteScl(bool high)
@@ -113,18 +123,21 @@ private:
     void pump()
     {
         if (_runner != nullptr) {
-            (void)_runner->runOnce(_now_tick);
+            (void)_runner->runOnce(
+                service::ServiceContext{static_cast<service::fast_tick_t>(_now_v - _last_pump_v), _now_v});
+            _last_pump_v = _now_v;
         }
     }
 
-    service::ServiceRunner* _runner = nullptr;
-    service::fast_tick_t _now_tick  = 0;
-    bool _master_scl_low            = false;
-    bool _master_sda_low            = false;
-    bool _external_slave_scl_low    = false;
-    bool _external_slave_sda_low    = false;
-    uint32_t _slave_scl_mask        = 0;
-    uint32_t _slave_sda_mask        = 0;
+    service::ServiceRunner* _runner   = nullptr;
+    service::fast_tick_t _now_v       = 0;
+    service::fast_tick_t _last_pump_v = 0;
+    bool _master_scl_low              = false;
+    bool _master_sda_low              = false;
+    bool _external_slave_scl_low      = false;
+    bool _external_slave_sda_low      = false;
+    uint32_t _slave_scl_mask          = 0;
+    uint32_t _slave_sda_mask          = 0;
 };
 
 // One slave's view of a `VirtualOpenDrainBus`: reads see the wired-AND of

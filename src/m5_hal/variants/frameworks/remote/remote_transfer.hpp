@@ -5,11 +5,13 @@
 
 #include "../../../hal/v2/bytecode/bytecode.hpp"
 #include "../../../hal/v2/data.hpp"
+#include "../../../hal/v2/remote/session_handle.hpp"
 #include "./session.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 
 namespace m5::hal::v2::remote {
 
@@ -40,6 +42,11 @@ public:
         _valid      = true;
     }
 
+    void invalidate()
+    {
+        _valid = false;
+    }
+
 private:
     bool matches(RemoteSession* session, data::ConstDataSpan cfg) const
     {
@@ -53,6 +60,18 @@ private:
     bool _valid                               = false;
 };
 
+inline std::shared_ptr<RemoteSessionHandle> makeBorrowedSessionHandle(RemoteSession& session)
+{
+    return session.sharedHandle();
+}
+
+result_t<size_t> remoteTransferWire(const std::shared_ptr<RemoteSessionHandle>& handle, types::bus_kind_t kind,
+                                    uint8_t bus_id, data::ConstDataSpan cfg_bytes, data::ConstDataSpan meta,
+                                    data::Source* src, size_t tx_len, data::Sink* dst, size_t rx_len,
+                                    uint32_t timeout_ms, RemoteConfigCache* config_cache = nullptr);
+
+// Compatibility seam for direct session tests and low-level callers. Proxy
+// buses retain one shared handle and use the overload above.
 result_t<size_t> remoteTransferWire(RemoteSession* session, types::bus_kind_t kind, uint8_t bus_id,
                                     data::ConstDataSpan cfg_bytes, data::ConstDataSpan meta, data::Source* src,
                                     size_t tx_len, data::Sink* dst, size_t rx_len, uint32_t timeout_ms,

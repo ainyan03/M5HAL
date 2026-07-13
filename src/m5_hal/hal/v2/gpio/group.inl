@@ -4,13 +4,55 @@
 
 #include "group.hpp"
 
+#include "../service/completion_gate.hpp"
+
 namespace m5::hal::v2::gpio {
+
+namespace group_detail {
+
+// Minimal RAII guard over runtime::Mutex (matches bus/registry.hpp,
+// bus/hw_pool.hpp: bool lock(timeout) / void unlock()).
+struct Guard {
+    runtime::Mutex& m;
+    explicit Guard(runtime::Mutex& mtx) : m{mtx}
+    {
+        (void)m.lock(types::TIMEOUT_FOREVER);
+    }
+    ~Guard(void)
+    {
+        m.unlock();
+    }
+    Guard(const Guard&)            = delete;
+    Guard& operator=(const Guard&) = delete;
+};
+
+}  // namespace group_detail
+
+void GPIOGroup::initWatchState()
+{
+    for (size_t i = 0; i < kMaxEntries; ++i) {
+        for (size_t p = 0; p < kMaxPortsPerEntry; ++p) {
+            _watch_mask[i][p].store(0, std::memory_order_relaxed);
+            _watch_shadow[i][p].store(0, std::memory_order_relaxed);
+        }
+    }
+    for (size_t i = 0; i < kMaxSinkDispatchers; ++i) {
+        _sink_dispatch_tasks[i].store(nullptr, std::memory_order_relaxed);
+    }
+}
+
+GPIOGroup::GPIOGroup() noexcept
+{
+    initWatchState();
+}
 
 GPIOGroup::GPIOGroup(const IGPIO* mcu_gpio) noexcept
 {
+    initWatchState();
     if (mcu_gpio != nullptr) {
-        _entries[0] = Entry{mcu_gpio, 0};
-        _count      = 1;
+        _entries[0]             = Entry{mcu_gpio, 0};
+        _entries[0].push_events = mcu_gpio->hasPushEvents();
+        _count                  = 1;
     }
 }
 
@@ -36,7 +78,13 @@ result_t<void> GPIOGroup::addGPIO(const IGPIO* gpio, types::gpio_slot_t slot)
     if (_count >= kMaxEntries) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
-    _entries[_count++] = Entry{gpio, slot};
+    for (size_t p = 0; p < kMaxPortsPerEntry; ++p) {
+        _watch_mask[_count][p].store(0, std::memory_order_relaxed);
+        _watch_shadow[_count][p].store(0, std::memory_order_relaxed);
+    }
+    _entries[_count]             = Entry{gpio, slot};
+    _entries[_count].push_events = gpio->hasPushEvents();
+    ++_count;
     return {};
 }
 
@@ -47,8 +95,20 @@ result_t<void> GPIOGroup::removeGPIO(types::gpio_slot_t slot)
     }
     for (size_t i = 0; i < _count; ++i) {
         if (_entries[i].slot == slot) {
-            _entries[i]        = _entries[_count - 1];
-            _entries[--_count] = Entry{};
+            const size_t last = _count - 1;
+            _entries[i]       = _entries[last];
+            // startup-only contract: no concurrent watcher access, so
+            // plain relaxed load/store is enough to move the row.
+            for (size_t p = 0; p < kMaxPortsPerEntry; ++p) {
+                _watch_mask[i][p].store(_watch_mask[last][p].load(std::memory_order_relaxed),
+                                        std::memory_order_relaxed);
+                _watch_shadow[i][p].store(_watch_shadow[last][p].load(std::memory_order_relaxed),
+                                          std::memory_order_relaxed);
+                _watch_mask[last][p].store(0, std::memory_order_relaxed);
+                _watch_shadow[last][p].store(0, std::memory_order_relaxed);
+            }
+            _entries[last] = Entry{};
+            _count         = last;
             return {};
         }
     }
@@ -60,110 +120,153 @@ void GPIOGroup::bindServiceRunner(service::ServiceRunner* runner)
     _service_runner = runner;
 }
 
-result_t<GPIOGroup::watch_id_t> GPIOGroup::watch(types::gpio_number_t gpio_num, Edge edge, WatchCallback callback)
+result_t<void> GPIOGroup::setWatchSink(WatchSink sink, void* ctx, uint32_t poll_interval_us)
 {
-    WatchConfig cfg;
-    return watch(gpio_num, edge, callback, nullptr, cfg);
-}
-
-result_t<GPIOGroup::watch_id_t> GPIOGroup::watch(types::gpio_number_t gpio_num, Edge edge, WatchCallback callback,
-                                                 void* ctx)
-{
-    WatchConfig cfg;
-    return watch(gpio_num, edge, callback, ctx, cfg);
-}
-
-result_t<GPIOGroup::watch_id_t> GPIOGroup::watch(types::gpio_number_t gpio_num, Edge edge, WatchCallback callback,
-                                                 void* ctx, const WatchConfig& cfg)
-{
-    if (callback == nullptr) {
-        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    {
+        group_detail::Guard guard{_watch_mutex};
+        _watch_sink     = nullptr;
+        _watch_sink_ctx = nullptr;
     }
-    auto pin = tryGetPin(gpio_num);
-    if (!pin.has_value()) {
-        return m5::stl::make_unexpected(pin.error());
+    waitSinkIdle();
+
+    // Deregister the poll service in every path (unregister AND
+    // register/replace): ServiceRunner keeps the next_due returned by
+    // the previous pass, so a re-register with a shorter interval must
+    // go through remove + add to reset the runner-visible due state —
+    // updating _watch_interval_ticks alone would leave the service
+    // suppressed until the OLD interval elapses.
+    bool was_registered = false;
+    {
+        group_detail::Guard guard{_watch_mutex};
+        was_registered            = _watch_service_registered;
+        _watch_service_registered = false;
     }
-    size_t index = kMaxWatchers;
-    for (size_t i = 0; i < kMaxWatchers; ++i) {
-        if (!_watchers[i].used) {
-            index = i;
-            break;
+    if (was_registered && _service_runner != nullptr) {
+        (void)_service_runner->remove(*this);  // R7: never call this while holding _watch_mutex
+    }
+
+    if (sink == nullptr) {
+        return {};
+    }
+
+    // Safe without the runner lock: remove() above is synchronous (no
+    // serviceImpl pass is in flight for this service anymore), so the
+    // pass-private due tick has no concurrent writer here.
+    _watch_next_tick = 0;
+
+    const auto ticks = usToTicks(poll_interval_us == 0 ? kDefaultWatchIntervalUs : poll_interval_us);
+    bool need_add    = false;
+    {
+        group_detail::Guard guard{_watch_mutex};
+        _watch_sink           = sink;
+        _watch_sink_ctx       = ctx;
+        _watch_interval_ticks = ticks;
+        need_add              = (_service_runner != nullptr);
+        if (need_add) {
+            _watch_service_registered = true;
         }
     }
-    if (index == kMaxWatchers) {
+    if (need_add && !_service_runner->add(*this)) {
+        // Deterministic failure state: NO sink and NO poll service. A
+        // failed REPLACE does not restore the previous sink — its
+        // service was already removed above and re-adding it could
+        // fail the same way, so "restore" cannot be guaranteed either.
+        // Callers see OUT_OF_RESOURCE and may retry.
+        group_detail::Guard guard{_watch_mutex};
+        _watch_sink               = nullptr;
+        _watch_sink_ctx           = nullptr;
+        _watch_service_registered = false;
         return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
     }
-
-    auto& w           = _watchers[index];
-    w.used            = true;
-    w.pin             = gpio_num;
-    w.edge            = edge;
-    w.callback        = callback;
-    w.ctx             = ctx;
-    w.last_level      = pin.value().read();
-    w.has_level       = true;
-    w.last_event_tick = 0;
-    w.poll_ticks      = usToTicks(cfg.poll_interval_us == 0 ? 1000 : cfg.poll_interval_us);
-    w.debounce_ticks  = usToTicks(cfg.debounce_us);
-    w.next_poll_tick  = 0;
-    w.generation      = static_cast<uint8_t>(w.generation + 1u);
-    if (w.generation == 0) {
-        w.generation = 1;
-    }
-
-    ensureWatchService();
-    return makeWatchId(index, w.generation);
+    return {};
 }
 
-bool GPIOGroup::unwatch(watch_id_t id)
+result_t<void> GPIOGroup::watch(types::gpio_number_t gpio_num)
 {
-    const size_t index = watchIndex(id);
-    if (index >= kMaxWatchers) {
-        return false;
+    if (!isValid(gpio_num)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
-    auto& w = _watchers[index];
-    if (!w.used || w.generation != watchGeneration(id)) {
-        return false;
+    const auto slot    = types::extractSlot(gpio_num);
+    const auto local   = types::extractLocalPin(gpio_num);
+    const uint8_t p    = local >> 5;
+    const uint32_t bit = 1u << (local & 31);
+    if (p >= kMaxPortsPerEntry) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
-    w.used     = false;
-    w.callback = nullptr;
-    dropQueuedEventsFor(index, w.generation);
-    maybeRemoveWatchService();
-    return true;
+    const size_t i = entryIndexOf(slot);
+    if (i >= kMaxEntries) {
+        // Defensive: isValid() already guarantees the slot resolves,
+        // so this should be unreachable; treat it as invalid input
+        // rather than indexing out of bounds.
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+
+    // Seed the shadow with the current level BEFORE publishing the
+    // mask bit: the opposite order would let a poll/notify pass that
+    // races the mask store observe an unseeded shadow and report a
+    // spurious edge on the very first sample.
+    const bool level = getPin(gpio_num).read();
+    if (level) {
+        _watch_shadow[i][p].fetch_or(bit);
+    } else {
+        _watch_shadow[i][p].fetch_and(~bit);
+    }
+    _watch_mask[i][p].fetch_or(bit, std::memory_order_release);
+    return {};
+}
+
+result_t<void> GPIOGroup::unwatch(types::gpio_number_t gpio_num)
+{
+    if (gpio_num < 0) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+    const auto slot    = types::extractSlot(gpio_num);
+    const auto local   = types::extractLocalPin(gpio_num);
+    const uint8_t p    = local >> 5;
+    const uint32_t bit = 1u << (local & 31);
+    const size_t i     = entryIndexOf(slot);
+    if (i >= kMaxEntries || p >= kMaxPortsPerEntry) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+    _watch_mask[i][p].fetch_and(~bit);  // idempotent: unwatching an unwatched pin still succeeds
+    return {};
 }
 
 void GPIOGroup::clearWatchers()
 {
-    if (_watch_service_registered && _service_runner != nullptr) {
-        (void)_service_runner->remove(*this);
+    for (size_t i = 0; i < kMaxEntries; ++i) {
+        for (size_t p = 0; p < kMaxPortsPerEntry; ++p) {
+            _watch_mask[i][p].store(0, std::memory_order_relaxed);
+        }
     }
-    _watch_service_registered = false;
-    for (size_t i = 0; i < kMaxWatchers; ++i) {
-        _watchers[i].used     = false;
-        _watchers[i].callback = nullptr;
-    }
-    _event_head  = 0;
-    _event_tail  = 0;
-    _event_count = 0;
+    (void)setWatchSink(nullptr, nullptr);
 }
 
 result_t<void> GPIOGroup::notifyPinStateChanged(types::gpio_number_t gpio_num, bool level)
 {
-    const auto now = service::defaultNowTick();
-    bool matched   = false;
-    for (size_t i = 0; i < kMaxWatchers; ++i) {
-        auto& w = _watchers[i];
-        if (!w.used || w.pin != gpio_num) {
-            continue;
-        }
-        matched = true;
-        auto r  = observeWatcher(i, level, now);
-        if (!r.has_value()) {
-            return m5::stl::make_unexpected(r.error());
-        }
+    if (gpio_num < 0) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
-    if (matched) {
-        ensureWatchService();
+    const auto slot    = types::extractSlot(gpio_num);
+    const auto local   = types::extractLocalPin(gpio_num);
+    const uint8_t p    = local >> 5;
+    const uint32_t bit = 1u << (local & 31);
+    const size_t i     = entryIndexOf(slot);
+    if (i >= kMaxEntries || p >= kMaxPortsPerEntry) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+
+    const uint32_t old = level ? _watch_shadow[i][p].fetch_or(bit) : _watch_shadow[i][p].fetch_and(~bit);
+    if (((old & bit) != 0) == level) {
+        return {};  // no transition: duplicate notification for the same level
+    }
+    if ((_watch_mask[i][p].load(std::memory_order_acquire) & bit) == 0) {
+        return {};  // not watched: state recorded, no listener to notify
+    }
+
+    SinkDispatchScope scope{*this};
+    if (scope.active) {
+        scope.cb(scope.ctx, gpio_num, level, level ? Edge::Rising : Edge::Falling);
     }
     return {};
 }
@@ -263,20 +366,14 @@ GPIOGroup::Entry* GPIOGroup::_findMut(types::gpio_slot_t slot)
     return nullptr;
 }
 
-GPIOGroup::watch_id_t GPIOGroup::makeWatchId(size_t index, uint8_t generation)
+size_t GPIOGroup::entryIndexOf(types::gpio_slot_t slot) const
 {
-    return static_cast<watch_id_t>((static_cast<watch_id_t>(generation) << 8) | static_cast<watch_id_t>(index + 1u));
-}
-
-size_t GPIOGroup::watchIndex(watch_id_t id)
-{
-    const uint8_t raw = static_cast<uint8_t>(id & 0xFFu);
-    return raw == 0 ? kMaxWatchers : static_cast<size_t>(raw - 1u);
-}
-
-uint8_t GPIOGroup::watchGeneration(watch_id_t id)
-{
-    return static_cast<uint8_t>((id >> 8) & 0xFFu);
+    for (size_t i = 0; i < _count; ++i) {
+        if (_entries[i].slot == slot) {
+            return i;
+        }
+    }
+    return kMaxEntries;
 }
 
 service::fast_tick_t GPIOGroup::usToTicks(uint32_t us)
@@ -289,153 +386,131 @@ service::fast_tick_t GPIOGroup::usToTicks(uint32_t us)
     return service::nsecToFastTickCeil(static_cast<service::tick_nsec_t>(clamped), service::fastTickFrequencyHz());
 }
 
-bool GPIOGroup::edgeMatches(Edge watch_edge, Edge observed)
+bool GPIOGroup::enterSinkDispatch(WatchSink& cb, void*& ctx)
 {
-    return watch_edge == Edge::Change || watch_edge == observed;
-}
-
-bool GPIOGroup::anyWatcherUsed() const
-{
-    for (size_t i = 0; i < kMaxWatchers; ++i) {
-        if (_watchers[i].used) {
-            return true;
+    {
+        group_detail::Guard guard{_watch_mutex};
+        if (_watch_sink == nullptr) {
+            return false;
         }
+        cb  = _watch_sink;
+        ctx = _watch_sink_ctx;
+        _sink_inflight.fetch_add(1, std::memory_order_relaxed);
     }
-    return false;
-}
-
-void GPIOGroup::ensureWatchService()
-{
-    if (!_watch_service_registered && _service_runner != nullptr && anyWatcherUsed()) {
-        _watch_service_registered = _service_runner->add(*this);
-    }
-}
-
-void GPIOGroup::maybeRemoveWatchService()
-{
-    if (_watch_service_registered && !anyWatcherUsed() && _service_runner != nullptr) {
-        (void)_service_runner->remove(*this);
-        _watch_service_registered = false;
-    }
-}
-
-result_t<void> GPIOGroup::enqueueEvent(size_t watcher_index, Edge edge, bool level)
-{
-    if (_event_count >= kMaxWatchEvents) {
-        return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
-    }
-    const auto& w        = _watchers[watcher_index];
-    _events[_event_tail] = WatchEvent{w.pin, edge, level, static_cast<uint8_t>(watcher_index), w.generation};
-    _event_tail          = (_event_tail + 1u) % kMaxWatchEvents;
-    ++_event_count;
-    return {};
-}
-
-result_t<void> GPIOGroup::observeWatcher(size_t index, bool level, service::fast_tick_t now)
-{
-    auto& w = _watchers[index];
-    if (!w.has_level) {
-        w.last_level = level;
-        w.has_level  = true;
-        return {};
-    }
-    if (w.last_level == level) {
-        return {};
-    }
-    const Edge observed = level ? Edge::Rising : Edge::Falling;
-    w.last_level        = level;
-    if (!edgeMatches(w.edge, observed)) {
-        return {};
-    }
-    if (w.debounce_ticks != 0 && w.last_event_tick != 0 &&
-        service::elapsedTicks(now, w.last_event_tick) < w.debounce_ticks) {
-        return {};
-    }
-    w.last_event_tick = now;
-    return enqueueEvent(index, observed, level);
-}
-
-void GPIOGroup::dropQueuedEventsFor(size_t watcher_index, uint8_t generation)
-{
-    size_t keep_count = 0;
-    WatchEvent keep[kMaxWatchEvents];
-    while (_event_count != 0) {
-        const auto ev = _events[_event_head];
-        _event_head   = (_event_head + 1u) % kMaxWatchEvents;
-        --_event_count;
-        if (ev.watcher_index == watcher_index && ev.generation == generation) {
-            continue;
+    const auto id = runtime::currentTaskId();
+    service::SpinBackoff backoff;
+    for (;;) {
+        bool claimed = false;
+        for (size_t i = 0; i < kMaxSinkDispatchers; ++i) {
+            void* expected = nullptr;
+            if (_sink_dispatch_tasks[i].compare_exchange_strong(expected, id)) {
+                claimed = true;
+                break;
+            }
         }
-        keep[keep_count++] = ev;
+        if (claimed) {
+            break;
+        }
+        backoff.step();
     }
-    _event_head = 0;
-    _event_tail = 0;
-    for (size_t i = 0; i < keep_count; ++i) {
-        _events[_event_tail] = keep[i];
-        _event_tail          = (_event_tail + 1u) % kMaxWatchEvents;
-    }
-    _event_count = keep_count;
-}
-
-bool GPIOGroup::dispatchOneEvent()
-{
-    if (_event_count == 0) {
-        return false;
-    }
-    const auto ev = _events[_event_head];
-    _event_head   = (_event_head + 1u) % kMaxWatchEvents;
-    --_event_count;
-
-    if (ev.watcher_index >= kMaxWatchers) {
-        return true;
-    }
-    const auto& w = _watchers[ev.watcher_index];
-    if (!w.used || w.generation != ev.generation || w.callback == nullptr) {
-        return true;
-    }
-    auto cb            = w.callback;
-    auto* callback_ctx = w.ctx;
-    cb(callback_ctx, ev.pin, ev.level, ev.edge);
     return true;
+}
+
+void GPIOGroup::exitSinkDispatch()
+{
+    const auto id = runtime::currentTaskId();
+    for (size_t i = 0; i < kMaxSinkDispatchers; ++i) {
+        if (_sink_dispatch_tasks[i].load(std::memory_order_relaxed) == id) {
+            _sink_dispatch_tasks[i].store(nullptr, std::memory_order_relaxed);
+            break;
+        }
+    }
+    _sink_inflight.fetch_sub(1, std::memory_order_release);
+}
+
+void GPIOGroup::waitSinkIdle()
+{
+    const auto id = runtime::currentTaskId();
+    for (size_t i = 0; i < kMaxSinkDispatchers; ++i) {
+        if (_sink_dispatch_tasks[i].load(std::memory_order_acquire) == id) {
+            return;  // self-unregister (R6): the calling task is itself mid-dispatch
+        }
+    }
+    service::SpinBackoff backoff;
+    while (_sink_inflight.load(std::memory_order_acquire) != 0) {
+        backoff.step();
+    }
 }
 
 service::ServicePoll GPIOGroup::serviceImpl(const service::ServiceContext& ctx)
 {
-    bool progressed               = false;
-    service::fast_tick_t next_due = 0;
+    // Private virtual timeline: advances only by caller-vouched elapsed,
+    // so the schedule below never compares ticks from different cores.
+    _watch_svc_now += ctx.elapsed;
+    if (_watch_next_tick != 0 && !service::hasReached(_watch_svc_now, _watch_next_tick)) {
+        return {service::ServiceResult::Idle, static_cast<service::fast_tick_t>(_watch_next_tick - _watch_svc_now)};
+    }
 
-    for (size_t i = 0; i < kMaxWatchers; ++i) {
-        auto& w = _watchers[i];
-        if (!w.used) {
-            continue;
+    service::fast_tick_t interval;
+    {
+        // Read once per pass; a mid-pass setWatchSink() change is
+        // picked up starting with the NEXT pass.
+        group_detail::Guard guard{_watch_mutex};
+        interval = _watch_interval_ticks;
+    }
+
+    bool progressed = false;
+
+    for (size_t i = 0; i < _count; ++i) {
+        const auto& e = _entries[i];
+        if (e.push_events) {
+            continue;  // single-source rule: push-fed entries are never polled
         }
-        if (w.next_poll_tick != 0 && !service::hasReached(ctx.now_tick, w.next_poll_tick)) {
-            if (next_due == 0 || service::hasReached(next_due, w.next_poll_tick)) {
-                next_due = w.next_poll_tick;
+        const uint8_t port_count = e.gpio->getPortCount();
+        const size_t ports       = port_count < kMaxPortsPerEntry ? port_count : kMaxPortsPerEntry;
+        for (size_t p = 0; p < ports; ++p) {
+            const uint32_t mask = _watch_mask[i][p].load(std::memory_order_acquire) & ~e.deny_mask[p];
+            if (mask == 0) {
+                continue;
             }
-            continue;
-        }
-        auto pin = tryGetPin(w.pin);
-        if (!pin.has_value()) {
-            w.used     = false;
+            IPort* port = e.gpio->getPort(static_cast<uint8_t>(p));
+            if (port == nullptr) {
+                continue;
+            }
+            const uint32_t value   = port->readPort();
+            const uint32_t old     = _watch_shadow[i][p].exchange(value);
+            const uint32_t changed = (old ^ value) & mask;
+            if (changed == 0) {
+                continue;
+            }
             progressed = true;
-            continue;
-        }
-        auto observed = observeWatcher(i, pin.value().read(), ctx.now_tick);
-        if (!observed.has_value()) {
-            return {service::ServiceResult::Error};
-        }
-        w.next_poll_tick = static_cast<service::fast_tick_t>(ctx.now_tick + w.poll_ticks);
-        if (next_due == 0 || service::hasReached(next_due, w.next_poll_tick)) {
-            next_due = w.next_poll_tick;
+            for (uint8_t bit_idx = 0; bit_idx < 32; ++bit_idx) {
+                const uint32_t bit_mask = 1u << bit_idx;
+                if ((changed & bit_mask) == 0) {
+                    continue;
+                }
+                // One enter/exit per callback (not per pass): a sink
+                // that unregisters/replaces itself from inside the
+                // callback must not receive the remaining events of
+                // the same pass — the next enter re-reads the sink
+                // and stops the whole dispatch when it went away.
+                SinkDispatchScope scope{*this};
+                if (!scope.active) {
+                    // No sink (anymore): shadows already exchanged stay
+                    // current, undispatched events are simply dropped
+                    // (nobody is listening).
+                    goto pass_done;
+                }
+                const auto pin =
+                    types::makeGpioNumber(e.slot, static_cast<types::gpio_local_pin_t>((p << 5) | bit_idx));
+                const bool lvl = (value & bit_mask) != 0;
+                scope.cb(scope.ctx, pin, lvl, lvl ? Edge::Rising : Edge::Falling);
+            }
         }
     }
-
-    while (dispatchOneEvent()) {
-        progressed = true;
-    }
-    maybeRemoveWatchService();
-    return {progressed ? service::ServiceResult::Progress : service::ServiceResult::Idle, next_due};
+pass_done:
+    _watch_next_tick = static_cast<service::fast_tick_t>(_watch_svc_now + interval);
+    return {progressed ? service::ServiceResult::Progress : service::ServiceResult::Idle, interval};
 }
 
 }  // namespace m5::hal::v2::gpio

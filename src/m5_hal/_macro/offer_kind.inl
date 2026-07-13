@@ -19,10 +19,11 @@
 //                                  kind still injected via `using namespace`
 //                                  (free functions + Mutex, see runtime.md)
 //   M5HAL_OFFER_KIND_FACADE_     — defined: the unsuffixed `Bus` is a runtime
-//                                  facade class in the kind header (ADR 034),
+// facade class in the kind header,
 //                                  so only the winner `BusConfig` alias is
 //                                  emitted (emitting `using Bus` would redefine
-//                                  the facade). Currently i2c only.
+//                                  the facade). Set for all facade-backed
+//                                  kinds (i2c / spi / i2s / uart).
 // Plus the current _offer.hpp's M5HAL_VARIANT_CURRENT_ALIAS_ (the variant
 // short name, doubling as the `_<variant>` type suffix) and
 // M5HAL_VARIANT_CURRENT_BASE_NS_ (used by the runtime injection only).

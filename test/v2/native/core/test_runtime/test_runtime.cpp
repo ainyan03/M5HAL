@@ -8,6 +8,7 @@
 // integration tests pin the S7 BREAKING semantics: contention WAITS
 // and fails with TIMEOUT_ERROR (not BUSY), timeout 0 is a try-lock.
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 #include <M5HAL_v2.hpp>
 
 #include <atomic>
@@ -122,6 +123,73 @@ TEST(RuntimeMutex, ContendedLockTimesOutThenSucceedsAfterRelease)
     holder.join();
 }
 
+// ---- event (posix latching binary event) ------------------------------------
+
+TEST(RuntimeEvent, NotifyBeforeWaitIsLatched)
+{
+    runtime::Event e;
+    e.notify();
+    EXPECT_TRUE(e.wait(0));   // the earlier notify is consumed, not lost
+    EXPECT_FALSE(e.wait(0));  // and consuming clears the latch
+}
+
+TEST(RuntimeEvent, MultipleNotifiesMergeIntoOne)
+{
+    runtime::Event e;
+    e.notify();
+    e.notify();
+    e.notify();
+    EXPECT_TRUE(e.wait(0));
+    EXPECT_FALSE(e.wait(0));  // merged: one consume drains them all
+}
+
+TEST(RuntimeEvent, WaitTimesOutWithoutNotify)
+{
+    runtime::Event e;
+    const uint32_t t0 = runtime::millis();
+    EXPECT_FALSE(e.wait(30));
+    // The wait is real (lower bound only — CI machines stall).
+    EXPECT_GE(runtime::millis() - t0, 25u);
+}
+
+TEST(RuntimeEvent, WaitWakesOnNotifyFromAnotherThread)
+{
+    runtime::Event e;
+    std::thread notifier([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        e.notify();
+    });
+    EXPECT_TRUE(e.wait(2000));  // wakes through the notify, well inside the budget
+    notifier.join();
+    EXPECT_FALSE(e.wait(0));  // consumed by the wait above
+}
+
+TEST(RuntimeEvent, ForeverWaitWakesOnNotify)
+{
+    runtime::Event e;
+    std::thread notifier([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        e.notify();
+    });
+    EXPECT_TRUE(e.wait(::m5::hal::v2::types::TIMEOUT_FOREVER));
+    notifier.join();
+}
+
+// ---- event (stub fake) -------------------------------------------------------
+
+TEST(RuntimeStubEvent, WaitNeverBlocksButLatchWorks)
+{
+    stub_rt::Event e;
+    // Single-task fake: with nobody around to notify, blocking could never
+    // end — even TIMEOUT_FOREVER fails immediately (documented exception).
+    EXPECT_FALSE(e.wait(10000));
+    EXPECT_FALSE(e.wait(::m5::hal::v2::types::TIMEOUT_FOREVER));
+    e.notify();
+    e.notify();  // merges
+    EXPECT_TRUE(e.wait(0));
+    EXPECT_FALSE(e.wait(0));
+}
+
 // ---- mutex (stub single-task guard) ----------------------------------------
 
 TEST(RuntimeStubMutex, ContentionFailsImmediately)
@@ -216,5 +284,6 @@ TEST(BusLock, ContendedLockWaitsForHolderAcrossTasks)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

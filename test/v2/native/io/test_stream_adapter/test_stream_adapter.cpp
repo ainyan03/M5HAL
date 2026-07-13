@@ -2,15 +2,16 @@
 // Native gtest for StreamSource / StreamSink (hal/v2/data/stream.hpp).
 //
 // Mechanically verifies the adapter contract on top of scripted fake
-// streams: `peek` is idempotent and monotonically non-decreasing, a
-// timeout surfaces as TIMEOUT_ERROR (never as an empty span = EOF),
+// streams: `peek` is idempotent and monotonically non-decreasing, an
+// idle timeout with no bytes surfaces as an empty successful span,
 // `advance` past the buffered bytes becomes a skip reservation that
 // later arrivals consume automatically, `reserve` lends a stable
 // scratch span, `commit` passes bytes through the writer and reports
-// short writes as IO_ERROR. Spec: spec/design/data_io.md §Stream
+// short writes as TIMEOUT_ERROR. Spec: spec/design/data_io.md §Stream
 // adapters.
 
 #include <gtest/gtest.h>
+#include "support/gtest_watchdog.hpp"
 #include <M5HAL_v2.hpp>
 
 #include <algorithm>
@@ -132,16 +133,17 @@ TEST(StreamSource, EmptyScratchIsInvalidArgument)
     EXPECT_EQ(peeked.error(), error_t::INVALID_ARGUMENT);
 }
 
-TEST(StreamSource, TimeoutIsAnErrorNotEof)
+TEST(StreamSource, TimeoutIsEmptyProgressNotEof)
 {
     FakeStreamReader reader;
     uint8_t scratch[8];
     StreamSource src{reader, DataSpan{scratch, sizeof scratch}};
 
     auto peeked = src.peek(4);
-    ASSERT_FALSE(peeked.has_value());
-    EXPECT_EQ(peeked.error(), error_t::TIMEOUT_ERROR);
+    ASSERT_TRUE(peeked.has_value());
+    EXPECT_EQ(peeked->size, 0u);
     EXPECT_FALSE(src.eof());
+    EXPECT_FALSE(src.closed());
 
     // Recoverable: data arriving later makes the next peek succeed.
     reader.feedCounting(3, 0x10);
@@ -229,8 +231,9 @@ TEST(StreamSource, AdvancePastBufferBecomesSkipReservation)
     EXPECT_EQ(src.pendingSkip(), 6u);
 
     auto starved = src.peek(8);
-    ASSERT_FALSE(starved.has_value());
-    EXPECT_EQ(starved.error(), error_t::TIMEOUT_ERROR);
+    ASSERT_TRUE(starved.has_value());
+    EXPECT_EQ(starved->size, 0u);
+    EXPECT_FALSE(src.eof());
 
     reader.feedCounting(8, 0x50);  // bytes 0x50..0x57; 0x50..0x55 fall into the skip
     auto after = src.peek(8);
@@ -372,6 +375,11 @@ TEST(StreamSink, ShortWriteIsTimeout)
     // Short writes classify as TIMEOUT_ERROR (retryable), symmetric with
     // the read side.
     EXPECT_EQ(committed.error(), error_t::TIMEOUT_ERROR);
+    // The accepted prefix (what actually reached the writer before the
+    // short write) must be readable back so a caller relaying bytes from
+    // an upstream Source can advance by exactly that much instead of
+    // resending it or dropping the remainder.
+    EXPECT_EQ(snk.partialCommitAccepted(), 2u);
 }
 
 TEST(StreamSink, WriterErrorsPropagate)
@@ -386,6 +394,8 @@ TEST(StreamSink, WriterErrorsPropagate)
     auto committed = snk.commit(2);
     ASSERT_FALSE(committed.has_value());
     EXPECT_EQ(committed.error(), error_t::TIMEOUT_ERROR);
+    // A hard writer error (as opposed to a short write) accepts nothing.
+    EXPECT_EQ(snk.partialCommitAccepted(), 0u);
 }
 
 }  // namespace
@@ -393,5 +403,6 @@ TEST(StreamSink, WriterErrorsPropagate)
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
+    m5hal_test_support::installGtestWatchdog();
     return RUN_ALL_TESTS();
 }

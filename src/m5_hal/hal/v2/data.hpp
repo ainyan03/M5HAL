@@ -122,10 +122,12 @@ struct DataSpan {
     between calls, but the content is consistent.
   - The span returned by `peek` is borrowed until the next `peek` or
     `advance` call.
-  - `peek` returning a zero-length span signals end-of-stream
-    (`eof()` also becomes true). Because of that, `peek(0)` is a
-    contract violation (`max_len` must be >= 1); the behavior is
-    derivation-defined.
+  - `peek` returning a zero-length span only means "no bytes are
+    currently lendable". It may be a temporary no-progress state
+    (ring buffer empty, stream idle) or final EOF; callers distinguish
+    those with `eof()` / `closed()`.
+  - `peek(0)` is a contract violation (`max_len` must be >= 1); the
+    behavior is derivation-defined.
   - `closed()` asks whether the PRODUCER side is finished: true means
     the bytes currently peekable are final and nothing will ever be
     appended (TCP half-close semantics — readable leftovers may
@@ -177,10 +179,12 @@ public:
     (mirrors `Source::peek`).
   - The span returned by `reserve` is borrowed until the next
     `reserve` or `commit` call.
-  - `reserve` returning a zero-length span signals end-of-writes
-    (`closed()` also becomes true). Because of that, `reserve(0)` is a
-    contract violation (`max_len` must be >= 1); the behavior is
-    derivation-defined.
+  - `reserve` returning a zero-length span only means "no writable
+    bytes are currently lendable". It may be temporary backpressure
+    (full ring, congested stream) or final closure; callers
+    distinguish those with `closed()`.
+  - `reserve(0)` is a contract violation (`max_len` must be >= 1); the
+    behavior is derivation-defined.
   - `commit(N)` reports the number of bytes written into the most
     recently reserved span. The caller MUST keep `N <= reserved size`.
   - Contract violations (oversized commit, commit without reserve,
@@ -198,6 +202,20 @@ public:
   - Callers MUST check `has_value()` on both APIs.
   - Derivation authors MUST document the error conditions and the
     post-error cursor state.
+
+  Partial commit (see spec/design/data_io.md §Sink):
+  - Most derivations apply `commit(N)` atomically: it either accepts
+    all N bytes or (on error) accepts none. But a derivation whose
+    `commit` itself performs blocking I/O (`StreamSink`, wrapping a
+    transport `write`) can accept a prefix shorter than N before that
+    I/O reports an error. `partialCommitAccepted()` exposes that
+    prefix length so a caller can advance its own cursor by exactly
+    what reached the sink, instead of by 0 (re-sending already-sent
+    bytes on the next attempt) or by N (silently dropping the rest).
+  - The default (0) is correct for every all-or-nothing derivation: a
+    failing `commit()` there accepts nothing, so callers only need to
+    query this after an erroring `commit()` on a derivation that
+    documents a non-default override.
  */
 class Sink {
 public:
@@ -206,6 +224,13 @@ public:
     virtual m5::hal::v2::result_t<DataSpan> reserve(size_t max_len) = 0;
     virtual m5::hal::v2::result_t<void> commit(size_t N)            = 0;
     virtual bool closed() const                                     = 0;
+
+    /// Bytes actually accepted by the most recently *failing* `commit()`
+    /// call. See the "Partial commit" contract block above.
+    virtual size_t partialCommitAccepted() const
+    {
+        return 0;
+    }
 };
 
 }  // namespace m5::hal::v2::data

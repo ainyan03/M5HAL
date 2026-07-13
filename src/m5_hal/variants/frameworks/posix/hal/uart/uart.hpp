@@ -73,15 +73,28 @@ public:
     // Static + public so the baud table can be unit-tested without a device.
     static bool baudToSpeed(uint32_t baud, uint32_t& out_speed);
 
+    /*! @brief Reconfiguration-skip count (diagnostic only); see spec/design/uart.md §state mutex. */
+    uint32_t reconfigSkips();
+
 protected:
     result_t<size_t> rawWrite(const uint8_t* data, size_t len, uint32_t timeout_ms) override;
     result_t<size_t> rawRead(uint8_t* buf, size_t len, uint32_t timeout_ms) override;
     result_t<size_t> rawReadableBytes() override;
 
 private:
-    result_t<void> applyConfig(const uart::AccessConfig& cfg);
+    // Reconfiguration quiescence gate (spec/design/uart.md): `owner`/`entered`
+    // identify the calling accessor and the channel it already holds so a
+    // config change different from `_applied_cfg` can be gated through
+    // `uart::IBus::tryAcquireOppositeChannel`. The first apply on a fresh fd
+    // (`!_begun`) — including the lazy open above — skips the gate.
+    result_t<void> applyConfig(bus::IAccessor* owner, Channel entered, const uart::AccessConfig& cfg);
+    // Actual termios apply; assumes `_state_mutex` is already held.
+    result_t<void> applyConfigLocked(const uart::AccessConfig& cfg);
     // Drain the coalescing buffer (no-op when empty / coalescing disabled).
+    // Self-locking (takes `_state_mutex`); call flushCoalescedLocked()
+    // instead from a caller that already holds it (write()'s append path).
     result_t<void> flushCoalesced(uint32_t timeout_ms);
+    result_t<void> flushCoalescedLocked(uint32_t timeout_ms);
 
     static constexpr size_t kCoalesceCapacity = 4096;
 
@@ -93,6 +106,12 @@ private:
     uart::AccessConfig _applied_cfg;
     size_t _co_used = 0;
     uint8_t _co_buf[kCoalesceCapacity];
+    // Leaf mutex (see uart::IBus class comment) guarding
+    // _fd/_owns_fd/_begun/_applied_cfg/_co_buf/_co_used against concurrent
+    // TX/RX access (B12: the coalescing buffer is written by write() and
+    // drained by read()/readableBytes(), i.e. from either channel).
+    runtime::Mutex _state_mutex;
+    uint32_t _reconfig_skips = 0;  // skipped reconfigures (opposite channel busy); read via reconfigSkips()
 };
 
 // Facade backend selection: uart::Bus::init(BusConfig_posix) -> Bus_posix.

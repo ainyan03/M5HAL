@@ -61,6 +61,58 @@ build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/device/i2c_slave.cpp>
 ; make the polling ~10x finer and the HIL matrix clean. Set via the project-root
 ; sdkconfig.defaults (this platform pin does not honor PlatformIO custom_sdkconfig).
 
+; ESP32-C61 variant of the register-map slave device: same firmware, RISC-V
+; stretch-cause SoC, wired SDA=GPIO5 / SCL=GPIO6 to a BASIC/Core2 master's
+; Port A. This is the slave-clock-fix cross-chip smoke target (the C61 boot code does not
+; yet gate the I2C functional clock, so it also runs UNFIXED builds -- a PASS
+; here is a regression check, not the decisive D1 cold-boot proof; that needs
+; C6/H2). Board def + platform mirror the ESP32_I2C_slave_example rig: the C61
+; board is unknown to espressif32@6.12.0, so this env rides the pioarduino
+; platform pin (common_esp32_arduino3 supplies only the platform zip; the
+; framework axis below overrides to espidf = IDF 5.5.x, same as the example's
+; common_pioidf).
+[env:v2_hil_i2c_slave_device_esp32c61]
+extends = common_esp32_arduino3, common_espidf
+board = esp32-c61-devkitc1
+build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/device/i2c_slave.cpp>
+build_flags = -DM5HAL_HIL_I2C_PIN_SDA=5 -DM5HAL_HIL_I2C_PIN_SCL=6
+
+; ESP32-C6 / ESP32-H2 variants of the register-map slave device, for the
+; controller-clock cold-boot proof (the decisive rig): the C6/H2 boot code
+; explicitly gates the I2C functional clock off (PCR i2c_sclk_en), so a build with
+; -DM5HAL_I2C_SLAVE_NO_CONTROLLER_CLOCK (the pre-D1 behavior, injected via
+; PLATFORMIO_BUILD_FLAGS) must be dead on cold boot while the fixed build works.
+; Rig = M5 NanoC6 <-> NanoH2, Port A cross-wired, both SDA=GPIO2 / SCL=GPIO1
+; (the device fixture's defaults, stated here explicitly anyway). Same
+; pioarduino platform ride as the C61 env above.
+[env:v2_hil_i2c_slave_device_esp32c6]
+extends = common_esp32_arduino3, common_espidf
+board = esp32-c6-devkitm-1
+build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/device/i2c_slave.cpp>
+build_flags = -DM5HAL_HIL_I2C_PIN_SDA=2 -DM5HAL_HIL_I2C_PIN_SCL=1
+
+[env:v2_hil_i2c_slave_device_esp32h2]
+extends = common_esp32_arduino3, common_espidf
+board = esp32-h2-devkitm-1
+build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/device/i2c_slave.cpp>
+build_flags = -DM5HAL_HIL_I2C_PIN_SDA=2 -DM5HAL_HIL_I2C_PIN_SCL=1
+
+; Classic ESP32 (Core2) variant of the register-map slave device, for the
+; master-role-rotation matrix: Core2 has no stretch-cause HW, so SlaveBus_espidf
+; selects the LL best-effort (BE) flavor and the accessor's register map is
+; served from the backend ISR (bindIsrRegMap fast path, spec/design/
+; i2c_slave.md) -- WTR/SPLIT reads work best-effort without clock stretch.
+; Acceptance = 100/400 kHz PASS; 800 kHz is informational only. The sweep
+; master must skip T14 against this slave (prefill consumes onRead counter
+; values ahead of the wire): inject PLATFORMIO_BUILD_FLAGS="-DSWEEP_SKIP_T14".
+; Address 0x41: the multi-slave shared bus already assigns 0x42/0x43/0x44 to
+; the S3/C6/H2 boards. Port A wiring = SDA=GPIO32 / SCL=GPIO33 (Core2's own
+; Port A pins, distinct from the S3/C6/H2 boards' G2/G1).
+[env:v2_hil_i2c_slave_device_esp32]
+extends = common_esp32dev_espidf5, common_espidf
+build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/device/i2c_slave.cpp>
+build_flags = -DM5HAL_HIL_I2C_PIN_SDA=32 -DM5HAL_HIL_I2C_PIN_SCL=33 -DM5HAL_HIL_I2C_SLAVE_ADDR=0x41
+
 ; STREAM echo variant of the same 2-board HIL: drives SlaveBus_espidf through a
 ; bare SlaveStreamAccessor (no register map) so the master can write up to 1 KB and
 ; read the same bytes back verbatim. This is the on-hardware test of the espidf TX
@@ -90,6 +142,72 @@ build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_echo_maste
 extends = common_esp32dev_espidf5, common_espidf
 build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_echo_master.cpp>
 build_flags = -DECHO_MASTER_SOFTWARE
+
+; INDEPENDENT verification master for the register-map HIL pair (pairs with
+; device/i2c_slave.cpp): unlike the two envs above, this firmware drives the
+; vendor transport directly (Arduino Wire, or the ESP-IDF i2c_master driver
+; below) instead of the M5HAL master API, so the SlaveBus_espidf slave is
+; validated by code that cannot share a bug with M5HAL's own master. Sweeps
+; SPLIT / WTR / window-base / repeat-read / 0xFF wrap / 96B long read+write /
+; a 200-round zero-gap stress, PLUS a WTR read / SPLIT read / WRITETEST-
+; equivalent write-then-verify length sweep (n=1..64 / k=1..48), at
+; 100/400/800 kHz, and prints a RESULT line (subsumes the private
+; i2c_slave_hybrid HIL pair's WTR/SPLIT/WTEST sweeps).
+; Source + wiring: experiments/v2/test/i2c_slave/master/i2c_regmap_sweep_master.cpp.
+[env:v2_hil_i2c_regmap_sweep_master_arduino_esp32]
+extends = common_esp32dev, common_arduino
+build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_regmap_sweep_master.cpp>
+
+; Same fixture over the ESP-IDF `driver/i2c_master.h` (generation-5) driver
+; instead of Arduino Wire -- i2c_master_transmit_receive gives it a
+; software-gap-free repeated START for the WTR path, the strictest stretch
+; exercise of the two transports.
+[env:v2_hil_i2c_regmap_sweep_master_idf_esp32]
+extends = common_esp32dev_espidf5, common_espidf
+build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_regmap_sweep_master.cpp>
+
+; C6 / H2 masters for the cold-boot rig (NanoC6 <-> NanoH2): each board
+; takes a turn as the sweep master while the other runs the slave device env
+; above, so the A/B proof covers both directions. IDF transport only (the
+; strictest of the two); Port A wiring = SDA=GPIO2 / SCL=GPIO1 on both.
+[env:v2_hil_i2c_regmap_sweep_master_idf_esp32c6]
+extends = common_esp32_arduino3, common_espidf
+board = esp32-c6-devkitm-1
+build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_regmap_sweep_master.cpp>
+build_flags = -DMASTER_PIN_SDA=2 -DMASTER_PIN_SCL=1
+
+[env:v2_hil_i2c_regmap_sweep_master_idf_esp32h2]
+extends = common_esp32_arduino3, common_espidf
+board = esp32-h2-devkitm-1
+build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_regmap_sweep_master.cpp>
+build_flags = -DMASTER_PIN_SDA=2 -DMASTER_PIN_SCL=1
+
+; CoreS3 (ESP32-S3) master, for the multi-slave master-role-rotation matrix (each of
+; the 4 shared-bus boards takes a turn as master). Port A wiring = SDA=GPIO2 /
+; SCL=GPIO1, same convention as the C6/H2 masters above.
+[env:v2_hil_i2c_regmap_sweep_master_idf_esp32s3]
+extends = common_esp32s3dev_espidf5, common_espidf
+build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_regmap_sweep_master.cpp>
+build_flags = -DMASTER_PIN_SDA=2 -DMASTER_PIN_SCL=1
+
+; INDEPENDENT verification master for the stream-echo HIL pair (pairs with
+; device/i2c_echo.cpp): unlike v2_hil_i2c_echo_master_esp32 above (M5HAL's own
+; MasterAccessor), this firmware drives the vendor transport directly (Arduino
+; Wire, or the ESP-IDF i2c_master driver below), so the slave is proven
+; reachable by code that shares nothing with M5HAL's own master -- the
+; scenario that matters for the "other library on the bus talks to an
+; M5HAL-served slave via plain Wire" coexistence use case. Sweeps the same
+; length x pattern matrix as v2_hil_i2c_echo_master_esp32 at 100/400/800 kHz
+; and prints a RESULT line. Source + wiring:
+; experiments/v2/test/i2c_slave/master/i2c_echo_sweep_master.cpp.
+[env:v2_hil_i2c_echo_sweep_master_arduino_esp32]
+extends = common_esp32dev, common_arduino
+build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_echo_sweep_master.cpp>
+
+; Same fixture over the ESP-IDF `driver/i2c_master.h` (generation-5) driver.
+[env:v2_hil_i2c_echo_sweep_master_idf_esp32]
+extends = common_esp32dev_espidf5, common_espidf
+build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_echo_sweep_master.cpp>
 
 ; SPI slave echo: ESP-IDF spi_slave driver on a CoreS3 (ESP32-S3).
 ; Echo contract: receive N bytes (one CS assertion), then send them back on

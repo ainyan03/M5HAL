@@ -131,6 +131,29 @@ constexpr uint8_t pull_down  = 0b1000;
   the concrete kind. The reverse is also true: every `BusConfig` /
   `AccessConfig` derivation sets its kind from its constructor.
  */
+// SAMD51's CMSIS device header (framework-cmsis-atmel) #defines DAC as the
+// peripheral's register base address, and STM32's CMSIS device headers
+// (framework-arduinoststm32) do the same for ADC (a legacy alias of
+// ADC1_COMMON), which textually corrupts not only the plain `DAC,`/`ADC,`
+// enumerators below but every later `BusKind::DAC`/`BusKind::ADC` spelling
+// in this translation unit too (preprocessing has no concept of enum-class
+// scoping, so restoring the macro after this definition would just move the
+// corruption to the next call site instead of fixing it). Pull in the core
+// header first so the macros exist here regardless of what the consumer TU
+// included before us, then #undef them permanently for the rest of the TU.
+// Any SAMD51/STM32 code that genuinely needs the raw CMSIS register macros
+// must grab them before pulling in M5HAL headers.
+//
+// The early include is scoped to non-ESP32 Arduino cores (the only place a
+// CMSIS DAC macro exists): on arduino-esp32 2.x, Arduino.h ahead of <cmath>
+// corrupts the bundled GCC 8.4 libstdc++ (::acos undeclared and friends) —
+// the mirror image of the abs()/round() <chrono> landmine on the GCC 9
+// cores (see _checker.hpp), just with the include order reversed.
+#if defined(ARDUINO) && !defined(ESP_PLATFORM) && __has_include(<Arduino.h>)
+#include <Arduino.h>
+#endif
+#undef DAC
+#undef ADC
 enum class BusKind : uint8_t {
     Unknown = 0,
     I2C,
@@ -149,7 +172,7 @@ using bus_kind_t = BusKind;
   @brief Whether a bus is driven by a dedicated hardware controller or a
          software (bit-bang) implementation.
 
-  Returned by `IBus::backendKind()`. A backend swap (ADR 034 phase 3) can
+  Returned by `IBus::backendKind()`. A backend swap can
   change a logical bus's backend kind at runtime, so any holder that cached
   hardware guarantees should re-query (or watch `backendGeneration()`).
  */
@@ -160,7 +183,7 @@ enum class BackendKind : uint8_t {
 using backend_kind_t = BackendKind;
 
 /*!
-  @brief Capability bitmask requested of / offered by a backend (ADR 034 phase 3).
+  @brief Capability bitmask requested of / offered by a backend.
 
   An allocation request states which capabilities a backend MUST, SHOULD, or
   MUST NOT have; a backend (a specific hardware controller, or the bit-bang
@@ -188,7 +211,7 @@ constexpr backend_caps_t LOW_POWER = 1u << 1;
 }  // namespace backend_caps
 
 /*!
-  @brief How strictly a specific controller index is requested (ADR 034 phase 3).
+  @brief How strictly a specific controller index is requested.
  */
 enum class ControllerMode : uint8_t {
     Any = 0,  ///< No controller preference (`controller_id` is ignored).
@@ -198,8 +221,7 @@ enum class ControllerMode : uint8_t {
 using controller_mode_t = ControllerMode;
 
 /*!
-  @brief A backend-allocation request expressed as capability constraints
-         (ADR 034 phase 3).
+  @brief A backend-allocation request expressed as capability constraints.
 
   This is the internal, resolver-facing form. Callers build it through the
   kind helpers (e.g. `i2c::requireHardware()`, `i2c::preferController(1)`)
@@ -223,7 +245,7 @@ struct AllocationIntent {
 
       A negative `controller_id` under Require/Prefer is an impossible request
       (no such controller), not "any controller" -- rejecting it here stops the
-      allocator from silently relaxing it to a generic hardware request (D3/F6).
+      allocator from silently relaxing it to a generic hardware request.
      */
     constexpr bool valid(void) const
     {
@@ -250,6 +272,23 @@ struct AllocationIntent {
   try-lock.
  */
 constexpr uint32_t TIMEOUT_FOREVER = 0xFFFFFFFFu;
+
+/*!
+  @brief runtime::Task::start core-placement sentinels (`core` argument).
+
+  Non-negative values pin the task to that core id. The sentinels:
+  TASK_CORE_ANY leaves placement to the scheduler (no affinity);
+  TASK_CORE_SAME pins to the CALLING core — the placement for a worker
+  that must share the caller's per-core clock domain (the CPU cycle
+  counter is per-core and stops in WFI, so time marks written by the
+  caller are only comparable on the same core; see service.md);
+  TASK_CORE_OPPOSITE pins to the complement of the calling core. On
+  single-core targets and backends without core placement (posix host,
+  stub) the sentinels degrade to "no effect".
+ */
+constexpr int TASK_CORE_ANY      = -1;
+constexpr int TASK_CORE_OPPOSITE = -2;
+constexpr int TASK_CORE_SAME     = -3;
 
 }  // namespace m5::hal::v2::types
 

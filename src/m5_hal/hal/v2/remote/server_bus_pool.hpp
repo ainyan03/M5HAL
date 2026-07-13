@@ -4,7 +4,12 @@
 
 #include "remote.hpp"
 
-#if defined(M5HAL_FRAMEWORK_HAS_ARDUINO) && M5HAL_FRAMEWORK_HAS_ARDUINO
+// arduino-esp32 only (see server_bus_pool.inl's HAS_ARDUINO_BUS_CONFIG_):
+// other Arduino cores (RP2040 / SAMD51) declare SPIClass inside their own
+// `arduino::` namespace, not the global namespace — a bare forward-declare
+// here would create a spurious, incompatible global ::SPIClass distinct
+// from the real type once <SPI.h> is included elsewhere in the same TU.
+#if defined(M5HAL_FRAMEWORK_HAS_ARDUINO) && M5HAL_FRAMEWORK_HAS_ARDUINO && defined(ESP_PLATFORM)
 class TwoWire;
 class SPIClass;
 #endif
@@ -48,7 +53,7 @@ struct PhysI2CSlot {
     i2c::Bus bus;
     uint8_t cfg[kServerPinConfigMax];
     uint8_t cfg_len = 0;
-#if defined(M5HAL_FRAMEWORK_HAS_ARDUINO) && M5HAL_FRAMEWORK_HAS_ARDUINO
+#if defined(M5HAL_FRAMEWORK_HAS_ARDUINO) && M5HAL_FRAMEWORK_HAS_ARDUINO && defined(ESP_PLATFORM)
     ::TwoWire* arduino_wire = nullptr;
 #endif
 };
@@ -60,7 +65,7 @@ struct PhysSPISlot {
     spi::Bus bus;
     uint8_t cfg[kServerPinConfigMax];
     uint8_t cfg_len = 0;
-#if defined(M5HAL_FRAMEWORK_HAS_ARDUINO) && M5HAL_FRAMEWORK_HAS_ARDUINO
+#if defined(M5HAL_FRAMEWORK_HAS_ARDUINO) && M5HAL_FRAMEWORK_HAS_ARDUINO && defined(ESP_PLATFORM)
     ::SPIClass* arduino_spi = nullptr;
 #endif
 };
@@ -87,7 +92,7 @@ struct ServerPhysicalBusPool {
     PhysUARTSlot uart[kServerBusPoolSlots];
     PhysI2SSlot i2s[kServerBusPoolSlots];
 
-#if defined(M5HAL_FRAMEWORK_HAS_ARDUINO) && M5HAL_FRAMEWORK_HAS_ARDUINO
+#if defined(M5HAL_FRAMEWORK_HAS_ARDUINO) && M5HAL_FRAMEWORK_HAS_ARDUINO && defined(ESP_PLATFORM)
     //! Register an externally initialized TwoWire with its physical pin claim.
     //! The pool borrows it only; pin setup and begin/end stay with the caller.
     result_t<void> adoptI2C(::TwoWire& wire, types::gpio_number_t scl, types::gpio_number_t sda);
