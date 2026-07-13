@@ -6,7 +6,8 @@
 // espidf/hal/i2c/slave.hpp's M5HAL_ESPIDF_I2C_SLAVE_LL derivation). Values
 // match a real stretch-cause SoC (e.g. ESP32-S3) by default.
 //
-// Define M5HAL_HOST_HARNESS_NO_STRETCH to flip SOC_I2C_SLAVE_CAN_GET_STRETCH_CAUSE
+// Define M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_NO_STRETCH_CAPABILITY to flip
+// SOC_I2C_SLAVE_CAN_GET_STRETCH_CAUSE
 // to 0 instead: the same LL-path headers (hal/i2c_ll.h, soc/i2c_struct.h,
 // soc/i2c_periph.h) stay __has_include-able, so the espidf slave backend's
 // M5HAL_ESPIDF_I2C_SLAVE_LL_BE gate now resolves true instead of
@@ -14,7 +15,7 @@
 // by the test_espidf_i2c_slave_be env.
 #define SOC_I2C_FIFO_LEN      32
 #define SOC_I2C_SUPPORT_SLAVE 1
-#if defined(M5HAL_HOST_HARNESS_NO_STRETCH)
+#if defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_NO_STRETCH_CAPABILITY)
 #define SOC_I2C_SLAVE_CAN_GET_STRETCH_CAUSE 0
 #else
 #define SOC_I2C_SLAVE_CAN_GET_STRETCH_CAUSE 1

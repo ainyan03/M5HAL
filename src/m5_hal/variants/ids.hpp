@@ -5,7 +5,7 @@
 // The single registry of variant identity numbers (v2).
 //
 // One number space for everything the variant machinery identifies:
-// platform detection (M5HAL_V2_TARGET_PLATFORM_VARIANT_ID,
+// platform detection (M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID,
 // platforms/_checker.hpp) and per-kind selection markers
 // (M5HAL_V2_SELECTED_VARIANT_<KIND>, _macro/offer_all.inl) both carry
 // values from THIS list, so any two of them compare meaningfully.
@@ -127,7 +127,7 @@ constexpr const char* variantIdName(variant_id_t id)
 }
 
 /*! @brief Overload for raw registry values (e.g. the
-    M5HAL_V2_SELECTED_VARIANT_<KIND> / M5HAL_V2_TARGET_PLATFORM_VARIANT_ID
+    M5HAL_V2_SELECTED_VARIANT_<KIND> / M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID
     integer markers). */
 constexpr const char* variantIdName(uint16_t id)
 {

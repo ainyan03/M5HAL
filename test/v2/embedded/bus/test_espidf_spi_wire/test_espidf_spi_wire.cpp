@@ -21,8 +21,8 @@
 
 #include "../spi_wire_capture.hpp"
 
-#ifndef M5HAL_TEST_ESPIDF_SPI_PIN_CLK
-#define M5HAL_TEST_ESPIDF_SPI_PIN_CLK 18
+#ifndef M5HAL_TEST_ESPIDF_SPI_PIN_CLOCK
+#define M5HAL_TEST_ESPIDF_SPI_PIN_CLOCK 18
 #endif
 
 #ifndef M5HAL_TEST_ESPIDF_SPI_PIN_MOSI
@@ -41,8 +41,8 @@
 #define M5HAL_TEST_ESPIDF_SPI_PIN_CS 5
 #endif
 
-#ifndef M5HAL_TEST_ESPIDF_SPI_FREQ
-#define M5HAL_TEST_ESPIDF_SPI_FREQ 2000
+#ifndef M5HAL_TEST_ESPIDF_SPI_FREQUENCY_HZ
+#define M5HAL_TEST_ESPIDF_SPI_FREQUENCY_HZ 2000
 #endif
 
 #ifndef M5HAL_TEST_ESPIDF_SPI_HOST
@@ -69,7 +69,7 @@ EspidfSpiBus& makeBus()
     static EspidfSpiBus bus;
     ::m5::hal::v2::spi::BusConfig_espidf bus_config;
     bus_config.host     = M5HAL_TEST_ESPIDF_SPI_HOST;
-    bus_config.pin_clk  = M5HAL_TEST_ESPIDF_SPI_PIN_CLK;
+    bus_config.pin_clk  = M5HAL_TEST_ESPIDF_SPI_PIN_CLOCK;
     bus_config.pin_mosi = M5HAL_TEST_ESPIDF_SPI_PIN_MOSI;
     bus_config.pin_miso = M5HAL_TEST_ESPIDF_SPI_PIN_MISO;
     bus_config.pin_dc   = M5HAL_TEST_ESPIDF_SPI_PIN_DC;
@@ -82,7 +82,7 @@ EspidfSpiBus& makeBus()
 {
     ::m5::hal::v2::spi::MasterAccessConfig cfg;
     cfg.pin_cs                = M5HAL_TEST_ESPIDF_SPI_PIN_CS;
-    cfg.freq                  = M5HAL_TEST_ESPIDF_SPI_FREQ;
+    cfg.freq                  = M5HAL_TEST_ESPIDF_SPI_FREQUENCY_HZ;
     cfg.spi_mode              = mode & 0x03;
     cfg.spi_order             = order ? 1 : 0;
     cfg.spi_command_length    = 8;
@@ -95,10 +95,10 @@ EspidfSpiBus& makeBus()
 void printWiring()
 {
     Serial.println("espidf SPI wire self-test (capture = output readback):");
-    Serial.printf("  CLK=%d MOSI=%d MISO=%d DC=%d CS=%d host=%d\n", M5HAL_TEST_ESPIDF_SPI_PIN_CLK,
+    Serial.printf("  CLK=%d MOSI=%d MISO=%d DC=%d CS=%d host=%d\n", M5HAL_TEST_ESPIDF_SPI_PIN_CLOCK,
                   M5HAL_TEST_ESPIDF_SPI_PIN_MOSI, M5HAL_TEST_ESPIDF_SPI_PIN_MISO, M5HAL_TEST_ESPIDF_SPI_PIN_DC,
                   M5HAL_TEST_ESPIDF_SPI_PIN_CS, static_cast<int>(M5HAL_TEST_ESPIDF_SPI_HOST));
-    Serial.printf("  freq=%u Hz\n", static_cast<unsigned>(M5HAL_TEST_ESPIDF_SPI_FREQ));
+    Serial.printf("  freq=%u Hz\n", static_cast<unsigned>(M5HAL_TEST_ESPIDF_SPI_FREQUENCY_HZ));
 }
 
 void testWriteCommandAddressDataWirePhases()
@@ -124,7 +124,7 @@ void testWriteCommandAddressDataWirePhases()
     cap::assertBits(edges, 36, tx, 16);
     cap::assertDcRange(edges, 0, 8, false);
     cap::assertDcRange(edges, 8, 44, true);
-    cap::assertClockNeverFasterThanConfigured(M5HAL_TEST_ESPIDF_SPI_FREQ);
+    cap::assertClockNeverFasterThanConfigured(M5HAL_TEST_ESPIDF_SPI_FREQUENCY_HZ);
 }
 
 void testReadCommandAddressDataWirePhases()
@@ -149,7 +149,7 @@ void testReadCommandAddressDataWirePhases()
     cap::assertBits(edges, 0, command_address, 32);
     cap::assertDcRange(edges, 0, 8, false);
     cap::assertDcRange(edges, 8, 64, true);
-    cap::assertClockNeverFasterThanConfigured(M5HAL_TEST_ESPIDF_SPI_FREQ);
+    cap::assertClockNeverFasterThanConfigured(M5HAL_TEST_ESPIDF_SPI_FREQUENCY_HZ);
 }
 
 void testWriteUsesLsbFirstBitOrder()
@@ -170,7 +170,7 @@ void testWriteUsesLsbFirstBitOrder()
     const size_t edge_count = cap::collectActiveRisingEdges(edges, sizeof(edges));
     TEST_ASSERT_EQUAL_UINT32_MESSAGE(8, edge_count, "unexpected LSB first clock count");
     cap::assertBits(edges, 0, tx, 8, true);
-    cap::assertClockNeverFasterThanConfigured(M5HAL_TEST_ESPIDF_SPI_FREQ);
+    cap::assertClockNeverFasterThanConfigured(M5HAL_TEST_ESPIDF_SPI_FREQUENCY_HZ);
 }
 
 void testSpiModesSetExpectedClockEdges()
@@ -203,7 +203,7 @@ void testSpiModesSetExpectedClockEdges()
             TEST_ASSERT_EQUAL_UINT8_MESSAGE(expected_rising ? 1 : 0, rising_edges[i] ? 1 : 0,
                                             "clock edge alternation mismatch");
         }
-        cap::assertClockNeverFasterThanConfigured(M5HAL_TEST_ESPIDF_SPI_FREQ);
+        cap::assertClockNeverFasterThanConfigured(M5HAL_TEST_ESPIDF_SPI_FREQUENCY_HZ);
     }
 }
 
@@ -215,7 +215,7 @@ void setup()
     Serial.begin(115200);
     delay(200);
     printWiring();
-    cap::setPins(M5HAL_TEST_ESPIDF_SPI_PIN_CLK, M5HAL_TEST_ESPIDF_SPI_PIN_MOSI, M5HAL_TEST_ESPIDF_SPI_PIN_DC,
+    cap::setPins(M5HAL_TEST_ESPIDF_SPI_PIN_CLOCK, M5HAL_TEST_ESPIDF_SPI_PIN_MOSI, M5HAL_TEST_ESPIDF_SPI_PIN_DC,
                  M5HAL_TEST_ESPIDF_SPI_PIN_CS);
 
     UNITY_BEGIN();

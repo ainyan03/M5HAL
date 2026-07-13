@@ -15,6 +15,9 @@
 // this fence is the v0v2_check_* env family (pio_envs/v0v2/check.ini.cli).
 
 #include <M5HAL_v0.hpp>
+// A standalone runtime-kind include may compute legitimate SELECTED outputs
+// before the umbrella scan.
+#include <m5_hal/hal/v2/runtime/runtime.hpp>
 #include <M5HAL_v2.hpp>
 
 #include <gtest/gtest.h>
@@ -25,7 +28,7 @@
 // registry. On native both must resolve to "unknown" / NONE
 // independently.
 static_assert(M5HAL_TARGET_PLATFORM_NUMBER == M5HAL_PLATFORM_NUMBER_UNKNOWN, "v0 platform number clobbered");
-static_assert(M5HAL_V2_TARGET_PLATFORM_VARIANT_ID == M5HAL_V2_VARIANT_ID_NONE,
+static_assert(M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID == M5HAL_V2_VARIANT_ID_NONE,
               "v2 platform variant id missing or clobbered");
 
 TEST(CoexistInclude, BothGenerationsVisibleInOneTU)

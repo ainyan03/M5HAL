@@ -8,6 +8,10 @@
 // included from its own TU. See spec/design/v0_v2_coexistence.md
 // §制約 for the full reasoning.
 
+#include "./m5_hal/hal/v0/build_support.hpp"
+
+#if M5HAL_DETAIL_V0_IMPLEMENTATION_SUPPORTED_
+
 #include "M5HAL_v0.hpp"
 
 #include "./m5_hal/hal/v0/bus/bus.inl"
@@ -24,3 +28,5 @@
 #if M5HAL_FRAMEWORK_HAS_ARDUINO
 #include "./m5_hal/hal/v0/frameworks/arduino/impl.inl"
 #endif
+
+#endif  // M5HAL_DETAIL_V0_IMPLEMENTATION_SUPPORTED_

@@ -92,6 +92,19 @@ M5HAL_INLINE_V2 namespace v2
 #include "../../../variants/ids.hpp"
 #include "../../../variants/frameworks/_checker.hpp"
 
+#if defined(M5HAL_V2_SELECTED_VARIANT_RUNTIME) && !defined(M5HAL_DETAIL_VARIANT_SELECTED_RUNTIME_)
+#error "M5HAL_V2_SELECTED_VARIANT_RUNTIME is a read-only output and must not be predefined"
+#endif
+#if defined(M5HAL_V2_SELECTED_VARIANT_RUNTIME_MUTEX) && !defined(M5HAL_DETAIL_VARIANT_SELECTED_RUNTIME_MUTEX_)
+#error "M5HAL_V2_SELECTED_VARIANT_RUNTIME_MUTEX is a read-only output and must not be predefined"
+#endif
+#if defined(M5HAL_V2_SELECTED_VARIANT_RUNTIME_TASK) && !defined(M5HAL_DETAIL_VARIANT_SELECTED_RUNTIME_TASK_)
+#error "M5HAL_V2_SELECTED_VARIANT_RUNTIME_TASK is a read-only output and must not be predefined"
+#endif
+#if defined(M5HAL_V2_SELECTED_VARIANT_RUNTIME_EVENT) && !defined(M5HAL_DETAIL_VARIANT_SELECTED_RUNTIME_EVENT_)
+#error "M5HAL_V2_SELECTED_VARIANT_RUNTIME_EVENT is a read-only output and must not be predefined"
+#endif
+
 // FreeRTOS framework variant: provides Mutex and Task. Scanned FIRST
 // so it wins RUNTIME_MUTEX / RUNTIME_TASK before arduino/espidf
 // (which win RUNTIME = time functions).
@@ -128,16 +141,16 @@ M5HAL_INLINE_V2 namespace v2
 // The stub fallback always offers runtime, so unlike the bus kinds
 // the selected-variant marker can never stay NONE — bus::IBus depends
 // on the type existing. Fail loudly if the invariant ever breaks.
-#ifndef M5HAL_V2_SELECTED_VARIANT_RUNTIME
+#ifndef M5HAL_DETAIL_VARIANT_SELECTED_RUNTIME_
 #error "runtime: no variant offered the runtime kind (the stub fallback must always offer it)"
 #endif
-#ifndef M5HAL_V2_SELECTED_VARIANT_RUNTIME_MUTEX
+#ifndef M5HAL_DETAIL_VARIANT_SELECTED_RUNTIME_MUTEX_
 #error "runtime: no variant offered runtime::Mutex (the stub fallback must always offer it)"
 #endif
-#ifndef M5HAL_V2_SELECTED_VARIANT_RUNTIME_TASK
+#ifndef M5HAL_DETAIL_VARIANT_SELECTED_RUNTIME_TASK_
 #error "runtime: no variant offered runtime::Task (the stub fallback must always offer it)"
 #endif
-#ifndef M5HAL_V2_SELECTED_VARIANT_RUNTIME_EVENT
+#ifndef M5HAL_DETAIL_VARIANT_SELECTED_RUNTIME_EVENT_
 #error "runtime: no variant offered runtime::Event (the stub fallback must always offer it)"
 #endif
 

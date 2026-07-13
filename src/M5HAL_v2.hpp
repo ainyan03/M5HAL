@@ -49,6 +49,34 @@ M5HAL_INLINE_V2 namespace v2
 #include "./m5_hal/variants/platforms/_checker.hpp"
 #include "./m5_hal/variants/frameworks/_checker.hpp"
 
+#if defined(M5HAL_V2_SELECTED_VARIANT_RUNTIME) && !defined(M5HAL_DETAIL_VARIANT_SELECTED_RUNTIME_)
+#error "M5HAL_V2_SELECTED_VARIANT_RUNTIME is a read-only output and must not be predefined"
+#endif
+#if defined(M5HAL_V2_SELECTED_VARIANT_RUNTIME_MUTEX) && !defined(M5HAL_DETAIL_VARIANT_SELECTED_RUNTIME_MUTEX_)
+#error "M5HAL_V2_SELECTED_VARIANT_RUNTIME_MUTEX is a read-only output and must not be predefined"
+#endif
+#if defined(M5HAL_V2_SELECTED_VARIANT_RUNTIME_TASK) && !defined(M5HAL_DETAIL_VARIANT_SELECTED_RUNTIME_TASK_)
+#error "M5HAL_V2_SELECTED_VARIANT_RUNTIME_TASK is a read-only output and must not be predefined"
+#endif
+#if defined(M5HAL_V2_SELECTED_VARIANT_RUNTIME_EVENT) && !defined(M5HAL_DETAIL_VARIANT_SELECTED_RUNTIME_EVENT_)
+#error "M5HAL_V2_SELECTED_VARIANT_RUNTIME_EVENT is a read-only output and must not be predefined"
+#endif
+#if defined(M5HAL_V2_SELECTED_VARIANT_GPIO) && !defined(M5HAL_DETAIL_VARIANT_SELECTED_GPIO_)
+#error "M5HAL_V2_SELECTED_VARIANT_GPIO is a read-only output and must not be predefined"
+#endif
+#if defined(M5HAL_V2_SELECTED_VARIANT_I2C) && !defined(M5HAL_DETAIL_VARIANT_SELECTED_I2C_)
+#error "M5HAL_V2_SELECTED_VARIANT_I2C is a read-only output and must not be predefined"
+#endif
+#if defined(M5HAL_V2_SELECTED_VARIANT_SPI) && !defined(M5HAL_DETAIL_VARIANT_SELECTED_SPI_)
+#error "M5HAL_V2_SELECTED_VARIANT_SPI is a read-only output and must not be predefined"
+#endif
+#if defined(M5HAL_V2_SELECTED_VARIANT_I2S) && !defined(M5HAL_DETAIL_VARIANT_SELECTED_I2S_)
+#error "M5HAL_V2_SELECTED_VARIANT_I2S is a read-only output and must not be predefined"
+#endif
+#if defined(M5HAL_V2_SELECTED_VARIANT_UART) && !defined(M5HAL_DETAIL_VARIANT_SELECTED_UART_)
+#error "M5HAL_V2_SELECTED_VARIANT_UART is a read-only output and must not be predefined"
+#endif
+
 // runtime kind (time + mutex): resolved EARLY, before any bus header —
 // bus::IBus embeds runtime::Mutex by value, so the winning variant must
 // be known here. The header below runs its own runtime-only scan pass
@@ -83,7 +111,7 @@ M5HAL_INLINE_V2 namespace v2
 #include "./m5_hal/variants/frameworks/remote/session.hpp"
 #include "./m5_hal/variants/frameworks/remote/backend.hpp"
 #include "./m5_hal/hal/v2/remote/server_adapter.hpp"
-#if __has_include(<sys/socket.h>) && __has_include(<netinet/tcp.h>)
+#if M5HAL_FRAMEWORK_HAS_BSD_SOCKET
 #include "./m5_hal/variants/frameworks/bsd/hal/remote/tcp_server.hpp"
 #endif
 
@@ -92,9 +120,9 @@ M5HAL_INLINE_V2 namespace v2
 #define M5HAL_STATIC_MACRO_CONCAT(x, y) M5HAL_STATIC_MACRO_STRING(x/y)
 // clang-format on
 
-#define M5HAL_STATIC_MACRO_PATH_HEADER M5HAL_STATIC_MACRO_CONCAT(M5HAL_V2_TARGET_PLATFORM_PATH, hal.hpp)
+#define M5HAL_STATIC_MACRO_PATH_HEADER M5HAL_STATIC_MACRO_CONCAT(M5HAL_V2_DETECTED_PLATFORM_VARIANT_PATH, hal.hpp)
 
-#if M5HAL_V2_TARGET_PLATFORM_VARIANT_ID != M5HAL_V2_VARIANT_ID_NONE
+#if M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID != M5HAL_V2_VARIANT_ID_NONE
 #include M5HAL_STATIC_MACRO_PATH_HEADER
 #endif
 
@@ -119,9 +147,9 @@ M5HAL_INLINE_V2 namespace v2
 #endif
 
 // Remote framework variant: proxy buses (I2C/SPI/UART/I2S) that forward to a
-// peer MCU over RemoteSession. Opt-in via M5HAL_CONFIG_REMOTE. The umbrella
-// defines the Bus_remote / BusConfig_remote types the offer scan below binds
-// as winner aliases, so it must precede that scan.
+// peer MCU over RemoteSession. Opt-in via M5HAL_CONFIG_REMOTE_VARIANT. The
+// umbrella defines the Bus_remote / BusConfig_remote types the offer scan below
+// binds as winner aliases, so it must precede that scan.
 #if M5HAL_FRAMEWORK_HAS_REMOTE
 #include "./m5_hal/variants/frameworks/remote/hal.hpp"
 #endif
@@ -151,8 +179,8 @@ M5HAL_INLINE_V2 namespace v2
 #include "./m5_hal/variants/frameworks/stub/hal.hpp"
 
 // 1. platform _offer.hpp scan
-#define M5HAL_STATIC_MACRO_PATH_OFFER M5HAL_STATIC_MACRO_CONCAT(M5HAL_V2_TARGET_PLATFORM_PATH, _offer.hpp)
-#if M5HAL_V2_TARGET_PLATFORM_VARIANT_ID != M5HAL_V2_VARIANT_ID_NONE
+#define M5HAL_STATIC_MACRO_PATH_OFFER M5HAL_STATIC_MACRO_CONCAT(M5HAL_V2_DETECTED_PLATFORM_VARIANT_PATH, _offer.hpp)
+#if M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID != M5HAL_V2_VARIANT_ID_NONE
 #include M5HAL_STATIC_MACRO_PATH_OFFER
 #include "./m5_hal/_macro/offer_all.inl"
 #endif
@@ -186,7 +214,8 @@ M5HAL_INLINE_V2 namespace v2
 #endif
 
 // 6. remote framework _offer.hpp scan (proxy buses that forward operations to
-//    a peer MCU via RemoteSession). Opt-in via M5HAL_CONFIG_REMOTE=1 build flag.
+//    a peer MCU via RemoteSession). Opt-in via
+//    M5HAL_CONFIG_REMOTE_VARIANT=1 build flag.
 //    Scanned after posix so posix wins UART (the host serial transport), while
 //    remote wins I2C / SPI / I2S / UART (the tunnelled bus kinds) on host builds
 //    where no higher-priority variant offers them.
@@ -212,28 +241,36 @@ M5HAL_INLINE_V2 namespace v2
 // default on purpose: bus::IBus depends on the type existing, so the
 // early scan in hal/v2/runtime/runtime.hpp #errors instead when no
 // variant offers it (the stub fallback always does).
-#ifndef M5HAL_V2_SELECTED_VARIANT_GPIO
-#define M5HAL_V2_SELECTED_VARIANT_GPIO M5HAL_V2_VARIANT_ID_NONE
+#ifndef M5HAL_DETAIL_VARIANT_SELECTED_GPIO_
+#define M5HAL_DETAIL_VARIANT_SELECTED_GPIO_ 1
+#define M5HAL_V2_SELECTED_VARIANT_GPIO      M5HAL_V2_VARIANT_ID_NONE
 #endif
-#ifndef M5HAL_V2_SELECTED_VARIANT_I2C
-#define M5HAL_V2_SELECTED_VARIANT_I2C M5HAL_V2_VARIANT_ID_NONE
+#ifndef M5HAL_DETAIL_VARIANT_SELECTED_I2C_
+#define M5HAL_DETAIL_VARIANT_SELECTED_I2C_ 1
+#define M5HAL_V2_SELECTED_VARIANT_I2C      M5HAL_V2_VARIANT_ID_NONE
 #endif
-#ifndef M5HAL_V2_SELECTED_VARIANT_SPI
-#define M5HAL_V2_SELECTED_VARIANT_SPI M5HAL_V2_VARIANT_ID_NONE
+#ifndef M5HAL_DETAIL_VARIANT_SELECTED_SPI_
+#define M5HAL_DETAIL_VARIANT_SELECTED_SPI_ 1
+#define M5HAL_V2_SELECTED_VARIANT_SPI      M5HAL_V2_VARIANT_ID_NONE
 #endif
-#ifndef M5HAL_V2_SELECTED_VARIANT_I2S
-#define M5HAL_V2_SELECTED_VARIANT_I2S M5HAL_V2_VARIANT_ID_NONE
+#ifndef M5HAL_DETAIL_VARIANT_SELECTED_I2S_
+#define M5HAL_DETAIL_VARIANT_SELECTED_I2S_ 1
+#define M5HAL_V2_SELECTED_VARIANT_I2S      M5HAL_V2_VARIANT_ID_NONE
 #endif
-#ifndef M5HAL_V2_SELECTED_VARIANT_UART
-#define M5HAL_V2_SELECTED_VARIANT_UART M5HAL_V2_VARIANT_ID_NONE
+#ifndef M5HAL_DETAIL_VARIANT_SELECTED_UART_
+#define M5HAL_DETAIL_VARIANT_SELECTED_UART_ 1
+#define M5HAL_V2_SELECTED_VARIANT_UART      M5HAL_V2_VARIANT_ID_NONE
 #endif
 
-// ----- M5HAL_PC_BUILD convenience macro -----
+// ----- M5HAL_V2_TARGET_IS_PC convenience macro -----
 //
 // True when the build targets a POSIX host (PC), not an MCU.
-// User code can branch on `#if M5HAL_PC_BUILD` instead of
+// User code can branch on `#if M5HAL_V2_TARGET_IS_PC` instead of
 // `#if !defined(ESP_PLATFORM)` for dual-target sources.
-#define M5HAL_PC_BUILD M5HAL_FRAMEWORK_HAS_POSIX
+#ifdef M5HAL_V2_TARGET_IS_PC
+#error "M5HAL_V2_TARGET_IS_PC is a read-only output and must not be predefined"
+#endif
+#define M5HAL_V2_TARGET_IS_PC M5HAL_FRAMEWORK_HAS_POSIX
 
 // ----- M5HALCore (singleton HAL object layer) -----
 //

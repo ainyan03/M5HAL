@@ -35,31 +35,41 @@
 // ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------
-#ifndef M5HAL_EXPERIMENT_REMOTE_BAUD
+#ifndef M5HAL_EXAMPLE_REMOTE_UART_BAUD_RATE
 #if M5HAL_FRAMEWORK_HAS_ARDUINO
-#define M5HAL_EXPERIMENT_REMOTE_BAUD 115200
+#define M5HAL_EXAMPLE_REMOTE_UART_BAUD_RATE 115200
 #else
-#define M5HAL_EXPERIMENT_REMOTE_BAUD 3000000
+#define M5HAL_EXAMPLE_REMOTE_UART_BAUD_RATE 3000000
 #endif
 #endif
 
-#ifndef M5HAL_EXPERIMENT_I2C_SCL
-#define M5HAL_EXPERIMENT_I2C_SCL 22
+#ifndef M5HAL_EXAMPLE_REMOTE_I2C_PIN_SCL
+#define M5HAL_EXAMPLE_REMOTE_I2C_PIN_SCL 22
 #endif
-#ifndef M5HAL_EXPERIMENT_I2C_SDA
-#define M5HAL_EXPERIMENT_I2C_SDA 21
+#ifndef M5HAL_EXAMPLE_REMOTE_I2C_PIN_SDA
+#define M5HAL_EXAMPLE_REMOTE_I2C_PIN_SDA 21
 #endif
-#ifndef M5HAL_EXPERIMENT_SPI_CLK
-#define M5HAL_EXPERIMENT_SPI_CLK 32
+#ifndef M5HAL_EXAMPLE_REMOTE_SPI_PIN_CLOCK
+#define M5HAL_EXAMPLE_REMOTE_SPI_PIN_CLOCK 32
 #endif
-#ifndef M5HAL_EXPERIMENT_SPI_MOSI
-#define M5HAL_EXPERIMENT_SPI_MOSI 26
+#ifndef M5HAL_EXAMPLE_REMOTE_SPI_PIN_MOSI
+#define M5HAL_EXAMPLE_REMOTE_SPI_PIN_MOSI 26
 #endif
-#ifndef M5HAL_EXPERIMENT_SPI_MISO
-#define M5HAL_EXPERIMENT_SPI_MISO 36
+#ifndef M5HAL_EXAMPLE_REMOTE_SPI_PIN_MISO
+#define M5HAL_EXAMPLE_REMOTE_SPI_PIN_MISO 36
 #endif
-#ifndef M5HAL_EXPERIMENT_SPI_CS
-#define M5HAL_EXPERIMENT_SPI_CS 33
+#ifndef M5HAL_EXAMPLE_REMOTE_SPI_PIN_CS
+#define M5HAL_EXAMPLE_REMOTE_SPI_PIN_CS 33
+#endif
+
+#ifndef M5HAL_EXAMPLE_REMOTE_STATIC_I2C
+#define M5HAL_EXAMPLE_REMOTE_STATIC_I2C 1
+#endif
+#ifndef M5HAL_EXAMPLE_REMOTE_SPI
+#define M5HAL_EXAMPLE_REMOTE_SPI 1
+#endif
+#ifndef M5HAL_EXAMPLE_REMOTE_TRANSPORT_USB_JTAG
+#define M5HAL_EXAMPLE_REMOTE_TRANSPORT_USB_JTAG 0
 #endif
 
 // ---------------------------------------------------------------------------
@@ -70,14 +80,14 @@ namespace m5hal = m5::hal::v2;
 // ---------------------------------------------------------------------------
 // Pin constants
 // ---------------------------------------------------------------------------
-static constexpr int PIN_I2C_SCL  = M5HAL_EXPERIMENT_I2C_SCL;
-static constexpr int PIN_I2C_SDA  = M5HAL_EXPERIMENT_I2C_SDA;
+static constexpr int PIN_I2C_SCL  = M5HAL_EXAMPLE_REMOTE_I2C_PIN_SCL;
+static constexpr int PIN_I2C_SDA  = M5HAL_EXAMPLE_REMOTE_I2C_PIN_SDA;
 static constexpr int PIN_UART_TX  = 1;
 static constexpr int PIN_UART_RX  = 3;
-static constexpr int PIN_SPI_CLK  = M5HAL_EXPERIMENT_SPI_CLK;
-static constexpr int PIN_SPI_MOSI = M5HAL_EXPERIMENT_SPI_MOSI;
-static constexpr int PIN_SPI_MISO = M5HAL_EXPERIMENT_SPI_MISO;
-static constexpr int PIN_SPI_CS   = M5HAL_EXPERIMENT_SPI_CS;
+static constexpr int PIN_SPI_CLK  = M5HAL_EXAMPLE_REMOTE_SPI_PIN_CLOCK;
+static constexpr int PIN_SPI_MOSI = M5HAL_EXAMPLE_REMOTE_SPI_PIN_MOSI;
+static constexpr int PIN_SPI_MISO = M5HAL_EXAMPLE_REMOTE_SPI_PIN_MISO;
+static constexpr int PIN_SPI_CS   = M5HAL_EXAMPLE_REMOTE_SPI_PIN_CS;
 
 static constexpr uint8_t BUS_ID_I2C = 0;
 static constexpr uint8_t BUS_ID_SPI = 2;
@@ -122,7 +132,7 @@ static void initDebugPins()
 // ---------------------------------------------------------------------------
 static void initBuses()
 {
-#if !defined(M5HAL_EXPERIMENT_SKIP_STATIC_I2C)
+#if M5HAL_EXAMPLE_REMOTE_STATIC_I2C
     // Static I2C + self-scan diagnostic. Note: this claims bus_id 0, so a
     // host-side dynamic I2C create for the same id is rejected with
     // INVALID_STATE; use env:RemoteServer_esp32_host_i2c when the host should
@@ -146,7 +156,7 @@ static void initBuses()
     (void)g_srv.registerI2C(BUS_ID_I2C, i2c_acc);
 #endif
 
-#if !defined(M5HAL_EXPERIMENT_SKIP_SPI)
+#if M5HAL_EXAMPLE_REMOTE_SPI
     m5hal::spi::BusConfig spi_cfg;
     spi_cfg.pin_clk  = PIN_SPI_CLK;
     spi_cfg.pin_mosi = PIN_SPI_MOSI;
@@ -191,7 +201,7 @@ void setup()
     (void)uart_bus.init(bus_cfg);
 
     m5hal::uart::AccessConfig uart_cfg;
-    uart_cfg.baud_rate             = M5HAL_EXPERIMENT_REMOTE_BAUD;
+    uart_cfg.baud_rate             = M5HAL_EXAMPLE_REMOTE_UART_BAUD_RATE;
     uart_cfg.first_byte_timeout_ms = 2;
     uart_cfg.inter_byte_timeout_ms = 1;
     uart_cfg.write_timeout_ms      = 100;
@@ -227,13 +237,13 @@ void loop()
 
 // ---- espidf ----
 
-#if !defined(M5HAL_USERAPP_TRANSPORT_USB_JTAG)
+#if !M5HAL_EXAMPLE_REMOTE_TRANSPORT_USB_JTAG
 static m5hal::uart::Bus_espidf uart_bus;
 #endif
 
 static m5hal::remote::RemoteServerAdapter* g_adapter = nullptr;
 
-#if defined(M5HAL_USERAPP_TRANSPORT_USB_JTAG)
+#if M5HAL_EXAMPLE_REMOTE_TRANSPORT_USB_JTAG
 #include <driver/usb_serial_jtag.h>
 
 static struct JtagReader : public m5hal::data::StreamReader {
@@ -264,7 +274,7 @@ extern "C" void app_main(void)
     initDebugPins();
     initBuses();
 
-#if defined(M5HAL_USERAPP_TRANSPORT_USB_JTAG)
+#if M5HAL_EXAMPLE_REMOTE_TRANSPORT_USB_JTAG
     usb_serial_jtag_driver_config_t jtag_cfg = {.tx_buffer_size = 4096, .rx_buffer_size = 4096};
     (void)usb_serial_jtag_driver_install(&jtag_cfg);
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -284,7 +294,7 @@ extern "C" void app_main(void)
     uart_flush(static_cast<uart_port_t>(bus_cfg.port_num));
 
     m5hal::uart::AccessConfig uart_cfg;
-    uart_cfg.baud_rate             = M5HAL_EXPERIMENT_REMOTE_BAUD;
+    uart_cfg.baud_rate             = M5HAL_EXAMPLE_REMOTE_UART_BAUD_RATE;
     uart_cfg.first_byte_timeout_ms = 2;
     uart_cfg.inter_byte_timeout_ms = 1;
     uart_cfg.write_timeout_ms      = 100;

@@ -27,33 +27,34 @@
 //   gen5: bus-device API (driver/i2c_master.h, ESP-IDF v5.2+).
 //   gen4: command-link (legacy) API (driver/i2c.h, ESP-IDF v2..v6.0 EOL).
 #if __has_include(<driver/i2c_master.h>)
-#define M5HAL_ESPIDF_I2C_HAVE_GEN5 1
+#define M5HAL_DETAIL_ESPIDF_I2C_HAS_GEN5_DRIVER_ 1
 #else
-#define M5HAL_ESPIDF_I2C_HAVE_GEN5 0
+#define M5HAL_DETAIL_ESPIDF_I2C_HAS_GEN5_DRIVER_ 0
 #endif
 #if __has_include(<driver/i2c.h>)
-#define M5HAL_ESPIDF_I2C_HAVE_GEN4 1
+#define M5HAL_DETAIL_ESPIDF_I2C_HAS_GEN4_DRIVER_ 1
 #else
-#define M5HAL_ESPIDF_I2C_HAVE_GEN4 0
+#define M5HAL_DETAIL_ESPIDF_I2C_HAS_GEN4_DRIVER_ 0
 #endif
 
 // Backend selection — M5HAL compiles exactly ONE I2C backend. ESP-IDF aborts at
 // runtime if the legacy command-link driver (driver/i2c.h) and the modern
 // bus-device driver (driver/i2c_master.h) are linked into the same image, so we
 // must never pull in both. Default = modern gen5. The legacy gen4 backend is
-// opt-in via M5HAL_CONFIG_IDF_I2C_LEGACY=1: a project that already uses the
+// opt-in via M5HAL_CONFIG_ESPIDF_I2C_MASTER_LEGACY_DRIVER=1: a project that already uses the
 // legacy driver sets it to force M5HAL onto gen4 and avoid the mixed-link abort.
 // Exception: on ESP-IDF older than v5.2 the modern driver does not exist (so no
 // conflict is possible), and M5HAL falls back to gen4 automatically there.
-#ifndef M5HAL_CONFIG_IDF_I2C_LEGACY
-#define M5HAL_CONFIG_IDF_I2C_LEGACY 0
+#ifndef M5HAL_CONFIG_ESPIDF_I2C_MASTER_LEGACY_DRIVER
+#define M5HAL_CONFIG_ESPIDF_I2C_MASTER_LEGACY_DRIVER 0
 #endif
-#if M5HAL_CONFIG_IDF_I2C_LEGACY
+#if M5HAL_CONFIG_ESPIDF_I2C_MASTER_LEGACY_DRIVER
 #define M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5 0
-#define M5HAL_ESPIDF_I2C_HAS_MASTER_GEN4 M5HAL_ESPIDF_I2C_HAVE_GEN4
+#define M5HAL_ESPIDF_I2C_HAS_MASTER_GEN4 M5HAL_DETAIL_ESPIDF_I2C_HAS_GEN4_DRIVER_
 #else
-#define M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5 M5HAL_ESPIDF_I2C_HAVE_GEN5
-#define M5HAL_ESPIDF_I2C_HAS_MASTER_GEN4 (!M5HAL_ESPIDF_I2C_HAVE_GEN5 && M5HAL_ESPIDF_I2C_HAVE_GEN4)
+#define M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5 M5HAL_DETAIL_ESPIDF_I2C_HAS_GEN5_DRIVER_
+#define M5HAL_ESPIDF_I2C_HAS_MASTER_GEN4 \
+    (!M5HAL_DETAIL_ESPIDF_I2C_HAS_GEN5_DRIVER_ && M5HAL_DETAIL_ESPIDF_I2C_HAS_GEN4_DRIVER_)
 #endif
 
 #define M5HAL_ESPIDF_I2C_HAS_MASTER (M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5 || M5HAL_ESPIDF_I2C_HAS_MASTER_GEN4)

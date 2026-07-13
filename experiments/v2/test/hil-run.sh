@@ -46,7 +46,7 @@ cd "$REPO"
 export M5HAL_PIO_EXTRA_CONFIG="pio_envs/v2/hil.ini.cli"
 
 echo "=== flash device ($dev_env) @ ${baud} baud ==="
-PLATFORMIO_BUILD_FLAGS="-DM5HAL_HIL_ECHO_BAUD=$baud" \
+PLATFORMIO_BUILD_FLAGS="-DM5HAL_HIL_UART_ECHO_BAUD_RATE=$baud" \
     pio run -e "$dev_env" -t upload --upload-port "$port"
 
 echo "=== build host ($host_env) ==="

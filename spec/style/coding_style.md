@@ -51,7 +51,7 @@ using namespace ::m5::hal::v2;  // resolve unqualified types::/bus:: refs
 | ローカル変数・引数 | lower_snake_case | `delay_cycle`, `cb_obj` |
 | 定数 (constexpr) | 用途に応じる (`kCamelCase` または `UPPER_SNAKE_CASE`) | `kDefaultTimeoutMs` |
 | enum class 値 | **基本** UpperCamelCase。 **例外として** エラーコード等 C 互換 / POSIX 慣習を意識する定数群は UPPER_SNAKE_CASE 許容 | `BusKind::I2C`, `GpioMode::Output` / 許容例: `error_t::OK`, `error_t::I2C_NO_ACK` |
-| 機能・設定マクロ | `M5HAL_` プレフィックス (アンダースコアなし) + UPPER_SNAKE_CASE。 世代間で値が異なり得るものは `M5HAL_V2_` で世代分離 | `M5HAL_V2_TARGET_PLATFORM_VARIANT_ID`, `M5HAL_ASSERT` |
+| 機能・設定マクロ | `M5HAL_` プレフィックス (アンダースコアなし) + UPPER_SNAKE_CASE。 世代間で値が異なり得るものは `M5HAL_V2_` で世代分離 | `M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID`, `M5HAL_ASSERT` |
 | ヘッダガード | `M5_HAL_<PATH>_HPP` (`M5_HAL_` = アンダースコアあり、 パスベース) | `M5_HAL_TYPES_HPP`, `M5_HAL_GPIO_GROUP_HPP_` |
 
 > **enum 値の補足 (acronym の扱い)**: UpperCamelCase 化では一般的な略語は **語として扱う** (`Gpio` / `Io` / `Dc` / `Tx` / `Rx` → 例 `SpiDataMode::DualIo`, `Channel::Tx`, `SpiDataMode::HalfDuplexWithDcPin`)。 一方、 確立したプロトコル名 / 業界表記は **大文字を保つ** (`BusKind::I2C` / `SPI` / `I2S` / `UART`)。

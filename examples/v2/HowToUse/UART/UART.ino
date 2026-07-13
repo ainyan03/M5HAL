@@ -24,8 +24,8 @@ namespace m5hal = m5::hal::v2;
 constexpr int PIN_UART_TX = 17;
 constexpr int PIN_UART_RX = 16;
 
-#ifndef M5HAL_EXAMPLE_HOWTOUSEUART_BAUD
-#define M5HAL_EXAMPLE_HOWTOUSEUART_BAUD 115200
+#ifndef M5HAL_EXAMPLE_UART_BAUD_RATE
+#define M5HAL_EXAMPLE_UART_BAUD_RATE 115200
 #endif
 
 // Shared owner, assigned in setup().
@@ -119,7 +119,7 @@ void setup()
     Serial.println();
     Serial.println("M5HAL HowToUseUART");
     Serial.printf("TX=%d RX=%d baud=%u\n", PIN_UART_TX, PIN_UART_RX,
-                  static_cast<unsigned>(M5HAL_EXAMPLE_HOWTOUSEUART_BAUD));
+                  static_cast<unsigned>(M5HAL_EXAMPLE_UART_BAUD_RATE));
     Serial.println("Connect TX to RX to see loopback bytes.");
 
     // Tag-typed pins: either order is correct (no swapped-pin accidents).
@@ -134,7 +134,7 @@ void setup()
     }
     uart_bus = acquired.value();
 
-    acc_cfg.baud_rate             = M5HAL_EXAMPLE_HOWTOUSEUART_BAUD;
+    acc_cfg.baud_rate             = M5HAL_EXAMPLE_UART_BAUD_RATE;
     acc_cfg.first_byte_timeout_ms = 20;
     acc_cfg.inter_byte_timeout_ms = 5;
     acc_cfg.write_timeout_ms      = 100;

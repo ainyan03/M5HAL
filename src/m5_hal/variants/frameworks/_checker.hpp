@@ -18,11 +18,12 @@
 
 // The arduino variant targets arduino-esp32 plus a short allowlist of other
 // Arduino cores that the variant's ESP_PLATFORM-gated fallback paths (Wire /
-// SPI begin() overloads, runtime::Mutex) have been written against: RP2040
-// (arduino-pico), SAMD51 (Adafruit/Arduino SAMD core), STM32 (official
-// ST core / STM32duino), nRF52840 (Adafruit nRF52 core), and ESP8266
-// (official ESP8266 Arduino core — Espressif silicon but NOT ESP_PLATFORM;
-// it takes the generic paths except where noted per call site). None is
+// SPI begin() overloads, runtime::Mutex) have been written against: RP2040 /
+// RP2350 (arduino-pico), UNO R4 Minima (ArduinoCore-renesas), SAMD51
+// (Adafruit/Arduino SAMD core), STM32 (official ST core / STM32duino),
+// nRF52840 (Adafruit nRF52 core), ESP8266 (official ESP8266 Arduino core),
+// and Sony SPRESENSE. ESP8266 is Espressif silicon but NOT ESP_PLATFORM;
+// it takes the generic paths except where noted per call site. None is
 // HIL-verified (build-check only, see spec/design/variants.md); other
 // Arduino cores still fail loudly here instead of dying deep inside a
 // variant header. Widen this allowlist only after adding the matching
@@ -33,7 +34,9 @@
 // surface (Mbed OS underneath, its own GCC toolchain whose <chrono> the
 // Arduino.h abs()/round() macros corrupt) — only earlephilhower's
 // arduino-pico core has been written against here.
-#if defined(ARDUINO_ARCH_RP2040) && !defined(ARDUINO_ARCH_MBED)
+#if defined(ARDUINO_ARCH_RP2040) && !defined(ARDUINO_ARCH_MBED) && !defined(PICO_RISCV) && !defined(__riscv)
+#define M5HAL_ARDUINO_VARIANT_SUPPORTED_ 1
+#elif defined(ARDUINO_ARCH_RENESAS_UNO) && defined(ARDUINO_UNOR4_MINIMA) && defined(ARDUINO_MINIMA)
 #define M5HAL_ARDUINO_VARIANT_SUPPORTED_ 1
 #elif defined(ARDUINO_ARCH_SAMD) && defined(__SAMD51__)
 #define M5HAL_ARDUINO_VARIANT_SUPPORTED_ 1
@@ -46,6 +49,8 @@
 #define M5HAL_ARDUINO_VARIANT_SUPPORTED_ 1
 #elif defined(ARDUINO_ARCH_ESP8266)
 #define M5HAL_ARDUINO_VARIANT_SUPPORTED_ 1
+#elif defined(ARDUINO_ARCH_SPRESENSE) && !defined(SUBCORE)
+#define M5HAL_ARDUINO_VARIANT_SUPPORTED_ 1
 #elif defined(ESP_PLATFORM)
 #define M5HAL_ARDUINO_VARIANT_SUPPORTED_ 1
 #else
@@ -54,7 +59,7 @@
 
 #if defined(ARDUINO) && !M5HAL_ARDUINO_VARIANT_SUPPORTED_
 #error \
-    "M5HAL's arduino variant supports arduino-esp32, RP2040 (arduino-pico), SAMD51, STM32 (official ST core), nRF52840 (Adafruit nRF52 core), and ESP8266 only; this Arduino core is not yet supported."
+    "M5HAL's arduino variant supports arduino-esp32, RP2040/RP2350 ARM (arduino-pico), UNO R4 Minima, SAMD51, STM32 (official ST core), nRF52840 (Adafruit nRF52 core), ESP8266, and SPRESENSE MainCore only; this Arduino core/configuration is not yet supported."
 #endif
 
 #undef M5HAL_ARDUINO_VARIANT_SUPPORTED_
@@ -101,7 +106,12 @@
 // BSD socket API: available on POSIX hosts (macOS / Linux) and on
 // ESP-IDF targets (lwIP exposes <sys/socket.h> through the VFS).
 // The bsd framework variant backs the TCP transport for the remote bus.
-#if __has_include(<sys/socket.h>) && __has_include(<netinet/tcp.h>)
+// SPRESENSE's NuttX SDK exposes BSD-shaped headers, but the current transport
+// is verified only against POSIX libc and ESP-IDF/lwIP. Do not silently turn a
+// compile-only Arduino fence into a claim that the NuttX socket semantics work.
+#if defined(ARDUINO_ARCH_SPRESENSE)
+#define M5HAL_FRAMEWORK_HAS_BSD_SOCKET 0
+#elif __has_include(<sys/socket.h>) && __has_include(<netinet/tcp.h>)
 #define M5HAL_FRAMEWORK_HAS_BSD_SOCKET 1
 #else
 #define M5HAL_FRAMEWORK_HAS_BSD_SOCKET 0
@@ -111,10 +121,10 @@
 // MCU over RemoteSession (mux transport). Opt-in via build flag; when
 // enabled, remote wins bus kinds not already claimed by a higher-priority
 // variant. Scanned after posix and before software in M5HAL_v2.hpp.
-#ifndef M5HAL_CONFIG_REMOTE
-#define M5HAL_CONFIG_REMOTE 0
+#ifndef M5HAL_CONFIG_REMOTE_VARIANT
+#define M5HAL_CONFIG_REMOTE_VARIANT 0
 #endif
-#if M5HAL_CONFIG_REMOTE
+#if M5HAL_CONFIG_REMOTE_VARIANT
 #define M5HAL_FRAMEWORK_HAS_REMOTE 1
 #else
 #define M5HAL_FRAMEWORK_HAS_REMOTE 0

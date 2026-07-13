@@ -39,7 +39,9 @@ public:
 protected:
     void _writePinEncoded(uint32_t encoded_num, bool v) override
     {
-        digitalWrite(static_cast<uint8_t>(encoded_num), v);
+        // HIGH/LOW retain ArduinoCore-API's PinStatus type on strict cores
+        // (ArduinoCore-renesas) while remaining integer macros elsewhere.
+        digitalWrite(static_cast<uint8_t>(encoded_num), v ? HIGH : LOW);
     }
     bool _readPinEncoded(uint32_t encoded_num) override
     {
@@ -54,7 +56,9 @@ protected:
         namespace bits      = types::gpio_mode_bits;
         const uint8_t value = static_cast<uint8_t>(mode);
 
-        uint8_t arduino_mode;
+        // Preserve the core's mode type. ArduinoCore-renesas uses the strict
+        // PinMode enum; older cores expose integer macros.
+        auto arduino_mode = INPUT;
         if (value & bits::output) {
             // Open-drain output constant name/availability varies by core:
             // arduino-esp32 spells it OUTPUT_OPEN_DRAIN, arduino-pico
@@ -62,7 +66,11 @@ protected:
             // dedicated open-drain output mode and fall back to plain
             // OUTPUT (push-pull), same degradation as the missing
             // OUTPUT+pull combination noted above.
-#if defined(OUTPUT_OPEN_DRAIN)
+#if defined(ARDUINO_ARCH_RENESAS_UNO)
+            // ArduinoCore-renesas declares OUTPUT_OPENDRAIN as a PinMode
+            // enumerator, so preprocessor existence checks cannot see it.
+            arduino_mode = (value & bits::open_drain) ? OUTPUT_OPENDRAIN : OUTPUT;
+#elif defined(OUTPUT_OPEN_DRAIN)
             arduino_mode = (value & bits::open_drain) ? OUTPUT_OPEN_DRAIN : OUTPUT;
 #elif defined(OUTPUT_OPENDRAIN)
             arduino_mode = (value & bits::open_drain) ? OUTPUT_OPENDRAIN : OUTPUT;

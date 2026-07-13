@@ -425,12 +425,12 @@ backend では受信の解釈 (先頭 byte = ポインタ、 以降 = レジス�
   いなければ、 その read は `tx_fill_byte` で埋まる (途中投入の反映は FIFO 水位補充以降)。
   remote 公開と arduino backend は後続段階 (BE flavor 自体は Kconfig 非依存のため
   arduino ビルドでもコンパイル対象になる)。
-  - **ISR の IRAM 配置 (`M5HAL_ESPIDF_I2C_SLAVE_IRAM_ISR`、 既定 1)**: LL stretch backend の
+  - **ISR の IRAM 配置 (`M5HAL_CONFIG_ESPIDF_I2C_SLAVE_IRAM_ISR`、 既定 1)**: LL stretch backend の
     slave ISR と到達コードは既定で IRAM に置き、 `ESP_INTR_FLAG_IRAM` で登録する — flash cache が
     無効な間 (別タスクの OTA / NVS / SPIFFS write 中) も外部 master にクロックされる slave が応答を
     続けられるようにするため (ISR が遅延すると stretch 中の master が取引途中で stall / timeout する)。
     この堅牢性は IRAM を ~1〜2KB 消費する。 **I2C slave 稼働中に flash を書かないと保証できるビルドは
-    `M5HAL_ESPIDF_I2C_SLAVE_IRAM_ISR=0` で opt-out** でき、 IRAM_ATTR と IRAM 割込フラグの両方が外れて
+    `M5HAL_CONFIG_ESPIDF_I2C_SLAVE_IRAM_ISR=0` で opt-out** でき、 IRAM_ATTR と IRAM 割込フラグの両方が外れて
     IRAM を回収する (代償 = flash-cache 無効窓中の slave 応答は保証されない)。
   - **既知の限界 (LL flavor 一部 SoC・800kHz)**: H2 系など一部 SoC では、 multi-slave バス上で
     エラーが高頻度に連続する 800kHz 運用下において、 slave 側が SW 再初期化 (release/init・

@@ -4,7 +4,7 @@ Host-buildable regression harness for M5HAL's ESP-IDF framework backends: a
 fake ESP-IDF header tree that lets an ISR-driven backend compile and run
 **unmodified** (no product logic changes -- only the compile-time gates that
 select the backend under `ESP_PLATFORM` are widened to also accept
-`M5HAL_ESPIDF_HOST_HARNESS`) on the native/host PlatformIO env, with a
+`M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS`) on the native/host PlatformIO env, with a
 deterministic, single-threaded test scripting fake ISR events instead of a
 real bus.
 
@@ -110,7 +110,7 @@ per-field notes in `soc/i2c_struct.h` for the ones that are NOT reset
 - **LL stretch and LL BE paths are both reachable; the v2-driver fallback is
   not.** `soc/soc_caps.h`'s `SOC_I2C_SLAVE_CAN_GET_STRETCH_CAUSE` defaults to
   1 (selects `M5HAL_ESPIDF_I2C_SLAVE_LL`, the `test_native_espidf_fake` env);
-  defining `M5HAL_HOST_HARNESS_NO_STRETCH` flips it to 0, which selects
+  defining `M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_NO_STRETCH_CAPABILITY` flips it to 0, which selects
   `M5HAL_ESPIDF_I2C_SLAVE_LL_BE` instead (the classic-ESP32 no-clock-stretch
   flavor, the `test_native_espidf_fake_be` env -- see
   `../test_espidf_i2c_slave_be/`). Both share this same fake header tree
@@ -138,9 +138,9 @@ backend (SPI slave, UART, ...) off-target,
    (init-only config) or operate on the model (the state-machine calls the
    backend's ISR/read/write paths actually use).
 3. Widen that backend's own `defined(ESP_PLATFORM)` gates to
-   `defined(ESP_PLATFORM) || defined(M5HAL_ESPIDF_HOST_HARNESS)` (the same
+   `defined(ESP_PLATFORM) || defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)` (the same
    minimal, gate-only edit this harness's I2C consumer makes) -- do NOT
-   reuse `M5HAL_ESPIDF_I2C_SLAVE_IRAM_ISR`-style per-kind build flags across
+   reuse `M5HAL_CONFIG_ESPIDF_I2C_SLAVE_IRAM_ISR`-style per-kind build flags across
    kinds; each backend keeps its own.
 4. Add a `test/v2/native_espidf/test_<kind>_slave/` (or similar) directory
    and a dedicated PlatformIO env analogous to `test_native_espidf_fake`,

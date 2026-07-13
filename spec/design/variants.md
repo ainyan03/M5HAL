@@ -21,12 +21,12 @@ scan 順と勝者 alias の詳細は §走査順・§`_offer.hpp`・§`offer_all
 ## 走査順 (`M5HAL_v2.hpp` 内)
 
 ```
-1. platform variant      (M5HAL_V2_TARGET_PLATFORM_PATH 経由で動的 include)
+1. platform variant      (M5HAL_V2_DETECTED_PLATFORM_VARIANT_PATH 経由で動的 include)
 2. freertos framework    (M5HAL_FRAMEWORK_HAS_FREERTOS のとき。 OS 基本プリミティブ: Mutex, Task)
 3. arduino framework     (M5HAL_FRAMEWORK_HAS_ARDUINO のとき)
 4. espidf framework      (M5HAL_FRAMEWORK_HAS_ESPIDF のとき。 Arduino と併存可)
 5. posix framework       (M5HAL_FRAMEWORK_HAS_POSIX のとき = 素の POSIX host。 UART のみ申告)
-6. remote framework      (M5HAL_CONFIG_REMOTE=1 のとき。 I2C/SPI/UART/I2S の proxy backend を申告。 opt-in: 既定 off)
+6. remote framework      (M5HAL_CONFIG_REMOTE_VARIANT=1 のとき。 I2C/SPI/UART/I2S の proxy backend を申告。 opt-in: 既定 off)
 7. software framework    (ビットバン fallback、 常に scan)
 8. stub fallback         (常に末尾、 必ず scan)
 ```
@@ -89,7 +89,7 @@ src/m5_hal/variants/
     remote/
       _offer.hpp
       hal.hpp
-      hal/i2c/i2c.hpp   I2C proxy (remote backend、 M5HAL_CONFIG_REMOTE=1 時有効)
+      hal/i2c/i2c.hpp   I2C proxy (remote backend、 M5HAL_CONFIG_REMOTE_VARIANT=1 時有効)
       hal/spi/spi.hpp   SPI proxy
       hal/uart/uart.hpp UART proxy
       hal/i2s/i2s.hpp   I2S proxy
@@ -99,7 +99,7 @@ src/m5_hal/variants/
       hal.hpp                 no-op 具象 (inline 定義のみ、 hal.inl 不要)
       hal/gpio/gpio.hpp
   platforms/
-    _checker.hpp          platform 軸の検出 (M5HAL_V2_TARGET_PLATFORM_VARIANT_ID / _PATH。 番号は ../ids.hpp)
+    _checker.hpp          platform 軸の検出 (`M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID` / `M5HAL_V2_DETECTED_PLATFORM_VARIANT_PATH`。 番号は ../ids.hpp)
     espressif/
       esp32/                chip-family 単位 (ESP32 / S2 / S3 / C2 / C3 / C5 / C6 / C61 / H2 / P4 を統合)
         _offer.hpp
@@ -287,7 +287,7 @@ RUNTIME_MUTEX / RUNTIME_TASK / RUNTIME_EVENT を勝ち取る)。
 ### 選択 variant の診断 (selected-variant marker)
 
 **`variants/ids.hpp` が variant 識別番号の唯一のレジストリ**。 platform 検出
-(`M5HAL_V2_TARGET_PLATFORM_VARIANT_ID`、 §検出) と kind 選択結果の両方がこのレジストリの値を
+(`M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID`、 §検出) と kind 選択結果の両方がこのレジストリの値を
 使うため、 検出値・選択値・定数のどの 2 つを比較しても意味が成立する。
 
 - 値域 (10 進グループ、 各レンジ内は **append-only**): 0 = `M5HAL_V2_VARIANT_ID_NONE`
@@ -355,7 +355,7 @@ X-macro リスト `M5HAL_V2_VARIANT_ID_LIST_` と、 そこから導出する型
 検出×選択の跨ぎ比較が直接書ける:
 
 ```cpp
-static_assert(M5HAL_V2_SELECTED_VARIANT_GPIO == M5HAL_V2_TARGET_PLATFORM_VARIANT_ID,
+static_assert(M5HAL_V2_SELECTED_VARIANT_GPIO == M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID,
               "the detected platform's variant should win GPIO here");
 ```
 
@@ -370,8 +370,8 @@ static_assert(M5HAL_V2_SELECTED_VARIANT_GPIO == M5HAL_V2_TARGET_PLATFORM_VARIANT
 
 | マクロ | 用途 |
 |---|---|
-| `M5HAL_V2_TARGET_PLATFORM_VARIANT_ID` | 検出された platform の variant ID (`variants/ids.hpp` のレジストリ値。 `M5HAL_V2_VARIANT_ID_NONE` = 不明 = native ビルド) |
-| `M5HAL_V2_TARGET_PLATFORM_PATH` | variant ヘッダの動的 include パス (例: `m5_hal/variants/platforms/espressif/esp32`) |
+| `M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID` | 検出された platform の variant ID (`variants/ids.hpp` のレジストリ値。 `M5HAL_V2_VARIANT_ID_NONE` = 不明 = native ビルド) |
+| `M5HAL_V2_DETECTED_PLATFORM_VARIANT_PATH` | variant ヘッダの動的 include パス (例: `m5_hal/variants/platforms/espressif/esp32`) |
 | `M5HAL_FRAMEWORK_HAS_<NAME>` | framework 検出フラグ (例: `M5HAL_FRAMEWORK_HAS_ARDUINO`)。 v0 と同名共有 (定義は token 同一を維持) |
 
 新規検出マクロ (例: `M5HAL_DETECTED_FRAMEWORK_*`) は必要が見えた時点で追加 (先回り追加なし)。
@@ -379,9 +379,10 @@ static_assert(M5HAL_V2_SELECTED_VARIANT_GPIO == M5HAL_V2_TARGET_PLATFORM_VARIANT
 ### arduino variant の対応コア (build gate)
 
 arduino variant は元々 **arduino-esp32 コア専用**だった (`TwoWire::begin(sda, scl)`、
-`SPIClass::transferBytes` 等のコア拡張 API に依存)。 RP2040 (arduino-pico)、 SAMD51
-(Adafruit/Arduino SAMD コア)、 STM32 (公式 ST コア / STM32duino)、 nRF52840 (Adafruit
-nRF52 コア)、 ESP8266 (公式 ESP8266 Arduino コア) は build-check レベルで対応済み:
+`SPIClass::transferBytes` 等のコア拡張 API に依存)。 RP2040 / RP2350 ARM (arduino-pico)、
+UNO R4 Minima (ArduinoCore-renesas)、 SAMD51 (Adafruit/Arduino SAMD コア)、 STM32
+(公式 ST コア / STM32duino)、 nRF52840 (Adafruit nRF52 コア)、 ESP8266 (公式 ESP8266
+Arduino コア)、 Sony SPRESENSE (公式 Arduino package) は build-check レベルで対応済み:
 ESP32 専用 API はすべて `#if defined(ESP_PLATFORM)` で分岐し、 非 ESP32 コアはポータブルな
 Arduino API (`Wire.begin()`, `SPI.begin()`, `SPIClass::transfer()` バイトループ等) へフォール
 バックする。 ESP8266 は Espressif シリコンだが ESP-IDF API 面 (`ESP_PLATFORM`) を持たず、
@@ -395,13 +396,26 @@ Adafruit コア限定で、 sandeepmistry 系 `ARDUINO_ARCH_NRF5` と mbed 系 N
 死なせない)。
 
 **スコープと既知の制約**:
-- v0 (`M5HAL_v0.cpp`) は非対応のまま (凍結レガシー API、 arduino-esp32 専用)。 非 ESP32 コア
-  の check env は `build_src_filter` で v0 を除外する
+- v0 は非対応のまま (レガシー API、 arduino-esp32 専用)。 ただし Arduino builder が
+  install 済み library の全 TU を compile する契約に合わせ、 `M5HAL_v0.cpp` は非 ESP32
+  Arduino で empty TU となる。 利用者が `M5HAL_v0.hpp` または v0 compatibility shim
+  `M5HAL.hpp` を明示 include した場合は、 `M5HAL_v2.hpp` を使うよう `#error` で早期に
+  拒否する。 check env は v0 TU を除外せず、配布 library と同じ全 `src` をビルドする
 - runtime kind の Mutex/Task/Event は非 `ESP_PLATFORM` コアではすべて `stub` variant の
   フォールバック実装が使われる (単一タスク前提、 ISR 非対応は元から想定内)。 **下層に
   FreeRTOS が実在する nRF52840 でも同様** — 詳細と利用制限は下の未解決ギャップ
 - **実機 HIL 検証は未実施** (bench rig に非 ESP32 コアのボードが無い)。 ビルド成功のみを
   保証する build-check gate であり、 実機での I2C/SPI/UART の動作保証ではない
+- UNO R4 の strict enum (`PinMode` / `PinStatus`) に合わせ、 GPIO variant は Arduino core が
+  公開する型を保持して `pinMode()` / `digitalWrite()` へ渡す。 Minima (RA4M1) の既定 pool 設定を
+  含む共通 API fence の実測は static RAM 13,132 / 32,768 bytes、 flash 101,476 / 262,144 bytes
+- SPRESENSE は公式 core `3.4.7` の MainCore / Memory=768、 bundled GCC 9.2.1 に
+  `-std=gnu++17` を明示して共通 API fence をビルドする。 Arduino CLI に未加工の public
+  library tree を渡し、 v0 empty-TU 契約を含む配布形を検査する。 NuttX SDK は
+  BSD 形状の socket header を持つが semantics 未検証のため TCP server transport は明示的に無効。
+  SubCore、 audio、 multicore、 peripheral 実動作は対象外。 実測 size は
+  234,272 / 786,432 bytes。 `library.properties` の `architectures=esp32` は正式な配布対象を示す
+  ため変更せず、 SPRESENSE lane の architecture warning は build-only gate では想定内
 - UART の `SERIAL_*` フォーマット定数は、 非 ESP32 コアではコアが macro として定義する分
   だけを使う (定数の有無 = その UART ペリフェラルの実能力。 例: nRF52 UARTE は odd parity
   非対応で Adafruit コアは `SERIAL_8O1/8O2` を定義しない)。 未定義の組み合わせはコンパイルを
@@ -456,11 +470,13 @@ Adafruit コア限定で、 sandeepmistry 系 `ARDUINO_ARCH_NRF5` と mbed 系 N
     Wire/SPI インスタンスを同時に使う場合は現状未検証**、 単一インスタンスのみの利用を推奨
   - RP2040 では `hal/v2/memory/pool.inl` の allocator lock (bool + 割り込み禁止方式、
     ARMv6-M に atomic RMW 命令が無く libatomic も無いため) と `hal/v2/service/service.inl` の
-    `sharedNowUs()` が `noInterrupts()`/`interrupts()` ベースで、 第2コアを保護しない
-    (SAMD51 は allocator lock は通常の `std::atomic_flag` 経路のまま、 かつ元来シングルコア)。
+    `sharedNowUs()` が `noInterrupts()`/`interrupts()` ベースで、 第2コアを保護しない。
+    RP2350 (Cortex-M33) の allocator lock は通常の `std::atomic_flag` をリンクできるが、
+    `sharedNowUs()` は同じ current-core 割り込み禁止方式のまま
+    (SAMD51 は allocator lock が `std::atomic_flag` で、 かつ元来シングルコア)。
     正しい修正には RP2040 のハードウェア spinlock (`pico/sync.h`) が要るが、 実機検証手段が
     無い状態で並行性クリティカルなコードを書くリスクを避け、 本 milestone では単一コア前提の
-    現状維持とする。 **RP2040 の第2コア (core1) を使う場合は現状未検証**
+    現状維持とする。 **RP2040 / RP2350 の第2コア (core1) を使う場合は現状未検証**
 - SAMD51 の CMSIS デバイスヘッダは `DAC` を、 STM32 の CMSIS デバイスヘッダは `ADC`
   (legacy alias) を、 それぞれレジスタベースアドレスの macro として定義するため、
   `types.hpp` は `BusKind` enumerator 定義の直前で `<Arduino.h>` を自ら include した上で
@@ -529,7 +545,7 @@ chip capability が複数増えて named `using` が煩雑になった時点で�
 | frameworks | `arduino/` | Arduino-ESP32 framework の HAL 具象 + runtime time (Arduino core millis/micros/delay) |
 | frameworks | `espidf/` | ESP-IDF framework の HAL 具象 + runtime time (esp_timer + vTaskDelay) |
 | frameworks | `posix/` | POSIX host の UART 具象 (termios serial。 opt-out = 既定有効、 `M5HAL_CONFIG_POSIX_UART=0` で UART kind のみ抑止) + runtime (CLOCK_MONOTONIC + std::timed_mutex) |
-| frameworks | `remote/` | I2C/SPI/UART/I2S の remote proxy 型。 `Hal::connect` 経由の remote acquire 自体はフラグ不要 (proxy と backend は umbrella `M5HAL_v2.hpp` と `M5HAL_v2.cpp` が無条件に include / コンパイルする)。 `M5HAL_CONFIG_REMOTE=1` は winner scan への参加 (remote variant の型 alias compile fence / host-side remote build) だけを opt-in する |
+| frameworks | `remote/` | I2C/SPI/UART/I2S の remote proxy 型。 `Hal::connect` 経由の remote acquire 自体はフラグ不要 (proxy と backend は umbrella `M5HAL_v2.hpp` と `M5HAL_v2.cpp` が無条件に include / コンパイルする)。 `M5HAL_CONFIG_REMOTE_VARIANT=1` は winner scan への参加 (remote variant の型 alias compile fence / host-side remote build) だけを opt-in する |
 | frameworks | `software/` | software bit-bang による I2C / SPI の framework 中立具象 |
 | frameworks | `stub/` | 実装済み kind の no-op / フェイク fallback (現行は GPIO と runtime、 test 用) |
 | platforms | `espressif/esp32/` | ESP32 family (`esp32` / `s2` / `s3` / `c2` / `c3` / `c5` / `c6` / `c61` / `h2` / `p4`) のレジスタ直叩き具象 |

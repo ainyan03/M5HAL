@@ -89,7 +89,7 @@ M5HAL_INLINE_V2 namespace v2
 
         static constexpr size_t tempBlockSize()
         {
-            return M5HAL_CONFIG_MEMORY_TEMP_BLOCK_SIZE;
+            return M5HAL_CONFIG_MEMORY_TEMP_BLOCK_SIZE_BYTES;
         }
 
         static constexpr size_t tempBlockCount()
@@ -99,7 +99,7 @@ M5HAL_INLINE_V2 namespace v2
 
         static constexpr size_t tempPoolSize()
         {
-            return M5HAL_CONFIG_MEMORY_TEMP_BLOCK_SIZE * M5HAL_CONFIG_MEMORY_TEMP_BLOCK_COUNT;
+            return M5HAL_CONFIG_MEMORY_TEMP_BLOCK_SIZE_BYTES * M5HAL_CONFIG_MEMORY_TEMP_BLOCK_COUNT;
         }
 
     private:
@@ -107,7 +107,8 @@ M5HAL_INLINE_V2 namespace v2
         void* reallocFallback(void* ptr, size_t preserve_size, size_t new_size, usage_t usage);
         void freeFallback(void* ptr);
 
-        detail::FixedBlockPool<M5HAL_CONFIG_MEMORY_TEMP_BLOCK_SIZE, M5HAL_CONFIG_MEMORY_TEMP_BLOCK_COUNT> _temp_pool;
+        detail::FixedBlockPool<M5HAL_CONFIG_MEMORY_TEMP_BLOCK_SIZE_BYTES, M5HAL_CONFIG_MEMORY_TEMP_BLOCK_COUNT>
+            _temp_pool;
         std::atomic<size_t> _temp_release_count{0};
         malloc_fn_t _malloc_fn   = nullptr;
         realloc_fn_t _realloc_fn = nullptr;

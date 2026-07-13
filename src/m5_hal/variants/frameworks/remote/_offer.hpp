@@ -5,7 +5,7 @@
 // No include guard / #pragma once: re-included during variant scanning.
 // Offers proxy buses for I2C, SPI, UART, and I2S that forward operations
 // to a peer MCU via RemoteSession (mux transport). Opt-in via
-// M5HAL_CONFIG_REMOTE build flag; scanned after posix and before software.
+// M5HAL_CONFIG_REMOTE_VARIANT build flag; scanned after posix and before software.
 
 #define M5HAL_VARIANT_CURRENT_ALIAS_   remote
 #define M5HAL_VARIANT_CURRENT_BASE_NS_ variants::frameworks::remote

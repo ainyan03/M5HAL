@@ -2,6 +2,12 @@
 #ifndef M5_HAL_V0_HPP
 #define M5_HAL_V0_HPP
 
+#include "./m5_hal/hal/v0/build_support.hpp"
+
+#if !M5HAL_DETAIL_V0_IMPLEMENTATION_SUPPORTED_
+#error "M5HAL v0 is ESP32-only; use <M5HAL_v2.hpp> on this Arduino core."
+#else
+
 // =============================================================================
 // M5HAL v0 expose entry header (explicit name).
 //
@@ -14,10 +20,10 @@
 // so existing `m5::hal::Foo` references resolve to v0 symbols and
 // legacy code needs no edits.
 //
-// To use the new v2 API, include `<M5HAL_v2.hpp>`. v0 and v2 entry
-// headers may coexist in the same translation unit, but each intermediate
-// library should still make its intended generation explicit. Details:
-// spec/design/v0_v2_coexistence.md.
+// To use the new v2 API, include `<M5HAL_v2.hpp>`. On v0-supported targets,
+// v0 and v2 entry headers may coexist in the same translation unit, but each
+// intermediate library should still make its intended generation explicit.
+// Details: spec/design/v0_v2_coexistence.md.
 // =============================================================================
 
 #include "m5_hal_config.hpp"  // M5HAL_INLINE_V0
@@ -78,5 +84,7 @@ using platforms::esp32::gpio::getPin;
 }  // namespace m5
 
 #endif
+
+#endif  // M5HAL_DETAIL_V0_IMPLEMENTATION_SUPPORTED_
 
 #endif  // M5_HAL_V0_HPP

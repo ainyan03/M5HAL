@@ -1,0 +1,84 @@
+# Sony SPRESENSE canonical Arduino build fence.
+#
+# SPRESENSE has no maintained official PlatformIO platform. Use Sony's pinned
+# board-manager package and compile the same v2 API surface as the PIO matrix.
+name: build-check-spresense
+
+permissions:
+  contents: read
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  SPRESENSE_CORE_PIN: SPRESENSE:spresense@3.4.7
+  SPRESENSE_FQBN: SPRESENSE:spresense:spresense:Core=Main,Memory=768
+  SPRESENSE_INDEX_URL: https://github.com/sonydevworld/spresense-arduino-compatible/releases/download/generic/package_spresense_index.json
+  ARDUINO_DIRECTORIES_DATA: ${{ github.workspace }}/.arduino-cli-spresense/data
+  ARDUINO_DIRECTORIES_DOWNLOADS: ${{ github.workspace }}/.arduino-cli-spresense/downloads
+  ARDUINO_DIRECTORIES_USER: ${{ github.workspace }}/.arduino-cli-spresense/user
+  ARDUINO_BUILD_CACHE_PATH: ${{ github.workspace }}/.arduino-cli-spresense/cache
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout M5HAL
+        uses: actions/checkout@v6
+        with:
+          path: M5HAL
+
+      - name: Determine M5Utility repo
+        id: m5utility
+        run: |
+          OWNER="${{ github.repository_owner }}"
+          if git ls-remote --heads "https://github.com/$OWNER/M5Utility.git" develop 2>/dev/null | grep -q .; then
+            REPO="$OWNER/M5Utility"
+          else
+            REPO="m5stack/M5Utility"
+          fi
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+          echo "Using $REPO@develop"
+
+      - name: Checkout M5Utility
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ steps.m5utility.outputs.repo }}
+          ref: develop
+          path: M5Utility
+
+      - name: Set up Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Cache Sony core and toolchain
+        uses: actions/cache@v5
+        continue-on-error: true
+        with:
+          path: .arduino-cli-spresense
+          key: ${{ runner.os }}-spresense-3.4.7-${{ hashFiles('M5HAL/test/arduino/BuildCheckSpresense/**', 'M5HAL/test/v2/build_check/**') }}
+          restore-keys: |
+            ${{ runner.os }}-spresense-3.4.7-
+
+      - name: Install Sony SPRESENSE core
+        env:
+          ARDUINO_BOARD_MANAGER_ADDITIONAL_URLS: ${{ env.SPRESENSE_INDEX_URL }}
+        run: |
+          if ! arduino-cli core list | grep -q '^SPRESENSE:spresense[[:space:]]*3.4.7'; then
+            arduino-cli core update-index
+            arduino-cli core install "$SPRESENSE_CORE_PIN"
+          fi
+          arduino-cli core list | grep '^SPRESENSE:spresense[[:space:]]'
+
+      - name: Compile SPRESENSE MainCore fence
+        env:
+          ARDUINO_BOARD_MANAGER_ADDITIONAL_URLS: ${{ env.SPRESENSE_INDEX_URL }}
+        run: |
+          arduino-cli compile --clean --fqbn "$SPRESENSE_FQBN" \
+            --build-property "compiler.cpp.extra_flags=-std=gnu++17 -I$GITHUB_WORKSPACE/M5HAL/test/v2/build_check" \
+            --build-path "$GITHUB_WORKSPACE/.arduino-cli-spresense/build" \
+            --library "$GITHUB_WORKSPACE/M5HAL" \
+            --library "$GITHUB_WORKSPACE/M5Utility" \
+            "$GITHUB_WORKSPACE/M5HAL/test/arduino/BuildCheckSpresense"

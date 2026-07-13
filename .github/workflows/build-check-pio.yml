@@ -30,23 +30,14 @@ jobs:
             run_native_test: "true"
           - name: arduino checks
             envs: -e v0_check_esp32_arduino -e v0_check_esp32s3_arduino -e v2_check_esp32_arduino -e v2_check_esp32s3_arduino
-          # Non-ESP32 Arduino cores (build-check only; no HIL rig for either
+          # Non-ESP32 Arduino cores (build-check only; no HIL rig for these;
           # — see _checker.hpp's variant allowlist and spec/design/variants.md
-          # §arduino variant の対応コア). v0 stays arduino-esp32-only and is
-          # excluded from these envs' build.
+          # §arduino variant の対応コア). v0 stays arduino-esp32-only and
+          # compiles as an empty TU here, so these envs consume the complete
+          # installed-library source set without claiming v0 support.
           #
-          # KNOWN GAP: this lane needs a matching M5Utility fix
-          # (compatibility_feature.cpp / log/library_log.*, the <thread>/
-          # <chrono> non-ESP32-Arduino fallback, platform_detect.hpp) that is
-          # NOT YET landed on m5stack/M5Utility's develop branch. The
-          # "Determine M5Utility repo" step below prefers the same-owner
-          # fork's develop branch when it exists (mirroring M5Unified's
-          # M5GFX resolution), so this lane is green on forks that carry the
-          # patch (e.g. ainyan03/M5Utility). Runs against the upstream
-          # m5stack/M5HAL repo still pull unpatched m5stack/M5Utility develop
-          # and fail until the fix is upstreamed there too.
           - name: multi-platform arduino checks
-            envs: -e v2_check_rp2040_arduino -e v2_check_samd51_arduino -e v2_check_stm32f4_arduino -e v2_check_nrf52840_arduino -e v2_check_esp8266_arduino -e v2_check_native_nochrono
+            envs: -e v2_check_rp2040_arduino -e v2_check_rp2350_arduino -e v2_check_unor4_minima_arduino -e v2_check_samd51_arduino -e v2_check_stm32f4_arduino -e v2_check_nrf52840_arduino -e v2_check_esp8266_arduino -e v2_check_native_nochrono
           - name: ESP-IDF 5 checks
             envs: -e v0_check_esp32_espidf -e v0_check_esp32s3_espidf -e v2_check_esp32_espidf -e v2_check_esp32s3_espidf
           - name: ESP-IDF 4 compatibility checks
@@ -114,6 +105,23 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.x"
+
+      - name: Check non-ESP v0 rejection contract
+        if: matrix.name == 'native checks'
+        working-directory: M5HAL
+        run: |
+          check_rejection() {
+            label="$1"
+            shift
+            log="$RUNNER_TEMP/m5hal-v0-rejection-$label.log"
+            if c++ -std=c++17 -Isrc "$@" -fsyntax-only test/v2/stub/build_check_v0_rejected.cpp >"$log" 2>&1; then
+              echo "$label unexpectedly compiled for a non-ESP Arduino target"
+              exit 1
+            fi
+            grep -F 'M5HAL v0 is ESP32-only; use <M5HAL_v2.hpp> on this Arduino core.' "$log"
+          }
+          check_rejection M5HAL_v0.hpp
+          check_rejection M5HAL.hpp -DM5HAL_TEST_V0_COMPATIBILITY_SHIM=1
 
       - name: Install PlatformIO
         # The older espressif32@5.4.0 (ESP-IDF 4.4) builder imports

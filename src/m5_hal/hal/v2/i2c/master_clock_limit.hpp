@@ -19,7 +19,7 @@
   asks for e.g. 2 MHz simply gets the closest achievable clock without needing to
   know the limit (matching how a user expects "set the fastest you can" to behave).
 
-  Override @c M5HAL_I2C_MASTER_MAX_CLOCK_HZ to raise or lower the ceiling.
+  Override @c M5HAL_CONFIG_I2C_MASTER_MAX_CLOCK_HZ to raise or lower the ceiling.
 
   Characterization: only ESP32 (classic) is measured so far -- 1.25 MHz works,
   1.30 MHz drives the master peripheral into abnormal operation (Core2 <-> CoreS3
@@ -30,11 +30,11 @@
   Arduino ports to other cores manage their own limits.
  */
 
-#ifndef M5HAL_I2C_MASTER_MAX_CLOCK_HZ
+#ifndef M5HAL_CONFIG_I2C_MASTER_MAX_CLOCK_HZ
 #if defined(ESP_PLATFORM)
-#define M5HAL_I2C_MASTER_MAX_CLOCK_HZ 1200000u
+#define M5HAL_CONFIG_I2C_MASTER_MAX_CLOCK_HZ 1200000u
 #else
-#define M5HAL_I2C_MASTER_MAX_CLOCK_HZ 0u  // 0 = no ceiling
+#define M5HAL_CONFIG_I2C_MASTER_MAX_CLOCK_HZ 0u  // 0 = no ceiling
 #endif
 #endif
 
@@ -50,7 +50,7 @@ namespace m5::hal::v2::i2c {
  */
 inline std::uint32_t clampMasterClockHz(std::uint32_t freq, bool* did_clamp = nullptr)
 {
-    constexpr std::uint32_t kMax = M5HAL_I2C_MASTER_MAX_CLOCK_HZ;
+    constexpr std::uint32_t kMax = M5HAL_CONFIG_I2C_MASTER_MAX_CLOCK_HZ;
     if (kMax != 0u && freq > kMax) {
         if (did_clamp != nullptr) {
             *did_clamp = true;

@@ -17,7 +17,7 @@ static_assert(M5HAL_TARGET_PLATFORM_NUMBER == M5HAL_PLATFORM_NUMBER_ESP32_1st,
 static_assert(M5HAL_TARGET_PLATFORM_NUMBER == M5HAL_PLATFORM_NUMBER_ESP32_S3,
               "v0 platform number clobbered by the v2 entry");
 #endif
-static_assert(M5HAL_V2_TARGET_PLATFORM_VARIANT_ID == M5HAL_V2_VARIANT_ID_PLATFORM_ESP32,
+static_assert(M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID == M5HAL_V2_VARIANT_ID_PLATFORM_ESP32,
               "v2 platform variant id missing or clobbered");
 
 // Both generations' core symbols resolve through their explicit namespaces.

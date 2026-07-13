@@ -1100,7 +1100,7 @@ static void checkService()
     (void)m5hal::service::nsecToFastTickCeil(1000, 1000000);
     (void)m5hal::service::fastTickFrequencyHz();
     (void)m5hal::service::defaultNowTick();
-#if !M5HAL_PC_BUILD
+#if !M5HAL_V2_TARGET_IS_PC
     (void)m5hal::service::fastTick();
 #endif
 

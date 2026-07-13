@@ -110,15 +110,15 @@ public:
             // respect a LOWER fail-safe ceiling if one is configured (see
             // master_clock_limit.hpp; 0 there means "no declared ceiling").
             constexpr uint32_t kLpMeasuredMaxHz = 400000u;
-            if (M5HAL_I2C_MASTER_MAX_CLOCK_HZ != 0 && M5HAL_I2C_MASTER_MAX_CLOCK_HZ < kLpMeasuredMaxHz) {
-                return M5HAL_I2C_MASTER_MAX_CLOCK_HZ;
+            if (M5HAL_CONFIG_I2C_MASTER_MAX_CLOCK_HZ != 0 && M5HAL_CONFIG_I2C_MASTER_MAX_CLOCK_HZ < kLpMeasuredMaxHz) {
+                return M5HAL_CONFIG_I2C_MASTER_MAX_CLOCK_HZ;
             }
             return kLpMeasuredMaxHz;
         }
 #endif
         // The fail-safe master ceiling (master_clock_limit.hpp). 0 there means
         // "no declared ceiling", which matches the base default.
-        return M5HAL_I2C_MASTER_MAX_CLOCK_HZ;
+        return M5HAL_CONFIG_I2C_MASTER_MAX_CLOCK_HZ;
     }
 
 #if M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5
@@ -190,7 +190,7 @@ struct BackendFor<BusConfig_espidf> {
 // request, binding the leased controller index to the ESP-IDF I2C port. This is
 // the only code that knows about i2c_port, so the kind-generic BusView / pool
 // stay variant-agnostic. M5HALCore wires this into i2c::BusView when this
-// variant provides hardware I2C (M5HAL_I2C_HAS_HW_BACKEND below).
+// variant provides hardware I2C (M5HAL_DETAIL_I2C_HAS_HARDWARE_BACKEND_ below).
 inline i2c::IBus* makeHardwareBackendForI2C(const i2c::LogicalBusConfig& logical, int8_t controller)
 {
     auto* backend = new (std::nothrow) Bus_espidf();
@@ -361,7 +361,7 @@ inline bus::LocalKindAdapter<i2c::BusTraits>::Topology controllerTopologyForI2C(
 
 // Tells M5HALCore that this build has a poolable hardware I2C backend, so the
 // I2C BusView is wired with the hardware factory + controller pool.
-#define M5HAL_I2C_HAS_HW_BACKEND 1
+#define M5HAL_DETAIL_I2C_HAS_HARDWARE_BACKEND_ 1
 
 }  // namespace m5::hal::v2::i2c
 

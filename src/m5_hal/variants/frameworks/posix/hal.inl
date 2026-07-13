@@ -17,9 +17,9 @@
 #include "hal/remote/uart_connection.hpp"
 #endif
 
-#define M5HAL_REMOTE_TCP_DEFINED 1
+#define M5HAL_DETAIL_REMOTE_TCP_DEFINED_ 1
 #if M5HAL_CONFIG_POSIX_UART
-#define M5HAL_REMOTE_UART_DEFINED 1
+#define M5HAL_DETAIL_REMOTE_UART_DEFINED_ 1
 #endif
 
 namespace m5 {

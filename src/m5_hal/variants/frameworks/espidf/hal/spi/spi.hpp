@@ -230,7 +230,7 @@ struct BackendFor<BusConfig_espidf> {
 // the generic hosts (SPI2_HOST + index), so the kind-generic BusView / pool stay
 // variant-agnostic. SPI1_HOST (flash) is deliberately not in the pool, so index
 // 0 is SPI2_HOST. M5HALCore wires this into spi::BusView when this variant
-// provides hardware SPI (M5HAL_SPI_HAS_HW_BACKEND below).
+// provides hardware SPI (M5HAL_DETAIL_SPI_HAS_HARDWARE_BACKEND_ below).
 inline spi::IBus* makeHardwareBackendForSPI(const spi::LogicalBusConfig& logical, int8_t controller)
 {
     ::spi_host_device_t host;
@@ -256,7 +256,7 @@ inline spi::IBus* makeHardwareBackendForSPI(const spi::LogicalBusConfig& logical
 
 // Tells M5HALCore that this build has a poolable hardware SPI backend, so the
 // SPI BusView is wired with the hardware factory + controller pool.
-#define M5HAL_SPI_HAS_HW_BACKEND 1
+#define M5HAL_DETAIL_SPI_HAS_HARDWARE_BACKEND_ 1
 
 }  // namespace m5::hal::v2::spi
 

@@ -6,7 +6,7 @@
 // test_master_clock_limit_disabled). The clamp function is a header-only inline
 // whose body depends on this macro, so the enabled and disabled cases live in
 // separate test executables to avoid an ODR clash on the inline definition.
-#define M5HAL_I2C_MASTER_MAX_CLOCK_HZ 1200000u
+#define M5HAL_CONFIG_I2C_MASTER_MAX_CLOCK_HZ 1200000u
 
 #include <gtest/gtest.h>
 #include "support/gtest_watchdog.hpp"

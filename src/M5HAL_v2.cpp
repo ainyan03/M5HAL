@@ -20,7 +20,7 @@
 #include "m5_hal/variants/frameworks/remote/session.inl"
 #include "m5_hal/variants/frameworks/remote/backend.inl"
 #include "m5_hal/variants/frameworks/remote/remote_transfer.inl"
-#if __has_include(<sys/socket.h>) && __has_include(<netinet/tcp.h>)
+#if M5HAL_FRAMEWORK_HAS_BSD_SOCKET
 #include "m5_hal/variants/frameworks/bsd/hal/remote/tcp_server.inl"
 #endif
 #include "m5_hal/variants/frameworks/remote/hal/i2c/i2c.inl"
@@ -38,9 +38,9 @@
 #include "m5_hal/hal/v2/uart/uart.inl"
 #include "m5_hal/hal/v2/i2s/i2s.inl"
 
-#define M5HAL_STATIC_MACRO_PATH_IMPL M5HAL_STATIC_MACRO_CONCAT(M5HAL_V2_TARGET_PLATFORM_PATH, hal.inl)
+#define M5HAL_STATIC_MACRO_PATH_IMPL M5HAL_STATIC_MACRO_CONCAT(M5HAL_V2_DETECTED_PLATFORM_VARIANT_PATH, hal.inl)
 
-#if M5HAL_V2_TARGET_PLATFORM_VARIANT_ID != M5HAL_V2_VARIANT_ID_NONE
+#if M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID != M5HAL_V2_VARIANT_ID_NONE
 #include M5HAL_STATIC_MACRO_PATH_IMPL
 #endif
 
@@ -247,13 +247,13 @@ M5HAL_INLINE_V2 namespace v2
     }
 
     // ---- initUart / initTcp fallback (when no platform provides them) ----
-#if !defined(M5HAL_REMOTE_UART_DEFINED)
+#if !defined(M5HAL_DETAIL_REMOTE_UART_DEFINED_)
     result_t<void> Hal::initUart(const char*, const remote::DeviceConfig&)
     {
         return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
     }
 #endif
-#if !defined(M5HAL_REMOTE_TCP_DEFINED)
+#if !defined(M5HAL_DETAIL_REMOTE_TCP_DEFINED_)
     result_t<void> Hal::initTcp(const char*, const remote::DeviceConfig&)
     {
         return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
@@ -267,20 +267,20 @@ M5HAL_INLINE_V2 namespace v2
     // _hal is last: it takes &_backend and its BusViews delegate through it.
     // The two hardware-backend guards are independent, so the init list is
     // spelled out per combination below.
-#if defined(M5HAL_I2C_HAS_HW_BACKEND) && defined(M5HAL_SPI_HAS_HW_BACKEND)
+#if defined(M5HAL_DETAIL_I2C_HAS_HARDWARE_BACKEND_) && defined(M5HAL_DETAIL_SPI_HAS_HARDWARE_BACKEND_)
     M5HALCore::M5HALCore()
         : _i2c_adapter{_backend.busRegistry(), &i2c::makeSoftwareBackendForI2C, &i2c::makeHardwareBackendForI2C,
                        i2c::hardwareControllerCountForI2C(), i2c::controllerTopologyForI2C()},
           _spi_adapter{_backend.busRegistry(), &spi::makeSoftwareBackendForSPI, &spi::makeHardwareBackendForSPI,
                        spi::hardwareControllerCountForSPI()},
           _hal{&_backend}
-#elif defined(M5HAL_I2C_HAS_HW_BACKEND)
+#elif defined(M5HAL_DETAIL_I2C_HAS_HARDWARE_BACKEND_)
     M5HALCore::M5HALCore()
         : _i2c_adapter{_backend.busRegistry(), &i2c::makeSoftwareBackendForI2C, &i2c::makeHardwareBackendForI2C,
                        i2c::hardwareControllerCountForI2C(), i2c::controllerTopologyForI2C()},
           _spi_adapter{_backend.busRegistry(), &spi::makeSoftwareBackendForSPI},
           _hal{&_backend}
-#elif defined(M5HAL_SPI_HAS_HW_BACKEND)
+#elif defined(M5HAL_DETAIL_SPI_HAS_HARDWARE_BACKEND_)
     M5HALCore::M5HALCore()
         : _i2c_adapter{_backend.busRegistry(), &i2c::makeSoftwareBackendForI2C},
           _spi_adapter{_backend.busRegistry(), &spi::makeSoftwareBackendForSPI, &spi::makeHardwareBackendForSPI,

@@ -38,19 +38,21 @@ opt-in — include `<M5HAL_v2.hpp>` explicitly to try it.
 
 - Confirmed specification documents live under [`spec/`](spec/README.md)
   (also bundled in the release packages).
+- Build-time behavior settings and diagnostic switches are listed in
+  [`spec/design/configuration.md`](spec/design/configuration.md).
 
 ## Where to start
 
 | Reader | Start here |
 |---|---|
-| Existing v0 user | Keep using `<M5HAL.hpp>` or `<M5HAL_v0.hpp>`. Read [v0 / v2 coexistence](#v0--v2-coexistence) only if you need to understand the migration period. |
+| Existing ESP32 v0 user | Keep using `<M5HAL.hpp>` or `<M5HAL_v0.hpp>`. Read [v0 / v2 coexistence](#v0--v2-coexistence) only if you need to understand the migration period. |
 | Trying v2 in a sketch | Read [Trying the v2 API](#trying-the-v2-api), then open [`examples/v2/HowToUse/I2C`](examples/v2/HowToUse/I2C/), [`examples/v2/HowToUse/SPI`](examples/v2/HowToUse/SPI/), or [`examples/v2/HowToUse/UART`](examples/v2/HowToUse/UART/). |
 | Implementing a backend or reviewing internals | Use [`spec/README.md`](spec/README.md) as the map. The main design files are `bus_accessor`, `i2c`, `spi`, `gpio`, and `variants`. |
 
 ## Trying the v2 API
 
-v2 is opt-in. Include `<M5HAL_v2.hpp>`. Mixing a v0 entry header into the
-same translation unit is also supported (see
+v2 is opt-in. Include `<M5HAL_v2.hpp>`. On v0-supported targets, mixing a v0
+entry header into the same translation unit is also supported (see
 [v0 / v2 coexistence](#v0--v2-coexistence)), but one generation per file
 reads better.
 
@@ -276,8 +278,14 @@ library. The entry headers are:
 | `<M5HAL_v0.hpp>` | `m5::hal::*` (= v0, via `inline namespace v0`) | Code that explicitly opts into the v0 (legacy) API |
 | `<M5HAL_v2.hpp>` | `m5::hal::v2::*` | Code that explicitly opts into the v2 API |
 
-- **Both entries may share a translation unit.** The include guards and
-  platform-detection macros are generation-separated, so one `.cpp` may
+- **Non-ESP Arduino targets are v2-only.** Include `<M5HAL_v2.hpp>`
+  explicitly. The installed library still carries `M5HAL_v0.cpp`, but that
+  translation unit compiles empty on non-ESP Arduino cores; including
+  `<M5HAL.hpp>` or `<M5HAL_v0.hpp>` there fails early with a message directing
+  the caller to v2. The compatibility shim never changes generation based on
+  the target platform.
+- **On v0-supported targets, both entries may share a translation unit.** The
+  include guards and platform-detection macros are generation-separated, so one `.cpp` may
   include both a v0 entry (`<M5HAL.hpp>` shim or `<M5HAL_v0.hpp>` direct)
   and `<M5HAL_v2.hpp>` — e.g. while migrating that file gradually. An
   intermediate library should still make its intended generation explicit

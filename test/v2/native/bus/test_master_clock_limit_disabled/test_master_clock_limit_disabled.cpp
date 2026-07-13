@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Companion to test_master_clock_limit: verifies the ceiling-DISABLED path.
 //
-// No M5HAL_I2C_MASTER_MAX_CLOCK_HZ is defined here, so on a non-ESP (native)
+// No M5HAL_CONFIG_I2C_MASTER_MAX_CLOCK_HZ is defined here, so on a non-ESP (native)
 // build the header default is 0 = no ceiling -- the behavior a non-ESP Arduino
 // port or the software bit-bang backend gets. Any frequency must pass through
 // untouched. (Separate executable from the enabled test: the clamp function is a
@@ -20,7 +20,7 @@ using m5::hal::v2::i2c::clampMasterClockHz;
 
 TEST(MasterClockLimitDisabled, CeilingIsZeroOnNonEspNativeBuild)
 {
-    EXPECT_EQ(M5HAL_I2C_MASTER_MAX_CLOCK_HZ, 0u);
+    EXPECT_EQ(M5HAL_CONFIG_I2C_MASTER_MAX_CLOCK_HZ, 0u);
 }
 
 TEST(MasterClockLimitDisabled, AnyFrequencyPassesThrough)

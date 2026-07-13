@@ -2,7 +2,7 @@
 //
 // Compile-time configuration for M5HAL.
 //
-// Macro families across the tree — a name tells you which it is:
+// Macro taxonomy across the tree — a name tells you who owns it:
 //
 //   1. Version/ABI inline-namespace switches (M5HAL_V0_INLINE / M5HAL_V2_INLINE).
 //      A grandfathered category of their own, NOT covered by the conventions
@@ -12,25 +12,28 @@
 //      affects ABI, so flip it all at once at a major release boundary.
 //      e.g. `-DM5HAL_V0_INLINE=0 -DM5HAL_V2_INLINE=1`.
 //
-//   2. Supported behavior knobs, prefixed `M5HAL_CONFIG_<area>_<knob>`. The rule:
+//   2. Supported behavior inputs use `M5HAL_CONFIG_<area>_<knob>`. The rule:
 //        - The M5HAL_CONFIG_ prefix marks a user-overridable INPUT; internal
 //          derived macros (M5HAL_FRAMEWORK_HAS_*, M5HAL_VARIANT_*, ...) never
 //          use it, so a name tells input from library-computed output.
 //        - Value-based, never definedness-based: every knob is `#ifndef`+default
 //          and read by VALUE (0/1 for flags), so `-D...=0` always disables.
 //          (A `#if defined(X)` knob silently ignores `=0` — that footgun is out.)
-//        - Positive nouns, no polarity verbs (no USE_/DISABLE_/NO_ in names);
-//          the documented default carries the polarity.
+//        - A boolean value of 1 reads as an affirmative proposition; CONFIG
+//          names do not use USE_/DISABLE_/NO_.
 //
-//   3. Diagnostic toggles, prefixed `M5HAL_DEBUG_<area>_<knob>`. Same value-based
-//      mechanism as (2), but these are UNSUPPORTED probes for debugging the
-//      library (default off, not in the public catalog). The distinct prefix
-//      keeps them out of the supported M5HAL_CONFIG_ surface; a debug toggle may
-//      name the diagnostic action directly (e.g. ..._NO_WAIT).
+//   3. Unsupported diagnostic inputs use `M5HAL_DEBUG_<area>_<knob>` and are
+//      cataloged in configuration.md. They include value-based boolean switches
+//      and dependent parameters such as marker pins. `NO_` is allowed here for
+//      explicit A/B fault injection.
 //
-//   Defaults for (2)/(3) are co-located with the subsystem that reads them (so
-//   code and default never drift); the cross-cutting ones live in this file. The
-//   supported-knob catalog is in spec/design/configuration.md.
+//   4. Library-computed public macros are read-only outputs. Implementation-only
+//      helpers use `M5HAL_DETAIL_*_`; local harness controls use `M5HAL_TEST_*`,
+//      `M5HAL_EXAMPLE_*`, or `M5HAL_HIL_*` and are not library configuration.
+//
+//   Defaults for input families are co-located with the subsystem that reads
+//   them; cross-cutting defaults live here. The catalogs and ownership rules are
+//   in spec/design/configuration.md.
 
 #ifndef M5_HAL_CONFIG_HPP
 #define M5_HAL_CONFIG_HPP
@@ -60,11 +63,10 @@
 #endif
 
 // Cross-cutting behavior knobs (see the convention note above). Subsystem-local
-// knobs live next to their code: M5HAL_CONFIG_IDF_I2C_LEGACY (espidf variant),
-// M5HAL_CONFIG_POSIX_UART (frameworks/_checker.hpp), M5HAL_CONFIG_SOFTWARE_I2C_*
-// (software i2c variant).
-#ifndef M5HAL_CONFIG_MEMORY_TEMP_BLOCK_SIZE
-#define M5HAL_CONFIG_MEMORY_TEMP_BLOCK_SIZE 256
+// knobs live next to the code that consumes them; the public catalog lists their
+// defaults and definition locations.
+#ifndef M5HAL_CONFIG_MEMORY_TEMP_BLOCK_SIZE_BYTES
+#define M5HAL_CONFIG_MEMORY_TEMP_BLOCK_SIZE_BYTES 256
 #endif
 
 #ifndef M5HAL_CONFIG_MEMORY_TEMP_BLOCK_COUNT

@@ -4,9 +4,9 @@
 
 #include "slave.hpp"
 
-// M5HAL_ESPIDF_HOST_HARNESS: mirrors the same gate in slave.hpp so this .inl
+// M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS: mirrors the same gate in slave.hpp so this .inl
 // compiles unmodified under the native host regression harness.
-#if (defined(ESP_PLATFORM) || defined(M5HAL_ESPIDF_HOST_HARNESS)) && \
+#if (defined(ESP_PLATFORM) || defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)) && \
     (M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_SLAVE_LL_BE || M5HAL_ESPIDF_I2C_HAS_SLAVE_V2)
 
 #include <algorithm>
@@ -16,6 +16,25 @@
 
 #include "../../../freertos/hal/runtime/time.hpp"
 #include <freertos/task.h>
+
+#ifndef M5HAL_DEBUG_ESPIDF_I2C_SLAVE_GPIO_MARKERS
+#define M5HAL_DEBUG_ESPIDF_I2C_SLAVE_GPIO_MARKERS 0
+#endif
+#ifndef M5HAL_DEBUG_ESPIDF_I2C_SLAVE_TX_FILL_MARKER_PIN
+#define M5HAL_DEBUG_ESPIDF_I2C_SLAVE_TX_FILL_MARKER_PIN 6
+#endif
+#ifndef M5HAL_DEBUG_ESPIDF_I2C_SLAVE_RX_DRAIN_MARKER_PIN
+#define M5HAL_DEBUG_ESPIDF_I2C_SLAVE_RX_DRAIN_MARKER_PIN 7
+#endif
+#ifndef M5HAL_DEBUG_ESPIDF_I2C_SLAVE_STRETCH_MARKER_PIN
+#define M5HAL_DEBUG_ESPIDF_I2C_SLAVE_STRETCH_MARKER_PIN 13
+#endif
+#ifndef M5HAL_DEBUG_ESPIDF_I2C_SLAVE_NO_TX_WATERMARK
+#define M5HAL_DEBUG_ESPIDF_I2C_SLAVE_NO_TX_WATERMARK 0
+#endif
+#ifndef M5HAL_DEBUG_ESPIDF_I2C_SLAVE_NO_CONTROLLER_CLOCK
+#define M5HAL_DEBUG_ESPIDF_I2C_SLAVE_NO_CONTROLLER_CLOCK 0
+#endif
 
 #if M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_SLAVE_LL_BE
 #include <driver/gpio.h>
@@ -28,9 +47,9 @@
 #include <driver/periph_ctrl.h>
 #endif
 
-#if defined(M5HAL_I2C_SLAVE_GPIO_MARKERS)
+#if M5HAL_DEBUG_ESPIDF_I2C_SLAVE_GPIO_MARKERS
 // Non-perturbing GPIO markers for logic-analyzer correlation (IRAM-safe gpio_ll).
-// Off by default; build the slave with -DM5HAL_I2C_SLAVE_GPIO_MARKERS and wire the
+// Off by default; build the slave with -DM5HAL_DEBUG_ESPIDF_I2C_SLAVE_GPIO_MARKERS=1 and wire the
 // pins to the analyzer alongside SCL/SDA to see, per 32-byte "息継ぎ" gap, WHO is
 // pausing the bus:
 //   TXFILL  (pin 6)  HIGH while the slave loads the TX FIFO  -> a read-side gap that
@@ -39,32 +58,23 @@
 //                    this pulse is the slave draining; a gap with NO pulse is the
 //                    master pausing (its own HW FIFO refill), not the slave.
 //   STRETCH (pin 13) HIGH while the stretch-cause ISR services a hold/refill.
-#ifndef M5HAL_I2C_SLAVE_MARK_TXFILL
-#define M5HAL_I2C_SLAVE_MARK_TXFILL 6
-#endif
-#ifndef M5HAL_I2C_SLAVE_MARK_RXDRAIN
-#define M5HAL_I2C_SLAVE_MARK_RXDRAIN 7
-#endif
-#ifndef M5HAL_I2C_SLAVE_MARK_STRETCH
-#define M5HAL_I2C_SLAVE_MARK_STRETCH 13
-#endif
 #include <hal/gpio_ll.h>
-#define M5HAL_MARK_HI(pin) ::gpio_ll_set_level(&GPIO, (::gpio_num_t)(pin), 1)
-#define M5HAL_MARK_LO(pin) ::gpio_ll_set_level(&GPIO, (::gpio_num_t)(pin), 0)
+#define M5HAL_DETAIL_I2C_SLAVE_MARK_HIGH_(pin) ::gpio_ll_set_level(&GPIO, (::gpio_num_t)(pin), 1)
+#define M5HAL_DETAIL_I2C_SLAVE_MARK_LOW_(pin)  ::gpio_ll_set_level(&GPIO, (::gpio_num_t)(pin), 0)
 #else
-#define M5HAL_MARK_HI(pin) ((void)0)
-#define M5HAL_MARK_LO(pin) ((void)0)
+#define M5HAL_DETAIL_I2C_SLAVE_MARK_HIGH_(pin) ((void)0)
+#define M5HAL_DETAIL_I2C_SLAVE_MARK_LOW_(pin)  ((void)0)
 #endif
 #endif
 
 // The proactive TX water-mark top-up (refills the TX FIFO at FIFO/2 before it empties,
 // smoothing the read-side 32-byte "息継ぎ" that the reactive TX_EMPTY stretch otherwise
-// causes) can be turned off for A/B diagnosis with -DM5HAL_I2C_SLAVE_NO_TX_WATERMARK.
+// causes) can be turned off for A/B diagnosis with -DM5HAL_DEBUG_ESPIDF_I2C_SLAVE_NO_TX_WATERMARK=1.
 // Default = on. With it off the TX FIFO is only refilled reactively on TX_EMPTY.
-#if defined(M5HAL_I2C_SLAVE_NO_TX_WATERMARK)
-#define M5HAL_I2C_SLAVE_TX_WM 0
+#if M5HAL_DEBUG_ESPIDF_I2C_SLAVE_NO_TX_WATERMARK
+#define M5HAL_DETAIL_I2C_SLAVE_TX_WATERMARK_ 0
 #else
-#define M5HAL_I2C_SLAVE_TX_WM 1
+#define M5HAL_DETAIL_I2C_SLAVE_TX_WATERMARK_ 1
 #endif
 
 namespace m5::hal::v2::i2c {
@@ -274,9 +284,9 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
     // AFTER i2c_ll_reset_register (the reset clears it). On P4 the clock control is
     // shared across peripherals and i2c_ll_set_source_clk is an RCC-atomic
     // function-like macro (same `::`-prefix caveat as the RCC block above).
-    // A/B diagnosis knob: -DM5HAL_I2C_SLAVE_NO_CONTROLLER_CLOCK skips this block
+    // A/B diagnosis knob: -DM5HAL_DEBUG_ESPIDF_I2C_SLAVE_NO_CONTROLLER_CLOCK=1 skips this block
     // (the pre-fix behavior) to reproduce the cold-boot failure on C6/H2.
-#if defined(M5HAL_I2C_SLAVE_NO_CONTROLLER_CLOCK)
+#if M5HAL_DEBUG_ESPIDF_I2C_SLAVE_NO_CONTROLLER_CLOCK
     // skipped: cold-boot A/B baseline
 #elif defined(SOC_PERIPH_CLK_CTRL_SHARED) && SOC_PERIPH_CLK_CTRL_SHARED
     PERIPH_RCC_ATOMIC()
@@ -356,8 +366,8 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
     ::i2c_ll_slave_set_stretch_protect_num(hw, 0x3ff);
     ::i2c_ll_slave_clear_stretch(hw);
 
-    if (::esp_intr_alloc(i2c_periph_signal[port].irq, M5HAL_I2C_SLAVE_ISR_INTR_FLAGS, &SlaveBus_espidf::isrThunk, this,
-                         &_intr) != ESP_OK) {
+    if (::esp_intr_alloc(i2c_periph_signal[port].irq, M5HAL_DETAIL_I2C_SLAVE_ISR_INTR_FLAGS_,
+                         &SlaveBus_espidf::isrThunk, this, &_intr) != ESP_OK) {
         auto released = release();
         if (!released.has_value()) {
             return m5::stl::make_unexpected(released.error());
@@ -367,9 +377,11 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
     _baseline_intrs = I2C_RXFIFO_WM_INT_ENA_M | I2C_TRANS_COMPLETE_INT_ENA_M | I2C_SLAVE_STRETCH_INT_ENA_M;
     ::i2c_ll_enable_intr_mask(hw, _baseline_intrs);
     ::i2c_ll_update(hw);
-#if defined(M5HAL_I2C_SLAVE_GPIO_MARKERS)
+#if M5HAL_DEBUG_ESPIDF_I2C_SLAVE_GPIO_MARKERS
     {
-        const int mpins[3] = {M5HAL_I2C_SLAVE_MARK_TXFILL, M5HAL_I2C_SLAVE_MARK_RXDRAIN, M5HAL_I2C_SLAVE_MARK_STRETCH};
+        const int mpins[3] = {M5HAL_DEBUG_ESPIDF_I2C_SLAVE_TX_FILL_MARKER_PIN,
+                              M5HAL_DEBUG_ESPIDF_I2C_SLAVE_RX_DRAIN_MARKER_PIN,
+                              M5HAL_DEBUG_ESPIDF_I2C_SLAVE_STRETCH_MARKER_PIN};
         for (int i = 0; i < 3; ++i) {
             ::gpio_set_direction((::gpio_num_t)mpins[i], GPIO_MODE_OUTPUT);
             ::gpio_set_level((::gpio_num_t)mpins[i], 0);
@@ -451,7 +463,7 @@ bool SlaveBus_espidf::drainRxLocked(uint32_t count, bool can_hold)
         }
     }
     uint8_t buf[SOC_I2C_FIFO_LEN];
-    M5HAL_MARK_HI(M5HAL_I2C_SLAVE_MARK_RXDRAIN);
+    M5HAL_DETAIL_I2C_SLAVE_MARK_HIGH_(M5HAL_DEBUG_ESPIDF_I2C_SLAVE_RX_DRAIN_MARKER_PIN);
     // The STOP-tail reserve (rx[] beyond the back-pressure threshold) must absorb
     // the deepest possible FIFO tail: at STOP the backlog is <= kRxCapacity (the
     // hold machine enforces it) and the FIFO holds <= SOC_I2C_FIFO_LEN.
@@ -474,7 +486,7 @@ bool SlaveBus_espidf::drainRxLocked(uint32_t count, bool can_hold)
                 // HW FIFO so the master stays held under the RX_FULL stretch (the
                 // caller masks the hold). read() resumes us once it frees ring space.
                 // Zero bytes are dropped -- this is the write-direction back-pressure.
-                M5HAL_MARK_LO(M5HAL_I2C_SLAVE_MARK_RXDRAIN);
+                M5HAL_DETAIL_I2C_SLAVE_MARK_LOW_(M5HAL_DEBUG_ESPIDF_I2C_SLAVE_RX_DRAIN_MARKER_PIN);
                 return true;
             }
             // STOP with even the reserve full: defensive only -- the hold machine
@@ -496,7 +508,7 @@ bool SlaveBus_espidf::drainRxLocked(uint32_t count, bool can_hold)
         }
         count -= c;
     }
-    M5HAL_MARK_LO(M5HAL_I2C_SLAVE_MARK_RXDRAIN);
+    M5HAL_DETAIL_I2C_SLAVE_MARK_LOW_(M5HAL_DEBUG_ESPIDF_I2C_SLAVE_RX_DRAIN_MARKER_PIN);
     return false;
 }
 
@@ -553,9 +565,9 @@ void SlaveBus_espidf::fillTxFromRespLocked()
     if (n == 0) {
         buf[n++] = _config.tx_fill_byte;  // underrun: keep the read moving
     }
-    M5HAL_MARK_HI(M5HAL_I2C_SLAVE_MARK_TXFILL);
+    M5HAL_DETAIL_I2C_SLAVE_MARK_HIGH_(M5HAL_DEBUG_ESPIDF_I2C_SLAVE_TX_FILL_MARKER_PIN);
     ::i2c_ll_write_txfifo(_hw, buf, static_cast<uint8_t>(n));
-    M5HAL_MARK_LO(M5HAL_I2C_SLAVE_MARK_TXFILL);
+    M5HAL_DETAIL_I2C_SLAVE_MARK_LOW_(M5HAL_DEBUG_ESPIDF_I2C_SLAVE_TX_FILL_MARKER_PIN);
 }
 
 void SlaveBus_espidf::enterTxHoldFromIsrLocked(bool& task_woken, bool address_read)
@@ -662,7 +674,7 @@ void SlaveBus_espidf::handleIsr()
     // the FIFO stays below the threshold); the FIFO then empties into the TX_EMPTY
     // stretch, which holds until the app streams more. Enabled on read-stretch release
     // and disabled at STOP / when the reply is exhausted (so it never fires on writes).
-#if M5HAL_I2C_SLAVE_TX_WM
+#if M5HAL_DETAIL_I2C_SLAVE_TX_WATERMARK_
     if (ints & I2C_TXFIFO_WM_INT_ENA_M) {
         if (is_read) {
             snapshotResponseLocked();
@@ -728,7 +740,7 @@ void SlaveBus_espidf::handleIsr()
 
     // Stretch: the HW is holding SCL low waiting for us.
     if (ints & I2C_SLAVE_STRETCH_INT_ENA_M) {
-        M5HAL_MARK_HI(M5HAL_I2C_SLAVE_MARK_STRETCH);
+        M5HAL_DETAIL_I2C_SLAVE_MARK_HIGH_(M5HAL_DEBUG_ESPIDF_I2C_SLAVE_STRETCH_MARKER_PIN);
         ::i2c_slave_stretch_cause_t cause;
         ::i2c_ll_slave_get_stretch_cause(hw, &cause);
         if (cause == I2C_SLAVE_STRETCH_CAUSE_ADDRESS_MATCH) {
@@ -779,7 +791,7 @@ void SlaveBus_espidf::handleIsr()
             if (_resp_pos < _resp_len) {
                 fillTxFromRespLocked();
                 ::i2c_ll_slave_clear_stretch(hw);
-#if M5HAL_I2C_SLAVE_TX_WM
+#if M5HAL_DETAIL_I2C_SLAVE_TX_WATERMARK_
                 // Re-arm the proactive water-mark top-up now that the reply is flowing.
                 ::i2c_ll_enable_intr_mask(hw, I2C_TXFIFO_WM_INT_ENA_M);
 #endif
@@ -801,7 +813,7 @@ void SlaveBus_espidf::handleIsr()
         } else {
             ::i2c_ll_slave_clear_stretch(hw);
         }
-        M5HAL_MARK_LO(M5HAL_I2C_SLAVE_MARK_STRETCH);
+        M5HAL_DETAIL_I2C_SLAVE_MARK_LOW_(M5HAL_DEBUG_ESPIDF_I2C_SLAVE_STRETCH_MARKER_PIN);
     }
 
     // Wake the serve() consumer on this activity (RX drained, hold entered, reply
@@ -884,7 +896,7 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
     }
 #endif
 
-#if defined(M5HAL_I2C_SLAVE_NO_CONTROLLER_CLOCK)
+#if M5HAL_DEBUG_ESPIDF_I2C_SLAVE_NO_CONTROLLER_CLOCK
     // skipped: cold-boot A/B baseline
 #elif defined(SOC_PERIPH_CLK_CTRL_SHARED) && SOC_PERIPH_CLK_CTRL_SHARED
     PERIPH_RCC_ATOMIC()
@@ -944,8 +956,8 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
     // selects this flavor in the first place), so skip it rather than call a
     // primitive that does nothing.
 
-    if (::esp_intr_alloc(i2c_periph_signal[port].irq, M5HAL_I2C_SLAVE_ISR_INTR_FLAGS, &SlaveBus_espidf::isrThunk, this,
-                         &_intr) != ESP_OK) {
+    if (::esp_intr_alloc(i2c_periph_signal[port].irq, M5HAL_DETAIL_I2C_SLAVE_ISR_INTR_FLAGS_,
+                         &SlaveBus_espidf::isrThunk, this, &_intr) != ESP_OK) {
         auto released = release();
         if (!released.has_value()) {
             return m5::stl::make_unexpected(released.error());
@@ -1682,7 +1694,7 @@ result_t<size_t> SlaveBus_espidf::write(bus::IAccessor* owner, data::ConstDataSp
 #if M5HAL_ESPIDF_I2C_SLAVE_LL
     if (release_stretch) {
         ::i2c_ll_slave_clear_stretch(hw_release);
-#if M5HAL_I2C_SLAVE_TX_WM
+#if M5HAL_DETAIL_I2C_SLAVE_TX_WATERMARK_
         // Arm the proactive TX water-mark top-up: this write() just started a reply
         // flowing, so keep the FIFO topped up before it empties (smooths the read).
         ::i2c_ll_enable_intr_mask(hw_release, I2C_TXFIFO_WM_INT_ENA_M);
@@ -1953,7 +1965,7 @@ void SlaveBus_espidf::requestTaskLoop()
         portEXIT_CRITICAL_SAFE(&_mux);
         if (release_stretch) {
             ::i2c_ll_slave_clear_stretch(hw_release);
-#if M5HAL_I2C_SLAVE_TX_WM
+#if M5HAL_DETAIL_I2C_SLAVE_TX_WATERMARK_
             // Arm the proactive TX water-mark top-up (the responder task just started a
             // reply flowing); keep the FIFO topped up before it empties.
             ::i2c_ll_enable_intr_mask(hw_release, I2C_TXFIFO_WM_INT_ENA_M);

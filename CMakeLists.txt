@@ -61,7 +61,7 @@ if(COMMAND idf_component_register)
     endif()
 
     # I2C is special on IDF v5.3+: the default backend uses esp_driver_i2c
-    # (driver/i2c_master.h), while M5HAL_CONFIG_IDF_I2C_LEGACY=1 switches the
+    # (driver/i2c_master.h), while M5HAL_CONFIG_ESPIDF_I2C_MASTER_LEGACY_DRIVER=1 switches the
     # C++ headers to driver/i2c.h. That config is usually a compiler definition,
     # not a CMake variable visible while REQUIRES is computed, so the component
     # declares both public dependencies. The C++ feature selection still compiles

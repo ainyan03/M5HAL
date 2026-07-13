@@ -132,12 +132,12 @@ C6/H2 は起動コードが I2C 機能クロックを明示的に gate off す�
 controller clock 有効化が効いていることの**決定的証拠はこのリグでのみ得られる**（S3/C61 はリセット値に
 救われて未修正でも動く）。リグ = M5 NanoC6 ↔ NanoH2、Grove Port A 直結、両機 SDA=GPIO2 / SCL=GPIO1。
 
-`slave.inl` の diag ノブ `-DM5HAL_I2C_SLAVE_NO_CONTROLLER_CLOCK` を注入したビルドと現行ビルドを
+`slave.inl` の diag ノブ `-DM5HAL_DEBUG_ESPIDF_I2C_SLAVE_NO_CONTROLLER_CLOCK=1` を注入したビルドと現行ビルドを
 比べる。前者は 100kHz を含む全速度で全滅し、後者は PASS する。
 
 ```sh
 export M5HAL_PIO_EXTRA_CONFIG=pio_envs/v2/hil.ini.cli
-PLATFORMIO_BUILD_FLAGS="-DM5HAL_I2C_SLAVE_NO_CONTROLLER_CLOCK" \
+PLATFORMIO_BUILD_FLAGS="-DM5HAL_DEBUG_ESPIDF_I2C_SLAVE_NO_CONTROLLER_CLOCK=1" \
   pio run -e v2_hil_i2c_slave_device_esp32c6 -t upload --upload-port <C6 のポート>
 pio run -e v2_hil_i2c_regmap_sweep_master_idf_esp32h2 -t upload --upload-port <H2 のポート>
 # 方向を入れ替える場合は _esp32h2 device / _esp32c6 master で同型

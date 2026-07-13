@@ -21,7 +21,7 @@
 ;   M5HAL_POSIX_UART_PORT=/dev/cu.usbserial-XXXX \
 ;     .pio/build/v2_hil_uart_echo_host/program
 ;   (M5HAL_POSIX_UART_BAUD optional, default 115200. For a high-baud run also
-;    flash with PLATFORMIO_BUILD_FLAGS="-DM5HAL_HIL_ECHO_BAUD=<baud>".)
+;    flash with PLATFORMIO_BUILD_FLAGS="-DM5HAL_HIL_UART_ECHO_BAUD_RATE=<baud>".)
 ; Or one-shot: experiments/v2/test/hil-run.sh uart_echo [port] [baud]
 ; =============================================================================
 
@@ -80,7 +80,7 @@ build_flags = -DM5HAL_HIL_I2C_PIN_SDA=5 -DM5HAL_HIL_I2C_PIN_SCL=6
 ; ESP32-C6 / ESP32-H2 variants of the register-map slave device, for the
 ; controller-clock cold-boot proof (the decisive rig): the C6/H2 boot code
 ; explicitly gates the I2C functional clock off (PCR i2c_sclk_en), so a build with
-; -DM5HAL_I2C_SLAVE_NO_CONTROLLER_CLOCK (the pre-D1 behavior, injected via
+; -DM5HAL_DEBUG_ESPIDF_I2C_SLAVE_NO_CONTROLLER_CLOCK=1 (the pre-D1 behavior, injected via
 ; PLATFORMIO_BUILD_FLAGS) must be dead on cold boot while the fixed build works.
 ; Rig = M5 NanoC6 <-> NanoH2, Port A cross-wired, both SDA=GPIO2 / SCL=GPIO1
 ; (the device fixture's defaults, stated here explicitly anyway). Same

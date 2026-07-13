@@ -38,19 +38,21 @@ M5 製品向けの HAL (ハードウェア抽象化レイヤ) です。
 
 - 確定した仕様文書は [`spec/`](spec/README.md) 配下にあります
   (リリースパッケージにも同梱されます)。
+- ビルド時の挙動設定と診断スイッチは
+  [`spec/design/configuration.md`](spec/design/configuration.md) に一覧化しています。
 
 ## 読み始める場所
 
 | 読者 | 最初に読む場所 |
 |---|---|
-| 既存 v0 利用者 | `<M5HAL.hpp>` または `<M5HAL_v0.hpp>` をそのまま使ってください。移行期間の意味を知りたい場合だけ [v0 / v2 共存](#v0--v2-共存) を読めば十分です。 |
+| 既存 ESP32 v0 利用者 | `<M5HAL.hpp>` または `<M5HAL_v0.hpp>` をそのまま使ってください。移行期間の意味を知りたい場合だけ [v0 / v2 共存](#v0--v2-共存) を読めば十分です。 |
 | v2 を sketch で試す人 | [v2 API を試す](#v2-api-を試す) を読んでから [`examples/v2/HowToUse/I2C`](examples/v2/HowToUse/I2C/)、[`examples/v2/HowToUse/SPI`](examples/v2/HowToUse/SPI/)、[`examples/v2/HowToUse/UART`](examples/v2/HowToUse/UART/) のいずれかを開いてください。 |
 | backend 実装者・内部レビュー担当 | [`spec/README.md`](spec/README.md) を地図として使ってください。中心になる設計文書は `bus_accessor`, `i2c`, `spi`, `gpio`, `variants` です。 |
 
 ## v2 API を試す
 
 v2 は明示的に opt-in して使います。 `<M5HAL_v2.hpp>` を include して
-ください。 同じ翻訳単位に v0 系エントリヘッダを混ぜることも可能です
+ください。 v0 対応 target では、同じ翻訳単位に v0 系エントリヘッダを混ぜることも可能です
 ([v0 / v2 共存](#v0--v2-共存) 参照) が、 ファイルごとに一方の世代に
 揃えたほうが読みやすくなります。
 
@@ -267,7 +269,13 @@ v2 API を 1 ライブラリ内に**共存**させる戦略を採用していま
 | `<M5HAL_v0.hpp>` | `m5::hal::*` (= v0、 `inline namespace v0` 経由) | 明示的に v0 (legacy) API を選ぶコード |
 | `<M5HAL_v2.hpp>` | `m5::hal::v2::*` | 明示的に v2 API を選ぶコード |
 
-- **同一翻訳単位 (TU) での両エントリ include も可能**。 include ガードと
+- **非 ESP32 Arduino target は v2 専用**。 `<M5HAL_v2.hpp>` を明示的に include
+  してください。install 済み library に `M5HAL_v0.cpp` は残りますが、非 ESP32
+  Arduino core では empty TU としてコンパイルされます。それらの target で
+  `<M5HAL.hpp>` または `<M5HAL_v0.hpp>` を include すると、v2 を使うよう案内する
+  error で早期に拒否されます。compatibility shim が target によって別世代を選ぶことは
+  ありません。
+- **v0 対応 target では、同一翻訳単位 (TU) での両エントリ include も可能**。 include ガードと
   platform 検出マクロは世代分離済みのため、 1 つの `.cpp` が v0 系
   エントリ (`<M5HAL.hpp>` shim か `<M5HAL_v0.hpp>` 直接) と
   `<M5HAL_v2.hpp>` を同時に include できます (ファイル単位で段階的に

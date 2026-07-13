@@ -1,0 +1,25 @@
+name: Config Macro Catalog Check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  config-macro-check:
+    name: Config Macro Catalog Check
+    runs-on: ${{ github.repository_owner == 'm5stack' && fromJSON('["self-hosted", "Linux", "X64"]') || 'ubuntu-latest' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate compile-time macro inputs and outputs
+        run: python3 .github/scripts/check-config-macros.py

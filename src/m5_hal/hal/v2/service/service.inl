@@ -135,12 +135,12 @@ uint64_t sharedNowUs()
     // exist on IDF/Arduino. Fail the build instead of miscounting.
 #error "M5HAL: ESP build without <esp_timer.h> — no wrap-safe shared clock available"
 #elif defined(ARDUINO)
-    // No <esp_timer.h> and no portable 64-bit free-running counter across
-    // RP2040/SAMD51 (see _checker.hpp's variant allowlist), so extend the
+    // No <esp_timer.h> and no portable 64-bit free-running counter across the
+    // allowlisted non-ESP Arduino cores (see _checker.hpp), so extend the
     // 32-bit micros() into a monotonic 64-bit count by tracking wraps.
     // Wrap-safe as long as this is called at least once per ~71-minute
-    // micros() period; noInterrupts() guards the CURRENT core only, same
-    // single-core caveat as memory/pool.inl's lockPool().
+    // micros() period; noInterrupts() guards the CURRENT core only, so RP2
+    // multicore use remains outside the verified surface.
     noInterrupts();
     static uint32_t s_last_us  = 0;
     static uint64_t s_epoch_us = 0;
@@ -210,7 +210,7 @@ bool ServiceRunner::add(IService& service)
             // every manual pass into a try-lock back-off
             // (spec/design/service.md: "posix では add() からの暗黙起動は
             // 行わない"). On bare-Arduino targets with only the stub Task
-            // (RP2040/SAMD51), the backend cannot run — skip the attempt
+            // (allowlisted non-ESP Arduino cores), the backend cannot run — skip the attempt
             // instead of ignoring its failure.
 #if defined(ESP_PLATFORM) || (defined(ARDUINO) && M5HAL_SERVICE_AUTORUN_TASK_SUPPORTED_)
             (void)startAutoRunLocked();

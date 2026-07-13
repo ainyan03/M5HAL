@@ -3,6 +3,7 @@
 #define M5HAL_TEST_V2_BUILD_CHECK_BUILD_CHECK_HPP_
 
 #include <M5HAL_v2.hpp>
+#include <m5_hal/hal/v0/build_support.hpp>
 
 #if defined(ARDUINO)
 #include <Arduino.h>
@@ -262,7 +263,7 @@ static_assert(M5HAL_V2_SELECTED_VARIANT_GPIO == M5HAL_V2_VARIANT_ID_PLATFORM_ESP
               "scan order: the platform variant wins GPIO on the ESP32 family");
 // Detection and selection share one id registry, so the cross
 // comparison is direct: the detected platform's variant wins GPIO.
-static_assert(M5HAL_V2_SELECTED_VARIANT_GPIO == M5HAL_V2_TARGET_PLATFORM_VARIANT_ID,
+static_assert(M5HAL_V2_SELECTED_VARIANT_GPIO == M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID,
               "the detected platform's variant should win GPIO on ESP32");
 #endif
 
@@ -293,14 +294,18 @@ static_assert(
     std::is_same<::m5::hal::v2::runtime::Event, ::m5::variants::frameworks::freertos::hal::v2::runtime::Event>::value,
     "the unsuffixed name and the freertos variant type must be the same entity");
 #elif defined(ARDUINO)
-// Non-ESP32 Arduino core (RP2040 / SAMD51, see _checker.hpp's variant
-// allowlist): no FreeRTOS, no <thread> — arduino still wins the time
+// Allowlisted non-ESP32 Arduino core (see _checker.hpp): no detected FreeRTOS
+// or <thread> — arduino still wins the time
 // injection, but Mutex/Event fall through to the stub fallback (single-task
 // fakes; see stub/hal/runtime/runtime.hpp).
 static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME == M5HAL_V2_VARIANT_ID_FRAMEWORK_ARDUINO,
               "scan order: arduino wins the runtime time injection when present");
 static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_MUTEX == M5HAL_V2_VARIANT_ID_FRAMEWORK_STUB,
               "scan order: no freertos/posix here, so the stub fake backs runtime::Mutex");
+static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_TASK == M5HAL_V2_VARIANT_ID_FRAMEWORK_STUB,
+              "scan order: no freertos/posix here, so the stub fake backs runtime::Task");
+static_assert(M5HAL_DETAIL_V0_IMPLEMENTATION_SUPPORTED_ == 0,
+              "the installed library must compile v0 as an empty TU on non-ESP Arduino cores");
 static_assert(
     std::is_same<::m5::hal::v2::runtime::Mutex, ::m5::variants::frameworks::stub::hal::v2::runtime::Mutex>::value,
     "the unsuffixed name and the stub variant type must be the same entity");

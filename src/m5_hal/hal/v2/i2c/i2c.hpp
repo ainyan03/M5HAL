@@ -183,7 +183,7 @@ struct MasterAccessConfig : public bus::IAccessConfig {
     /*!
       @brief Bus clock frequency in Hz.
       @note On ESP targets the value is clamped to a fail-safe ceiling
-      (@c M5HAL_I2C_MASTER_MAX_CLOCK_HZ, see master_clock_limit.hpp) so an
+      (@c M5HAL_CONFIG_I2C_MASTER_MAX_CLOCK_HZ, see master_clock_limit.hpp) so an
       over-high request can never drive the master peripheral into abnormal
       operation; the closest achievable clock is used instead of failing.
      */

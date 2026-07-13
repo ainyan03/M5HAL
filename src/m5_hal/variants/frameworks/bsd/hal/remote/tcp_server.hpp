@@ -17,13 +17,15 @@
 
 namespace m5::hal::v2::remote {
 
-#ifndef M5HAL_REMOTE_TCP_MAX_CONN
-#define M5HAL_REMOTE_TCP_MAX_CONN 2
+#ifndef M5HAL_CONFIG_REMOTE_TCP_MAX_CONNECTIONS
+#define M5HAL_CONFIG_REMOTE_TCP_MAX_CONNECTIONS 2
 #endif
+static_assert(M5HAL_CONFIG_REMOTE_TCP_MAX_CONNECTIONS >= 1,
+              "M5HAL_CONFIG_REMOTE_TCP_MAX_CONNECTIONS must be at least 1");
 
 class BsdTcpRemoteServer {
 public:
-    static constexpr size_t kMaxConnections = M5HAL_REMOTE_TCP_MAX_CONN;
+    static constexpr size_t kMaxConnections = M5HAL_CONFIG_REMOTE_TCP_MAX_CONNECTIONS;
 
     using connection_setup_fn_t = result_t<void> (*)(void* ctx, Server& server);
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-#ifndef M5HAL_HPP
-#define M5HAL_HPP
+#ifndef M5_HAL_HPP
+#define M5_HAL_HPP
 
 // =============================================================================
 // M5HAL compatibility shim.
@@ -21,4 +21,4 @@
 
 #include "M5HAL_v0.hpp"
 
-#endif  // M5HAL_HPP
+#endif  // M5_HAL_HPP

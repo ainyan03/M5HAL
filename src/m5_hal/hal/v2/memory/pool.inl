@@ -163,7 +163,7 @@ size_t FixedBlockPool<BlockSize, BlockCount>::largestFreeRun() const
 template <size_t BlockSize, size_t BlockCount>
 void FixedBlockPool<BlockSize, BlockCount>::lockPool() const
 {
-#if defined(ARDUINO_ARCH_RP2040)
+#if defined(PICO_RP2040)
     noInterrupts();
     while (_lock) {
         interrupts();
@@ -180,7 +180,7 @@ void FixedBlockPool<BlockSize, BlockCount>::lockPool() const
 template <size_t BlockSize, size_t BlockCount>
 void FixedBlockPool<BlockSize, BlockCount>::unlockPool() const
 {
-#if defined(ARDUINO_ARCH_RP2040)
+#if defined(PICO_RP2040)
     noInterrupts();
     _lock = false;
     interrupts();

@@ -11,8 +11,8 @@
 
 #include "../spi_wire_capture.hpp"
 
-#ifndef M5HAL_TEST_SOFTWARE_SPI_PIN_CLK
-#define M5HAL_TEST_SOFTWARE_SPI_PIN_CLK 18
+#ifndef M5HAL_TEST_SOFTWARE_SPI_PIN_CLOCK
+#define M5HAL_TEST_SOFTWARE_SPI_PIN_CLOCK 18
 #endif
 
 #ifndef M5HAL_TEST_SOFTWARE_SPI_PIN_MOSI
@@ -27,24 +27,24 @@
 #define M5HAL_TEST_SOFTWARE_SPI_PIN_CS 5
 #endif
 
-#ifndef M5HAL_TEST_SOFTWARE_SPI_CAPTURE_CLK
-#define M5HAL_TEST_SOFTWARE_SPI_CAPTURE_CLK M5HAL_TEST_SOFTWARE_SPI_PIN_CLK
+#ifndef M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_CLOCK
+#define M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_CLOCK M5HAL_TEST_SOFTWARE_SPI_PIN_CLOCK
 #endif
 
-#ifndef M5HAL_TEST_SOFTWARE_SPI_CAPTURE_MOSI
-#define M5HAL_TEST_SOFTWARE_SPI_CAPTURE_MOSI M5HAL_TEST_SOFTWARE_SPI_PIN_MOSI
+#ifndef M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_MOSI
+#define M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_MOSI M5HAL_TEST_SOFTWARE_SPI_PIN_MOSI
 #endif
 
-#ifndef M5HAL_TEST_SOFTWARE_SPI_CAPTURE_DC
-#define M5HAL_TEST_SOFTWARE_SPI_CAPTURE_DC M5HAL_TEST_SOFTWARE_SPI_PIN_DC
+#ifndef M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_DC
+#define M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_DC M5HAL_TEST_SOFTWARE_SPI_PIN_DC
 #endif
 
-#ifndef M5HAL_TEST_SOFTWARE_SPI_CAPTURE_CS
-#define M5HAL_TEST_SOFTWARE_SPI_CAPTURE_CS M5HAL_TEST_SOFTWARE_SPI_PIN_CS
+#ifndef M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_CS
+#define M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_CS M5HAL_TEST_SOFTWARE_SPI_PIN_CS
 #endif
 
-#ifndef M5HAL_TEST_SOFTWARE_SPI_FREQ
-#define M5HAL_TEST_SOFTWARE_SPI_FREQ 2000
+#ifndef M5HAL_TEST_SOFTWARE_SPI_FREQUENCY_HZ
+#define M5HAL_TEST_SOFTWARE_SPI_FREQUENCY_HZ 2000
 #endif
 
 namespace {
@@ -60,7 +60,7 @@ void initBus(SoftwareSpiBus& bus)
     // Typed init: the software Bus takes its own variant config, not the
     // abstract IBusConfig. Pin fields are inherited from the base.
     ::m5::hal::v2::spi::BusConfig_software bus_config;
-    bus_config.pin_clk  = M5HAL_TEST_SOFTWARE_SPI_PIN_CLK;
+    bus_config.pin_clk  = M5HAL_TEST_SOFTWARE_SPI_PIN_CLOCK;
     bus_config.pin_mosi = M5HAL_TEST_SOFTWARE_SPI_PIN_MOSI;
     bus_config.pin_miso = -1;
     bus_config.pin_dc   = M5HAL_TEST_SOFTWARE_SPI_PIN_DC;
@@ -72,7 +72,7 @@ void initBus(SoftwareSpiBus& bus)
 {
     ::m5::hal::v2::spi::MasterAccessConfig cfg;
     cfg.pin_cs                = M5HAL_TEST_SOFTWARE_SPI_PIN_CS;
-    cfg.freq                  = M5HAL_TEST_SOFTWARE_SPI_FREQ;
+    cfg.freq                  = M5HAL_TEST_SOFTWARE_SPI_FREQUENCY_HZ;
     cfg.spi_mode              = mode & 0x03;
     cfg.spi_order             = order ? 1 : 0;
     cfg.spi_command_length    = 8;
@@ -84,32 +84,32 @@ void initBus(SoftwareSpiBus& bus)
 
 void configureCapturePins()
 {
-    if (M5HAL_TEST_SOFTWARE_SPI_CAPTURE_CLK != M5HAL_TEST_SOFTWARE_SPI_PIN_CLK) {
-        pinMode(M5HAL_TEST_SOFTWARE_SPI_CAPTURE_CLK, INPUT);
+    if (M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_CLOCK != M5HAL_TEST_SOFTWARE_SPI_PIN_CLOCK) {
+        pinMode(M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_CLOCK, INPUT);
     }
-    if (M5HAL_TEST_SOFTWARE_SPI_CAPTURE_MOSI != M5HAL_TEST_SOFTWARE_SPI_PIN_MOSI) {
-        pinMode(M5HAL_TEST_SOFTWARE_SPI_CAPTURE_MOSI, INPUT);
+    if (M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_MOSI != M5HAL_TEST_SOFTWARE_SPI_PIN_MOSI) {
+        pinMode(M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_MOSI, INPUT);
     }
-    if (M5HAL_TEST_SOFTWARE_SPI_CAPTURE_DC != M5HAL_TEST_SOFTWARE_SPI_PIN_DC) {
-        pinMode(M5HAL_TEST_SOFTWARE_SPI_CAPTURE_DC, INPUT);
+    if (M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_DC != M5HAL_TEST_SOFTWARE_SPI_PIN_DC) {
+        pinMode(M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_DC, INPUT);
     }
-    if (M5HAL_TEST_SOFTWARE_SPI_CAPTURE_CS != M5HAL_TEST_SOFTWARE_SPI_PIN_CS) {
-        pinMode(M5HAL_TEST_SOFTWARE_SPI_CAPTURE_CS, INPUT_PULLUP);
+    if (M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_CS != M5HAL_TEST_SOFTWARE_SPI_PIN_CS) {
+        pinMode(M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_CS, INPUT_PULLUP);
     }
 }
 
 void printWiring()
 {
     Serial.println("Software SPI wire self-test wiring:");
-    Serial.printf("  CLK  out GPIO%d -> capture GPIO%d\n", M5HAL_TEST_SOFTWARE_SPI_PIN_CLK,
-                  M5HAL_TEST_SOFTWARE_SPI_CAPTURE_CLK);
+    Serial.printf("  CLK  out GPIO%d -> capture GPIO%d\n", M5HAL_TEST_SOFTWARE_SPI_PIN_CLOCK,
+                  M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_CLOCK);
     Serial.printf("  MOSI out GPIO%d -> capture GPIO%d\n", M5HAL_TEST_SOFTWARE_SPI_PIN_MOSI,
-                  M5HAL_TEST_SOFTWARE_SPI_CAPTURE_MOSI);
+                  M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_MOSI);
     Serial.printf("  DC   out GPIO%d -> capture GPIO%d\n", M5HAL_TEST_SOFTWARE_SPI_PIN_DC,
-                  M5HAL_TEST_SOFTWARE_SPI_CAPTURE_DC);
+                  M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_DC);
     Serial.printf("  CS   out GPIO%d -> capture GPIO%d\n", M5HAL_TEST_SOFTWARE_SPI_PIN_CS,
-                  M5HAL_TEST_SOFTWARE_SPI_CAPTURE_CS);
-    Serial.printf("  freq=%u Hz mode=0 order=MSB first\n", static_cast<unsigned>(M5HAL_TEST_SOFTWARE_SPI_FREQ));
+                  M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_CS);
+    Serial.printf("  freq=%u Hz mode=0 order=MSB first\n", static_cast<unsigned>(M5HAL_TEST_SOFTWARE_SPI_FREQUENCY_HZ));
 }
 
 void testWriteCommandAddressDataWirePhases()
@@ -136,7 +136,7 @@ void testWriteCommandAddressDataWirePhases()
     cap::assertBits(edges, 36, tx, 16);
     cap::assertDcRange(edges, 0, 8, false);
     cap::assertDcRange(edges, 8, 44, true);
-    cap::assertClockNeverFasterThanConfigured(M5HAL_TEST_SOFTWARE_SPI_FREQ);
+    cap::assertClockNeverFasterThanConfigured(M5HAL_TEST_SOFTWARE_SPI_FREQUENCY_HZ);
 }
 
 void testReadCommandAddressDataWirePhases()
@@ -162,7 +162,7 @@ void testReadCommandAddressDataWirePhases()
     cap::assertBits(edges, 0, command_address, 32);
     cap::assertDcRange(edges, 0, 8, false);
     cap::assertDcRange(edges, 8, 64, true);
-    cap::assertClockNeverFasterThanConfigured(M5HAL_TEST_SOFTWARE_SPI_FREQ);
+    cap::assertClockNeverFasterThanConfigured(M5HAL_TEST_SOFTWARE_SPI_FREQUENCY_HZ);
 }
 
 void testWriteUsesLsbFirstBitOrder()
@@ -184,7 +184,7 @@ void testWriteUsesLsbFirstBitOrder()
     const size_t edge_count = cap::collectActiveRisingEdges(edges, sizeof(edges));
     TEST_ASSERT_EQUAL_UINT32_MESSAGE(8, edge_count, "unexpected LSB first clock count");
     cap::assertBits(edges, 0, tx, 8, true);
-    cap::assertClockNeverFasterThanConfigured(M5HAL_TEST_SOFTWARE_SPI_FREQ);
+    cap::assertClockNeverFasterThanConfigured(M5HAL_TEST_SOFTWARE_SPI_FREQUENCY_HZ);
 }
 
 void testSpiModesSetExpectedClockEdges()
@@ -216,7 +216,7 @@ void testSpiModesSetExpectedClockEdges()
             TEST_ASSERT_EQUAL_UINT8_MESSAGE(expected_rising ? 1 : 0, rising_edges[i] ? 1 : 0,
                                             "clock edge alternation mismatch");
         }
-        cap::assertClockNeverFasterThanConfigured(M5HAL_TEST_SOFTWARE_SPI_FREQ);
+        cap::assertClockNeverFasterThanConfigured(M5HAL_TEST_SOFTWARE_SPI_FREQUENCY_HZ);
     }
 }
 
@@ -228,8 +228,8 @@ void setup()
     Serial.begin(115200);
     delay(200);
     printWiring();
-    cap::setPins(M5HAL_TEST_SOFTWARE_SPI_CAPTURE_CLK, M5HAL_TEST_SOFTWARE_SPI_CAPTURE_MOSI,
-                 M5HAL_TEST_SOFTWARE_SPI_CAPTURE_DC, M5HAL_TEST_SOFTWARE_SPI_CAPTURE_CS);
+    cap::setPins(M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_CLOCK, M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_MOSI,
+                 M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_DC, M5HAL_TEST_SOFTWARE_SPI_CAPTURE_PIN_CS);
     configureCapturePins();
 
     UNITY_BEGIN();

@@ -9,7 +9,7 @@
 // Pin defaults match M5Stack Core BASIC LCD (ILI9342C) wiring:
 //   SCLK=18, MOSI=23, MISO=19, D/C=27, CS=14
 //
-// When M5HAL_EXAMPLE_SPI_LCD_DEMO is defined (default on ESP32), the sketch
+// When M5HAL_EXAMPLE_SPI_LCD_DEMO=1 (default on ESP32), the sketch
 // also initialises the ILI9342C panel and paints colour bars — a visual
 // confirmation that writeCommand / writeCommandData / writeCommandAddress
 // actually reach the display. Define M5HAL_EXAMPLE_SPI_LCD_DEMO=0 to skip
@@ -34,8 +34,8 @@ constexpr int PIN_SPI_MISO = 19;
 constexpr int PIN_SPI_DC = 27;
 constexpr int PIN_SPI_CS = 14;
 
-#ifndef M5HAL_EXAMPLE_HOWTOUSESPI_FREQ
-#define M5HAL_EXAMPLE_HOWTOUSESPI_FREQ 40000000
+#ifndef M5HAL_EXAMPLE_SPI_FREQUENCY_HZ
+#define M5HAL_EXAMPLE_SPI_FREQUENCY_HZ 40000000
 #endif
 
 #ifndef M5HAL_EXAMPLE_SPI_LCD_DEMO
@@ -199,7 +199,7 @@ void setup()
 
     Serial.println("M5HAL HowToUseSPI");
     Serial.printf("pins: SCLK=%d MOSI=%d MISO=%d DC=%d CS=%d freq=%u\n", PIN_SPI_CLK, PIN_SPI_MOSI, PIN_SPI_MISO,
-                  PIN_SPI_DC, PIN_SPI_CS, static_cast<unsigned>(M5HAL_EXAMPLE_HOWTOUSESPI_FREQ));
+                  PIN_SPI_DC, PIN_SPI_CS, static_cast<unsigned>(M5HAL_EXAMPLE_SPI_FREQUENCY_HZ));
 
     // Tag-typed core pins (CLK / MOSI / MISO): a swapped wiring will not compile.
     // BusConfig selects the build's default backend; use BusConfig_espidf or
@@ -219,7 +219,7 @@ void setup()
     // writeCommand* expects, in one call.
     m5hal::spi::AccessConfig acc_cfg;
     acc_cfg.setupWithDCPin(PIN_SPI_DC).pin_cs = PIN_SPI_CS;
-    acc_cfg.freq                              = M5HAL_EXAMPLE_HOWTOUSESPI_FREQ;
+    acc_cfg.freq                              = M5HAL_EXAMPLE_SPI_FREQUENCY_HZ;
     acc_cfg.spi_mode                          = 0;  // (default; shown for clarity)
     acc_cfg.spi_order                         = 0;  // 0 = MSB first (default; shown for clarity)
     acc_cfg.spi_address_length                = 24;

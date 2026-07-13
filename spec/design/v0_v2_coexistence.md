@@ -8,15 +8,18 @@
 
 > **両世代が同名で定義する macro (`M5HAL_FRAMEWORK_HAS_ARDUINO` / `_FREERTOS` / `_SDL`、 `M5HAL_STATIC_MACRO_*`) は token 単位で定義を同一に保つこと。**
 
-v0 は変更不可。 同一性維持の責任は v2 側の編集にかかる。 逸脱すると同一 TU で両エントリを include するビルド (`test_coexist_include` / `v0v2_check_*`) で redefinition エラーが発生する。
+v0 API と ESP32 implementation は互換維持のため機能変更しない。例外は配布
+library のビルド成立に必要な target 境界のみ。同一性維持の責任は v2 側の編集に
+かかる。逸脱すると、v0 対応環境で同一 TU に両エントリを include するビルド
+(`test_coexist_include` / `v0v2_check_*`) で redefinition エラーが発生する。
 
 ## 基本方針
 
-1. **物理共存** — v0 と v2 を同じライブラリ内で同時ビルド・同時リンクする
+1. **物理共存** — v0 対応環境では v0 と v2 を同じライブラリ内で同時ビルド・同時リンクする。非 ESP32 Arduino では v2 のみを生成する
 2. **namespace 分離** — v0 は `m5::hal::v0::*`、 v2 は `m5::hal::v2::*` に置く
 3. **inline 切替** — `inline namespace` の有無でどちらが `m5::hal::*` として解決されるかを切り替える (既定は v0 が inline)
 4. **マクロ制御** — `M5HAL_V0_INLINE` / `M5HAL_V2_INLINE` で既定 namespace を制御する
-5. **v0 freeze** — v0 側は freeze 例外として保持し、 v2 の配置規約は適用しない
+5. **v0 freeze** — v0 側は配布ビルド用の target 境界を除いて機能変更せず、 v2 の配置規約は適用しない
 6. **variants は v2 オンリー** — variant 機構は v2 用のみ提供する
 
 ## namespace 配置 (1 か所のみ定義)
@@ -58,14 +61,20 @@ namespace m5 { namespace hal { M5HAL_INLINE_V2 namespace v2 {} } }
 | `M5HAL_v0.hpp` | 明示的に v0 を選ぶコード | v0 (= `m5::hal::*`) |
 | `M5HAL_v2.hpp` | 明示的に v2 を選ぶコード | v2 (= `m5::hal::v2::*`) |
 
-同一 TU での両エントリ include も安全: include ガードの世代分離に加え、 platform checker の macro 名前空間も世代分離されている (v0 = 無印 `M5HAL_TARGET_PLATFORM_*`、 v2 = `M5HAL_V2_TARGET_PLATFORM_*`)。
+v0 対応環境では同一 TU での両エントリ include も安全: include ガードの世代分離に加え、 platform checker の macro 名前空間も世代分離されている (v0 = 無印 `M5HAL_TARGET_PLATFORM_*`、 v2 = `M5HAL_V2_DETECTED_PLATFORM_VARIANT_*`)。
+
+ただし v0 の公開 API は ESP32 専用である。非 ESP32 Arduino では、install 済み library
+の全 TU をビルドできるよう `M5HAL_v0.cpp` のみ empty TU となるが、`M5HAL.hpp`
+または `M5HAL_v0.hpp` を利用者が include すると `#error` で拒否する。それらの target
+では `M5HAL_v2.hpp` を明示的に使う。プラットフォームによって `M5HAL.hpp` の解決先を
+v2 へ変えることはしない。
 
 ## 同一 TU 安全性の保証 (coexist fence)
 
-同一 TU での両エントリ同時 include が安全である根拠:
+v0 対応環境で、同一 TU での両エントリ同時 include が安全である根拠:
 
 1. **include ガード分離** — v0 は `M5_HAL_V0_` プレフィックス、 v2 は別系統。 重複定義なし。
-2. **platform macro 分離** — 世代間で値が異なり得る macro は名前ごと世代分離する。 v0 = 無印 `M5HAL_TARGET_PLATFORM_*`、 v2 = `M5HAL_V2_TARGET_PLATFORM_*`。
+2. **platform macro 分離** — 世代間で値が異なり得る macro は名前ごと世代分離する。 v0 = 無印 `M5HAL_TARGET_PLATFORM_*`、 v2 = `M5HAL_V2_DETECTED_PLATFORM_VARIANT_*`。
 3. **ODR 非衝突** — namespace が分離されるため、 同名クラス・関数が両世代に存在しても ODR 衝突しない。
 4. **macro 同一性** — 上記「唯一の不変条件」により、 両世代が定義する共通名 macro はトークン単位で同一。 同一定義の再定義は C++ 規格上無害。
 
@@ -86,12 +95,15 @@ src/
     variants/            v2 のみ
 ```
 
-## v0 の既知制限 (変更不可のため残る)
+## v0 の既知制限
 
-v0 は公開互換のための変更不可ツリーであり、 以下の制限は修正せず v2 への移行で解消する:
+v0 は公開互換のため原則として機能変更しない。配布 library のビルド成立に必要な
+target 境界は追加するが、以下の API 制限は v0 を拡張せず v2 への移行で解消する:
 
+- **対応 framework**: v0 の Arduino API は arduino-esp32 専用。非 `ESP_PLATFORM` Arduino では
+  v0 implementation を生成せず、v0 public entry の include も明示的に拒否する
 - **対応 chip**: v0 の platform checker が知るのは ESP32 (無印) / S2 / S3 / C3 / C6 / H2 / P4 系の当時の一覧まで。 それ以降の新 chip (C5 / C61 等) は generic fallback で動作し、 platform 固有最適化は乗らない。 新 chip の一次対応は v2 のみ。
-- **software I2C / SPI**: 複数インスタンス管理と排他制御が未整備 (単一インスタンス前提)。 ソース内の TODO は変更不可のため対応しない。
+- **software I2C / SPI**: 複数インスタンス管理と排他制御が未整備 (単一インスタンス前提)。 v0 の機能拡張は行わず v2 で対応する。
 - **エラーコード**: 細分化されていない (I2C 系 + 汎用のみ)。 詳細な分類は v2 `error_t` を使う。
 
 ## v3/v4 への前方互換レイアウト
@@ -101,7 +113,7 @@ v0 は公開互換のための変更不可ツリーであり、 以下の制限�
 - `m5::hal::v3::*` / `m5::hal::v4::*` を追加する
 - エントリヘッダ `M5HAL_v3.hpp` / `M5HAL_v4.hpp` を追加する
 - 切替マクロ `M5HAL_V3_INLINE` / `M5HAL_V4_INLINE` を同じ排他ガードで追加する
-- platform macro は `M5HAL_V3_TARGET_PLATFORM_*` 系へ分離する
+- platform macro は `M5HAL_V3_DETECTED_PLATFORM_VARIANT_*` 系へ分離する
 - `m5::hal::*` が指す世代は引き続き 1 つのみ
 
 この設計により、 利用者は移行の準備ができるまで古い世代を明示的に include し続けられる。

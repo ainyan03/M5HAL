@@ -5,7 +5,7 @@
 // M5HAL_ESPIDF_I2C_SLAVE_LL_BE section, bound via
 // m5_hal/hal/v2/i2c/slave.hpp's ISlaveBus::bindIsrRegMap). The backend under
 // test compiles UNMODIFIED against the same fake IDF header tree as
-// ../test_espidf_i2c_slave/, except this env's M5HAL_HOST_HARNESS_NO_STRETCH
+// ../test_espidf_i2c_slave/, except this env's M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_NO_STRETCH_CAPABILITY
 // build flag flips soc/soc_caps.h's SOC_I2C_SLAVE_CAN_GET_STRETCH_CAUSE to 0,
 // which selects M5HAL_ESPIDF_I2C_SLAVE_LL_BE instead of
 // M5HAL_ESPIDF_I2C_SLAVE_LL -- see ../fakes/README.md.
@@ -135,7 +135,7 @@ void countingOnWrite(uint8_t reg, uint8_t value, void* ctx)
     counters->writes.emplace_back(reg, value);
 }
 
-// Owns a fresh SlaveBus_espidf, inits it (BE flavor: M5HAL_HOST_HARNESS_NO_STRETCH
+// Owns a fresh SlaveBus_espidf, inits it (BE flavor: M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_NO_STRETCH_CAPABILITY
 // makes M5HAL_ESPIDF_I2C_SLAVE_LL_BE win -- see this file's header comment),
 // THEN constructs the SlaveRegMapAccessor -- that ORDER matters:
 // SlaveRegMapAccessor's constructor calls bindIsrRegMap immediately, which

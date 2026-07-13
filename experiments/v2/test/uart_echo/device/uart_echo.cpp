@@ -23,13 +23,13 @@ constexpr int PIN_UART_TX = 1;  // UART0 TX (USB bridge) on classic ESP32
 constexpr int PIN_UART_RX = 3;  // UART0 RX (USB bridge) on classic ESP32
 
 // Override at build time to match the host (e.g. for a high-baud HIL run):
-//   PLATFORMIO_BUILD_FLAGS="-DM5HAL_HIL_ECHO_BAUD=3000000" pio run -e ... -t upload
+//   PLATFORMIO_BUILD_FLAGS="-DM5HAL_HIL_UART_ECHO_BAUD_RATE=3000000" pio run -e ... -t upload
 // (The Core BASIC v2.7 USB bridge is a CH9102, good to ~3 Mbaud+; the older
 //  CP2104 revision caps ~2 Mbaud. The M5HAL UART itself goes higher still.)
-#ifndef M5HAL_HIL_ECHO_BAUD
-#define M5HAL_HIL_ECHO_BAUD 115200
+#ifndef M5HAL_HIL_UART_ECHO_BAUD_RATE
+#define M5HAL_HIL_UART_ECHO_BAUD_RATE 115200
 #endif
-constexpr uint32_t BAUD = M5HAL_HIL_ECHO_BAUD;
+constexpr uint32_t BAUD = M5HAL_HIL_UART_ECHO_BAUD_RATE;
 
 m5hal::uart::Bus uart_bus;  // flat-injected = arduino UART variant on this build
 m5hal::uart::AccessConfig uart_cfg;

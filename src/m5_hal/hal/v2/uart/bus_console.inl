@@ -21,7 +21,7 @@
 #ifndef tinyusb_cdcacm_init
 #define tinyusb_cdcacm_init(cfg) tusb_cdc_acm_init(cfg)
 #endif
-#define M5HAL_BUS_CONSOLE_HAS_USB_CDC 1
+#define M5HAL_DETAIL_BUS_CONSOLE_HAS_USB_CDC_ 1
 #endif
 #elif !defined(_WIN32) && !defined(ARDUINO)
 #include <errno.h>
@@ -43,7 +43,7 @@ struct BusConsoleCdcBridge {
 };
 }  // namespace detail
 
-#if defined(M5HAL_BUS_CONSOLE_HAS_USB_CDC)
+#if defined(M5HAL_DETAIL_BUS_CONSOLE_HAS_USB_CDC_)
 namespace {
 Bus_console* s_cdc_console                        = nullptr;
 portMUX_TYPE s_cdc_console_mux                    = portMUX_INITIALIZER_UNLOCKED;
@@ -131,7 +131,7 @@ result_t<void> Bus_console::init(FILE* in, FILE* out)
     // Runtime auto-detection. When TinyUSB CDC is enabled, try OTG CDC
     // first (USB-JTAG driver install can succeed even when the phy is in
     // OTG mode, producing a silent dead path). Otherwise try USB-JTAG first.
-#if defined(M5HAL_BUS_CONSOLE_HAS_USB_CDC)
+#if defined(M5HAL_DETAIL_BUS_CONSOLE_HAS_USB_CDC_)
     {
         const tinyusb_config_t tusb_cfg = {};
         esp_err_t err                   = tinyusb_driver_install(&tusb_cfg);
@@ -189,7 +189,7 @@ result_t<void> Bus_console::release()
     }
 
 #if defined(ESP_PLATFORM)
-#if defined(M5HAL_BUS_CONSOLE_HAS_USB_CDC)
+#if defined(M5HAL_DETAIL_BUS_CONSOLE_HAS_USB_CDC_)
     if (_transport == Transport::UsbCdc) {
         (void)tinyusb_cdcacm_unregister_callback(TINYUSB_CDC_ACM_0, CDC_EVENT_RX);
 
@@ -230,7 +230,7 @@ result_t<size_t> Bus_console::rawWrite(const uint8_t* data, size_t len, uint32_t
             return (n > 0) ? static_cast<size_t>(n) : static_cast<size_t>(0);
         }
 #endif
-#if defined(M5HAL_BUS_CONSOLE_HAS_USB_CDC)
+#if defined(M5HAL_DETAIL_BUS_CONSOLE_HAS_USB_CDC_)
         case Transport::UsbCdc: {
             const size_t queued = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, data, len);
             if (queued > 0) {
@@ -274,7 +274,7 @@ result_t<size_t> Bus_console::rawRead(uint8_t* buf, size_t len, uint32_t timeout
             return (n > 0) ? static_cast<size_t>(n) : static_cast<size_t>(0);
         }
 #endif
-#if defined(M5HAL_BUS_CONSOLE_HAS_USB_CDC)
+#if defined(M5HAL_DETAIL_BUS_CONSOLE_HAS_USB_CDC_)
         case Transport::UsbCdc: {
             size_t rx_size = 0;
             (void)tinyusb_cdcacm_read(TINYUSB_CDC_ACM_0, buf, len, &rx_size);

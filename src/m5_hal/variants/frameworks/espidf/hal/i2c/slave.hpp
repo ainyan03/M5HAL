@@ -5,10 +5,10 @@
 #include "../../detail/espidf_version.hpp"
 #include "../../../../../hal/v2/i2c/slave.hpp"
 
-// M5HAL_ESPIDF_HOST_HARNESS: opt-in for the native host regression harness
+// M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS: opt-in for the native host regression harness
 // (test/v2/native_espidf), which supplies a fake soc/soc_caps.h on the include
 // path so this backend compiles and runs off-target. See fakes/README.md.
-#if defined(ESP_PLATFORM) || defined(M5HAL_ESPIDF_HOST_HARNESS)
+#if defined(ESP_PLATFORM) || defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)
 #include <soc/soc_caps.h>
 #endif
 
@@ -44,11 +44,11 @@
 // on v6.0 (idf component lane; h4 has no LL slave backend per above). NOTE: only
 // ESP32-S3 is HW-validated -- the other stretch-cause SoCs are compile-verified
 // (capability present) but not yet bench-tested.
-// M5HAL_ESPIDF_HOST_HARNESS forces the LL-path probe here too: the harness
+// M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS forces the LL-path probe here too: the harness
 // supplies fake soc/i2c_periph.h, soc/i2c_struct.h and hal/i2c_ll.h headers,
 // so the __has_include probes below resolve the same way they would on a
 // real stretch-cause SoC.
-#if (defined(ESP_PLATFORM) || defined(M5HAL_ESPIDF_HOST_HARNESS)) &&                         \
+#if (defined(ESP_PLATFORM) || defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)) &&          \
     (defined(SOC_I2C_SLAVE_CAN_GET_STRETCH_CAUSE) && SOC_I2C_SLAVE_CAN_GET_STRETCH_CAUSE) && \
     __has_include(<soc/i2c_periph.h>) && __has_include(<soc/i2c_struct.h>) && __has_include(<hal/i2c_ll.h>)
 #define M5HAL_ESPIDF_I2C_SLAVE_LL 1
@@ -62,8 +62,8 @@
 // i2c_ll_slave_enable_scl_stretch / i2c_ll_slave_clear_stretch etc. are no-ops
 // on these SoCs -- see ESP32_I2C_slave_example's I2C_SLAVE_HAS_STRETCH gate for
 // the reference behavior this flavor reproduces.
-#if !M5HAL_ESPIDF_I2C_SLAVE_LL && (defined(ESP_PLATFORM) || defined(M5HAL_ESPIDF_HOST_HARNESS)) && \
-    (defined(SOC_I2C_SUPPORT_SLAVE) && SOC_I2C_SUPPORT_SLAVE) &&                                   \
+#if !M5HAL_ESPIDF_I2C_SLAVE_LL && (defined(ESP_PLATFORM) || defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)) && \
+    (defined(SOC_I2C_SUPPORT_SLAVE) && SOC_I2C_SUPPORT_SLAVE) &&                                                  \
     __has_include(<soc/i2c_periph.h>) && __has_include(<soc/i2c_struct.h>) && __has_include(<hal/i2c_ll.h>)
 #define M5HAL_ESPIDF_I2C_SLAVE_LL_BE 1
 #else
@@ -75,31 +75,31 @@
 // clock-stretched master even while the flash cache is disabled (an OTA / NVS /
 // SPIFFS write running on another task). That robustness costs ~1-2 KB of IRAM.
 // A build that never writes flash while the I2C slave is active can reclaim it by
-// defining M5HAL_ESPIDF_I2C_SLAVE_IRAM_ISR=0: that drops both the ESP_INTR_FLAG_IRAM
+// defining M5HAL_CONFIG_ESPIDF_I2C_SLAVE_IRAM_ISR=0: that drops both the ESP_INTR_FLAG_IRAM
 // registration and the IRAM_ATTR on the ISR-reachable functions. The trade-off is
 // that an interrupt arriving during a flash-cache-disabled window is deferred,
 // which can stall (or time out) the master mid-transaction. Default on = safe; the
 // I2C slave is clocked by an external master, so a deferred ISR strands the bus.
 //
-// M5HAL_I2C_SLAVE_ISR_IRAM is the attribute applied to every function reachable
+// M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ is the attribute applied to every function reachable
 // from the LL ISR (declared once, honored at the definition). It is empty unless
 // the LL path is active AND the option is on, so v2-driver builds and opt-out
-// builds carry no needless IRAM. M5HAL_I2C_SLAVE_ISR_INTR_FLAGS matches it for the
+// builds carry no needless IRAM. M5HAL_DETAIL_I2C_SLAVE_ISR_INTR_FLAGS_ matches it for the
 // esp_intr_alloc() call.
-#ifndef M5HAL_ESPIDF_I2C_SLAVE_IRAM_ISR
-#define M5HAL_ESPIDF_I2C_SLAVE_IRAM_ISR 1
+#ifndef M5HAL_CONFIG_ESPIDF_I2C_SLAVE_IRAM_ISR
+#define M5HAL_CONFIG_ESPIDF_I2C_SLAVE_IRAM_ISR 1
 #endif
-#if (M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_SLAVE_LL_BE) && M5HAL_ESPIDF_I2C_SLAVE_IRAM_ISR
-#define M5HAL_I2C_SLAVE_ISR_IRAM       IRAM_ATTR
-#define M5HAL_I2C_SLAVE_ISR_INTR_FLAGS (ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_LEVEL3)
+#if (M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_SLAVE_LL_BE) && M5HAL_CONFIG_ESPIDF_I2C_SLAVE_IRAM_ISR
+#define M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_       IRAM_ATTR
+#define M5HAL_DETAIL_I2C_SLAVE_ISR_INTR_FLAGS_ (ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_LEVEL3)
 #else
-#define M5HAL_I2C_SLAVE_ISR_IRAM
-#define M5HAL_I2C_SLAVE_ISR_INTR_FLAGS (ESP_INTR_FLAG_LEVEL3)
+#define M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_
+#define M5HAL_DETAIL_I2C_SLAVE_ISR_INTR_FLAGS_ (ESP_INTR_FLAG_LEVEL3)
 #endif
 
-// M5HAL_ESPIDF_HOST_HARNESS: body gate opens for the host harness too (the
+// M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS: body gate opens for the host harness too (the
 // class itself is unchanged; only fake headers stand in for the real SDK).
-#if (defined(ESP_PLATFORM) || defined(M5HAL_ESPIDF_HOST_HARNESS)) && \
+#if (defined(ESP_PLATFORM) || defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)) && \
     (M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_SLAVE_LL_BE || M5HAL_ESPIDF_I2C_HAS_SLAVE_V2)
 
 #if M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_SLAVE_LL_BE
@@ -221,16 +221,16 @@ private:
     // a fresh slot for a pure read and notifies the responder task on a read
     // stretch). With ESP_INTR_FLAG_IRAM that whole call chain must be in IRAM, so
     // they carry the ISR-IRAM attribute (empty on the v2 path / opt-out builds).
-    Transaction* M5HAL_I2C_SLAVE_ISR_IRAM allocateTransactionLocked();
+    Transaction* M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ allocateTransactionLocked();
     Transaction* newestTransactionLocked();
     Transaction* oldestOpenableTransactionLocked();
     void discardTransactionLocked(Transaction& txn);
     bool isOpenOwnerLocked(bus::IAccessor* owner) const;
-    void M5HAL_I2C_SLAVE_ISR_IRAM notifyTaskFromISR(bool& task_woken);
+    void M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ notifyTaskFromISR(bool& task_woken);
     // Wake the serve() consumer (the task blocked in waitForActivity) on RX/TX/STOP
     // activity. Reached from the LL ISR and the v2 driver callbacks, so it
     // carries the ISR-IRAM attribute (empty on the v2 path).
-    void M5HAL_I2C_SLAVE_ISR_IRAM notifyConsumerFromISR(bool& task_woken);
+    void M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ notifyConsumerFromISR(bool& task_woken);
     void notifyTaskFromTask();
     void requestTaskLoop();
     ::TickType_t requestWaitTicksLocked(::TickType_t now_tick) const;
@@ -276,8 +276,8 @@ private:
     // RX into the current transaction and, on a read stretch, wakes the responder
     // task which fills the TX FIFO from the open transaction's tx queue and then
     // releases the stretch.
-    static void M5HAL_I2C_SLAVE_ISR_IRAM isrThunk(void* arg);
-    void M5HAL_I2C_SLAVE_ISR_IRAM handleIsr();
+    static void M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ isrThunk(void* arg);
+    void M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ handleIsr();
     // Drain `count` RX-FIFO bytes into the current transaction's rx ring. With
     // can_hold=true (mid-transaction) it pulls only as many bytes as the ring has
     // free space for and LEAVES the rest in the HW FIFO, returning true so the
@@ -285,21 +285,21 @@ private:
     // can_hold=false (STOP / no later lift) it drains the whole count, dropping any
     // tail that no longer fits (surfaced via rxOverflowCount). Returns true iff it
     // stopped early on a full ring with bytes still pending in the FIFO.
-    bool M5HAL_I2C_SLAVE_ISR_IRAM drainRxLocked(uint32_t count, bool can_hold);
+    bool M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ drainRxLocked(uint32_t count, bool can_hold);
     // Refills _resp from the open transaction's tx ring (only when _resp is fully
     // sent). Reached from the LL ISR's TX_EMPTY continuation (to stream a >FIFO reply
     // from the tx ring without task latency) as well as the responder task, so it
     // carries the ISR-IRAM attribute.
-    void M5HAL_I2C_SLAVE_ISR_IRAM snapshotResponseLocked();
-    void M5HAL_I2C_SLAVE_ISR_IRAM fillTxFromRespLocked();
-    void M5HAL_I2C_SLAVE_ISR_IRAM enterTxHoldFromIsrLocked(bool& task_woken, bool address_read);
+    void M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ snapshotResponseLocked();
+    void M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ fillTxFromRespLocked();
+    void M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ enterTxHoldFromIsrLocked(bool& task_woken, bool address_read);
     // Write-direction back-pressure: assert HoldKind::rx_full and MASK the stretch +
     // RX-water-mark interrupts (without clearing the RX_FULL stretch the HW already
     // holds), so the ISR does not spin on the still-full FIFO. read() lifts it once
     // it drains the ring. Idempotent (a second RX_FULL in the same hold is a no-op).
-    void M5HAL_I2C_SLAVE_ISR_IRAM enterRxHoldFromIsrLocked();
-    uint32_t M5HAL_I2C_SLAVE_ISR_IRAM clearHoldLocked();
-    void M5HAL_I2C_SLAVE_ISR_IRAM enableMaskedInterrupts(uint32_t mask);
+    void M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ enterRxHoldFromIsrLocked();
+    uint32_t M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ clearHoldLocked();
+    void M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ enableMaskedInterrupts(uint32_t mask);
     void restorePins();
 
     ::i2c_dev_t* _hw      = nullptr;
@@ -330,20 +330,20 @@ private:
     // after every STOP -- so it only drops back below the threshold while a
     // read is genuinely draining it. See ESP32_I2C_slave_example's
     // I2C_SLAVE_HAS_STRETCH=0 path for the reference this flavor is based on.
-    static void M5HAL_I2C_SLAVE_ISR_IRAM isrThunk(void* arg);
-    void M5HAL_I2C_SLAVE_ISR_IRAM handleIsr();
+    static void M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ isrThunk(void* arg);
+    void M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ handleIsr();
     // Drain `count` RX-FIFO bytes into the current transaction's rx ring. BE has
     // no RX_FULL stretch to hold the master, so there is no back-pressure: once
     // the ring's unread backlog fills, further bytes are dropped and counted via
     // rxOverflowCount() (the LL flavor's can_hold=true path does not exist here).
-    void M5HAL_I2C_SLAVE_ISR_IRAM drainRxLocked(uint32_t count);
+    void M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ drainRxLocked(uint32_t count);
     // Refills _resp from the open transaction's tx ring (only when _resp is
     // fully sent) -- same contract as the LL flavor's snapshotResponseLocked,
     // kept as a separate copy per the house style of not #if-threading HW logic.
-    void M5HAL_I2C_SLAVE_ISR_IRAM snapshotResponseLocked();
+    void M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ snapshotResponseLocked();
     // Unlike the LL flavor, an exhausted _resp tops up the WHOLE TX FIFO free
     // space with tx_fill_byte (not a single byte) -- see the class comment above.
-    void M5HAL_I2C_SLAVE_ISR_IRAM fillTxFromRespLocked();
+    void M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ fillTxFromRespLocked();
     void restorePins();
 
     // ISR register-map fast path (bound via bindIsrRegMap): while _isr_binding
@@ -360,20 +360,20 @@ private:
     // each transaction sets _isr_binding->pointer, subsequent bytes store via
     // regMapWriteByte (auto-increment, firing onWrite). No back-pressure and no
     // Transaction.rx[] involvement. Must run with _mux held.
-    void M5HAL_I2C_SLAVE_ISR_IRAM drainRxRegMapLocked(uint32_t count);
+    void M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ drainRxRegMapLocked(uint32_t count);
     // Fill the TX FIFO's free space from the bound register map starting at
     // _isr_binding->pointer + tx_offset (auto-increment, 8-bit wrap, via
     // regMapReadByte). Unlike fillTxFromRespLocked there is no underrun case --
     // the reply IS the register map, so there is always a next byte. Must run
     // with _mux held.
-    void M5HAL_I2C_SLAVE_ISR_IRAM fillTxRegMapLocked();
+    void M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ fillTxRegMapLocked();
     // Discard whatever the TX FIFO holds and refill it from the register map at
     // the current pointer (offset 0) -- the fast-path counterpart of
     // snapshotResponseLocked + fillTxFromRespLocked, run whenever the pointer may
     // have changed (every RX drain, mirroring the reference's unconditional
     // rebuild) or a fresh transaction starts (every STOP / a fresh bind). A no-op
     // before init() (_hw == nullptr). Must run with _mux held.
-    void M5HAL_I2C_SLAVE_ISR_IRAM rebuildTxRegMapLocked();
+    void M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ rebuildTxRegMapLocked();
 
     ::i2c_dev_t* _hw      = nullptr;
     ::intr_handle_t _intr = nullptr;

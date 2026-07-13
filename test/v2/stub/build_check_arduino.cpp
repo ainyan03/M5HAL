@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Build check stub for v2 Arduino-based ESP32 envs.
+// Shared build-check stub for v2 Arduino envs that need no target assertion.
 // Provides setup() / loop() so the firmware links during build check.
 #include <Arduino.h>
 

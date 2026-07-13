@@ -3,7 +3,7 @@
 ;
 ; 同一 TU で <M5HAL_v0.hpp> と <M5HAL_v2.hpp> の両方を include する device
 ; 向け fence。include ガードの世代分離と platform checker のマクロ名前空間
-; 分離 (v0 = 無印 M5HAL_TARGET_PLATFORM_*, v2 = M5HAL_V2_TARGET_PLATFORM_*)
+; 分離 (v0 = 無印 M5HAL_TARGET_PLATFORM_*, v2 = M5HAL_V2_DETECTED_PLATFORM_VARIANT_*)
 ; を build で保証する。native 側の同種 fence は test_coexist_include (gtest)。
 ; 対応 stub: test/v2/stub/build_check_coexist_{arduino,espidf}.cpp
 ;

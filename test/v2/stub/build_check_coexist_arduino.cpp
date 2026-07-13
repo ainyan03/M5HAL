@@ -6,7 +6,7 @@
 // native fence (test_coexist_include) already guards include-guard
 // collisions; this device fence additionally proves the two platform
 // checkers keep their own macro namespaces: v0 owns the unprefixed
-// M5HAL_TARGET_PLATFORM_* names, v2 owns M5HAL_V2_TARGET_PLATFORM_*.
+// M5HAL_TARGET_PLATFORM_* names, v2 owns M5HAL_V2_DETECTED_PLATFORM_VARIANT_*.
 #include <M5HAL_v0.hpp>
 
 #include "../build_check/build_check.hpp"  // includes <M5HAL_v2.hpp>
@@ -19,7 +19,7 @@ static_assert(M5HAL_TARGET_PLATFORM_NUMBER == M5HAL_PLATFORM_NUMBER_ESP32_1st,
 static_assert(M5HAL_TARGET_PLATFORM_NUMBER == M5HAL_PLATFORM_NUMBER_ESP32_S3,
               "v0 platform number clobbered by the v2 entry");
 #endif
-static_assert(M5HAL_V2_TARGET_PLATFORM_VARIANT_ID == M5HAL_V2_VARIANT_ID_PLATFORM_ESP32,
+static_assert(M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID == M5HAL_V2_VARIANT_ID_PLATFORM_ESP32,
               "v2 platform variant id missing or clobbered");
 
 // Both generations' core symbols resolve through their explicit namespaces.

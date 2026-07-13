@@ -21,7 +21,7 @@ experiments/v2/test/hil-run.sh uart_echo                            # 115200
 experiments/v2/test/hil-run.sh uart_echo /dev/cu.usbserial-X 3000000  # 3 Mbaud
 ```
 
-`hil-run.sh` は device を指定 baud で焼き（`-DM5HAL_HIL_ECHO_BAUD`）、host をビルドして
+`hil-run.sh` は device を指定 baud で焼き（`-DM5HAL_HIL_UART_ECHO_BAUD_RATE=<baud>`）、host をビルドして
 `M5HAL_POSIX_UART_PORT`/`_BAUD` を渡して実行する。
 
 ## 期待結果

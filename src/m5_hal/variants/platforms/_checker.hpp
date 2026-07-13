@@ -11,11 +11,15 @@
 //
 // Detection logic only — the identity numbers live in the single
 // registry (../ids.hpp). The detected platform is reported as
-// M5HAL_V2_TARGET_PLATFORM_VARIANT_ID, a registry value, so it compares
+// M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID, a registry value, so it compares
 // directly against M5HAL_V2_SELECTED_VARIANT_<KIND> and the
 // M5HAL_V2_VARIANT_ID_* constants.
 
 #include "../ids.hpp"
+
+#if defined(M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID) || defined(M5HAL_V2_DETECTED_PLATFORM_VARIANT_PATH)
+#error "M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID/PATH are read-only outputs and must not be predefined"
+#endif
 
 #if defined(ESP_PLATFORM)
 #if __has_include(<sdkconfig.h>)
@@ -24,15 +28,15 @@
 
 // clang-format off
 #if defined(CONFIG_IDF_TARGET)
-#define M5HAL_V2_TARGET_PLATFORM_VARIANT_ID M5HAL_V2_VARIANT_ID_PLATFORM_ESP32
-#define M5HAL_V2_TARGET_PLATFORM_PATH       m5_hal/variants/platforms/espressif/esp32
+#define M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID M5HAL_V2_VARIANT_ID_PLATFORM_ESP32
+#define M5HAL_V2_DETECTED_PLATFORM_VARIANT_PATH m5_hal/variants/platforms/espressif/esp32
 #endif
 #else
 #endif
 // clang-format on
 
-#if !defined(M5HAL_V2_TARGET_PLATFORM_VARIANT_ID)
-#define M5HAL_V2_TARGET_PLATFORM_VARIANT_ID M5HAL_V2_VARIANT_ID_NONE
+#if !defined(M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID)
+#define M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID M5HAL_V2_VARIANT_ID_NONE
 #endif
 
 #endif

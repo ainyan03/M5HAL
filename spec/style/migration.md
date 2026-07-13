@@ -6,9 +6,9 @@ v0 API 利用者が v2 API に移行する際の指針を示す。
 
 ## 基本方針
 
-- 既存コードをそのまま使い続ける場合は `<M5HAL.hpp>` または `<M5HAL_v0.hpp>` を使う
+- v0 対応 target で既存コードをそのまま使い続ける場合は `<M5HAL.hpp>` または `<M5HAL_v0.hpp>` を使う。非 ESP32 Arduino target では v0 entry は利用できないため、`<M5HAL_v2.hpp>` を使う
 - v2 API を使う場合は `<M5HAL_v2.hpp>` を使う
-- v0 と v2 は同一ライブラリ内で共存し、 **同一 translation unit での両エントリ include も可能** (移行途中のファイル等。 [design/v0_v2_coexistence.md](../design/v0_v2_coexistence.md) §エントリヘッダ)。 ただし可読性のため、 通常は TU ごとに使う世代を明示する
+- v0 対応 target では v0 と v2 が同一ライブラリ内で共存し、 **同一 translation unit での両エントリ include も可能** (移行途中のファイル等。 [design/v0_v2_coexistence.md](../design/v0_v2_coexistence.md) §エントリヘッダ)。 ただし可読性のため、 通常は TU ごとに使う世代を明示する
 - v2 への移行は、 旧 API の置き換えではなく **新しい API 体系への移行** として扱う
 
 ## ヘッダ選択
@@ -32,7 +32,7 @@ v0 API 利用者が v2 API に移行する際の指針を示す。
 | `error::error_t` / `error::isError` / `error::isOk` | `hal/error.hpp` | cross-cutting な型 |
 | `types::GpioMode` | `hal/types.hpp` | 命名維持 |
 | `types::gpio_number_t` | `hal/types.hpp` | pin 指定の基本型 |
-| `M5HAL_V2_TARGET_PLATFORM_*` / `M5HAL_FRAMEWORK_HAS_*` | 各 `_checker.hpp` | variant 機構で利用。 platform 系は世代分離のため `M5HAL_V2_` プレフィックス (無印は v0 が所有) |
+| `M5HAL_V2_DETECTED_PLATFORM_VARIANT_*` / `M5HAL_FRAMEWORK_HAS_*` | 各 `_checker.hpp` | variant 機構で利用。 platform 系は世代分離のため `M5HAL_V2_` プレフィックス (無印は v0 が所有) |
 
 ## v0 → v2 読み替え一覧
 
@@ -62,7 +62,7 @@ v0 API 利用者が v2 API に移行する際の指針を示す。
 
 | 機能 | 説明 |
 |---|---|
-| リモートバス機構 | `Hal::connect(endpoint)` (endpoint = `"uart:<path>"` / `"tcp:<host>:<port>"`。 typed API `initUart(port)` / `initTcp("host:port")` も存続) で遠隔 M5HAL server に接続し、 同型 `hal.I2C.acquire()` / `SPI.acquire()` 等で proxy bus を取得する。reconnect 前の proxy は旧 connection を延命せず以後 `CLOSED`。明示解放は Accessor/alias を先に破棄して `hal.<KIND>.release(bus)` を呼び、成功時に handle 自体が reset される。追加のビルドフラグは不要 (`M5HAL_CONFIG_REMOTE=1` は winner scan へ remote variant を参加させる別用途の opt-in)。 詳細は [design/remote.md](../design/remote.md) / [design/bus_accessor.md](../design/bus_accessor.md) |
+| リモートバス機構 | `Hal::connect(endpoint)` (endpoint = `"uart:<path>"` / `"tcp:<host>:<port>"`。 typed API `initUart(port)` / `initTcp("host:port")` も存続) で遠隔 M5HAL server に接続し、 同型 `hal.I2C.acquire()` / `SPI.acquire()` 等で proxy bus を取得する。reconnect 前の proxy は旧 connection を延命せず以後 `CLOSED`。明示解放は Accessor/alias を先に破棄して `hal.<KIND>.release(bus)` を呼び、成功時に handle 自体が reset される。追加のビルドフラグは不要 (`M5HAL_CONFIG_REMOTE_VARIANT=1` は winner scan へ remote variant を参加させる別用途の opt-in)。 詳細は [design/remote.md](../design/remote.md) / [design/bus_accessor.md](../design/bus_accessor.md) |
 
 ## 移行時の確認項目
 

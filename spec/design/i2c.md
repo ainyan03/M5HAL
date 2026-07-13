@@ -348,7 +348,7 @@ ESP-IDF gen5 I2C master backend (`driver/i2c_master.h`) は `freq == 0`、アド
 
 `driver/i2c_master.h` が無く `driver/i2c.h` がある ESP-IDF 世代では gen4 master backend (`driver/i2c.h`) を使う。これは Arduino-ESP32 2.x 系のように SPI master driver はあるが gen5 I2C master driver は無い環境で、ESP-IDF I2C variant を明示利用できるようにするためである。 gen4 backend は 7-bit address の master transfer / probe を対象とし、10-bit address は driver 呼び出し前に `INVALID_ARGUMENT` とする。
 
-master の SCL クロック (`MasterAccessConfig::freq`) は、ESP ターゲットでフェールセーフ上限 (`M5HAL_I2C_MASTER_MAX_CLOCK_HZ`、`hal/v2/i2c/master_clock_limit.hpp`) に**クランプ**する。これは spec / バス品質の制限ではなく、過大なクロックで I2C master ペリフェラルが**異常動作** (波形停止・ライン張り付き) に陥り利用者をデバッグ沼に陥れることを防ぐ安全弁である (弱い pull-up による通信不能は利用者の配線責務であり対象外)。上限超過は**エラーにせず最も近い設定可能クロックに丸める** (利用者が上限値を知らなくても「最速を設定」が機能する)。gen4 / gen5 / Arduino-on-ESP の各 master backend に適用し、超過時は `M5_LIB_LOGW` を一度出す。既定はクロスターゲット保守値で、HW 実測済みは ESP32 classic のみ (~1.25MHz 動作 / 1.3MHz で異常動作)。非 ESP ターゲット (software bit-bang は守るべきペリフェラルが無い / 他コアへの Arduino port) は上限 0 = 無効で、`M5HAL_I2C_MASTER_MAX_CLOCK_HZ` で上書きできる。
+master の SCL クロック (`MasterAccessConfig::freq`) は、ESP ターゲットでフェールセーフ上限 (`M5HAL_CONFIG_I2C_MASTER_MAX_CLOCK_HZ`、`hal/v2/i2c/master_clock_limit.hpp`) に**クランプ**する。これは spec / バス品質の制限ではなく、過大なクロックで I2C master ペリフェラルが**異常動作** (波形停止・ライン張り付き) に陥り利用者をデバッグ沼に陥れることを防ぐ安全弁である (弱い pull-up による通信不能は利用者の配線責務であり対象外)。上限超過は**エラーにせず最も近い設定可能クロックに丸める** (利用者が上限値を知らなくても「最速を設定」が機能する)。gen4 / gen5 / Arduino-on-ESP の各 master backend に適用し、超過時は `M5_LIB_LOGW` を一度出す。既定はクロスターゲット保守値で、HW 実測済みは ESP32 classic のみ (~1.25MHz 動作 / 1.3MHz で異常動作)。非 ESP ターゲット (software bit-bang は守るべきペリフェラルが無い / 他コアへの Arduino port) は上限 0 = 無効で、`M5HAL_CONFIG_I2C_MASTER_MAX_CLOCK_HZ` で上書きできる。
 
 ## RAII (ScopedAccess) との組み合わせ
 

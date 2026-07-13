@@ -13,7 +13,7 @@
 // init() picks the concrete backend from the CONFIG type you pass. The default
 // i2c::BusConfig maps to the build's winner backend; an explicit suffixed
 // config forces a specific one (see the bus declaration and setup() below).
-// Build with -DM5HAL_EXAMPLE_FORCE_SOFTWARE_I2C to drive the same pins with the
+// Build with -DM5HAL_EXAMPLE_I2C_SOFTWARE_BACKEND=1 to drive the same pins with the
 // software (bit-bang) backend.
 //
 // Shared-owner model: acquire() interns the wiring and returns an owning
@@ -42,8 +42,12 @@ constexpr int PIN_SCL = 22;
 static constexpr uint8_t REG_PROBE_R  = 0x00;
 static constexpr uint8_t REG_PROBE_R2 = 0x01;
 
-#ifndef M5HAL_EXAMPLE_HOWTOUSEI2C_FREQ
-#define M5HAL_EXAMPLE_HOWTOUSEI2C_FREQ 100000
+#ifndef M5HAL_EXAMPLE_I2C_FREQUENCY_HZ
+#define M5HAL_EXAMPLE_I2C_FREQUENCY_HZ 100000
+#endif
+
+#ifndef M5HAL_EXAMPLE_I2C_SOFTWARE_BACKEND
+#define M5HAL_EXAMPLE_I2C_SOFTWARE_BACKEND 0
 #endif
 
 // Shared owner, assigned in setup().
@@ -126,13 +130,13 @@ void setup()
 
     Serial.println("M5HAL HowToUseI2C");
     Serial.printf("pins: SDA=%d SCL=%d freq=%u\n", PIN_SDA, PIN_SCL,
-                  static_cast<unsigned>(M5HAL_EXAMPLE_HOWTOUSEI2C_FREQ));
+                  static_cast<unsigned>(M5HAL_EXAMPLE_I2C_FREQUENCY_HZ));
 
     // Tag-typed pins: either order is correct (no swapped-pin accidents). The
     // config TYPE selects the backend: the default BusConfig maps to the winner
     // backend (and carries the Arduino TwoWire handle), while BusConfig_software
     // selects the bit-bang backend on the same pins.
-#ifdef M5HAL_EXAMPLE_FORCE_SOFTWARE_I2C
+#if M5HAL_EXAMPLE_I2C_SOFTWARE_BACKEND
     m5hal::i2c::BusConfig_software bus_cfg{m5hal::i2c::Scl{PIN_SCL}, m5hal::i2c::Sda{PIN_SDA}};
 #else
     m5hal::i2c::BusConfig bus_cfg{m5hal::i2c::Scl{PIN_SCL}, m5hal::i2c::Sda{PIN_SDA}};
@@ -156,7 +160,7 @@ void setup()
 
     m5hal::i2c::MasterAccessConfig acc_cfg;
     acc_cfg.i2c_addr        = addr;
-    acc_cfg.freq            = M5HAL_EXAMPLE_HOWTOUSEI2C_FREQ;
+    acc_cfg.freq            = M5HAL_EXAMPLE_I2C_FREQUENCY_HZ;
     acc_cfg.wire_timeout_ms = 100;
     m5hal::i2c::MasterAccessor dev{i2c_bus, acc_cfg};  // co-owns the acquired bus
 

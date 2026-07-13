@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Host regression harness for the espidf I2C slave backend
 // (m5_hal/variants/frameworks/espidf/hal/i2c/slave.inl). The backend under
-// test compiles UNMODIFIED (gated only by M5HAL_ESPIDF_HOST_HARNESS, added
+// test compiles UNMODIFIED (gated only by M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS, added
 // alongside its existing ESP_PLATFORM gates) against the fake IDF header
 // tree in ../fakes/include. See ../fakes/README.md for the harness design,
 // its fidelity limits, and how to extend it to another peripheral.

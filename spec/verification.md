@@ -16,7 +16,9 @@ M5HAL v2 開発で使う検証コマンドとその運用詳細を示す。
 | SPI API 単体 | SPI Accessor API skeleton の狭い確認 | `pio test -e test_native -f v2/native/bus/test_spi_api` |
 | ThreadSanitizer | posix runtime の並行性契約 (`service::ServiceRunner` auto-run、[design/service.md](design/service.md) §R1-R8) と remote session/proxy/release の並行回帰を `-fsanitize=thread` つきで検証。`test_native` と同じスイートを別ビルドで走らせる (低頻度・時間がかかるため常用の CI には含めない) | `pio test -e test_native_tsan` |
 | クロスチェック v0 | v0 公開 entry の native + ESP32/S3/C3/C6 Arduino/ESP-IDF build fence | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v0/check.ini.cli pio run -e v0_check_native -e v0_check_esp32_arduino -e v0_check_esp32_espidf -e v0_check_esp32_espidf4 -e v0_check_esp32_espidf6 -e v0_check_esp32s3_arduino -e v0_check_esp32s3_espidf -e v0_check_esp32s3_espidf6 -e v0_check_esp32c3_arduino -e v0_check_esp32c3_espidf -e v0_check_esp32c6_espidf` |
-| クロスチェック v2 | v2 公開 entry と主要 API surface の native + ESP32/S3/C3/C6 Arduino/ESP-IDF build fence | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v2/check.ini.cli pio run -e v2_check_native -e v2_check_esp32_arduino -e v2_check_esp32_espidf -e v2_check_esp32_espidf4 -e v2_check_esp32_espidf6 -e v2_check_esp32s3_arduino -e v2_check_esp32s3_espidf -e v2_check_esp32s3_espidf6 -e v2_check_esp32c3_arduino -e v2_check_esp32c3_espidf -e v2_check_esp32c6_espidf` |
+| クロスチェック v2 | v2 公開 entry と主要 API surface の native + ESP32/S3/C3/C6 + allowlist 済み非 ESP32 Arduino/ESP-IDF build fence。非 ESP32 env も v0 empty TU を含む未加工 `src` をビルド | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v2/check.ini.cli pio run -e v2_check_native -e v2_check_esp32_arduino -e v2_check_esp32_espidf -e v2_check_esp32_espidf4 -e v2_check_esp32_espidf6 -e v2_check_esp32s3_arduino -e v2_check_esp32s3_espidf -e v2_check_esp32s3_espidf6 -e v2_check_esp32c3_arduino -e v2_check_esp32c3_espidf -e v2_check_esp32c6_espidf -e v2_check_rp2040_arduino -e v2_check_rp2350_arduino -e v2_check_unor4_minima_arduino -e v2_check_samd51_arduino -e v2_check_stm32f4_arduino -e v2_check_nrf52840_arduino -e v2_check_esp8266_arduino` |
+| 非 ESP32 v0 rejection fence | 非 ESP32 Arduino が `M5HAL_v0.hpp` または compatibility shim `M5HAL.hpp` を include すると、v2 entry への案内つきで compile-fail することを検査 | `test/v2/stub/build_check_v0_rejected.cpp` を直接 entry / shim entry の2構成で期待失敗させ、`build-check-pio.yml` が error message も照合 |
+| SPRESENSE build fence | Sony 公式 Arduino core 3.4.7 / MainCore / 768 KiB 構成で、v0 empty TU を含む未加工 library tree から v2 共通 API surface をビルド | `.github/workflows/build-check-spresense.yml` の Arduino CLI 手順 |
 | v2 inline flip fence | `m5::hal::*` が v2 に resolve される構成の確認 | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v2/check.ini.cli pio run -e v2_check_native_inline` |
 | v0/v2 共存 fence (device) | 同一 TU で両エントリを include し、 include ガードの世代分離と platform checker の macro 名前空間分離 (v0 = 無印 / v2 = `M5HAL_V2_`) を device build で保証 (native 側は `test_coexist_include`) | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v0v2/check.ini.cli pio run -e v0v2_check_esp32_arduino -e v0v2_check_esp32s3_arduino -e v0v2_check_esp32_espidf` |
 | examples build | `pio_envs/v2/examples.ini` の全 env をビルド。 内訳: `HowToUse_{I2C,SPI,UART,UARTEcho,I2SAudio}_{esp32,esp32s3}` / `HowToUse_I2CRegistry_{esp32,esp32s3}` / `HowToUse_Bytecode_esp32` / `HowToUse_Remote_host` / `HowToUse_RemoteI2S_host` / `BuildTest_*` / `RemoteServer_{esp32,esp32s3,esp32_arduino}` / `RemoteServerTCP_{esp32,esp32_arduino,esp32s3_arduino}` / `RemoteTest_host` | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v2/examples.ini pio run -e HowToUse_I2C_esp32 -e HowToUse_I2C_esp32s3 -e HowToUse_SPI_esp32 -e HowToUse_SPI_esp32s3 -e HowToUse_UART_esp32 -e HowToUse_UART_esp32s3 -e HowToUse_UARTEcho_esp32 -e HowToUse_UARTEcho_esp32s3 -e HowToUse_I2CRegistry_esp32 -e HowToUse_I2CRegistry_esp32s3 -e HowToUse_I2SAudio_esp32s3 -e HowToUse_I2SAudio_esp32 -e HowToUse_Bytecode_esp32 -e HowToUse_Remote_host -e HowToUse_RemoteI2S_host -e BuildTest_esp32 -e BuildTest_esp32s3 -e BuildTest_host -e RemoteServer_esp32 -e RemoteServer_esp32s3 -e RemoteServer_esp32_arduino -e RemoteServerTCP_esp32 -e RemoteServerTCP_esp32_arduino -e RemoteServerTCP_esp32s3_arduino -e RemoteTest_host` |
@@ -33,8 +35,8 @@ M5HAL v2 開発で使う検証コマンドとその運用詳細を示す。
 ## CI
 
 push 時の build / test チェックは `.github/workflows/` の workflow に委ねる:
-`build-check-pio.yml`、`build-check-idf.yml`、`clang-format-check.yml`、
-`Arduino-Lint-Check.yml`。各 job の env 構成・cache 設定は workflow file を参照。 ローカルでは上記の検証
+`build-check-pio.yml`、`build-check-idf.yml`、`build-check-spresense.yml`、`clang-format-check.yml`、
+`config-macro-check.yml`、`Arduino-Lint-Check.yml`。各 job の env 構成・cache 設定は workflow file を参照。 ローカルでは上記の検証
 コマンド表で同じ build / test を実行でき、 push 前のバックストップになる。
 
 build 系 workflow は upstream repository と fork で同じ定義を使う。 lint /
@@ -46,8 +48,9 @@ GitHub-hosted runner 固定にする。 これにより fork でも非 fork で�
 CI の v2 compile fence は公開 examples を流用しない。 examples は Arduino IDE
 利用者が読む単独完結コードとして保ち、compile fence は
 `test/v2/build_check/build_check.hpp` に集約する。 この共通コードは
-`test/v2/stub/build_check_{native,arduino,espidf}.cpp` (および inline flip fence 用
-`build_check_v2inline.cpp`) から各 env でビルドされ、さらに
+`test/v2/stub/build_check_{native,arduino,espidf}.cpp`、 target assertion 付きの
+`build_check_{rp2350,unor4_minima}_arduino.cpp`、 SPRESENSE 専用 sketch (および inline flip
+fence 用 `build_check_v2inline.cpp`) から各 env でビルドされ、さらに
 `test/v2/native/test_build_check/` の gtest から同じ関数を実行する。
 これにより I2C / SPI / UART の accessor sugar、Source/Sink overload、Arduino /
 ESP-IDF variant config の公開名が examples と独立して壊れていないことを確認する。

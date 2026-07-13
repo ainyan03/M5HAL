@@ -2,7 +2,7 @@
 #pragma once
 
 // Peripheral-agnostic placement-attribute fake. This harness always builds
-// with M5HAL_ESPIDF_I2C_SLAVE_IRAM_ISR=0 (see platformio.ini), so the
+// with M5HAL_CONFIG_ESPIDF_I2C_SLAVE_IRAM_ISR=0 (see platformio.ini), so the
 // product code never actually applies IRAM_ATTR -- these are defined
 // (empty) only so a backend that references them unconditionally still
 // compiles, and so future peripherals added to this harness (see
