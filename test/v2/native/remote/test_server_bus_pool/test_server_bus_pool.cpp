@@ -31,11 +31,25 @@ data::ConstDataSpan spanOf(const std::array<uint8_t, N>& bytes)
     return data::ConstDataSpan{bytes.data(), bytes.size()};
 }
 
-void putI16LE(std::array<uint8_t, 4>& out, size_t offset, int16_t value)
+template <size_t N>
+void putI16LE(std::array<uint8_t, N>& out, size_t offset, int16_t value)
 {
     const auto v    = static_cast<uint16_t>(value);
     out[offset]     = static_cast<uint8_t>(v & 0xFFu);
     out[offset + 1] = static_cast<uint8_t>(v >> 8);
+}
+
+std::array<uint8_t, 11> i2sConfig(int16_t bclk, int16_t ws, int16_t dout, int16_t din, uint8_t role = 0)
+{
+    std::array<uint8_t, 11> out{};
+    putI16LE(out, 0, bclk);
+    putI16LE(out, 2, ws);
+    putI16LE(out, 4, dout);
+    putI16LE(out, 6, din);
+    out[8]  = role;
+    out[9]  = 8;
+    out[10] = 8;
+    return out;
 }
 
 std::array<uint8_t, 4> i2cConfig(int16_t scl, int16_t sda)
@@ -109,6 +123,11 @@ result_t<void> createI2C(ServerCtx& ctx, uint8_t bus_id, data::ConstDataSpan pin
 result_t<void> releaseI2C(ServerCtx& ctx, uint8_t bus_id)
 {
     return remote::ServerBusPool::handler(&ctx.pool, false, types::bus_kind_t::I2C, bus_id, {nullptr, 0});
+}
+
+result_t<void> createI2S(ServerCtx& ctx, uint8_t bus_id, data::ConstDataSpan pin_config)
+{
+    return remote::ServerBusPool::handler(&ctx.pool, true, types::bus_kind_t::I2S, bus_id, pin_config);
 }
 
 class ServerBusPoolPhysicalSharing : public ::testing::Test {
@@ -206,6 +225,36 @@ TEST_F(ServerBusPoolPhysicalSharing, ReleaseAllOnlyDropsThisConnectionReference)
 
     b.pool.releaseAll();
     EXPECT_EQ(usedI2CSlots(phys), 0u);
+}
+
+TEST_F(ServerBusPoolPhysicalSharing, I2SBusCreateRejectsIncompleteStandardWiringBeforeBackendSelection)
+{
+    remote::ServerPhysicalBusPool phys;
+    ServerCtx ctx{phys};
+
+    const auto missing_bclk = i2sConfig(-1, 25, 26, -1);
+    expectError(createI2S(ctx, 0, spanOf(missing_bclk)), error::error_t::INVALID_ARGUMENT);
+
+    const auto missing_ws_slave = i2sConfig(24, -1, -1, 26, 1);
+    expectError(createI2S(ctx, 0, spanOf(missing_ws_slave)), error::error_t::INVALID_ARGUMENT);
+
+    const auto missing_data = i2sConfig(24, 25, -1, -1);
+    expectError(createI2S(ctx, 0, spanOf(missing_data)), error::error_t::INVALID_ARGUMENT);
+
+    const auto valid_rx_only = i2sConfig(24, 25, -1, 26);
+    expectError(createI2S(ctx, 0, spanOf(valid_rx_only)), error::error_t::NOT_IMPLEMENTED);
+}
+
+TEST(RemoteI2SBusInit, RejectsIncompleteStandardWiringBeforeSessionState)
+{
+    i2s::Bus_remote bus;
+    i2s::BusConfig_remote cfg;
+    cfg.pin_ws   = 25;
+    cfg.pin_dout = 26;
+
+    auto r = bus.init(cfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), error::error_t::INVALID_ARGUMENT) << "err=" << error::toString(r.error());
 }
 
 }  // namespace

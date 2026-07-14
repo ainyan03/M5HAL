@@ -122,6 +122,15 @@ struct Din {
     types::gpio_number_t value;
 };
 
+/*!
+  @brief Standard-I2S wiring and backend configuration.
+
+  Both master and slave configurations require non-negative BCLK and WS pins,
+  plus at least one direction pin (DOUT for TX and/or DIN for RX). `init()` /
+  typed `acquire()` reject an incomplete configuration with `INVALID_ARGUMENT`;
+  MCLK remains optional. PDM is a separate bus/API and is not selected through
+  this configuration.
+ */
 struct IBusConfig : public bus::IBusConfig {
     /*!
       @brief Clock direction (which side of the link drives BCLK / WS).
@@ -136,8 +145,8 @@ struct IBusConfig : public bus::IBusConfig {
         Slave  = 1,
     };
 
-    types::gpio_number_t pin_bclk = -1;
-    types::gpio_number_t pin_ws   = -1;
+    types::gpio_number_t pin_bclk = -1;  ///< Required standard-I2S bit clock pin.
+    types::gpio_number_t pin_ws   = -1;  ///< Required standard-I2S word-select/LRCLK pin.
     types::gpio_number_t pin_dout = -1;  ///< TX (playback) data out; -1 = no TX channel.
     types::gpio_number_t pin_din  = -1;  ///< RX (recording) data in; -1 = no RX channel.
     types::gpio_number_t pin_mclk = -1;  ///< External MCLK output for codecs that require it; -1 = disabled.
@@ -210,7 +219,7 @@ struct AccessConfig : public bus::IAccessConfig {
     uint32_t write_timeout_ms = 1000;  ///< Max wait for DMA free space during write, in ms; 0 = non-blocking.
     uint32_t read_timeout_ms  = 1000;  ///< Max wait for DMA captured data during read, in ms; 0 = non-blocking.
     uint8_t bits_per_sample   = 16;    ///< Currently only 16 is supported.
-    uint8_t channels          = 2;     ///< 1 = mono / 2 = stereo.
+    uint8_t channels          = 2;     ///< Logical PCM shape: 1 = mono / 2 = interleaved stereo.
 
     constexpr AccessConfig(void) : bus::IAccessConfig{types::bus_kind_t::I2S}
     {

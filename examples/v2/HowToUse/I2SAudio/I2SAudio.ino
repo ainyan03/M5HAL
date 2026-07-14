@@ -16,13 +16,11 @@
 //                                  may be incomplete).
 //
 // Pin / register sources:
-//   M5Unified.cpp (M5Unified_sandbox)
-//   - CoreS3: line 2211-2221 (spk_cfg), lines 415-488 (aw88298 / aw9523 init)
-//             internal I2C: line 78 SCL=GPIO11, SDA=GPIO12
-//             I2S: BCK=GPIO34, WS=GPIO33, DOUT=GPIO13
-//   - Core2 V1.1: line 2483-2490 (spk_cfg BCK=GPIO12, WS=GPIO0, DOUT=GPIO2)
-//             speaker enable via AXP2101 ALDO3 = 3300 mV (line 447-448)
-//             external I2C: line 125 SCL=GPIO22, SDA=GPIO21
+//   M5Unified's public board definitions and speaker bring-up implementations.
+//   - CoreS3: AW9523 / AW88298 initialization; internal I2C uses SCL=GPIO11,
+//             SDA=GPIO12; I2S uses BCK=GPIO34, WS=GPIO33, DOUT=GPIO13.
+//   - Core2 V1.1: AXP2101 ALDO3 speaker power; external I2C uses SCL=GPIO22,
+//             SDA=GPIO21; I2S uses BCK=GPIO12, WS=GPIO0, DOUT=GPIO2.
 //
 // Audio configuration:
 //   - 44100 Hz sample rate, 16-bit stereo, Philips standard
@@ -127,7 +125,8 @@ static void printError(const char* label, m5hal::error::error_t error)
 
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
 
-// CoreS3 amplifier init sequence derived from M5Unified.cpp lines 458-488.
+// This register sequence follows M5Unified's CoreS3 AW9523/AW88298
+// speaker bring-up.
 // sample_rate=44100 → rate index 7 in rate_tbl {4,5,6,8,10,11,15,20,22,44}
 // → reg 0x06 = 7 | 0x14C0 (BCK mode 16*2) = 0x14C7.
 static void initAmplifier(const std::shared_ptr<m5hal::i2c::IBus>& i2c)
@@ -167,7 +166,7 @@ static void initAmplifier(const std::shared_ptr<m5hal::i2c::IBus>& i2c)
 #elif defined(CONFIG_IDF_TARGET_ESP32)
 
 // Core2 V1.1 amplifier init: AXP2101 ALDO3 → 3300 mV to power the speaker.
-// Source: M5Unified.cpp (AXP2101_Class::_set_LDO(2, 3300)): reg 0x94 =
+// The voltage encoding follows M5Unified's AXP2101_Class::_set_LDO(2, 3300): reg 0x94 =
 // (3300 - 500) / 100 = 0x1C, reg 0x90 bit 2 = ALDO3 enable.
 static void initAmplifier(const std::shared_ptr<m5hal::i2c::IBus>& i2c)
 {

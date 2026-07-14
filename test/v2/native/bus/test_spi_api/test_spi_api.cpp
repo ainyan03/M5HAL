@@ -533,7 +533,7 @@ TEST(MasterAccessor, SyncPreflightRejectionAlsoPoisonsTransaction)
 
     // Even though the bus would now succeed, the transaction is poisoned.
     bus.fail_transfer = false;
-    auto second = accessor.transfer(spi::TransferDesc{}, tx, data::DataSpan{});
+    auto second       = accessor.transfer(spi::TransferDesc{}, tx, data::DataSpan{});
     ASSERT_FALSE(second.has_value());
     EXPECT_EQ(second.error(), error::error_t::IO_ERROR);
     EXPECT_TRUE(bus.calls.empty());  // the second segment never reached the bus
@@ -881,11 +881,8 @@ TEST(SoftwareIBus, AccessorPinDcOverridesBusPinDc)
     EXPECT_EQ(countWrites(port.events, softPin(1), true), 0u);
 }
 
-// Rejection boundary for the single-lane variants: multi-lane
-// modes (dual/quad/octal) are always NOT_IMPLEMENTED; half-duplex modes
-// are rejected only when one transfer carries BOTH tx and rx data
-// (full-duplex clocking would corrupt the response). One-directional
-// half-duplex transfers keep working — the DC-pin demos depend on them.
+// Rejection boundary for the single-lane software variant: multi-lane
+// modes remain unimplemented, while half-duplex TX and RX are sequential.
 TEST(SoftwareIBus, UnimplementedDataModesAreRejected)
 {
     auto& gpio = softwareSpiGPIO();
@@ -911,8 +908,9 @@ TEST(SoftwareIBus, UnimplementedDataModesAreRejected)
         EXPECT_EQ(result.error(), error::error_t::NOT_IMPLEMENTED);
     }
 
-    // Half-duplex carrying both tx and rx data: rejected.
+    // Half-duplex carrying both tx and rx data: TX then RX.
     {
+        gpio._port.setReadValue(true);
         spi::MasterAccessConfig cfg;
         cfg.freq          = 20000000;
         cfg.spi_data_mode = spi::spi_data_mode_t::HalfDuplex;
@@ -921,12 +919,9 @@ TEST(SoftwareIBus, UnimplementedDataModesAreRejected)
         auto result =
             accessor.transfer(spi::TransferDesc{}, data::ConstDataSpan{tx, sizeof(tx)}, data::DataSpan{rx, sizeof(rx)});
         auto end = accessor.endTransaction();
-        ASSERT_FALSE(result.has_value());
-        EXPECT_EQ(result.error(), error::error_t::NOT_IMPLEMENTED);
-        // The rejected segment poisons the transaction (unified latch
-        // contract, spec/design/spi.md §transaction 中のエラー).
-        ASSERT_FALSE(end.has_value());
-        EXPECT_EQ(end.error(), error::error_t::NOT_IMPLEMENTED);
+        ASSERT_TRUE(result.has_value()) << "err=" << error::toString(result.error());
+        ASSERT_TRUE(end.has_value()) << "err=" << error::toString(end.error());
+        EXPECT_EQ(rx[0], 0xFF);
     }
 
     // Half-duplex one-directional write: still works.
@@ -938,6 +933,62 @@ TEST(SoftwareIBus, UnimplementedDataModesAreRejected)
         auto result = accessor.write(data::ConstDataSpan{tx, sizeof(tx)});
         EXPECT_TRUE(result.has_value());
     }
+}
+
+TEST(SoftwareIBus, MisoLessReadRequiresAndUsesHalfDuplexMosi)
+{
+    auto& gpio = softwareSpiGPIO();
+    auto& port = gpio._port;
+    m5::hal::v2::spi::Bus_software bus;
+    spi::BusConfig_software bus_cfg;
+    bus_cfg.pin_clk  = softPin(0);
+    bus_cfg.pin_mosi = softPin(2);
+    ASSERT_TRUE(bus.init(bus_cfg).has_value());
+
+    uint8_t rx[1]      = {};
+    const uint8_t tx[] = {0xA5};
+
+    spi::MasterAccessConfig full_cfg;
+    full_cfg.freq = 20000000;
+    spi::MasterAccessor full{bus, full_cfg};
+    ASSERT_TRUE(full.beginTransaction().has_value());
+    port.clear();
+    auto rejected =
+        full.transfer(spi::TransferDesc{}, data::ConstDataSpan{tx, sizeof(tx)}, data::DataSpan{rx, sizeof(rx)});
+    EXPECT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error(), error::error_t::INVALID_STATE);
+    EXPECT_EQ(countWrites(port.events, softPin(0), true), 0u);
+    EXPECT_FALSE(full.endTransaction().has_value());
+
+    spi::MasterAccessConfig half_cfg;
+    half_cfg.freq          = 20000000;
+    half_cfg.spi_data_mode = spi::spi_data_mode_t::HalfDuplex;
+    spi::MasterAccessor half{bus, half_cfg};
+    port.setReadValue(true);
+    ASSERT_TRUE(half.beginTransaction().has_value());
+    port.clear();
+    auto transferred =
+        half.transfer(spi::TransferDesc{}, data::ConstDataSpan{tx, sizeof(tx)}, data::DataSpan{rx, sizeof(rx)});
+    ASSERT_TRUE(transferred.has_value()) << "err=" << error::toString(transferred.error());
+    ASSERT_TRUE(half.endTransaction().has_value());
+    EXPECT_EQ(rx[0], 0xFF);
+
+    const auto input_mode = std::find_if(port.events.begin(), port.events.end(), [](const auto& event) {
+        return event.gpio_num == 2 && event.kind == RecordingPort::Kind::SetMode &&
+               event.mode == types::gpio_mode_t::Input;
+    });
+    ASSERT_NE(input_mode, port.events.end());
+    const auto output_mode = std::find_if(input_mode + 1, port.events.end(), [](const auto& event) {
+        return event.gpio_num == 2 && event.kind == RecordingPort::Kind::SetMode &&
+               event.mode == types::gpio_mode_t::Output;
+    });
+    ASSERT_NE(output_mode, port.events.end());
+    EXPECT_TRUE(std::any_of(port.events.begin(), input_mode, [](const auto& event) {
+        return event.gpio_num == 2 && event.kind == RecordingPort::Kind::Write;
+    }));
+    EXPECT_TRUE(std::any_of(input_mode, output_mode, [](const auto& event) {
+        return event.gpio_num == 2 && event.kind == RecordingPort::Kind::Read;
+    }));
 }
 
 TEST(SoftwareIBus, ReadSamplesMiso)

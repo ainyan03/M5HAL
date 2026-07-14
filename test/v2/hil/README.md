@@ -1,25 +1,24 @@
-# experiments/test — `pio run` 方式のテスト
+# test/v2/hil — `pio run` 方式の実機テスト
 
 ここは **`pio test` ではなく `pio run` で動かすテスト系**の置き場。現状の主役は
 **HIL（hardware-in-the-loop）**: native ホストプロセスと実機 firmware が実リンク（USB シリアル等）で
 同時に動き、**ホスト側が実機と通信して結果を判定する**検証。
 
-`test/` 配下（`pio test` の gtest スイート）とは役割が違う:
+`pio test` で実行する native / embedded スイートとは役割が違う:
 
 | 場所 | 主体 | 判定 | CI |
 |---|---|---|---|
 | `test/v2/native/` | host のみ | host gtest（`pio test`） | ✅ 自動・HW 不要 |
 | `test/v2/embedded/` | device のみ | device 自己判定（Unity） | 手動・実機 |
-| `experiments/v2/` | device のみ | 人間が目視 / ロジアナ | 手動・探索/デモ |
-| **`experiments/v2/test/`（ここ）** | **device + host ペア** | **host が device と喋って判定** | 手動・実機＋ポート指定 |
+| **`test/v2/hil/`（ここ）** | **device + host ペア** | **host が device と喋って判定** | 手動・実機＋ポート指定 |
 
-`pio test` は探索先が `test_dir`（=`test/`）に固定されるため使えない。よって host ドライバは
+device / host の専用 env が対象ソースを明示しているため、host ドライバは
 **gtest バイナリを `pio run` でビルド → 直接実行**する。
 
 ## レイアウト
 
 ```
-experiments/v2/test/
+test/v2/hil/
   common/hil_host.hpp        共有ホストハーネス（ポート open / sync / drain / readExact / env）
   hil-run.sh                 ランナー（flash → host ビルド → host 実行）
   <name>/
@@ -36,8 +35,8 @@ env は `pio_envs/v2/hil.ini.cli`（GUI に出さない `.ini.cli`。`M5HAL_PIO_
 一発（ポート自動検出 / baud 指定可）:
 
 ```sh
-experiments/v2/test/hil-run.sh uart_echo                       # 既定 115200
-experiments/v2/test/hil-run.sh uart_echo /dev/cu.usbserial-X 3000000
+test/v2/hil/hil-run.sh uart_echo                       # 既定 115200
+test/v2/hil/hil-run.sh uart_echo /dev/cu.usbserial-X 3000000
 ```
 
 手動:
@@ -54,10 +53,10 @@ M5HAL_POSIX_UART_PORT=/dev/cu.usbserial-X \
 
 ## 新しい HIL テストの追加
 
-1. `experiments/v2/test/<name>/device/<name>.cpp`（実機 firmware）と
-   `experiments/v2/test/<name>/host/<name>.cpp`（host gtest、`#include "../../common/hil_host.hpp"`）を作る。
+1. `test/v2/hil/<name>/device/<name>.cpp`（実機 firmware）と
+   `test/v2/hil/<name>/host/<name>.cpp`（host gtest、`#include "../../common/hil_host.hpp"`）を作る。
 2. `pio_envs/v2/hil.ini.cli` に `v2_hil_<name>_device_esp32` と `v2_hil_<name>_host` を追加。
-3. `experiments/v2/test/<name>/README.md` に配線・実行・期待結果を書く。
-4. `experiments/v2/test/hil-run.sh <name>` で動く。
+3. `test/v2/hil/<name>/README.md` に配線・実行・期待結果を書く。
+4. `test/v2/hil/hil-run.sh <name>` で動く。
 
 remote バス等の将来の HIL（host transport ↔ device server）も同じ枠に乗る。

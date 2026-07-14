@@ -147,6 +147,55 @@ bool MuxFrameEncoder::writeFrame(frame::Kind kind, uint8_t b3, ConstDataSpan pay
     return true;
 }
 
+bool MuxFrameEncoder::writeFrameWithOptionalPrefix(frame::Kind prefix_kind, uint8_t prefix_b3,
+                                                   ConstDataSpan prefix_payload, frame::Kind required_kind,
+                                                   uint8_t required_b3, ConstDataSpan required_payload,
+                                                   bool* prefix_written)
+{
+    if (prefix_written != nullptr) {
+        *prefix_written = false;
+    }
+    if (_alloc == nullptr || _output.blockCount() >= BlockSource::kMaxBlocks) {
+        return false;
+    }
+
+    // Reserve the required frame's memory before attempting the optional
+    // prefix. This is the response-priority boundary under allocator pressure.
+    auto* required_block = static_cast<uint8_t*>(_alloc->allocate(frame::kMaxFrameSize, memory::usage_t::Temp));
+    if (required_block == nullptr) {
+        return false;
+    }
+    auto required_encoded =
+        frame::encodeChecked({required_block, frame::kMaxFrameSize}, required_kind, required_b3, required_payload);
+    if (!required_encoded.has_value()) {
+        _alloc->deallocate(required_block);
+        return false;
+    }
+
+    if (_output.blockCount() + 1 < BlockSource::kMaxBlocks) {
+        auto* prefix_block = static_cast<uint8_t*>(_alloc->allocate(frame::kMaxFrameSize, memory::usage_t::Temp));
+        if (prefix_block != nullptr) {
+            auto prefix_encoded =
+                frame::encodeChecked({prefix_block, frame::kMaxFrameSize}, prefix_kind, prefix_b3, prefix_payload);
+            if (prefix_encoded.has_value() && _output.addBlock(prefix_block, prefix_encoded.value())) {
+                if (prefix_written != nullptr) {
+                    *prefix_written = true;
+                }
+            } else {
+                _alloc->deallocate(prefix_block);
+            }
+        }
+    }
+
+    // The capacity check above reserved this queue slot. addBlock can only
+    // fail here if its structural contract changes.
+    if (!_output.addBlock(required_block, required_encoded.value())) {
+        _alloc->deallocate(required_block);
+        return false;
+    }
+    return true;
+}
+
 bool MuxFrameEncoder::writeDelimiter()
 {
     if (_alloc == nullptr) {

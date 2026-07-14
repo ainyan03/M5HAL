@@ -396,9 +396,10 @@ size_t encodeLenVar(uint8_t* dst, size_t value)
 
 result_t<data::DataSpan> BytecodeEncoder::beginInstruction(OpCode opcode, size_t payload_size)
 {
-    // A payload near SIZE_MAX (broken caller span) would wrap the size
-    // arithmetic below; reject it before any reservation happens.
-    if (payload_size > static_cast<size_t>(-1) - 8) {
+    // The length field includes the opcode and is encoded as u32. Reject both
+    // host-size overflow and values that only fit size_t on a 64-bit host.
+    constexpr size_t kMaxPayloadSize = static_cast<size_t>(UINT32_MAX) - 1;
+    if (payload_size > kMaxPayloadSize || payload_size > static_cast<size_t>(-1) - 6) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
     }
     const size_t size_field = 1 + payload_size;
@@ -805,7 +806,14 @@ result_t<void> BytecodeEncoder::streamTransfer(types::bus_kind_t kind, uint8_t b
 result_t<void> BytecodeEncoder::busCreate(types::bus_kind_t kind, uint8_t bus_id, uint8_t store_id,
                                           data::ConstDataSpan pin_config)
 {
-    auto payload = beginInstruction(OpCode::BusCreate, 3 + pin_config.size);
+    if (pin_config.data == nullptr && pin_config.size != 0) {
+        return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
+    }
+    auto payload_size = checkedPayload(3, pin_config.size);
+    if (!payload_size.has_value()) {
+        return m5::stl::make_unexpected(payload_size.error());
+    }
+    auto payload = beginInstruction(OpCode::BusCreate, payload_size.value());
     if (!payload.has_value()) {
         return m5::stl::make_unexpected(payload.error());
     }
@@ -856,7 +864,11 @@ result_t<void> BytecodeEncoder::storeData(uint8_t store_id, data::ConstDataSpan 
     if (bytes.data == nullptr && bytes.size != 0) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
     }
-    auto payload = beginInstruction(OpCode::StoreData, 1 + bytes.size);
+    auto payload_size = checkedPayload(1, bytes.size);
+    if (!payload_size.has_value()) {
+        return m5::stl::make_unexpected(payload_size.error());
+    }
+    auto payload = beginInstruction(OpCode::StoreData, payload_size.value());
     if (!payload.has_value()) {
         return m5::stl::make_unexpected(payload.error());
     }

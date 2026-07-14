@@ -11,10 +11,24 @@
 #include <gtest/gtest.h>
 #include "support/gtest_watchdog.hpp"
 #include <M5HAL_v2.hpp>
+#include "m5_hal/variants/frameworks/arduino/hal/i2c/begin_result.hpp"
 
 #include <cstdint>
 
 namespace {
+
+TEST(ArduinoI2CBeginResult, VoidReturnHasNoFailureSignal)
+{
+    bool called = false;
+    EXPECT_TRUE(m5::hal::v2::i2c::wire_begin_detail::invokeWireBegin([&] { called = true; }));
+    EXPECT_TRUE(called);
+}
+
+TEST(ArduinoI2CBeginResult, BoolReturnPropagatesSuccessAndFailure)
+{
+    EXPECT_TRUE(m5::hal::v2::i2c::wire_begin_detail::invokeWireBegin([] { return true; }));
+    EXPECT_FALSE(m5::hal::v2::i2c::wire_begin_detail::invokeWireBegin([] { return false; }));
+}
 
 namespace bus   = m5::hal::v2::bus;
 namespace data  = m5::hal::v2::data;
@@ -118,7 +132,7 @@ TEST(I2CMasterAccessor, SyncPreflightRejectionAlsoPoisonsTransaction)
 
     // Even though the bus would now succeed, the transaction is poisoned.
     bus.fail_transfer = false;
-    auto second = accessor.transfer(i2c::TransferDesc{}, tx, data::DataSpan{});
+    auto second       = accessor.transfer(i2c::TransferDesc{}, tx, data::DataSpan{});
     ASSERT_FALSE(second.has_value());
     EXPECT_EQ(second.error(), error::error_t::INVALID_ARGUMENT);
     EXPECT_EQ(bus.transfer_calls, 0u);  // the second segment never reached the bus

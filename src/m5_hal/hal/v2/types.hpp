@@ -191,8 +191,10 @@ using backend_kind_t = BackendKind;
   LOCAL to a bus kind (i2c, spi, i2s each define their own), EXCEPT bits 0-1
   (`HARDWARE`, `LOW_POWER`) which are reserved across all kinds so the
   kind-agnostic controller resolver can reason about them without knowing the
-  kind. The software (bit-bang) backend offers no capabilities (it does not
-  set `HARDWARE`).
+  kind. The software (bit-bang) backend does not participate in controller
+  capability matching (and never sets `HARDWARE`). A kind may guarantee that
+  its software fallback implements a declared feature and use the matching
+  kind-local bit only to exclude hardware controllers that do not.
  */
 using backend_caps_t = uint16_t;
 

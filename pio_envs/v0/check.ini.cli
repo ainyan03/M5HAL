@@ -9,7 +9,6 @@
 ; 使い方:
 ;   pio run -e v0_check_native
 ;   pio run -e v0_check_esp32_arduino
-;   pio run -e v0_check_esp32_espidf4
 ;   pio run -e v0_check_esp32_espidf6
 ; =============================================================================
 
@@ -23,10 +22,6 @@ build_src_filter = +<*> +<../test/v0/stub/build_check_arduino.cpp>
 
 [env:v0_check_esp32_espidf]
 extends = common_esp32dev_espidf5, common_espidf
-build_src_filter = +<*> +<../test/v0/stub/build_check_espidf.cpp>
-
-[env:v0_check_esp32_espidf4]
-extends = common_esp32dev_espidf4, common_espidf
 build_src_filter = +<*> +<../test/v0/stub/build_check_espidf.cpp>
 
 [env:v0_check_esp32_espidf6]

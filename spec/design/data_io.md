@@ -117,7 +117,7 @@ public:
 - **`commit(N)`**: 通常は直前の `reserve` で返した DataSpan に書き込んだ量を報告する。 `N ≤ reserve size` であること
 - **契約違反は未定義動作 (UB)** — `commit size > reserve size`、 `reserve` なしで `commit`、 等は派生実装に依存し一般に未定義。 派生実装は size 検証ロジックを **持たなくてよい** (任意で debug assert を持つことを推奨)
 - **`closed()`**: 「これ以上書き込めない」 final state の問い合わせ
-- **`partialCommitAccepted()` (部分 commit の受理数)**: ほとんどの派生では `commit(N)` は atomic (成功なら N 全量、 失敗なら 0) だが、 `commit` 自体が内部でブロッキング I/O を行う派生 (`StreamSink` が transport `write` をラップする場合など) は、 その I/O が N より短いプレフィックスだけ受理してからエラーを返し得る。 `partialCommitAccepted()` は直近の失敗した `commit()` が実際に受理したバイト数を返す。 デフォルト実装は 0 で、 commit が atomic な派生 (`MemorySink`/`RingFIFO::SinkView` 等) はこれで正しい。 デコレータ (`LimitedSink`) は base の受理数を転送する。 (`StdioSink` は `fwrite` の戻り値を検査しないため atomic の例には数えない — 監査 minor 既知)。 `Source`/`Sink` を介して転送を中継する caller (§stream 系: `remote::detail::drainToSink` 等) は、 `commit` 失敗時にこの値だけ upstream の `Source::advance` を呼ぶことで、 「受理済みバイトを二度と再送しない・未受理バイトを捨てない (残りは次回の pump で再開)」 という中継契約を実装する
+- **`partialCommitAccepted()` (部分 commit の受理数)**: ほとんどの派生では `commit(N)` は atomic (成功なら N 全量、 失敗なら 0) だが、 `commit` 自体が内部でブロッキング I/O を行う派生 (`StreamSink` が transport `write` をラップする場合など) は、 その I/O が N より短いプレフィックスだけ受理してからエラーを返し得る。 `partialCommitAccepted()` は直近の失敗した `commit()` が実際に受理したバイト数を返す。 デフォルト実装は 0 で、 commit が atomic な派生 (`MemorySink`/`RingFIFO::SinkView` 等) はこれで正しい。 デコレータ (`LimitedSink`) は base の受理数を転送する。`StdioSink` は `fwrite` の短い戻りまたは `fflush` 失敗を `IO_ERROR` として返し、`fwrite` が受理したプレフィックス長を `partialCommitAccepted()` で公開する。 `Source`/`Sink` を介して転送を中継する caller (§stream 系: `remote::detail::drainToSink` 等) は、 `commit` 失敗時にこの値だけ upstream の `Source::advance` を呼ぶことで、 「受理済みバイトを二度と再送しない・未受理バイトを捨てない (残りは次回の pump で再開)」 という中継契約を実装する
 
 ## Source と Sink の意図的な非対称性
 
@@ -132,7 +132,7 @@ public:
 
 ## error path の責務
 
-Source / Sink の 4 つの core API (`peek` / `advance` / `reserve` / `commit`) は全て `result_t<...>` を返す。 これは **将来の stream 通信派生 (TCP/UDP/network ringbuffer/DMA/remote bus 等、 真の I/O error を発生させ得る派生) を視野に入れた抽象基底の規約**。 typical な同期メモリ系派生 (`MemorySource` / `MemorySink` / `LimitedSource` / `LimitedSink`) が現状 error を返さないのは **派生実装の現状であり、 抽象基底の規約ではない**。
+Source / Sink の 4 つの core API (`peek` / `advance` / `reserve` / `commit`) は全て `result_t<...>` を返す。 これは **将来の stream 通信派生 (TCP/UDP/network ringbuffer/DMA/remote bus 等、 真の I/O error を発生させ得る派生) を視野に入れた抽象基底の規約**。 typical な同期メモリ系派生 (`MemorySource` / `MemorySink`) が現状 error を返さないのは **派生実装の現状であり、 抽象基底の規約ではない**。`LimitedSource` / `LimitedSink` は自ら新しい error を生成しないが、base の error はそのまま伝播する。
 
 ### caller 側の遵守事項
 
@@ -178,7 +178,7 @@ stream / frame / remote 系で必要になる粒度は v2 `error_t` に追加済
 |---|---|---|
 | `MemorySource` | `hal/data/memory.hpp` | 固定 `ConstDataSpan` を起点に Source として yield する基本実装。 ctor は span 版に加え `(const uint8_t*, len)` 糖衣あり |
 | `MemorySink` | 同上 | 固定 `DataSpan` に書き込む基本実装。 ctor は span 版に加え `(uint8_t*, len)` 糖衣。 進捗系 = `written()` / `capacity()` / `remaining()`。 `commit(N)` の oversize は契約違反で debug assert (release は cursor を clamp して overrun させない) |
-| `LimitedSource` | `hal/data/limited.hpp` | base となる Source を「先頭 N byte だけ」 に制限する装飾。 base が先に eof / closed になればその時点で eof / closed。 cap 消費後も closed。 **ctor 2 種**: 参照版は base 必須、 ポインタ版は optional で **null = 意図的な空 Source** (即 eof) |
+| `LimitedSource` | `hal/data/limited.hpp` | base となる Source を「先頭 N byte だけ」 に制限する装飾。 base が先に eof / closed になればその時点で eof / closed。 cap 消費後も closed。base の error はそのまま伝播し、`advance` 失敗時は local cap を消費しない。error 後の cursor 状態と retry 可否は base の契約に従う。 **ctor 2 種**: 参照版は base 必須、 ポインタ版は optional で **null = 意図的な空 Source** (即 eof) |
 | `LimitedSink` | 同上 | base となる Sink を「N byte だけ」 に制限する装飾。 ringbuffer 等の容量不明 / 無限 Sink から「N byte だけ受信」 を実現するのが典型用途。 ctor 2 種は `LimitedSource` と同様 (ポインタ版 null = 意図的な空 Sink、 即 closed) |
 | `StreamReader` / `StreamWriter` | `hal/data/stream.hpp` | pull/push 型バイトストリームの最小能力を表す抽象 (§Stream アダプタ)。 UART split accessor 等の transport が実装する |
 | `StreamSource` | 同上 | `StreamReader` を Source に持ち上げるアダプタ。 caller 提供 scratch で `peek` の借用契約を実現 |

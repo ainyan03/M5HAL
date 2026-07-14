@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
 //
-// experiments/v2/test/common/hil_host.hpp
+// test/v2/hil/common/hil_host.hpp
 //
-// Shared host-side harness for HIL (hardware-in-the-loop) experiment-tests: a
+// Shared host-side harness for HIL (hardware-in-the-loop) tests: a
 // native host process drives a real device over a serial link through the
 // M5HAL posix UART variant, and judges the device by what comes back.
 //
-// HIL tests live under experiments/v2/test/<name>/{device,host}/ and run via
-// `pio run` + executing the built host binary (NOT `pio test`, whose discovery
-// is locked to test_dir). See experiments/v2/test/README.md.
+// HIL tests live under test/v2/hil/<name>/{device,host}/ and run via
+// `pio run` + executing the built host binary (NOT `pio test`; dedicated HIL
+// environments select the device and host sources). See test/v2/hil/README.md.
 //
 // Reusable pieces:
 //   - env helpers:    hil::portEnv(), hil::baudEnv()
@@ -20,8 +20,8 @@
 //
 // New HIL host drivers reuse these so each driver stays thin.
 
-#ifndef M5HAL_EXPERIMENTS_TEST_COMMON_HIL_HOST_HPP_
-#define M5HAL_EXPERIMENTS_TEST_COMMON_HIL_HOST_HPP_
+#ifndef M5HAL_TEST_V2_HIL_COMMON_HIL_HOST_HPP_
+#define M5HAL_TEST_V2_HIL_COMMON_HIL_HOST_HPP_
 
 #include <M5HAL_v2.hpp>
 

@@ -3,6 +3,7 @@
 #define M5_HAL_VARIANTS_FRAMEWORKS_ARDUINO_HAL_I2C_I2C_INL
 
 #include "i2c.hpp"
+#include "begin_result.hpp"
 #include "../../../../../hal/v2/bus/bus.hpp"
 #include <M5Utility.hpp>
 
@@ -65,14 +66,14 @@ error::error_t Bus_arduino::attach(::TwoWire& wire)
 
 result_t<void> Bus_arduino::init(const BusConfig_arduino& config)
 {
-    _config = config;
-    if (_wire) {
-        (void)release();
-    }
     auto* wire = config.wire;
     if (wire == nullptr) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
+    if (_wire) {
+        (void)release();
+    }
+    bool began = false;
 
 #if defined(ESP_PLATFORM) || defined(ARDUINO_ARCH_ESP8266)
     // TwoWire::begin(sda, scl) is an Espressif extension (arduino-esp32 and
@@ -80,17 +81,24 @@ result_t<void> Bus_arduino::init(const BusConfig_arduino& config)
     // Arduino core (see _checker.hpp) has a matching overload —
     // TwoWire::begin(uint8_t) means "start as I2C slave at this address" on
     // the portable Arduino Wire API, not pin selection.
-    if (_config.pin_sda >= 0 && _config.pin_scl >= 0) {
-        wire->begin(static_cast<int>(_config.pin_sda), static_cast<int>(_config.pin_scl));
+    if (config.pin_sda >= 0 && config.pin_scl >= 0) {
+        began = wire_begin_detail::invokeWireBegin(
+            [&] { return wire->begin(static_cast<int>(config.pin_sda), static_cast<int>(config.pin_scl)); });
     } else {
-        wire->begin();
+        began = wire_begin_detail::invokeWireBegin([&] { return wire->begin(); });
     }
 #else
     // Portable cores fix SDA/SCL per Wire instance (board variant file);
     // a configured pin pair cannot be honored here and is ignored.
-    wire->begin();
+    began = wire_begin_detail::invokeWireBegin([&] { return wire->begin(); });
 #endif
 
+    if (!began) {
+        impl_arduino::wireEnd(*wire);
+        return m5::stl::make_unexpected(error::error_t::IO_ERROR);
+    }
+
+    _config  = config;
     auto err = attach(*wire);
     if (error::isError(err)) {
         impl_arduino::wireEnd(*wire);

@@ -177,6 +177,31 @@ TEST(BusRegistry, DistinctPinsReturnDistinctInstances)
     EXPECT_EQ(reg.liveCount(), 2u);
 }
 
+TEST(BusRegistry, UnsetPinsAreOrdinaryIdentityValuesAndFailedMakeIsNotInterned)
+{
+    v2::bus::BusRegistry reg;
+    const auto unset = keyOf(-1, -1);
+    int failed_calls = 0;
+    auto failed =
+        reg.acquireOrFind(v2::types::bus_kind_t::SPI, unset, [&]() -> v2::result_t<std::shared_ptr<v2::bus::IBus>> {
+            ++failed_calls;
+            return m5::stl::make_unexpected(v2::error::error_t::INVALID_ARGUMENT);
+        });
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), v2::error::error_t::INVALID_ARGUMENT);
+    EXPECT_EQ(failed_calls, 1);
+    EXPECT_EQ(reg.liveCount(), 0u);
+
+    int success_calls = 0;
+    auto a            = reg.acquireOrFind(v2::types::bus_kind_t::SPI, unset, CountingMaker{&success_calls});
+    auto b            = reg.acquireOrFind(v2::types::bus_kind_t::SPI, unset, CountingMaker{&success_calls});
+    ASSERT_TRUE(a.has_value());
+    ASSERT_TRUE(b.has_value());
+    EXPECT_EQ(a.value().get(), b.value().get());
+    EXPECT_EQ(success_calls, 1);
+    EXPECT_EQ(reg.liveCount(), 1u);
+}
+
 TEST(BusRegistry, FullRegistryReturnsOutOfResource)
 {
     v2::bus::BusRegistry reg;

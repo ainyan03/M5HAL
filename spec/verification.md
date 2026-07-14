@@ -15,8 +15,8 @@ M5HAL v2 開発で使う検証コマンドとその運用詳細を示す。
 | remote TCP E2E | 実物の TCP connection/server 経路。Hal reconnect 後も旧 GPIO `Pin` storage が有効で、新 peer と分離され、最終 cache/no-op 契約になることを含む | `pio test -e test_native -f v2/native/remote/test_tcp_remote_server` |
 | SPI API 単体 | SPI Accessor API skeleton の狭い確認 | `pio test -e test_native -f v2/native/bus/test_spi_api` |
 | ThreadSanitizer | posix runtime の並行性契約 (`service::ServiceRunner` auto-run、[design/service.md](design/service.md) §R1-R8) と remote session/proxy/release の並行回帰を `-fsanitize=thread` つきで検証。`test_native` と同じスイートを別ビルドで走らせる (低頻度・時間がかかるため常用の CI には含めない) | `pio test -e test_native_tsan` |
-| クロスチェック v0 | v0 公開 entry の native + ESP32/S3/C3/C6 Arduino/ESP-IDF build fence | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v0/check.ini.cli pio run -e v0_check_native -e v0_check_esp32_arduino -e v0_check_esp32_espidf -e v0_check_esp32_espidf4 -e v0_check_esp32_espidf6 -e v0_check_esp32s3_arduino -e v0_check_esp32s3_espidf -e v0_check_esp32s3_espidf6 -e v0_check_esp32c3_arduino -e v0_check_esp32c3_espidf -e v0_check_esp32c6_espidf` |
-| クロスチェック v2 | v2 公開 entry と主要 API surface の native + ESP32/S3/C3/C6 + allowlist 済み非 ESP32 Arduino/ESP-IDF build fence。非 ESP32 env も v0 empty TU を含む未加工 `src` をビルド | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v2/check.ini.cli pio run -e v2_check_native -e v2_check_esp32_arduino -e v2_check_esp32_espidf -e v2_check_esp32_espidf4 -e v2_check_esp32_espidf6 -e v2_check_esp32s3_arduino -e v2_check_esp32s3_espidf -e v2_check_esp32s3_espidf6 -e v2_check_esp32c3_arduino -e v2_check_esp32c3_espidf -e v2_check_esp32c6_espidf -e v2_check_rp2040_arduino -e v2_check_rp2350_arduino -e v2_check_unor4_minima_arduino -e v2_check_samd51_arduino -e v2_check_stm32f4_arduino -e v2_check_nrf52840_arduino -e v2_check_esp8266_arduino` |
+| クロスチェック v0 | v0 公開 entry の native + ESP32/S3/C3/C6 Arduino/ESP-IDF build fence | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v0/check.ini.cli pio run -e v0_check_native -e v0_check_esp32_arduino -e v0_check_esp32_espidf -e v0_check_esp32_espidf6 -e v0_check_esp32s3_arduino -e v0_check_esp32s3_espidf -e v0_check_esp32s3_espidf6 -e v0_check_esp32c3_arduino -e v0_check_esp32c3_espidf -e v0_check_esp32c6_espidf` |
+| クロスチェック v2 | v2 公開 entry と主要 API surface の native + ESP32/S3/C3/C6 + allowlist 済み非 ESP32 Arduino/ESP-IDF build fence。IDF 5上のlegacy I2C backendも含む。非 ESP32 env も v0 empty TU を含む未加工 `src` をビルド | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v2/check.ini.cli pio run -e v2_check_native -e v2_check_esp32_arduino -e v2_check_esp32_espidf -e v2_check_esp32_espidf_legacy_i2c -e v2_check_esp32_espidf6 -e v2_check_esp32s3_arduino -e v2_check_esp32s3_espidf -e v2_check_esp32s3_espidf6 -e v2_check_esp32c3_arduino -e v2_check_esp32c3_espidf -e v2_check_esp32c6_espidf -e v2_check_rp2040_arduino -e v2_check_rp2350_arduino -e v2_check_unor4_minima_arduino -e v2_check_samd51_arduino -e v2_check_stm32f4_arduino -e v2_check_nrf52840_arduino -e v2_check_esp8266_arduino` |
 | 非 ESP32 v0 rejection fence | 非 ESP32 Arduino が `M5HAL_v0.hpp` または compatibility shim `M5HAL.hpp` を include すると、v2 entry への案内つきで compile-fail することを検査 | `test/v2/stub/build_check_v0_rejected.cpp` を直接 entry / shim entry の2構成で期待失敗させ、`build-check-pio.yml` が error message も照合 |
 | SPRESENSE build fence | Sony 公式 Arduino core 3.4.7 / MainCore / 768 KiB 構成で、v0 empty TU を含む未加工 library tree から v2 共通 API surface をビルド | `.github/workflows/build-check-spresense.yml` の Arduino CLI 手順 |
 | v2 inline flip fence | `m5::hal::*` が v2 に resolve される構成の確認 | `M5HAL_PIO_EXTRA_CONFIG=pio_envs/v2/check.ini.cli pio run -e v2_check_native_inline` |
@@ -74,11 +74,11 @@ v2 API surface を呼ぶ。 これによりコンポーネント依存 (`REQUIRE
 コミュニティ fork の pioarduino platform は h2/p4 をビルドできるが、 公式実装との
 挙動一致が保証されないため**検証ゲートには使わない**。
 
-## test / experiments の使い分け
+## test / private experiments の使い分け
 
-`test/` は合否をコードで判定できる検証を置く。 native test は host 上で完結する単体・protocol semantic を対象にし、 embedded test は実機・実配線を使うが、実行後に PASS/FAIL をテストコード自身が判断できるものを対象にする。
+`test/` は合否をコードで判定できる検証を置く。 native test は host 上で完結する単体・protocol semantic を対象にし、 embedded test は実機・実配線を使うが、実行後に PASS/FAIL をテストコード自身が判断できるものを対象にする。device と host、または独立 vendor master を組み合わせる再利用可能な HIL fixture は `test/v2/hil/` に置く。
 
-`experiments/` は開発中の観測・測定・調査用 sketch を置く。 ロジアナやオシロで波形品質、実効クロック、rise time、jitter を見るもの、または PlatformIO の `build_flags` で backend / 周波数 / runner 条件を差し替えて探索するものは experiments に置く。
+ロジアナやオシロで波形品質、実効クロック、rise time、jitter を見る一時的な観測 sketch、または backend / 周波数 / runner 条件を差し替える探索コードは公開ライブラリに同梱せず、private workspace で管理する。そこから得た再現可能な合否判定だけを `test/` へ昇格する。
 
 方針として、ロジアナ等で意図を確認した protocol-level の不変条件は、可能なら embedded test に落とす。 たとえば software SPI の command/address/dummy/data phase、CS/DC の区間、dummy clock 数、bit order は低速 self-test で検証できるため、`test/v2/embedded/bus/test_software_spi_wire/` の実機 wire test として管理する。
 
@@ -120,7 +120,7 @@ DC out   -> DC capture in
 
 明示 transaction の検証では、2 回以上の `transfer()` / `write()` を連続実行しても CS assert/deassert が transaction の前後 1 回ずつに留まることを見る。 これは command と data を別 transfer に分ける display controller 風の使い方を想定したもの。
 
-この self-test はロジアナの代替ではなく、ロジアナで確認した protocol semantic を守る回帰テストとして扱う。 実効速度、立ち上がり時間、overshoot、jitter は引き続き experiments + 外部測定器で見る。
+この self-test はロジアナの代替ではなく、ロジアナで確認した protocol semantic を守る回帰テストとして扱う。 実効速度、立ち上がり時間、overshoot、jitter は private な観測用 workspace + 外部測定器で見る。
 
 ## M5UnitUnified 連携ビルドチェック
 

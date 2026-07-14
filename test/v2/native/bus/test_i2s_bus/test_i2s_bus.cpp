@@ -36,6 +36,9 @@ class FakeBus : public IBus {
 public:
     m5::hal::v2::result_t<void> init(const FakeBusConfig& cfg)
     {
+        if (cfg.pin_bclk < 0 || cfg.pin_ws < 0 || (cfg.pin_dout < 0 && cfg.pin_din < 0)) {
+            return m5::stl::make_unexpected(m5::hal::v2::error::error_t::INVALID_ARGUMENT);
+        }
         _config = cfg;  // slice pins/kind for getConfig()
         return {};
     }
@@ -146,6 +149,32 @@ TEST(I2sBusFacade, InitWithFakeBackendSucceeds)
     ASSERT_TRUE(r.has_value());
 }
 
+TEST(I2sBusFacade, InitRejectsIncompleteStandardWiring)
+{
+    const auto expect_invalid = [](v2::i2s::FakeBusConfig cfg) {
+        v2::i2s::Bus facade;
+        auto r = facade.init(cfg);
+        ASSERT_FALSE(r.has_value());
+        EXPECT_EQ(r.error(), v2::error::error_t::INVALID_ARGUMENT) << "err=" << v2::error::toString(r.error());
+    };
+
+    v2::i2s::FakeBusConfig missing_bclk;
+    missing_bclk.pin_ws   = 5;
+    missing_bclk.pin_dout = 6;
+    expect_invalid(missing_bclk);
+
+    v2::i2s::FakeBusConfig missing_ws;
+    missing_ws.pin_bclk = 4;
+    missing_ws.pin_din  = 7;
+    missing_ws.role     = v2::i2s::IBusConfig::Role::Slave;
+    expect_invalid(missing_ws);
+
+    v2::i2s::FakeBusConfig missing_data;
+    missing_data.pin_bclk = 4;
+    missing_data.pin_ws   = 5;
+    expect_invalid(missing_data);
+}
+
 TEST(I2sBusFacade, WriteForwardedToBackend)
 {
     v2::i2s::Bus facade;
@@ -254,19 +283,31 @@ TEST(I2sBusView, DifferentBclkPinsReturnDistinctInstances)
     EXPECT_NE(a.value().get(), b.value().get()) << "different BCLK -> distinct instances";
 }
 
-TEST(I2sBusView, InvalidPinsReturnError)
+TEST(I2sBusView, TypedAcquireRejectsIncompleteStandardWiring)
 {
     auto& hal = v2::getM5_Hal();
 
-    v2::i2s::FakeBusConfig cfg;
-    // pin_bclk = -1 (invalid sentinel) -> INVALID_ARGUMENT
-    cfg.pin_bclk = -1;
-    cfg.pin_ws   = 4;
-    cfg.pin_dout = 5;
+    const auto expect_invalid = [&hal](v2::i2s::FakeBusConfig cfg) {
+        auto r = hal.I2S.acquire(cfg);
+        ASSERT_FALSE(r.has_value());
+        EXPECT_EQ(r.error(), v2::error::error_t::INVALID_ARGUMENT) << "err=" << v2::error::toString(r.error());
+    };
 
-    auto r = hal.I2S.acquire(cfg);
-    ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(r.error(), v2::error::error_t::INVALID_ARGUMENT);
+    v2::i2s::FakeBusConfig missing_bclk;
+    missing_bclk.pin_ws   = 4;
+    missing_bclk.pin_dout = 5;
+    expect_invalid(missing_bclk);
+
+    v2::i2s::FakeBusConfig missing_ws;
+    missing_ws.pin_bclk = 3;
+    missing_ws.pin_din  = 5;
+    missing_ws.role     = v2::i2s::IBusConfig::Role::Slave;
+    expect_invalid(missing_ws);
+
+    v2::i2s::FakeBusConfig missing_data;
+    missing_data.pin_bclk = 3;
+    missing_data.pin_ws   = 4;
+    expect_invalid(missing_data);
 }
 
 TEST(I2sBusView, AcquiredBusReturnsKindI2S)
@@ -294,13 +335,13 @@ TEST(I2sBusView, LogicalAcquireSurfaceExistsButIsStaticPolicy)
 {
     auto& hal = v2::getM5_Hal();
     v2::i2s::LogicalBusConfig req;
-    req.pin_bclk                               = 21;
-    req.pin_ws                                 = 22;
-    req.pin_dout                               = 23;
-    v2::i2s::LogicalBusConfig invalid_identity = req;
-    invalid_identity.pin_bclk                  = -1;
+    req.pin_bclk                        = 21;
+    req.pin_ws                          = 22;
+    req.pin_dout                        = 23;
+    v2::i2s::LogicalBusConfig unset_pin = req;
+    unset_pin.pin_bclk                  = -1;
 
-    v2::test::bus_contract::expectStaticLogicalAcquireContract(hal.I2S, req, invalid_identity);
+    v2::test::bus_contract::expectStaticLogicalAcquireContract(hal.I2S, req, unset_pin);
 }
 
 // Co-own: a TxAccessor built from the acquire temporary keeps the bus alive

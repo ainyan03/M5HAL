@@ -173,6 +173,103 @@ TEST(EspidfSpiControllerMap, AttachRequiresMatchingGeneralPurposeController)
     EXPECT_FALSE(detail::attachedControllerMatches(1, -1, count, first_host));
 }
 
+TEST(EspidfSpiReleaseOrder, RemoveFailurePreservesWorkerAndBus)
+{
+    namespace detail = m5::hal::v2::spi::detail_espidf_spi;
+    std::vector<int> calls;
+
+    const auto result = detail::releaseDriverBeforeWorker(
+        true, false,
+        [&calls]() {
+            calls.push_back(1);
+            return m5::hal::v2::error::error_t::IO_ERROR;
+        },
+        [&calls]() {
+            calls.push_back(2);
+            return m5::hal::v2::error::error_t::OK;
+        },
+        [&calls]() { calls.push_back(3); });
+
+    EXPECT_EQ(result.error, m5::hal::v2::error::error_t::IO_ERROR);
+    EXPECT_FALSE(result.bus_released);
+    EXPECT_FALSE(result.worker_stopped);
+    EXPECT_EQ(calls, (std::vector<int>{1}));
+}
+
+TEST(EspidfSpiReleaseOrder, BusFailurePreservesWorker)
+{
+    namespace detail = m5::hal::v2::spi::detail_espidf_spi;
+    std::vector<int> calls;
+
+    const auto result = detail::releaseDriverBeforeWorker(
+        true, false,
+        [&calls]() {
+            calls.push_back(1);
+            return m5::hal::v2::error::error_t::OK;
+        },
+        [&calls]() {
+            calls.push_back(2);
+            return m5::hal::v2::error::error_t::IO_ERROR;
+        },
+        [&calls]() { calls.push_back(3); });
+
+    EXPECT_EQ(result.error, m5::hal::v2::error::error_t::IO_ERROR);
+    EXPECT_FALSE(result.bus_released);
+    EXPECT_FALSE(result.worker_stopped);
+    EXPECT_EQ(calls, (std::vector<int>{1, 2}));
+}
+
+TEST(EspidfSpiReleaseOrder, DestructiveBusFailureCompletesRelease)
+{
+    namespace detail = m5::hal::v2::spi::detail_espidf_spi;
+    std::vector<int> calls;
+
+    const auto result = detail::releaseDriverBeforeWorker(
+        true, true,
+        [&calls]() {
+            calls.push_back(1);
+            return m5::hal::v2::error::error_t::OK;
+        },
+        [&calls]() {
+            calls.push_back(2);
+            return m5::hal::v2::error::error_t::IO_ERROR;
+        },
+        [&calls]() { calls.push_back(3); });
+
+    EXPECT_EQ(result.error, m5::hal::v2::error::error_t::OK);
+    EXPECT_TRUE(result.bus_released);
+    EXPECT_TRUE(result.worker_stopped);
+    EXPECT_EQ(calls, (std::vector<int>{1, 2, 3}));
+}
+
+TEST(EspidfSpiReleaseOrder, OwnedAndAttachedSuccessPathsStopLast)
+{
+    namespace detail = m5::hal::v2::spi::detail_espidf_spi;
+    for (const bool owns_bus : {false, true}) {
+        std::vector<int> calls;
+        const auto result = detail::releaseDriverBeforeWorker(
+            owns_bus, false,
+            [&calls]() {
+                calls.push_back(1);
+                return m5::hal::v2::error::error_t::OK;
+            },
+            [&calls]() {
+                calls.push_back(2);
+                return m5::hal::v2::error::error_t::OK;
+            },
+            [&calls]() { calls.push_back(3); });
+
+        EXPECT_EQ(result.error, m5::hal::v2::error::error_t::OK);
+        EXPECT_EQ(result.bus_released, owns_bus);
+        EXPECT_TRUE(result.worker_stopped);
+        if (owns_bus) {
+            EXPECT_EQ(calls, (std::vector<int>{1, 2, 3}));
+        } else {
+            EXPECT_EQ(calls, (std::vector<int>{1, 3}));
+        }
+    }
+}
+
 // -------------------------------------------------------------------------
 // Accessor unbound: serve() rejects with INVALID_ARGUMENT
 // -------------------------------------------------------------------------

@@ -26,6 +26,12 @@ uint8_t AllocationCore::hardwareInUse(void) const
     return _pool.inUse();
 }
 
+void AllocationCore::retagIntent(IManagedBus& bus, const types::AllocationIntent& intent)
+{
+    SerialGuard intent_guard{_intent_mutex};
+    bus.retagIntent(intent);
+}
+
 result_t<void> AllocationCore::commitBuses(uint32_t timeout_ms)
 {
     // Excludes claimController/releaseClaimedController for the whole pass:
@@ -50,22 +56,25 @@ result_t<void> AllocationCore::commitBuses(uint32_t timeout_ms)
     Entry entries[BusRegistry::kCapacity];
     IBus* qbus[BusRegistry::kCapacity];
     size_t n = 0;
-    _registry.forEachLive(kind, [&](const std::shared_ptr<IBus>& sp) {
-        if (n >= BusRegistry::kCapacity) {
-            return;
-        }
-        entries[n].holder        = sp;
-        entries[n].bus           = sp.get();
-        entries[n].managed_bus   = &_kind.toManaged(*sp);
-        entries[n].managed       = entries[n].managed_bus->managed();
-        entries[n].backend_kind  = entries[n].bus->backendKind();
-        entries[n].controller_id = entries[n].bus->controllerId();
-        if (entries[n].managed) {
-            entries[n].intent = entries[n].managed_bus->intent();
-        }
-        qbus[n] = entries[n].bus;
-        ++n;
-    });
+    {
+        SerialGuard intent_guard{_intent_mutex};
+        _registry.forEachLive(kind, [&](const std::shared_ptr<IBus>& sp) {
+            if (n >= BusRegistry::kCapacity) {
+                return;
+            }
+            entries[n].holder        = sp;
+            entries[n].bus           = sp.get();
+            entries[n].managed_bus   = &_kind.toManaged(*sp);
+            entries[n].managed       = entries[n].managed_bus->managed();
+            entries[n].backend_kind  = entries[n].bus->backendKind();
+            entries[n].controller_id = entries[n].bus->controllerId();
+            if (entries[n].managed) {
+                entries[n].intent = entries[n].managed_bus->intent();
+            }
+            qbus[n] = entries[n].bus;
+            ++n;
+        });
+    }
 
     // Reject conflicting intents (a cap both required and forbidden) up
     // front, before any backend is swapped, so no bus is left half-changed.
@@ -210,7 +219,7 @@ result_t<void> AllocationCore::commitBuses(uint32_t timeout_ms)
         }
         // commitPlaceholder builds + adopts under the bus lock:
         // makePlaceholder's init() no longer runs outside the swap guard.
-        auto r = _kind.commitPlaceholder(*entries[i].managed_bus, timeout_ms);
+        auto r = _kind.commitPlaceholder(*entries[i].managed_bus, entries[i].intent, timeout_ms);
         if (!r.has_value()) {
             demote_failed[i] = true;  // its release failed: keep it off the promote loop
             if (!have_error) {
@@ -243,7 +252,7 @@ result_t<void> AllocationCore::commitBuses(uint32_t timeout_ms)
         }
         // commitHardware builds + adopts under the bus lock; a null
         // hardware factory result becomes OUT_OF_RESOURCE inside it.
-        auto r = _kind.commitHardware(*entries[i].managed_bus, target[i], timeout_ms);
+        auto r = _kind.commitHardware(*entries[i].managed_bus, entries[i].intent, target[i], timeout_ms);
         if (!r.has_value()) {
             _pool.release(target[i]);
             if (!have_error) {
@@ -310,7 +319,7 @@ bool AllocationCore::_eligible(const IManagedBus& bus, const types::AllocationIn
     }
     // Pin-domain check: non-uniform only, consulted last so the capability /
     // opt-in filters above still run identically to before.
-    return _kind.controllerAcceptsBus(bus, controller);
+    return _kind.controllerAcceptsBus(bus, want, controller);
 }
 
 result_t<int8_t> AllocationCore::claimController(const types::AllocationIntent& intent)

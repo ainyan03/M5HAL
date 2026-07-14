@@ -184,8 +184,9 @@ constexpr size_t lenVarSize(size_t value)
 /*!
   @brief Write a LenVar; `dst` must hold `lenVarSize(value)` bytes. Returns bytes written.
 
-  The valid range is [0, 0xFFFFFFFE] (i.e. the full u32 space minus the
-  reserved marker 0xFF). On a 64-bit host, passing a value above 0xFFFFFFFF
+  The valid range is [0, 0xFFFFFFFF] (the full u32 space). The reserved marker
+  0xFF is a prefix byte, not a reserved decoded value. On a 64-bit host,
+  passing a value above 0xFFFFFFFF
   silently truncates to the low 32 bits — this is a caller-contract violation.
   The caller is responsible for ensuring the value fits in u32 before calling.
  */

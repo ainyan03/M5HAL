@@ -666,6 +666,26 @@ TEST(BytecodeEncoder, RejectsPayloadSizeOverflowBeforeReserve)
     ASSERT_FALSE(i2c_overflow.has_value());
     EXPECT_EQ(i2c_overflow.error(), error_t::INVALID_ARGUMENT);
 
+    auto create_overflow = enc.busCreate(types::bus_kind_t::I2C, 0, bytecode::kDiscardStoreId,
+                                         data::ConstDataSpan{&byte, static_cast<size_t>(-1)});
+    ASSERT_FALSE(create_overflow.has_value());
+    EXPECT_EQ(create_overflow.error(), error_t::INVALID_ARGUMENT);
+
+    auto store_overflow = enc.storeData(0, data::ConstDataSpan{&byte, static_cast<size_t>(-1)});
+    ASSERT_FALSE(store_overflow.has_value());
+    EXPECT_EQ(store_overflow.error(), error_t::INVALID_ARGUMENT);
+
+    // Exact wire boundary: instruction length is a u32 and includes the
+    // opcode, so a UINT32_MAX-byte payload is one byte too large.
+    auto store_wire_overflow = enc.storeData(0, data::ConstDataSpan{&byte, static_cast<size_t>(UINT32_MAX) - 1});
+    ASSERT_FALSE(store_wire_overflow.has_value());
+    EXPECT_EQ(store_wire_overflow.error(), error_t::INVALID_ARGUMENT);
+
+    auto create_null =
+        enc.busCreate(types::bus_kind_t::I2C, 0, bytecode::kDiscardStoreId, data::ConstDataSpan{nullptr, 1});
+    ASSERT_FALSE(create_null.has_value());
+    EXPECT_EQ(create_null.error(), error_t::INVALID_ARGUMENT);
+
     const types::gpio_number_t pin = 0;
     const size_t too_many_pins     = (static_cast<size_t>(-1) / 2) + 1;
     auto gpio_overflow             = enc.gpioWriteHigh(&pin, too_many_pins);

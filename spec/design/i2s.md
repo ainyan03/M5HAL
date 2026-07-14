@@ -9,6 +9,17 @@ Philips standard・16bit・mono/stereo** で、raw PCM の搬送までを役割�
 WAV 等のコンテナ解釈・デコード・ミキシングは上位 (アプリケーション / example) の責務
 ([goals.md](../goals.md) の「音声のドメインロジックは含めない」を維持する)。
 
+### Standard I2S と必須 pin
+
+- `i2s::BusConfig` は master / slave とも **BCLK と WS を必須**とし、TX の DOUT または
+  RX の DIN を最低1本必要とする。BCLK / WS のどちらかが負値、または DOUT / DIN が
+  ともに負値なら、`init()` / typed `acquire()` / remote `BusCreate` は
+  `INVALID_ARGUMENT` で拒否する。エラーを初回 I/O まで遅延させない。
+- MCLK は任意で、`-1` は無効を表す。
+- この `i2s` API は BCLK / WS を持つ standard I2S 専用であり、WS を持たない PDM を
+  mode 分岐として受け入れない。PDM は公開 API / bus kind を分離し、物理的な I2S
+  controller の占有だけを standard I2S と共有する設計境界とする。
+
 ## write の意味論
 
 I2S の最も重要な契約 — Audio 層実装者が最初に必要とする前提。
@@ -26,8 +37,9 @@ I2S の最も重要な契約 — Audio 層実装者が最初に必要とする�
   - 受理量は **サンプル境界 (`bits_per_sample / 8` byte の倍数) で切れる**。espidf
     backend はこれを能動的に保証する — DMA 満杯間際の non-blocking 受理は奇数バイトで
     止まり得るが、1 byte の位相ズレは以後の全再生を fs/2 サイドバンドノイズに変える
-    ため、半サンプルは短いブロッキング書きで必ず完結させてから戻る (mono→stereo
-    複製モードでは物理フレーム単位で同じ完結を行う)
+    ため、半サンプルは短いブロッキング書きで必ず完結させてから戻る。ESP-IDF backend が
+    論理 `channels=1` の sample を内部で 2 physical slot へ展開する場合も、物理フレーム単位で
+    同じ完結を行う。この展開は backend 内部処理であり、公開 PCM 形状は mono のまま。
   - **フレーム境界 (channels × sample) までは保証しない**: stereo で L サンプルだけ
     受理されて戻ることはある。ただし DMA はバイト列として連続するので、**次の write
     を続きのバイトから再開すれば壊れない** — 呼び出し側の端数持ち回りは「受理されな
@@ -45,7 +57,13 @@ write の鏡像。RX チャネル (`pin_din` 配線時) の DMA が取り込ん�
 - **overrun はエラーにしない**: 読み手が遅れて DMA が最古ディスクリプタを上書きしても、
   欠落として静かに継続する (underrun を無音で継続するのと対称の縮退)。
 - **切れ目契約は write と同じ**: 半サンプルで戻さない (1 byte 位相ズレ防止に短いブロッキング
-  読みで完結)。mono→stereo モードでは物理フレーム単位で完結し、左スロットを論理 mono として返す。
+  読みで完結)。ESP-IDF backend が 2 physical slot の capture を内部で collapse する場合は
+  物理フレーム単位で完結し、左スロットを 1 sample の論理 mono として返す。この正規化は
+  backend 内部処理であり、公開契約は一貫して `channels=1`。
+- `channels` は DMA バッファの**論理 PCM 形状**を表す。`channels=1` の read は物理配線や
+  backend にかかわらず 1 sample/frame の mono 列を返す。`channels=2` は L/R interleaved 列を返すため、
+  送信元が同じ mono sample を両スロットへ出していれば `x,x,y,y...` と見える。mono 入力を
+  stereo 配列へソフト複製する設定は持たず、それは上位のチャネル変換の責務とする。
 
 ## API 形 — uart 同型の非トランザクショナル bus
 
@@ -96,7 +114,7 @@ struct Accessor;  // TX + RX 束ね (全二重を 1 つで)
 | 構造体 | 内容 | 所有 |
 |---|---|---|
 | `IBusConfig` | pins (bclk / ws / dout / din / mclk)、`tx_buffer_size` / `rx_buffer_size` (各方向 DMA 総量の目安)、`role` (Master / Slave、既定 Master・identity 外) | bus を生成・登録する側 (device) |
-| `AccessConfig` | `sample_rate_hz` / `bits_per_sample` (当面 16) / `channels` (1=mono, 2=stereo) / `write_timeout_ms` / `read_timeout_ms` | アクセスする側 |
+| `AccessConfig` | `sample_rate_hz` / `bits_per_sample` (当面 16) / `channels` (論理PCM形状: 1=mono, 2=L/R interleaved stereo) / `write_timeout_ms` / `read_timeout_ms` | アクセスする側 |
 
 他バスと同じく AccessConfig は呼び出しごとに渡され、backend は前回設定と異なる場合のみ
 再構成する (明示的な start / stop API は置かない。DMA channel は最初の write / read で

@@ -11,8 +11,10 @@ M5 製品向けの HAL (ハードウェア抽象化レイヤ) です。
 
 ## 動作要件
 
-- ESP32 系ボード。 公開パッケージは `espressif32` platform
-  (Arduino-ESP32 または ESP-IDF >= 4.4) を対象としています。
+- ESP32 系ボード。 公開パッケージは `espressif32` platform を対象とします。
+  ESP-IDF component として直接使う場合は ESP-IDF >= 5.0 が必要です。
+  Arduino-ESP32 は独立したversion軸で、内部SDKがESP-IDF 4.4のcore 2.xも
+  対応範囲に含みます。
 - C++17 に対応したコンパイラ。
 - [M5Utility](https://github.com/m5stack/M5Utility) — PlatformIO と
   ESP-IDF component manager は自動で取得します。 Arduino IDE では
@@ -33,6 +35,10 @@ M5 製品向けの HAL (ハードウェア抽象化レイヤ) です。
   dependencies:
     m5stack/M5HAL: "*"
   ```
+
+  ESP-IDF 5.0同梱のcomponent managerは、後発ESP32系targetを含む現在の
+  manifest schemaより古いため、ESP-IDF 5.0環境を有効化した後に
+  `python -m pip install --upgrade idf-component-manager`で更新してください。
 
 ## ドキュメント
 
@@ -282,7 +288,8 @@ v2 API を 1 ライブラリ内に**共存**させる戦略を採用していま
   移行する場合など)。 ただし中間ライブラリでは、 可読性のため TU ごとに
   使う世代を明示することを推奨します。
 
-inline namespace の既定切替 (`M5HAL_V0_INLINE`)、世代分離した platform
+inline namespaceの既定をv2へ切り替える場合は、`M5HAL_V0_INLINE=0`と
+`M5HAL_V2_INLINE=1`を組み合わせます。完全な切替契約、世代分離したplatform
 マクロ、 将来世代を既存利用者を巻き込まず追加できる `hal/<vN>/`
 配置の詳細は
 [`spec/design/v0_v2_coexistence.md`](spec/design/v0_v2_coexistence.md)

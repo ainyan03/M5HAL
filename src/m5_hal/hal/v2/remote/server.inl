@@ -228,7 +228,8 @@ result_t<void> Server::completePendingStream(data::MuxFrameEncoder& enc, remote_
     if (dec != nullptr) {
         dec->destroyStream(stream_id);
     }
-    _pending_stream = PendingStreamTransfer{};
+    _pending_stream         = PendingStreamTransfer{};
+    _defer_current_response = false;
     return writeDeferredResponse(enc, seq, status);
 }
 
@@ -240,7 +241,8 @@ void Server::abortPendingStream()
     if (_pending_stream.dec != nullptr) {
         _pending_stream.dec->destroyStream(_pending_stream.stream_id);
     }
-    _pending_stream = PendingStreamTransfer{};
+    _pending_stream         = PendingStreamTransfer{};
+    _defer_current_response = false;
 }
 
 result_t<void> Server::poll(data::MuxFrameEncoder& enc, uint32_t now_ms)
@@ -285,7 +287,7 @@ result_t<void> Server::poll(data::MuxFrameEncoder& enc, uint32_t now_ms)
                                         ? static_cast<size_t>(_pending_stream.rx_len) - _pending_stream.rx_produced
                                         : 0;
         const size_t want_rx      = remaining_rx < sizeof(rx_buf) ? remaining_rx : sizeof(rx_buf);
-        if (want_rx != 0 && enc.output().blockCount() >= data::BlockSource::kMaxBlocks) {
+        if (want_rx != 0 && enc.output().blockCount() + 1 >= data::BlockSource::kMaxBlocks) {
             return {};
         }
         size_t actual_tx = 0;

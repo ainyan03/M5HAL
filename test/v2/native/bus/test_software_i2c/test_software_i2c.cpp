@@ -4256,7 +4256,7 @@ TEST(AccessorRaw, RawAndSpanOverloadsAreEquivalentForWriteRegister)
 // `IBusConfig` exposes a single gpio_number_t path: `pin_scl` /
 // `pin_sda` default to `-1`. Callers fill in gpio_number values via
 // the 2-argument ctor or field assignment, and `init()` resolves a
-// `Pin` from `m5::hal::v2::M5_Hal.Gpio.getPin(num)` through the
+// `Pin` from `m5::hal::v2::M5_Hal.Gpio.tryGetPin(num)` through the
 // singleton `GPIOGroup`. Coverage axes:
 //   1. Both pins default to -1.
 //   2. Calling `init` while pins are -1 returns INVALID_ARGUMENT.
@@ -4290,7 +4290,7 @@ TEST(IBusConfig, SoftwareVariantRejectsInvalidPins)
 TEST(IBusConfig, FieldAssignedGpioNumbersResolveViaGPIOGroup)
 {
     // Field-assigned gpio_numbers land in `pin_scl` / `pin_sda`.
-    // `init()` calls `m5::hal::v2::M5_Hal.Gpio.getPin(num)`, which
+    // `init()` calls `m5::hal::v2::M5_Hal.Gpio.tryGetPin(num)`, which
     // resolves to a `stub::Port` Pin in the native build via
     // `M5_Hal.Gpio` -> `stub::GPIO`.
     auto cfg = makeSoftwareBusConfig(/*scl=*/21, /*sda=*/22);

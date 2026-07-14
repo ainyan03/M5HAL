@@ -14,10 +14,9 @@
 // GPIO, so the test is about allocation, the controller assignments, and the
 // swap generations — the real software/espidf wire paths are covered elsewhere.
 //
-// SPI is at i2c's degenerate point (uniform controllers + a software
-// placeholder), so the cross-kind AllocationCore-seam paths (null placeholder,
-// the capability eligibility filter) are exercised by the i2c-file's
-// AllocationCoreSeam tests and not repeated here.
+// SPI is normally at i2c's degenerate point (uniform controllers + a software
+// placeholder). The shared allocation contract stays in the common tests;
+// SPI-specific feature filtering is exercised near the end of this file.
 
 // Test-local config + backend for the TYPED acquire<CfgT> path (an explicit
 // backend choice). The BackendFor specialization lets `BusView::acquire(cfg)`
@@ -134,8 +133,9 @@ struct SpiIntentHarness {
     Adapter adapter;
     v2::spi::BusView view;
 
-    SpiIntentHarness(Adapter::SwFactory sw, Adapter::HwFactory hw = nullptr, uint8_t hw_capacity = 0)
-        : adapter{backend.busRegistry(), sw, hw, hw_capacity}, view{&backend}
+    SpiIntentHarness(Adapter::SwFactory sw, Adapter::HwFactory hw = nullptr, uint8_t hw_capacity = 0,
+                     Adapter::Topology topology = {})
+        : adapter{backend.busRegistry(), sw, hw, hw_capacity, topology}, view{&backend}
     {
         backend.registerKind(adapter);
     }
@@ -157,6 +157,18 @@ v2::spi::TypedFakeHwConfig makeTypedFakeHwConfig(void)
     pinned_cfg.pin_mosi = 11;
     pinned_cfg.pin_miso = 9;
     return pinned_cfg;
+}
+
+v2::types::backend_caps_t hardwareWithoutSharedRx(int8_t)
+{
+    return v2::spi::caps::HARDWARE;
+}
+
+SpiIntentHarness::Adapter::Topology topologyWithoutSharedRx(void)
+{
+    SpiIntentHarness::Adapter::Topology topology;
+    topology.controller_caps = &hardwareWithoutSharedRx;
+    return topology;
 }
 
 }  // namespace
@@ -190,6 +202,13 @@ TEST(SpiBusIntent, TypedAcquireIsNotManagedByCommit)
 {
     SpiIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
     v2::test::bus_contract::expectTypedAcquireIsNotManagedByCommit(h.view, &reqByIndex, &makeTypedFakeConfig);
+}
+
+TEST(SpiBusIntent, TypedReacquireThroughLogicalBecomesManaged)
+{
+    SpiIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
+    v2::test::bus_contract::expectTypedReacquireThroughLogicalBecomesManaged(h.view, &reqByIndex,
+                                                                             &makeTypedFakeConfig);
 }
 
 TEST(SpiBusIntent, UnmanagedHardwareBusReservesItsController)
@@ -314,4 +333,69 @@ TEST(SpiBusIntent, MisoLessWiringIsValidIdentity)
     ASSERT_TRUE(h.view.commitBuses().has_value());
     EXPECT_EQ(bus.value()->backendKind(), kHw);
     EXPECT_EQ(bus.value()->controllerId(), 0);
+}
+
+TEST(SpiFeatureIntent, HelperComposesWithHardwarePreference)
+{
+    const auto intent = v2::spi::requireMosiSharedRx(v2::spi::preferHardware());
+
+    EXPECT_EQ(intent.require, v2::spi::caps::MOSI_SHARED_RX);
+    EXPECT_EQ(intent.prefer, v2::spi::caps::HARDWARE);
+    EXPECT_EQ(intent.forbid, 0u);
+}
+
+TEST(SpiFeatureIntent, CapableHardwareIsSelected)
+{
+    SpiIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/1};
+    auto bus = h.view.acquire(reqByIndex(0, v2::spi::requireMosiSharedRx()));
+    ASSERT_TRUE(bus.has_value()) << "err=" << v2::error::toString(bus.error());
+
+    auto committed = h.view.commitBuses(0);
+    ASSERT_TRUE(committed.has_value()) << "err=" << v2::error::toString(committed.error());
+    EXPECT_EQ(bus.value()->backendKind(), kHw);
+    EXPECT_EQ(bus.value()->controllerId(), 0);
+}
+
+TEST(SpiFeatureIntent, UnsupportedHardwareFallsBackToSoftware)
+{
+    SpiIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/1, topologyWithoutSharedRx()};
+    auto bus = h.view.acquire(reqByIndex(0, v2::spi::requireMosiSharedRx(v2::spi::preferHardware())));
+    ASSERT_TRUE(bus.has_value()) << "err=" << v2::error::toString(bus.error());
+
+    auto committed = h.view.commitBuses(0);
+    ASSERT_TRUE(committed.has_value()) << "err=" << v2::error::toString(committed.error());
+    EXPECT_EQ(bus.value()->backendKind(), v2::types::backend_kind_t::Software);
+    EXPECT_EQ(bus.value()->controllerId(), -1);
+}
+
+TEST(SpiFeatureIntent, RequiredHardwareDoesNotFallBackWhenFeatureIsUnsupported)
+{
+    SpiIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/1, topologyWithoutSharedRx()};
+    auto bus = h.view.acquire(reqByIndex(0, v2::spi::requireMosiSharedRx(v2::spi::requireHardware())));
+    ASSERT_TRUE(bus.has_value()) << "err=" << v2::error::toString(bus.error());
+
+    auto committed = h.view.commitBuses(0);
+    ASSERT_FALSE(committed.has_value());
+    EXPECT_EQ(committed.error(), v2::error::error_t::OUT_OF_RESOURCE);
+    EXPECT_EQ(bus.value()->backendKind(), v2::types::backend_kind_t::Software);
+}
+
+TEST(SpiFeatureIntent, ReacquireDemotesUnsupportedHardwareBeforeUse)
+{
+    SpiIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/1, topologyWithoutSharedRx()};
+    auto bus = h.view.acquire(reqByIndex(0, v2::spi::automatic()));
+    ASSERT_TRUE(bus.has_value()) << "err=" << v2::error::toString(bus.error());
+    auto first_commit = h.view.commitBuses(0);
+    ASSERT_TRUE(first_commit.has_value()) << "err=" << v2::error::toString(first_commit.error());
+    ASSERT_EQ(bus.value()->backendKind(), kHw);
+    const uint32_t hardware_generation = bus.value()->backendGeneration();
+
+    auto retagged = h.view.acquire(reqByIndex(0, v2::spi::requireMosiSharedRx()));
+    ASSERT_TRUE(retagged.has_value()) << "err=" << v2::error::toString(retagged.error());
+    ASSERT_EQ(retagged.value().get(), bus.value().get());
+    auto second_commit = h.view.commitBuses(0);
+    ASSERT_TRUE(second_commit.has_value()) << "err=" << v2::error::toString(second_commit.error());
+
+    EXPECT_EQ(bus.value()->backendKind(), v2::types::backend_kind_t::Software);
+    EXPECT_GT(bus.value()->backendGeneration(), hardware_generation);
 }

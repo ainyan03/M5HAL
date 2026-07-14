@@ -1,34 +1,34 @@
 #!/usr/bin/env bash
 #
-# hil-run.sh — run a HIL (hardware-in-the-loop) experiment-test end to end:
+# hil-run.sh — run a HIL (hardware-in-the-loop) test end to end:
 # flash the device firmware, build the host driver, then execute the host driver
 # against the connected serial port.
 #
-#   experiments/v2/test/hil-run.sh <name> [port] [baud]
-#     <name>  a HIL test under experiments/v2/test/<name>/ (e.g. uart_echo)
+#   test/v2/hil/hil-run.sh <name> [port] [baud]
+#     <name>  a HIL test under test/v2/hil/<name>/ (e.g. uart_echo)
 #     port    serial device (default: first /dev/cu.usbserial-* / ttyUSB* found)
 #     baud    link baud (default: 115200)
 #
-# Materializes pio_envs/v2/hil.ini.cli -> hil.ini for the run and removes it
-# afterwards. Requires the device + host envs v2_hil_<name>_device_esp32 and
-# v2_hil_<name>_host (see pio_envs/v2/hil.ini.cli).
+# Loads pio_envs/v2/hil.ini.cli through M5HAL_PIO_EXTRA_CONFIG. Requires the
+# device + host envs v2_hil_<name>_device_esp32 and v2_hil_<name>_host (see
+# pio_envs/v2/hil.ini.cli).
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="$(cd "$SCRIPT_DIR/../../.." && pwd)"  # experiments/v2/test -> repo root
+REPO="$(cd "$SCRIPT_DIR/../../.." && pwd)"  # test/v2/hil -> repo root
 
 name="${1:-}"
 port="${2:-}"
 baud="${3:-115200}"
 
 if [ -z "$name" ]; then
-    echo "usage: experiments/v2/test/hil-run.sh <name> [port] [baud]" >&2
-    echo "  e.g. experiments/v2/test/hil-run.sh uart_echo /dev/cu.usbserial-XXXX 3000000" >&2
+    echo "usage: test/v2/hil/hil-run.sh <name> [port] [baud]" >&2
+    echo "  e.g. test/v2/hil/hil-run.sh uart_echo /dev/cu.usbserial-XXXX 3000000" >&2
     exit 2
 fi
-if [ ! -d "$REPO/experiments/v2/test/$name/host" ]; then
-    echo "no HIL test '$name' (expected $REPO/experiments/v2/test/$name/)" >&2
+if [ ! -d "$REPO/test/v2/hil/$name/host" ]; then
+    echo "no HIL test '$name' (expected $REPO/test/v2/hil/$name/)" >&2
     exit 2
 fi
 if [ -z "$port" ]; then

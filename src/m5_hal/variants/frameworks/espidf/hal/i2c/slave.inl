@@ -50,7 +50,7 @@
 #if M5HAL_DEBUG_ESPIDF_I2C_SLAVE_GPIO_MARKERS
 // Non-perturbing GPIO markers for logic-analyzer correlation (IRAM-safe gpio_ll).
 // Off by default; build the slave with -DM5HAL_DEBUG_ESPIDF_I2C_SLAVE_GPIO_MARKERS=1 and wire the
-// pins to the analyzer alongside SCL/SDA to see, per 32-byte "息継ぎ" gap, WHO is
+// pins to the analyzer alongside SCL/SDA to see, for each 32-byte pause, WHO is
 // pausing the bus:
 //   TXFILL  (pin 6)  HIGH while the slave loads the TX FIFO  -> a read-side gap that
 //                    lines up with this pulse is the slave refilling (TX_EMPTY).
@@ -68,7 +68,7 @@
 #endif
 
 // The proactive TX water-mark top-up (refills the TX FIFO at FIFO/2 before it empties,
-// smoothing the read-side 32-byte "息継ぎ" that the reactive TX_EMPTY stretch otherwise
+// smoothing the read-side 32-byte pause that the reactive TX_EMPTY stretch otherwise
 // causes) can be turned off for A/B diagnosis with -DM5HAL_DEBUG_ESPIDF_I2C_SLAVE_NO_TX_WATERMARK=1.
 // Default = on. With it off the TX FIFO is only refilled reactively on TX_EMPTY.
 #if M5HAL_DEBUG_ESPIDF_I2C_SLAVE_NO_TX_WATERMARK
@@ -253,19 +253,21 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
     ::i2c_dev_t* const hw   = I2C_LL_GET_HW(port);
     _hw                     = hw;
 
-    // periph_module_enable() は RCC リファクタで新世代SoC(C61/C5/P4等)では非機能
-    // (deprecated "not functional")。ESP-IDF 公式 I2C ドライバ(esp_driver_i2c/
-    // i2c_common.c)と同じ RCC API で I2C0 のバスクロック有効化+レジスタリセットを
-    // 行う(v5.5/v6.0 両対応・全SoC portable)。
-    // SOC_RCC_IS_INDEPENDENT が真のSoC(c5/c6/c61/h2)では i2c_ll_* を直接呼べる
-    // (RCC_ATOMIC 不要・空展開相当)。RCC 共有のSoC(s2/s3/c3/p4)では
-    // i2c_ll_enable_bus_clock が __DECLARE_RCC_ATOMIC_ENV を要求するため
-    // PERIPH_RCC_ATOMIC() ブロック内で呼ぶ。
-    // 注意: ここでは敢えて `::` を付けない。RCC 共有SoCの i2c_ll.h では
-    // i2c_ll_enable_bus_clock / i2c_ll_reset_register が関数形式マクロ
-    // (`do {(void)__DECLARE_RCC_ATOMIC_ENV; ...} while(0)` 展開)であり、
-    // `::` を前置すると `:: do{...}` となり "expected id-expression" で壊れる。
-    // 無修飾でもグローバルの実関数/マクロに解決される(衝突する近傍名は無い)。
+    // periph_module_enable() is deprecated as "not functional" on newer SoCs
+    // (C61/C5/P4 and others) after the RCC refactor. Use the same RCC API as
+    // ESP-IDF's I2C driver (esp_driver_i2c/i2c_common.c) to enable the I2C0 bus
+    // clock and reset its registers. This works across IDF 5.5/6.0 and all SoCs.
+    // SoCs with independent RCC (c5/c6/c61/h2) can call i2c_ll_* directly;
+    // RCC_ATOMIC is unnecessary there. On SoCs with shared RCC
+    // (s2/s3/c3/p4), i2c_ll_enable_bus_clock requires
+    // __DECLARE_RCC_ATOMIC_ENV and therefore must run inside
+    // PERIPH_RCC_ATOMIC().
+    // Deliberately omit the `::` qualifier here. In shared-RCC i2c_ll.h these
+    // operations are function-like macros expanding to
+    // `do {(void)__DECLARE_RCC_ATOMIC_ENV; ...} while(0)`. A qualifier would
+    // produce `:: do{...}` and fail with "expected id-expression". The
+    // unqualified names resolve to the global functions or macros without a
+    // conflicting nearby declaration.
 #if defined(SOC_RCC_IS_INDEPENDENT) && SOC_RCC_IS_INDEPENDENT
     i2c_ll_enable_bus_clock(port, true);
     i2c_ll_reset_register(port);
@@ -669,7 +671,7 @@ void SlaveBus_espidf::handleIsr()
     // clocks the reply out continuously instead of the slave stretching to refill at
     // every FIFO drain. The TX_EMPTY stretch below is the underrun FALLBACK (reply not
     // yet supplied), NOT the steady-state refill -- this proactive top-up is what
-    // removes the 32-byte read-side "息継ぎ" (each FIFO-empty -> stretch -> refill). If
+    // removes the 32-byte read-side pause (each FIFO-empty -> stretch -> refill). If
     // no reply bytes are queued yet, stop the water mark re-firing (it asserts while
     // the FIFO stays below the threshold); the FIFO then empties into the TX_EMPTY
     // stretch, which holds until the app streams more. Enabled on read-stretch release
@@ -1754,6 +1756,8 @@ void SlaveBus_espidf::resetStateLocked()
     _request_pending    = false;
     _pending_fill       = false;
     _pending_commit_len = 0;
+    _pending_commit_txn = nullptr;
+    _pending_commit_seq = 0;
     _next_seq           = 1;
     _rx_overflow_count  = 0;
     _request_tick       = 0;
@@ -2027,10 +2031,12 @@ bool SlaveBus_espidf::collectPendingWrite(uint8_t* dst, size_t& len, bool& gener
         return false;
     }
 
-    auto* txn = _current;
-    if (txn != nullptr && txn->opened && txn->tx_read < txn->tx_size) {
+    auto* txn = _open;
+    if (txn != nullptr && txn == _current && txn->opened && txn->tx_read < txn->tx_size) {
         len                 = std::min(txn->tx_size - txn->tx_read, kTxCapacity);
         _pending_commit_len = len;
+        _pending_commit_txn = txn;
+        _pending_commit_seq = txn->seq;
         _pending_fill       = false;
         const size_t start  = txn->tx_read & (kTxCapacity - 1);
         const size_t first  = std::min(len, kTxCapacity - start);
@@ -2044,6 +2050,8 @@ bool SlaveBus_espidf::collectPendingWrite(uint8_t* dst, size_t& len, bool& gener
         len                 = 1;
         _request_pending    = false;
         _pending_commit_len = 0;
+        _pending_commit_txn = nullptr;
+        _pending_commit_seq = 0;
         _pending_fill       = true;
         generated_fill      = true;
         should_write        = true;
@@ -2055,14 +2063,17 @@ bool SlaveBus_espidf::collectPendingWrite(uint8_t* dst, size_t& len, bool& gener
 void SlaveBus_espidf::markWriteCommitted(size_t len)
 {
     portENTER_CRITICAL_SAFE(&_mux);
-    if (_current != nullptr && _current->opened) {
-        const size_t remaining = (_current->tx_read < _current->tx_size) ? (_current->tx_size - _current->tx_read) : 0;
-        _current->tx_read += std::min(len, remaining);
-        if (_current->tx_read >= _current->tx_size) {
+    auto* txn = _pending_commit_txn;
+    if (txn != nullptr && txn->in_use && txn->opened && txn->seq == _pending_commit_seq) {
+        const size_t remaining = (txn->tx_read < txn->tx_size) ? (txn->tx_size - txn->tx_read) : 0;
+        txn->tx_read += std::min(len, std::min(remaining, _pending_commit_len));
+        if (txn == _current && txn->tx_read >= txn->tx_size) {
             _request_pending = false;
         }
     }
     _pending_commit_len = 0;
+    _pending_commit_txn = nullptr;
+    _pending_commit_seq = 0;
     _pending_fill       = false;
     portEXIT_CRITICAL_SAFE(&_mux);
 }

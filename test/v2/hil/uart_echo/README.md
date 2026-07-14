@@ -17,8 +17,8 @@
 ## 実行
 
 ```sh
-experiments/v2/test/hil-run.sh uart_echo                            # 115200
-experiments/v2/test/hil-run.sh uart_echo /dev/cu.usbserial-X 3000000  # 3 Mbaud
+test/v2/hil/hil-run.sh uart_echo                            # 115200
+test/v2/hil/hil-run.sh uart_echo /dev/cu.usbserial-X 3000000  # 3 Mbaud
 ```
 
 `hil-run.sh` は device を指定 baud で焼き（`-DM5HAL_HIL_UART_ECHO_BAUD_RATE=<baud>`）、host をビルドして

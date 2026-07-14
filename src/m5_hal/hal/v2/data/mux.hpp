@@ -52,6 +52,14 @@ public:
 
     bool writeFrame(frame::Kind kind, uint8_t b3, ConstDataSpan payload = {});
 
+    // Queue `required` while adding `prefix` first only when both queue and
+    // allocator capacity permit it. The required frame block is allocated
+    // before the optional prefix, so best-effort traffic cannot consume the
+    // resource needed by a terminal response.
+    bool writeFrameWithOptionalPrefix(frame::Kind prefix_kind, uint8_t prefix_b3, ConstDataSpan prefix_payload,
+                                      frame::Kind required_kind, uint8_t required_b3, ConstDataSpan required_payload,
+                                      bool* prefix_written = nullptr);
+
     bool writeDelimiter();
 
     BlockSource& output();

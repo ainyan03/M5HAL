@@ -48,7 +48,19 @@
 // supplies fake soc/i2c_periph.h, soc/i2c_struct.h and hal/i2c_ll.h headers,
 // so the __has_include probes below resolve the same way they would on a
 // real stretch-cause SoC.
+#if defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)
+#define M5HAL_DETAIL_ESPIDF_I2C_SLAVE_LL_HEADERS_USABLE_ 1
+#elif defined(ESP_PLATFORM) && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
+#define M5HAL_DETAIL_ESPIDF_I2C_SLAVE_LL_HEADERS_USABLE_ 1
+#else
+// ESP-IDF 5.0's hal/i2c_ll.h is not C++-compatible (volatile anonymous-union
+// copies and implicit integer-to-enum conversions in unused inline helpers).
+// Do not expose an LL slave backend there; other ESP-IDF backends remain usable.
+#define M5HAL_DETAIL_ESPIDF_I2C_SLAVE_LL_HEADERS_USABLE_ 0
+#endif
+
 #if (defined(ESP_PLATFORM) || defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)) &&          \
+    M5HAL_DETAIL_ESPIDF_I2C_SLAVE_LL_HEADERS_USABLE_ &&                                      \
     (defined(SOC_I2C_SLAVE_CAN_GET_STRETCH_CAUSE) && SOC_I2C_SLAVE_CAN_GET_STRETCH_CAUSE) && \
     __has_include(<soc/i2c_periph.h>) && __has_include(<soc/i2c_struct.h>) && __has_include(<hal/i2c_ll.h>)
 #define M5HAL_ESPIDF_I2C_SLAVE_LL 1
@@ -62,8 +74,8 @@
 // i2c_ll_slave_enable_scl_stretch / i2c_ll_slave_clear_stretch etc. are no-ops
 // on these SoCs -- see ESP32_I2C_slave_example's I2C_SLAVE_HAS_STRETCH gate for
 // the reference behavior this flavor reproduces.
-#if !M5HAL_ESPIDF_I2C_SLAVE_LL && (defined(ESP_PLATFORM) || defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)) && \
-    (defined(SOC_I2C_SUPPORT_SLAVE) && SOC_I2C_SUPPORT_SLAVE) &&                                                  \
+#if !M5HAL_ESPIDF_I2C_SLAVE_LL && (defined(ESP_PLATFORM) || defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)) &&    \
+    M5HAL_DETAIL_ESPIDF_I2C_SLAVE_LL_HEADERS_USABLE_ && (defined(SOC_I2C_SUPPORT_SLAVE) && SOC_I2C_SUPPORT_SLAVE) && \
     __has_include(<soc/i2c_periph.h>) && __has_include(<soc/i2c_struct.h>) && __has_include(<hal/i2c_ll.h>)
 #define M5HAL_ESPIDF_I2C_SLAVE_LL_BE 1
 #else
@@ -266,9 +278,14 @@ private:
     bool _task_running         = false;
     bool _pending_fill         = false;
     size_t _pending_commit_len = 0;
-    uint32_t _next_seq         = 1;
-    size_t _rx_overflow_count  = 0;
-    ::TickType_t _request_tick = 0;
+    // Identity captured with the backend-owned copy passed to the driver.
+    // The slot pointer alone is insufficient because a completed slot can be
+    // recycled while the driver call runs outside _mux.
+    Transaction* _pending_commit_txn = nullptr;
+    uint32_t _pending_commit_seq     = 0;
+    uint32_t _next_seq               = 1;
+    size_t _rx_overflow_count        = 0;
+    ::TickType_t _request_tick       = 0;
 
     // ---- HW-facing layer (path specific) -----------------------------------
 #if M5HAL_ESPIDF_I2C_SLAVE_LL

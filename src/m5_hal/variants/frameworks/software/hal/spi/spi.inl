@@ -111,6 +111,13 @@ TransferPlan makePlan(const spi::MasterAccessConfig& cfg, bool has_mosi, bool ha
     return plan;
 }
 
+bool isSingleLaneHalfDuplexMode(spi::spi_data_mode_t mode)
+{
+    using spi::spi_data_mode_t;
+    return mode == spi_data_mode_t::HalfDuplex || mode == spi_data_mode_t::HalfDuplexWithDcPin ||
+           mode == spi_data_mode_t::HalfDuplexWithDcBit;
+}
+
 result_t<void> resolveOptionalPin(types::gpio_number_t gpio_num, gpio::Pin& out)
 {
     out = {};
@@ -284,27 +291,36 @@ public:
     }
 
     void begin(const spi::MasterAccessConfig& cfg, const spi::TransferDesc& desc, data::Source* src, size_t tx_len,
-               data::Sink* dst, size_t rx_len, service::fast_tick_t half_tick, bool has_mosi, bool has_miso)
+               data::Sink* dst, size_t rx_len, service::fast_tick_t half_tick, bool has_mosi, bool has_miso,
+               bool half_duplex, bool shared_data_pin)
     {
-        _plan         = makePlan(cfg, has_mosi, has_miso);
-        _tx           = src;
-        _rx           = dst;
-        _tx_remaining = (src != nullptr) ? tx_len : 0;
-        _rx_remaining = (dst != nullptr) ? rx_len : 0;
-        _half_tick    = half_tick;
+        _plan            = makePlan(cfg, has_mosi, half_duplex ? false : has_miso);
+        _tx              = src;
+        _rx              = dst;
+        _tx_remaining    = (src != nullptr) ? tx_len : 0;
+        _rx_remaining    = (dst != nullptr) ? rx_len : 0;
+        _half_tick       = half_tick;
+        _half_duplex     = half_duplex;
+        _shared_data_pin = shared_data_pin;
+        _input_available = has_miso;
+        _rx_phase        = false;
+        if (_shared_data_pin) {
+            _mosi.setMode(types::gpio_mode_t::Output);
+        }
         // Intra-call spin anchor: begin() itself paces real edges through
         // setDC (enterPhase below), so it reads the live counter once. This
         // absolute tick never leaves the call — polls re-derive their own
         // real-axis anchor from ctx (see service()).
-        _due_tick      = service::fastTick();
-        _command       = desc.command;
-        _address       = desc.address;
-        _command_bytes = desc.command_bytes;
-        _address_bytes = desc.address_bytes;
-        _command_dc    = desc.command_dc_level;
-        _address_dc    = desc.address_dc_level;
-        _data_dc       = desc.data_dc_level;
-        if (_data_dc < 0 && desc.dc_level_valid) {
+        _due_tick               = service::fastTick();
+        _command                = desc.command;
+        _address                = desc.address;
+        _command_bytes          = desc.command_bytes;
+        _address_bytes          = desc.address_bytes;
+        _command_dc             = desc.command_dc_level;
+        _address_dc             = desc.address_dc_level;
+        _data_dc                = desc.data_dc_level;
+        const bool has_phase_dc = _command_dc >= 0 || _address_dc >= 0 || _data_dc >= 0;
+        if (!has_phase_dc && desc.dc_level_valid) {
             _data_dc = desc.dc_level ? 1 : 0;
         }
         _dummy_remaining = desc.dummy_cycles;
@@ -497,6 +513,9 @@ private:
                 if ((_command_dc >= 0 || _address_dc >= 0) && _data_dc < 0) {
                     setDC(1);
                 }
+                if (_half_duplex && !txPending()) {
+                    enterRxPhase();
+                }
                 break;
 
             case Phase::dummy:
@@ -532,7 +551,25 @@ private:
         stepClock(_clk, _plan.cpol, _half_tick, _due_tick);
         _due_tick += _half_tick;
         waitUntil(_due_tick);
+        if (_shared_data_pin) {
+            _mosi.setMode(types::gpio_mode_t::Output);
+        }
         _phase = Phase::done;
+    }
+
+    bool txPending() const
+    {
+        return _tx != nullptr && _tx_remaining > 0 && !_tx->eof();
+    }
+
+    void enterRxPhase()
+    {
+        _rx_phase      = true;
+        _plan.has_mosi = false;
+        _plan.has_miso = _input_available;
+        if (_shared_data_pin) {
+            _mosi.setMode(types::gpio_mode_t::Input);
+        }
     }
 
     service::fast_tick_t nextEdgeDue() const
@@ -589,21 +626,28 @@ private:
         _chunk_len   = 0;
         _chunk_index = 0;
 
-        if (_tx != nullptr && _tx_remaining > 0 && !_tx->eof()) {
-            auto peeked = _tx->peek(_tx_remaining);
-            if (!peeked.has_value()) {
-                return m5::stl::make_unexpected(peeked.error());
+        if (!_half_duplex || !_rx_phase) {
+            if (_tx != nullptr && _tx_remaining > 0 && !_tx->eof()) {
+                auto peeked = _tx->peek(_tx_remaining);
+                if (!peeked.has_value()) {
+                    return m5::stl::make_unexpected(peeked.error());
+                }
+                _tx_span = peeked.value();
+                _tx_span = _tx_span.first(_tx_remaining);
             }
-            _tx_span = peeked.value();
-            _tx_span = _tx_span.first(_tx_remaining);
         }
-        if (_rx != nullptr && _rx_remaining > 0 && !_rx->closed()) {
-            auto reserved = _rx->reserve(_rx_remaining);
-            if (!reserved.has_value()) {
-                return m5::stl::make_unexpected(reserved.error());
+        if (_half_duplex && !_rx_phase && _tx_span.size == 0) {
+            enterRxPhase();
+        }
+        if (!_half_duplex || _rx_phase) {
+            if (_rx != nullptr && _rx_remaining > 0 && !_rx->closed()) {
+                auto reserved = _rx->reserve(_rx_remaining);
+                if (!reserved.has_value()) {
+                    return m5::stl::make_unexpected(reserved.error());
+                }
+                _rx_span = reserved.value();
+                _rx_span = _rx_span.first(_rx_remaining);
             }
-            _rx_span = reserved.value();
-            _rx_span = _rx_span.first(_rx_remaining);
         }
 
         _chunk_len = (_tx_span.size > _rx_span.size) ? _tx_span.size : _rx_span.size;
@@ -690,6 +734,10 @@ private:
     int8_t _command_dc       = -1;
     int8_t _address_dc       = -1;
     int8_t _data_dc          = -1;
+    bool _half_duplex        = false;
+    bool _shared_data_pin    = false;
+    bool _input_available    = false;
+    bool _rx_phase           = false;
     Phase _phase             = Phase::done;
     error::error_t _error    = error::error_t::OK;
 };
@@ -824,22 +872,18 @@ result_t<void> Bus_software::transfer(bus::IAccessor* owner, const spi::MasterAc
     }
 
     // This variant bit-bangs a single-lane MOSI/MISO pair. Multi-lane
-    // modes (dual/quad/octal) are physically unimplemented: always
-    // reject. Half-duplex modes share the full-duplex wire shape as long
-    // as a transfer carries data in only ONE direction (the meta phase
-    // is already sent sequentially — the DC demos rely on that); what
-    // cannot be honored is half-duplex with BOTH src and dst data, which
-    // full-duplex clocking would corrupt.
+    // modes (dual/quad/octal) are physically unimplemented. Single-lane
+    // half duplex runs TX and RX as sequential phases; with no MISO pin,
+    // the MOSI pin changes to input for the RX phase.
+    bool half_duplex = false;
     {
         using spi::spi_data_mode_t;
         const auto mode       = cfg.spi_data_mode;
         const bool multi_lane = mode == spi_data_mode_t::DualOutput || mode == spi_data_mode_t::DualIo ||
                                 mode == spi_data_mode_t::QuadOutput || mode == spi_data_mode_t::QuadIo ||
                                 mode == spi_data_mode_t::OctalOutput || mode == spi_data_mode_t::OctalIo;
-        const bool half_duplex = mode == spi_data_mode_t::HalfDuplex || mode == spi_data_mode_t::HalfDuplexWithDcPin ||
-                                 mode == spi_data_mode_t::HalfDuplexWithDcBit;
-        if (multi_lane ||
-            (half_duplex && src != nullptr && tx_len > 0 && !src->eof() && dst != nullptr && rx_len > 0)) {
+        half_duplex = impl_software::isSingleLaneHalfDuplexMode(mode);
+        if (multi_lane) {
             return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
         }
     }
@@ -852,6 +896,12 @@ result_t<void> Bus_software::transfer(bus::IAccessor* owner, const spi::MasterAc
     }
     if (desc.command_bytes > 4 || desc.address_bytes > 4) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+    const bool has_mosi        = _pin_mosi.isValid();
+    const bool has_miso        = _pin_miso.isValid();
+    const bool shared_data_pin = rx_len > 0 && !has_miso && half_duplex && has_mosi;
+    if (rx_len > 0 && !has_miso && !shared_data_pin) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
     }
 
     // Per-device D/C override: a non-negative accessor pin_dc beats the
@@ -884,10 +934,9 @@ result_t<void> Bus_software::transfer(bus::IAccessor* owner, const spi::MasterAc
         }
     }
 
-    const bool has_mosi = _pin_mosi.isValid();
-    const bool has_miso = _pin_miso.isValid();
+    gpio::Pin& input_pin = shared_data_pin ? _pin_mosi : _pin_miso;
 
-    auto* transfer_service = new (std::nothrow) impl_software::TransferService{_pin_clk, _pin_mosi, _pin_miso, dc_pin};
+    auto* transfer_service = new (std::nothrow) impl_software::TransferService{_pin_clk, _pin_mosi, input_pin, dc_pin};
     if (transfer_service == nullptr) {
         return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
     }
@@ -896,7 +945,8 @@ result_t<void> Bus_software::transfer(bus::IAccessor* owner, const spi::MasterAc
     _transfer_error   = error::error_t::OK;
     _transfer_gate.arm();
 
-    transfer_service->begin(cfg, desc, src, tx_len, dst, rx_len, half_tick.value(), has_mosi, has_miso);
+    transfer_service->begin(cfg, desc, src, tx_len, dst, rx_len, half_tick.value(), has_mosi,
+                            has_miso || shared_data_pin, half_duplex, shared_data_pin);
     // First poll: a fresh stream vouches for nothing yet (elapsed 0);
     // local_tick anchors the intra-call edge spins.
     auto first = serviceTransfer(service::ServiceContext{0, service::fastTick()});

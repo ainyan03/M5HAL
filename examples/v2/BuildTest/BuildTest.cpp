@@ -650,7 +650,11 @@ static void checkGPIO()
     m5hal::gpio::GPIOGroup group;
     m5hal::gpio::IGPIO* gpio = nullptr;
     m5hal::gpio::IPort* port = nullptr;
+    m5hal::gpio::IGPIO::PinLocation location{};
+    m5hal::types::gpio_local_pin_t local_pin{};
     m5hal::gpio::GPIOGroup::PortAccess access{port, 0};
+    (void)location;
+    (void)local_pin;
     (void)access.port;
     (void)access.deny_mask;
 
@@ -667,6 +671,9 @@ static void checkGPIO()
 
         (void)gpio->portForPin(0);
         (void)gpio->getPort(0);
+        (void)gpio->locatePin(0);
+        (void)gpio->tryLocatePin(0, &location);
+        (void)gpio->localPinForLocation(0, 0, &local_pin);
         (void)gpio->getPinCount();
         (void)gpio->getPortCount();
         (void)gpio->isValid(0);

@@ -167,12 +167,10 @@ bool Bus_espidf::onRecvCallback(::i2s_chan_handle_t /*handle*/, ::i2s_event_data
 // ---------------------------------------------------------------------------
 result_t<void> Bus_espidf::init(const BusConfig_espidf& config)
 {
-    // D5/F10: reject a no-direction config up front. An I2S bus needs at least
-    // one data line (dout for TX, din for RX); BCLK/WS alone cannot transfer.
-    // Without this, init/acquire would succeed and the failure would surface
-    // only later at the first I/O (ensureChannel), inconsistent with the
-    // acquire/init validation boundary.
-    if (config.pin_dout < 0 && config.pin_din < 0) {
+    // Standard I2S always needs both clocks and at least one data direction.
+    // Reject incomplete wiring here so init/acquire cannot succeed only to
+    // fail later when the first I/O lazily creates the channel.
+    if (config.pin_bclk < 0 || config.pin_ws < 0 || (config.pin_dout < 0 && config.pin_din < 0)) {
         return m5::stl::make_unexpected(m5::hal::v2::error::error_t::INVALID_ARGUMENT);
     }
     // Re-init: tear down any existing channel first — clearing the handle
@@ -266,6 +264,11 @@ void Bus_espidf::updateDerivedState(const i2s::AccessConfig& cfg, size_t& out_fr
 #else
     _expand_mono = false;
 #endif
+    // IDF 5.5 on HW v2 reports one active DMA slot for MONO+BOTH, yet RX exposes
+    // an adjacent L/R-shaped pair (duplicates when the source drives identical
+    // mono slots). HW v1 already captures stereo-shaped frames for its software
+    // mono path. In both cases read() keeps one physical left sample per frame.
+    _collapse_mono_rx  = (cfg.channels == 1);
     const size_t slots = _expand_mono ? 2u : cfg.channels;
     out_frame_bytes    = static_cast<size_t>(cfg.bits_per_sample / 8) * slots;
 
@@ -484,10 +487,10 @@ result_t<void> Bus_espidf::ensureChannel(const i2s::AccessConfig& cfg)
         // measured via the remote-stream drain rate). Prefer sample rates with an
         // exact PLL_160M divider on this chip.
         // Fully explicit Philips slot configuration (mirrors the field set proven
-        // on this hardware family by M5Unified's speaker path). slot_mask BOTH
-        // matches M5Unified; on HW v2 with slot_mode MONO the driver maps this to
-        // its hardware sample-duplication path (HW v2 mono never reaches here —
-        // see _expand_mono above).
+        // on this hardware family by M5Unified's speaker path). TX mono uses BOTH
+        // so one logical sample is emitted on both wire slots. RX uses the same
+        // mask because HW v2 returns no data with a single-slot mono mask on the
+        // tested S3; read() collapses the stereo-shaped physical capture instead.
         std_cfg.slot_cfg.data_bit_width = static_cast<i2s_data_bit_width_t>(cfg.bits_per_sample);
         std_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_16BIT;
         std_cfg.slot_cfg.slot_mode      = slot_mode;
@@ -557,6 +560,7 @@ result_t<void> Bus_espidf::ensureChannel(const i2s::AccessConfig& cfg)
         // on_sent callback drains them as they play out as silence). RX has no
         // equivalent — its DMA starts empty and fills as samples arrive.
         if (_tx_handle != nullptr) {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
             uint8_t zeros[480] = {};
             size_t preloaded   = 0;
             size_t loaded      = 0;
@@ -569,6 +573,12 @@ result_t<void> Bus_espidf::ensureChannel(const i2s::AccessConfig& cfg)
                 preloaded += loaded;
             } while (loaded == sizeof(zeros) && preloaded < _dma_capacity);
             _dma_in_flight.store(preloaded, std::memory_order_relaxed);
+#else
+            // ESP-IDF 5.0 has the channel API but not its preload helper.
+            // Start empty there; later releases retain the deterministic
+            // silence preload used to avoid classic-ESP32 frame misalignment.
+            _dma_in_flight.store(0, std::memory_order_relaxed);
+#endif
         }
 
         // --- Enable each wired channel
@@ -857,11 +867,12 @@ result_t<size_t> Bus_espidf::read(bus::IAccessor* owner, const i2s::AccessConfig
             break;  // sink is full
         }
 
-        if (_expand_mono) {
-            // HW v1 mono capture: the DMA delivers duplicated stereo frames, so
-            // read physical stereo into a bounce buffer and keep the left slot
-            // of each frame as the logical mono sample. `want` (and `done`) stay
-            // in logical (mono) bytes; only the i2s_channel_read size is physical.
+        if (_collapse_mono_rx) {
+            // Mono capture: the DMA delivers stereo-shaped physical pairs, so
+            // read them into a bounce buffer and keep the left slot of each
+            // frame as the logical mono sample. With a mono TX the pair is
+            // duplicated. `want` (and `done`) stay in logical bytes; only the
+            // i2s_channel_read size is physical.
             uint8_t bounce[960];
             size_t logical_cap = want;
             if (logical_cap > sizeof(bounce) / 2) {
@@ -885,12 +896,18 @@ result_t<size_t> Bus_espidf::read(bus::IAccessor* owner, const i2s::AccessConfig
             }
             const size_t got_samples = read_phys / 4;
             if (got_samples > 0) {
-                for (size_t i = 0; i < got_samples; ++i) {
-                    reserved.value().data[i * 2 + 0] = bounce[i * 4 + 0];
-                    reserved.value().data[i * 2 + 1] = bounce[i * 4 + 1];
-                }
-                const size_t got_logical = got_samples * 2;
-                auto committed           = dst->commit(got_logical);
+#if SOC_I2S_HW_VERSION_1
+                // HW v1 transposes the two 16-bit halves in every DMA word;
+                // raw pair[1] is therefore the physical left slot. Mono TX
+                // duplicates L/R so the distinction only shows with an
+                // external source whose slots differ.
+                constexpr bool kHwVersion1 = true;
+#else
+                constexpr bool kHwVersion1 = false;
+#endif
+                const size_t got_logical = detail_espidf_i2s::collapseStereo16RxPairsToMonoLeft(
+                    reserved.value().data, bounce, got_samples, kHwVersion1);
+                auto committed = dst->commit(got_logical);
                 if (!committed.has_value()) {
                     return m5::stl::make_unexpected(committed.error());
                 }
@@ -1055,8 +1072,8 @@ result_t<size_t> Bus_espidf::readableBytes(bus::IAccessor* owner, const i2s::Acc
 
     const size_t available = _dma_rx_available.load(std::memory_order_relaxed);
     // Public accounting stays in logical (mono) bytes; the physical capture is
-    // duplicated stereo on HW v1 mono, so halve it.
-    return _expand_mono ? available / 2 : available;
+    // stereo-shaped physical pairs in mono mode, so halve it.
+    return _collapse_mono_rx ? available / 2 : available;
 }
 
 }  // namespace m5::hal::v2::i2s

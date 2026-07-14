@@ -112,6 +112,29 @@ void expectTypedAcquireIsNotManagedByCommit(View& view, MakeReq make_req, MakeTy
     EXPECT_EQ(view.hardwareInUse(), 1u);
 }
 
+template <class View, class MakeReq, class MakeTypedConfig>
+void expectTypedReacquireThroughLogicalBecomesManaged(View& view, MakeReq make_req,
+                                                      MakeTypedConfig make_typed_config)
+{
+    auto typed_bus = view.acquire(make_typed_config());
+    ASSERT_TRUE(typed_bus.has_value());
+    ASSERT_TRUE(typed_bus.value());
+    EXPECT_EQ(typed_bus.value()->backendKind(), kManagedSw);
+    EXPECT_EQ(typed_bus.value()->backendGeneration(), 0u);
+
+    // Identity is wiring-only. A logical acquire of the same typed-created
+    // facade must return that facade and retag it as intent-managed.
+    auto logical_bus = view.acquire(make_req(1, kManagedRequire));
+    ASSERT_TRUE(logical_bus.has_value());
+    EXPECT_EQ(logical_bus.value().get(), typed_bus.value().get());
+
+    ASSERT_TRUE(view.commitBuses().has_value());
+    EXPECT_EQ(typed_bus.value()->backendKind(), kManagedHw);
+    EXPECT_EQ(typed_bus.value()->controllerId(), 0);
+    EXPECT_EQ(typed_bus.value()->backendGeneration(), 1u);
+    EXPECT_EQ(view.hardwareInUse(), 1u);
+}
+
 template <class View, class MakeReq, class MakeTypedHwConfig>
 void expectUnmanagedHardwareBusReservesItsController(View& view, MakeReq make_req, MakeTypedHwConfig make_hw_config)
 {

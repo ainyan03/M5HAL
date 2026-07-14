@@ -15,15 +15,18 @@ void expectStaticCommitSurface(View& view)
 }
 
 template <class View, class LogicalConfig>
-void expectStaticLogicalAcquireContract(View& view, LogicalConfig valid_req, LogicalConfig invalid_identity_req)
+void expectStaticLogicalAcquireContract(View& view, LogicalConfig valid_req, LogicalConfig unset_pin_req)
 {
     auto r = view.acquire(valid_req);
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), error::error_t::NOT_IMPLEMENTED);
 
-    auto invalid_identity = view.acquire(invalid_identity_req);
-    ASSERT_FALSE(invalid_identity.has_value());
-    EXPECT_EQ(invalid_identity.error(), error::error_t::INVALID_ARGUMENT);
+    // Identity preserves unset pin roles; the static backend, not BusView,
+    // decides whether it can create such a bus. This backend offers no logical
+    // creation at all, so both requests reach the same NOT_IMPLEMENTED result.
+    auto unset_pin = view.acquire(unset_pin_req);
+    ASSERT_FALSE(unset_pin.has_value());
+    EXPECT_EQ(unset_pin.error(), error::error_t::NOT_IMPLEMENTED);
 
     LogicalConfig invalid_intent  = valid_req;
     invalid_intent.intent.require = types::backend_caps::HARDWARE;

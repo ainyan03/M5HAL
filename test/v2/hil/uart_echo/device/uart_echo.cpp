@@ -7,8 +7,8 @@
 // deliberately NO Arduino `Serial` console and NO logging: the USB channel is a
 // clean echo pipe so the host driver can verify round-trips byte-exact.
 //
-// Pair with the host driver: experiments/v2/test/uart_echo/host/uart_echo.cpp.
-// Run (or use experiments/v2/test/hil-run.sh uart_echo):
+// Pair with the host driver: test/v2/hil/uart_echo/host/uart_echo.cpp.
+// Run (or use test/v2/hil/hil-run.sh uart_echo):
 //   export M5HAL_PIO_EXTRA_CONFIG=pio_envs/v2/hil.ini.cli
 //   pio run -e v2_hil_uart_echo_device_esp32 -t upload
 

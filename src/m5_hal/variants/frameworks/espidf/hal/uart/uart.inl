@@ -283,10 +283,7 @@ result_t<size_t> Bus_espidf::write(bus::IAccessor* owner, const uart::AccessConf
     }
     auto result = Bus_streaming::write(owner, cfg, src, len);
     auto mapped = impl_espidf::mapEspErr(::uart_wait_tx_done(_port, impl_espidf::ticks(cfg.write_timeout_ms)));
-    if (error::isError(mapped) && result.has_value()) {
-        return m5::stl::make_unexpected(mapped);
-    }
-    return result;
+    return completeWrite(std::move(result), mapped);
 }
 
 result_t<size_t> Bus_espidf::read(bus::IAccessor* owner, const uart::AccessConfig& cfg, data::Sink* dst, size_t len)

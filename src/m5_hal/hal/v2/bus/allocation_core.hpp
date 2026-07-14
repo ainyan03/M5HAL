@@ -46,6 +46,16 @@ public:
     uint8_t hardwareInUse(void) const;
 
     /*!
+      @brief Re-tag one managed bus, serialized against commit intent snapshots.
+
+      A logical re-acquire is excluded only from the short intent-snapshot
+      phase of `commitBuses()`. An update that lands after that snapshot is
+      intentionally deferred to the next commit; the current pass threads its
+      captured intent through planning and backend construction.
+     */
+    void retagIntent(IManagedBus& bus, const types::AllocationIntent& intent);
+
+    /*!
       @brief Resolve every live bus of this kind's backend from its intent.
 
       See the original I2C `commitBuses` for the contract: highest priority
@@ -72,11 +82,13 @@ public:
       `INVALID_ARGUMENT` (a claim is defined as hardware occupancy). A
       claimed controller survives `commitBuses()`'s `releaseAll()` rebuild
       (see `HwControllerPool::releaseAll`) and is reserved out of the
-      resolver's `used[]` set for the whole commit.
+      resolver's `used[]` set for the whole commit. Call only while the
+      caller holds no access/transaction window for this kind: a concurrent
+      commit may hold the allocation lock while waiting for that bus lock.
      */
     result_t<int8_t> claimController(const types::AllocationIntent& intent);
 
-    /*! @brief Return a controller claimed via `claimController`. */
+    /*! @brief Return a controller claimed via `claimController`; same no-access-window rule. */
     result_t<void> releaseClaimedController(int8_t controller);
 
 private:
@@ -103,14 +115,15 @@ private:
     static int allocTier(const types::AllocationIntent& a);
 
     // Serializes commitBuses / claimController / releaseClaimedController
-    // against each other. The resolver was designed to drive a whole
+    // against each other. The resolver drives a whole
     // bin-packing pass from one task context, but claimController is a
     // public entry another task may call while a commit is mid-rebuild
     // (_syncPoolFromLive drops every ordinary lease before re-establishing
     // them one by one); without this lock a concurrent claim could take a
     // controller a live bus still occupies. Held across the whole commit;
-    // claims never take a bus lock, so the nesting order (this, then
-    // pool/bus internals) is one-way and cannot deadlock.
+    // claims never take a bus lock themselves. Public callers must likewise
+    // hold no access-window bus lock while claiming/releasing; otherwise a
+    // concurrent commit can form bus -> serial / serial -> bus lock order.
     struct SerialGuard {
         runtime::Mutex& m;
         explicit SerialGuard(runtime::Mutex& mtx) : m{mtx}
@@ -128,6 +141,11 @@ private:
     BusRegistry& _registry;
     const IAllocationKind& _kind;
     HwControllerPool _pool;
+    // Protects only intent retags and the commit-time intent snapshot. It is
+    // deliberately NOT held while a commit waits for a bus lock: an accessor
+    // owner may re-acquire the same logical bus without creating a
+    // bus-lock -> intent-lock / intent-lock -> bus-lock cycle.
+    runtime::Mutex _intent_mutex;
     runtime::Mutex _serial_mutex;
 };
 

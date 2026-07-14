@@ -327,7 +327,7 @@ struct ManagedBusFacade : public FacadeCore<Traits>, public IManagedBus {
     }
 
     /*! @brief The acquire intent recorded for this bus (commit-time resolver). */
-    const types::AllocationIntent& intent(void) const override
+    types::AllocationIntent intent(void) const override
     {
         return _intent;
     }
@@ -349,27 +349,31 @@ struct ManagedBusFacade : public FacadeCore<Traits>, public IManagedBus {
       @brief Update the recorded acquire intent (a re-acquire re-tags the bus).
 
       The commit-time resolver acts on the latest intent, so promoting a bus
-      to `requireHardware()` (or demoting to `software()`) is a setIntent
-      followed by `commitBuses()`. Re-tagging through the logical path also
-      marks the bus intent-managed.
+      to `requireHardware()` (or demoting to `software()`) is a logical
+      re-acquire followed by `commitBuses()`. `AllocationCore` calls this hook
+      under the same short lock used to snapshot a commit's intents;
+      re-tagging also marks a typed-created facade intent-managed. An update
+      after the snapshot belongs to the next commit.
      */
-    void setIntent(const LogicalBusConfig& logical)
+private:
+    void retagIntent(const types::AllocationIntent& intent) override
     {
-        _intent  = logical.intent;
+        _intent  = intent;
         _managed = true;
     }
 
+public:
     /*!
       @brief Rebuild the logical request from the recorded wiring + intent.
 
       The commit-time resolver hands this to a backend factory to re-make the
       backend (software or hardware) for this bus during a swap.
      */
-    LogicalBusConfig logicalConfig(void) const
+    LogicalBusConfig logicalConfig(const types::AllocationIntent& intent) const
     {
         LogicalBusConfig logical;
         Traits::fillLogical(logical, this->_config);
-        logical.intent = _intent;
+        logical.intent = intent;
         return logical;
     }
 

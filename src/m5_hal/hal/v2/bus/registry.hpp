@@ -22,9 +22,8 @@ namespace m5::hal::v2::bus {
   intern to one instance (identity = the wiring, NOT which
   backend / controller drives it, NOT the per-accessor frequency). The
   roles are positional and fixed, so no order normalization is needed --
-  swapping pins is a different bus. Each kind puts its two essential
-  wires in pins[0]/pins[1] (so `valid()` is kind-agnostic) and any extra
-  identifying wires after them: I2C = {SCL, SDA}; SPI = {CLK, MOSI, MISO}
+  swapping pins is a different bus. Each kind puts its core signal roles in
+  order: I2C = {SCL, SDA}; SPI = {CLK, MOSI, MISO}
   (the 3-wire core; quad/octal data lines and DC are NOT identity -- the
   same core wires are the same physical bus); UART = {TX, RX}; I2S =
   {BCLK, WS, DOUT, DIN}. `kMaxPins` covers the widest of these.
@@ -47,12 +46,12 @@ struct IdentityKey {
     /*!
       @brief Build a key from a kind's identity pins in role order.
 
-      The single shared identity projection: each kind passes its essential
-      wires first (pins[0]/pins[1], required by `valid()`) then any extra
-      identifying wires, exactly as the per-kind layout doc above. Unset
-      trailing roles stay at the `-1` sentinel (e.g. an I2S RX-only DOUT), so
-      "wire absent" remains observable in the key (it must, for interning).
-      A list longer than `kMaxPins` is clamped (a kind never exceeds it).
+      The single shared identity projection: each kind passes its signal roles
+      exactly as the per-kind layout doc above. Any unset role stays at the
+      `-1` sentinel, including a leading role; identity compares that sentinel
+      like any other value and does not validate whether a backend can operate
+      with the requested wiring. A list longer than `kMaxPins` is clamped (a
+      kind never exceeds it).
      */
     static IdentityKey fromPins(std::initializer_list<types::gpio_number_t> role_pins)
     {
@@ -67,10 +66,6 @@ struct IdentityKey {
         return key;
     }
 
-    constexpr bool valid(void) const
-    {
-        return pins[0] >= 0 && pins[1] >= 0;
-    }
     bool operator==(const IdentityKey& other) const
     {
         for (size_t i = 0; i < kMaxPins; ++i) {

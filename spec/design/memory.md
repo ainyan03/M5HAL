@@ -26,9 +26,9 @@ M5HAL v2 は短寿命の作業領域を扱うための memory allocator を持�
 namespace m5::hal::v2::memory {
 
 enum class usage_t : uint8_t {
-    temp,
-    persistent,
-    persistent_slow,
+    Temp,
+    Persistent,
+    PersistentSlow,
 };
 
 class Allocator {
@@ -37,8 +37,8 @@ public:
     using realloc_fn_t = void* (*)(void*, size_t preserve_size, size_t new_size, usage_t);
     using free_fn_t   = void (*)(void*);
 
-    void* allocate(size_t size, usage_t usage = usage_t::temp);
-    void* reallocate(void* ptr, size_t preserve_size, size_t new_size, usage_t usage = usage_t::temp);
+    void* allocate(size_t size, usage_t usage = usage_t::Temp);
+    void* reallocate(void* ptr, size_t preserve_size, size_t new_size, usage_t usage = usage_t::Temp);
     void deallocate(void* ptr);
 
     void setFallback(malloc_fn_t malloc_fn, free_fn_t free_fn);
@@ -48,7 +48,7 @@ public:
 class TempBuffer {
 public:
     TempBuffer() = default;
-    TempBuffer(Allocator& alloc, size_t size, usage_t usage = usage_t::temp);
+    TempBuffer(Allocator& alloc, size_t size, usage_t usage = usage_t::Temp);
     ~TempBuffer();
 
     TempBuffer(TempBuffer&& other) noexcept;
@@ -156,7 +156,7 @@ class FixedBlockPool {
 
 この API は pointer を変更しうる。成功時は必ず戻り値を新しい所有 pointer として扱い、古い pointer は使わない。失敗時は `nullptr` を返し、旧 pointer の所有権と内容は維持される。
 
-`usage_t::temp` かつ `ptr` が temp pool 所有の場合は、まず pool 内で再確保を試す。
+`usage_t::Temp` かつ `ptr` が temp pool 所有の場合は、まず pool 内で再確保を試す。
 
 - 旧 run の bit を外した `released_bitmap` を作る
 - `released_bitmap` 上で旧 index に `new_size` 分の run が置ける場合はそこを優先する
@@ -190,17 +190,17 @@ fallback pointer の再確保は `setFallback(malloc, realloc, free)` で登録�
 
 ## fallback
 
-`usage_t::temp` は pool を優先し、失敗時に fallback する。
+`usage_t::Temp` は pool を優先し、失敗時に fallback する。
 
-`usage_t::persistent` / `persistent_slow` は pool を使わず fallback へ直接回す。初期実装では `std::malloc` / `std::free` を default fallback とする。
+`usage_t::Persistent` / `usage_t::PersistentSlow` は pool を使わず fallback へ直接回す。初期実装では `std::malloc` / `std::free` を default fallback とする。
 
 ESP-IDF / Arduino / native の環境差は `setFallback()` で吸収する。`ESP_PLATFORM` が有効な環境では HAL 初期化時に `heap_caps_malloc` / `heap_caps_realloc` / `heap_caps_free` を fallback として登録する。ArduinoESP32 は ESP-IDF の上にあるため、この fallback は Arduino variant と ESP-IDF variant が同居する構成でも有効になる。
 
 ESP-IDF fallback の usage mapping:
 
-- `usage_t::temp`: temp pool 失敗時に `MALLOC_CAP_DEFAULT`
-- `usage_t::persistent`: `MALLOC_CAP_DEFAULT`
-- `usage_t::persistent_slow`: `MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT` を優先し、失敗時は `MALLOC_CAP_DEFAULT`
+- `usage_t::Temp`: temp pool 失敗時に `MALLOC_CAP_DEFAULT`
+- `usage_t::Persistent`: `MALLOC_CAP_DEFAULT`
+- `usage_t::PersistentSlow`: `MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT` を優先し、失敗時は `MALLOC_CAP_DEFAULT`
 
 native や ESP-IDF 以外の環境では、fallback hook 未設定時に `std::malloc` / `std::free` を使う。Allocator 本体の public API は framework-specific fallback に依存しない。
 

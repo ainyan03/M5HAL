@@ -195,7 +195,9 @@ facade (`spi::Bus`) が `init(BusConfig_myfw)` を受けたとき、
 ### init
 
 - config を `_config` にコピー保存する
-- GPIO pin を `M5_Hal.Gpio.getPin(num)` で解決する
+- raw config の pin は、`-1` がそのfieldで未指定を表せるかを先に判定する。指定されたpinは
+  `M5_Hal.Gpio.tryGetPin(num)` で解決し、範囲外・未登録ならエラーを返す。asserting APIの
+  `getPin()` は検証済みinvariantにだけ使い、利用者入力へ直接使わない
 - framework 固有のリソースを確保する
 - 失敗時は `INVALID_ARGUMENT` または `IO_ERROR` を返す
 
@@ -207,8 +209,9 @@ facade (`spi::Bus`) が `init(BusConfig_myfw)` を受けたとき、
 ### beginTransaction / endTransaction
 
 - CS pin の assert / deassert を行う
-- D/C pin を data level に初期化する (§D/C pin 契約 参照)
-- `owner` を検証してロック整合を保つ (基底の `lock`/`unlock` を利用)
+- D/C pin をdata側idleのHighへ初期化する (§D/C pin 契約 参照)
+- accessorがlockを取得してから呼ぶため、backendはlock済みとして動作する。`owner`は必要なら
+  transactionの整合確認に使うが、基底`lock`/`unlock`を再実行しない
 
 ### transfer
 
@@ -225,7 +228,10 @@ facade (`spi::Bus`) が `init(BusConfig_myfw)` を受けたとき、
 ### backendKind / controllerId
 
 - HW ペリフェラルを使うなら `Hardware` を返す
-- `controllerId` は HW controller の番号 (SPI2_HOST = 1 等)。不明なら `-1`
+- `controllerId` はM5HAL controller poolの0始まりindex。ESP-IDF SPIなら
+  `SPI2_HOST → 0`、`SPI3_HOST → 1`で、native host値そのものではない。software・台帳外など
+  controllerを申告しないbackendは`-1`を返す。native値が必要ならvariant固有query
+  (`Bus_espidf::nativeHost()`等)を使う
 
 ## 9. D/C pin 契約 (SPI 固有)
 
@@ -239,20 +245,25 @@ SPI の D/C (Data/Command) pin は 3 層で解決される:
 
 **実装が守るべき契約**:
 
-1. `beginTransaction` で D/C pin を **data level に設定する**
-   - data level は `TransferDesc::dc_level` で指定される (典型は HIGH)
-   - 設定可能であり、常に HIGH とは限らない
+1. `beginTransaction` でD/C pinをdata側idleの **High** にする。このAPIは`TransferDesc`を
+   受け取らないため、per-transfer levelはここでは参照しない
 2. `transfer` の command phase で `desc.command_dc_level` に従い D/C を切り替える
 3. `transfer` の address phase で `desc.address_dc_level` に従い D/C を切り替える
-4. command / address phase の後、data phase に入る前に D/C を **data level に復帰させる**
-   - `desc.data_dc_level >= 0` ならその値、そうでなければ `desc.dc_level` (= data level)
-5. `write()` (plain data write) は D/C pin を**触らない** — 上記 1 + 4 の不変条件に依存する
+4. command / address phase の後、data phase に入る前にD/Cを復帰させる
+   - phase別指定が1つでもあり、`desc.data_dc_level < 0`ならHigh
+   - `desc.data_dc_level >= 0`ならその値
+   - phase別指定が無い場合だけlegacy `desc.dc_level_valid` / `desc.dc_level`をtransfer全体へ適用
+5. `write()` (plain data write) はtransaction開始時のHighを維持し、`TransferDesc`由来の追加切替は行わない
 
 **実装例** (擬似コード):
 
 ```cpp
 result_t<void> transfer(..., const TransferDesc& desc, ...) {
     auto dc_pin = resolvePin(cfg.pin_dc, _config.pin_dc);
+    bool has_phase_dc = (desc.command_dc_level >= 0)
+                     || (desc.address_dc_level >= 0)
+                     || (desc.data_dc_level >= 0);
+    if (!has_phase_dc && desc.dc_level_valid) setDC(dc_pin, desc.dc_level);
     // command phase
     if (desc.command_bytes > 0) {
         if (desc.command_dc_level >= 0) setDC(dc_pin, desc.command_dc_level);
@@ -264,13 +275,7 @@ result_t<void> transfer(..., const TransferDesc& desc, ...) {
         sendMeta(desc.address, desc.address_bytes);
     }
     // data level restore
-    bool has_phase_dc = (desc.command_dc_level >= 0) || (desc.address_dc_level >= 0);
-    if (has_phase_dc) {
-        int8_t restore = (desc.data_dc_level >= 0)
-            ? desc.data_dc_level
-            : (desc.dc_level_valid ? static_cast<int8_t>(desc.dc_level) : currentDataLevel());
-        setDC(dc_pin, restore);
-    }
+    if (has_phase_dc) setDC(dc_pin, desc.data_dc_level >= 0 ? desc.data_dc_level : 1);
     // data phase
     transferData(src, tx_len, dst, rx_len);
     return {};

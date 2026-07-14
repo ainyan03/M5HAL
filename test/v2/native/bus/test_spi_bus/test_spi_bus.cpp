@@ -131,12 +131,13 @@ TEST(SpiBusView, DifferentClkPinsReturnDistinctInstances)
     EXPECT_NE(a.value().get(), b.value().get()) << "different CLK -> distinct instances";
 }
 
-TEST(SpiBusView, InvalidPinsReturnError)
+TEST(SpiBusView, BackendRejectsMissingClockPin)
 {
     auto& hal = v2::getM5_Hal();
 
     v2::spi::BusConfig_software cfg;
-    // pin_clk = -1 (invalid sentinel) -> INVALID_ARGUMENT
+    // BusView accepts -1 as part of the identity; this software backend still
+    // requires a physical clock pin and rejects the config during init.
     cfg.pin_clk  = -1;
     cfg.pin_mosi = 4;
     cfg.pin_miso = 5;

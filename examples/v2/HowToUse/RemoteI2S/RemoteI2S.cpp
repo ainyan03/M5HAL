@@ -231,8 +231,9 @@ int streamTone(const std::shared_ptr<m5hal::i2s::IBus>& bus, uint32_t seconds, u
         }
 
         // Pace the sender to the playback rate (plus a DMA prefill worth of
-        // lead). The device accepts data faster than the I2S clock drains it;
-        // an unpaced sender overruns the device DMA and the excess is lost.
+        // lead). This loop preserves a short-write remainder for retry, but an
+        // unpaced sender creates sustained backpressure, longer waits, and a
+        // greater risk of hitting the remote request timeout.
         const uint64_t budget =
             static_cast<uint64_t>(elapsed * static_cast<double>(nominal)) + static_cast<uint64_t>(TX_DMA_BYTES);
         if (total_sent >= budget) {

@@ -12,11 +12,10 @@
 
 // ESP-IDF I2C master driver detection.
 //
-// gen<N> is an ERA TAG: it names the I2C driver M5HAL uses on ESP-IDF v<N>.x,
-// matching the espidf4 / espidf5 / espidf6 build envs. It is NOT a driver
-// design-generation count. ESP-IDF has had only two I2C driver designs:
+// gen<N> is an ERA TAG, not a driver design-generation count. ESP-IDF has had
+// only two I2C driver designs:
 //   - command-link (driver/i2c.h): the original, dating to 2015; spans v2..v5.1,
-//     deprecated in v5.2, EOL as of v6.0. Tagged gen4 (M5HAL's IDF4 support floor).
+//     deprecated in v5.2, EOL as of v6.0. Tagged gen4 for its legacy era.
 //   - bus-device (driver/i2c_master.h): introduced in v5.2; current on v5.2 and
 //     later (incl. v6.x). Tagged gen5 (= "IDF5 or later", until a newer design ships).
 // Detection is by header presence (__has_include), not by version number, so a
@@ -25,7 +24,7 @@
 // Capability probes (header presence) — independent of which backend M5HAL
 // actually selects below.
 //   gen5: bus-device API (driver/i2c_master.h, ESP-IDF v5.2+).
-//   gen4: command-link (legacy) API (driver/i2c.h, ESP-IDF v2..v6.0 EOL).
+//   gen4: command-link (legacy) API (driver/i2c.h, ESP-IDF v2..v5.x).
 #if __has_include(<driver/i2c_master.h>)
 #define M5HAL_DETAIL_ESPIDF_I2C_HAS_GEN5_DRIVER_ 1
 #else

@@ -101,7 +101,7 @@
 | ポート | port | `IPort` 抽象 |
 | 個別ピン | pin | `IPin` |
 | 統合 GPIO 番号 | unified GPIO number | `gpio_number_t` |
-| ローカル pin | local pin | `IPort` 内の通し番号 (0〜255) |
+| ローカル pin | local pin | `IGPIO` 内のローカル番号 (0〜255)。port ordinal / mask bit との対応は `IGPIO::locatePin()` が定義 |
 | slot | slot | `GPIOGroup` の slot 0..N、 固有名詞扱い |
 | MCU GPIO | MCU GPIO | 「slot 0 は MCU GPIO 予約」 |
 | I/O expander | I/O expander | PCA9554 等 |

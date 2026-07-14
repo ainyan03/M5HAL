@@ -11,13 +11,14 @@ async executor 連携は後続段階で扱う。
 
 共通機構は [bus_accessor.md](bus_accessor.md) §Bus の保持 を参照。本 kind 固有の差分のみ以下に示す。
 
-- **identity = TX / RX**（両必須）。TX-only / RX-only は直接構築で。
+- **identity = TX / RX**。`-1`の未指定roleもidentityの値として保持し、対応可否はbackendが判定する。
+  したがってTX-only / RX-onlyやbackend既定pinをBusView自体は拒否しない。
 - RTS / CTS と buffer size は identity 外だが、同一 TX/RX identity の typed acquire で値が食い違う場合は
   `INVALID_STATE` を返す (既存 bus は再構成しない)。backend 固有 selector (ESP-IDF `port_num`、
   POSIX `device_path` 等) は現行 identity では表現しないため、初回 acquire の config が有効。
 - UART は **static-backend policy**。`commitBuses()` は no-op、`hardwareInUse()` は 0。
-  `acquire(LogicalBusConfig)` は I2C/SPI と同じ surface と validation を持つが、現時点では
-  有効な logical request に `NOT_IMPLEMENTED` を返す。bus 生成は `acquire<CfgT>(cfg)` が担い、
+  `acquire(LogicalBusConfig)` は I2C/SPI と同じ surface とintent validationを持つが、現時点では
+  pin値によらず `NOT_IMPLEMENTED` を返す。bus 生成は `acquire<CfgT>(cfg)` が担い、
   backend は初回 acquire の config 型で固定される。
 
 ```cpp
@@ -182,7 +183,10 @@ timeout は部分行（0 を含む短い戻り）で表れ、エラーではな�
 ## write semantics
 
 `write(src, len)` は最大 `len` byte を `Source` から送信する。戻り値は driver
-へ受け渡した byte 数。
+へ受け渡した byte 数。1 byte 以上を driver が受理した後で後続 write や物理 drain が
+失敗した場合、受理済みprefixのbyte数を正常なshort successとして返す。0 byteのまま
+timeout/errorになった場合だけerrorを返す。この優先順位により、callerが未受理suffixだけを
+再試行でき、受理済みprefixの重複送信を防ぐ。
 
 **完了保証の正準契約は ESP-IDF backend の意味 (timeout 付き物理 drain 待ち)**。
 他 backend は実装手段の制約により完全には一致しない。完全統一は不可能なため、差は
@@ -190,14 +194,16 @@ timeout は部分行（0 を含む短い戻り）で表れ、エラーではな�
 
 | backend | write 復帰タイミング | `write_timeout_ms` の扱い |
 |---|---|---|
-| ESP-IDF | `uart_wait_tx_done()` で物理 TX FIFO の drain まで | drain 待ちの上限。超過は `TIMEOUT_ERROR` |
+| ESP-IDF | `uart_wait_tx_done()` で物理 TX FIFO の drain まで | drain 待ちの上限。0 byte受理時の超過は `TIMEOUT_ERROR`、受理済みならshort success |
+| ESP-IDF USB CDC | TinyUSB queue投入後にflush | 0 byte受理時のflush失敗はerror、受理済みならshort success |
+| ESP-IDF USB Serial/JTAG | driver bufferへ受理された時点 | 0 byteのtimeoutは`TIMEOUT_ERROR`、受理済みならshort success |
 | Arduino | `HardwareSerial::flush()` で物理送信完了まで | **使われない** (flush に timeout 引数がなく無期限待ち)。利用者は baud と len から所要時間を見積もれる |
 | POSIX | OS の tx buffer へ受理された時点 (**drain しない**。await-reply パターンが buffered output でデッドロックしない設計上の選択) | 使われない |
 
 ## error semantics
 
 - API contract 違反（bus kind 不一致、baud/data bits/stop bits/parity の未対応値、POSIX の null path 等）は `INVALID_ARGUMENT`。
-- 受信 timeout は `TIMEOUT_ERROR` ではなく正常な短い read（0 byte または partial）として扱う。ESP-IDF backend の TX drain timeout は driver が timeout として返すため `TIMEOUT_ERROR`。
+- 受信 timeout は `TIMEOUT_ERROR` ではなく正常な短い read（0 byte または partial）として扱う。送信は受理済みbyteが無いtimeoutを`TIMEOUT_ERROR`とし、受理済みprefixがあればそのbyte数をshort successとして返す。
 - POSIX の `open` / `termios` / `select` / `read` / `write` 失敗、および ESP-IDF driver の未分類 `esp_err_t` は transport/OS/driver 障害として `IO_ERROR`。
 - driver install や一時 buffer 確保など bounded resource の不足は `OUT_OF_RESOURCE`。
 
@@ -217,7 +223,7 @@ timeout は部分行（0 を含む短い戻り）で表れ、エラーではな�
 - `variants::frameworks::espidf` は ESP-IDF UART driver
   (`uart_driver_install`, `uart_read_bytes`, `uart_write_bytes`) に委譲する。
   variant 固有の `uart::BusConfig` は `port_num` を持ち、負値の場合は
-  `UART_NUM_0` を既定値にする。IDF 4 / 5 / 6 の代表 build で確認する。
+  `UART_NUM_0` を既定値にする。IDF 5 / 6 の代表 build で確認する。
 - `variants::frameworks::posix` は POSIX host の termios serial に委譲する。
   variant 固有の `uart::BusConfig` は `device_path`（`/dev/ttyUSB0` 等）を持つ。
   `open(device_path, baud)` で device を所有開放し、`attach(int fd)` で

@@ -122,15 +122,16 @@ TEST(UartBusView, DifferentTxReturnDistinctInstances)
     EXPECT_NE(a.value().get(), b.value().get());
 }
 
-TEST(UartBusView, InvalidPinsReturnError)
+TEST(UartBusView, UnsetPinRemainsPartOfIdentity)
 {
     auto& hal = v2::getM5_Hal();
     v2::uart::FakeBusConfig cfg;
-    cfg.pin_tx = -1;  // TX unset -> both required for a registry-acquired UART
+    cfg.pin_tx = -1;
     cfg.pin_rx = 5;
     auto r     = hal.UART.acquire(cfg);
-    ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(r.error(), v2::error::error_t::INVALID_ARGUMENT);
+    ASSERT_TRUE(r.has_value()) << "err=" << v2::error::toString(r.error());
+    EXPECT_EQ(r.value()->getConfig().pin_tx, -1);
+    EXPECT_EQ(r.value()->getConfig().pin_rx, 5);
 }
 
 TEST(UartBusView, StaticPolicyCommitIsNoop)
@@ -143,9 +144,9 @@ TEST(UartBusView, LogicalAcquireSurfaceExistsButIsStaticPolicy)
 {
     auto& hal = v2::getM5_Hal();
     v2::uart::LogicalBusConfig req{v2::uart::Tx{18}, v2::uart::Rx{19}};
-    v2::uart::LogicalBusConfig invalid_identity{v2::uart::Tx{-1}, v2::uart::Rx{19}};
+    v2::uart::LogicalBusConfig unset_pin{v2::uart::Tx{-1}, v2::uart::Rx{19}};
 
-    v2::test::bus_contract::expectStaticLogicalAcquireContract(hal.UART, req, invalid_identity);
+    v2::test::bus_contract::expectStaticLogicalAcquireContract(hal.UART, req, unset_pin);
 }
 
 // ---- UART-specific: independent TX / RX channel locks through the facade -----

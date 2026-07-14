@@ -4,7 +4,17 @@
 
 #include "bus_streaming.hpp"
 
+#include <utility>
+
 namespace m5::hal::v2::uart {
+
+result_t<size_t> Bus_streaming::completeWrite(result_t<size_t>&& accepted, error::error_t completion_error)
+{
+    if (!accepted.has_value() || accepted.value() > 0 || !error::isError(completion_error)) {
+        return std::move(accepted);
+    }
+    return m5::stl::make_unexpected(completion_error);
+}
 
 result_t<size_t> Bus_streaming::write(bus::IAccessor* owner, const AccessConfig& cfg, data::Source* src, size_t len)
 {
@@ -20,6 +30,9 @@ result_t<size_t> Bus_streaming::write(bus::IAccessor* owner, const AccessConfig&
         }
         auto w = rawWrite(span.value().data, span.value().size, cfg.write_timeout_ms);
         if (!w.has_value()) {
+            if (done > 0) {
+                return done;
+            }
             return m5::stl::make_unexpected(w.error());
         }
         if (w.value() == 0) {

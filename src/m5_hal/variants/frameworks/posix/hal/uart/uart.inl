@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <errno.h>
 #include <fcntl.h>
+#include <new>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
@@ -184,9 +185,23 @@ bool Bus_posix::baudToSpeed(uint32_t baud, uint32_t& out_speed)
 
 result_t<void> Bus_posix::init(const BusConfig_posix& config)
 {
-    (void)release();  // release() takes its own _state_mutex critical section
+    char* device_path = nullptr;
+    if (config.device_path != nullptr) {
+        const size_t len = ::strlen(config.device_path);
+        device_path      = new (std::nothrow) char[len + 1];
+        if (device_path == nullptr) {
+            return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+        }
+        ::memcpy(device_path, config.device_path, len + 1);
+    }
+
+    auto released = release();  // release() takes its own _state_mutex critical section
+    if (!released.has_value()) {
+        delete[] device_path;
+        return m5::stl::make_unexpected(released.error());
+    }
     _config      = config;
-    _device_path = config.device_path;  // termios open is lazy (first write/read)
+    _device_path = device_path;  // termios open is lazy (first write/read)
     _tx_coalesce = config.tx_coalesce_bytes;
     return {};
 }
@@ -204,6 +219,11 @@ result_t<void> Bus_posix::release(void)
     _fd      = -1;
     _owns_fd = false;
     _begun   = false;
+    delete[] _device_path;
+    _device_path = nullptr;
+    // Preserve the init-time coalescing policy across attach(fd), as before.
+    // attach() deliberately calls release() before adopting the descriptor.
+    _co_used = 0;
     return {};
 }
 

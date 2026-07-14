@@ -64,9 +64,6 @@ public:
             return m5::stl::make_unexpected(error::error_t::NOT_CONNECTED);
         }
         IdentityKey id = Traits::identityFromConfig(cfg);
-        if (!id.valid()) {
-            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
         {
             auto r = _backend->acquireBusTyped(KIND, id, cfg);
             if (r.has_value()) {
@@ -121,9 +118,6 @@ public:
             return m5::stl::make_unexpected(rc.error());
         }
         IdentityKey id = Traits::identityFromLogical(eff);
-        if (!id.valid()) {
-            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
         if (!eff.intent.valid()) {
             return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
         }
@@ -151,8 +145,8 @@ public:
       the passed handle and immediately reclaims the registry slot. For a
       remote backend it also sends BusRelease to the peer. On failure the
       handle remains unchanged. Pass the `shared_ptr<IBus>` returned by acquire().
-      Returns `INVALID_ARGUMENT` if the bus is null, its config pins
-      are invalid, or no matching exact instance is registered; returns `BUSY`
+      Returns `INVALID_ARGUMENT` if the bus is null or no matching exact
+      instance is registered; returns `BUSY`
       if another strong owner exists or release is already in progress.
      */
     result_t<void> release(std::shared_ptr<IBus>& bus)
@@ -161,9 +155,6 @@ public:
             return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
         }
         IdentityKey id = Traits::identityFromConfig(bus->getConfig());
-        if (!id.valid()) {
-            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
         // Move the caller's ownership into the type-erased backend argument.
         // This avoids creating an extra strong owner that would make the
         // registry's sole-owner check indistinguishable from a real alias.
@@ -186,7 +177,9 @@ public:
       free controller); see `AllocationCore::claimController` for the full
       resolution contract. NOT_IMPLEMENTED on a backend / kind with no local
       allocation core (e.g. RemoteBackend, or a kind such as UART/I2S that
-      never manages controllers this way).
+      never manages controllers this way). Call only outside every active
+      access/transaction window for this bus kind; a concurrent commit may
+      hold the allocation lock while waiting for such a window to close.
      */
     result_t<int8_t> claimController(const types::AllocationIntent& intent = {})
     {
@@ -196,7 +189,7 @@ public:
         return _backend->claimController(KIND, intent);
     }
 
-    /*! @brief Return a controller claimed via `claimController`. */
+    /*! @brief Return a controller claimed via `claimController`; same no-access-window rule. */
     result_t<void> releaseClaimedController(int8_t controller)
     {
         if (_backend == nullptr) {

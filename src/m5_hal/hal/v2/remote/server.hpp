@@ -20,7 +20,7 @@ namespace m5::hal::v2::remote {
   spec/design/remote.md §safety boundary).
 
   Execution policy (spec §server execution model): scripts are executed
-  only from complete, CHECK16-verified frames; before running, the script
+  only from complete, CHECK8-verified frames; before running, the script
   is scanned once and rejected with `ReportError(INVALID_ARGUMENT)` when
   its total `DelayMs` exceeds `Config::max_delay_ms` or a
   `BusConfigure` carries a timeout above `Config::max_bus_timeout_ms` —

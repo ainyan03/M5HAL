@@ -1,14 +1,14 @@
 ; =============================================================================
 ; M5HAL — v2 HIL (hardware-in-the-loop) envs: host POSIX UART <-> ESP32 echo
 ;
-; HIL tests live in experiments/v2/test/<name>/{device,host}/ and run via `pio run`
-; (NOT `pio test`, whose discovery is locked to test_dir). The host driver is a
+; HIL tests live in test/v2/hil/<name>/{device,host}/ and run via `pio run`.
+; Dedicated environments select device and host sources; the host driver is a
 ; gtest binary built with `pio run` and then executed directly.
 ;
 ; This is a *.ini.cli file: it is NOT auto-loaded (extra_configs only globs
 ; *.ini). Load it for a run by pointing M5HAL_PIO_EXTRA_CONFIG at it (no copy):
 ;   export M5HAL_PIO_EXTRA_CONFIG=pio_envs/v2/hil.ini.cli
-; The runner experiments/v2/test/hil-run.sh sets this for you.
+; The runner test/v2/hil/hil-run.sh sets this for you.
 ;
 ; Setup (M5Stack Core BASIC, classic ESP32): the echo firmware drives UART0
 ; (GPIO1=TX / GPIO3=RX = the USB bridge) via M5HAL UART, echo-only, no logging.
@@ -22,19 +22,19 @@
 ;     .pio/build/v2_hil_uart_echo_host/program
 ;   (M5HAL_POSIX_UART_BAUD optional, default 115200. For a high-baud run also
 ;    flash with PLATFORMIO_BUILD_FLAGS="-DM5HAL_HIL_UART_ECHO_BAUD_RATE=<baud>".)
-; Or one-shot: experiments/v2/test/hil-run.sh uart_echo [port] [baud]
+; Or one-shot: test/v2/hil/hil-run.sh uart_echo [port] [baud]
 ; =============================================================================
 
 [env:v2_hil_uart_echo_device_esp32]
 extends = common_esp32dev, common_arduino
-build_src_filter = +<*> +<../experiments/v2/test/uart_echo/device/uart_echo.cpp>
+build_src_filter = +<*> +<../test/v2/hil/uart_echo/device/uart_echo.cpp>
 build_flags =
     ${common_esp32.build_flags}
     -DCORE_DEBUG_LEVEL=0
 
 [env:v2_hil_uart_echo_host]
 extends = common_native, test_fw
-build_src_filter = +<*> +<../experiments/v2/test/uart_echo/host/uart_echo.cpp>
+build_src_filter = +<*> +<../test/v2/hil/uart_echo/host/uart_echo.cpp>
 
 ; -----------------------------------------------------------------------------
 ; I2C slave (D8 stretch backend) — 2-board HIL: a CoreS3SE (ESP32-S3) slave
@@ -50,10 +50,10 @@ build_src_filter = +<*> +<../experiments/v2/test/uart_echo/host/uart_echo.cpp>
 ; (SOC_I2C_SLAVE_CAN_GET_STRETCH_CAUSE). framework=espidf (IDF5): the LL path
 ; needs the stretch-cause caps + i2c_ll_* helpers that the Arduino platform
 ; (espressif32@6.12.0 = IDF 4.4) does not ship. Wiring + flash steps live in the
-; source: experiments/v2/test/i2c_slave/device/i2c_slave.cpp.
+; source: test/v2/hil/i2c_slave/device/i2c_slave.cpp.
 [env:v2_hil_i2c_slave_device_esp32s3]
 extends = common_esp32s3dev_espidf5, common_espidf
-build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/device/i2c_slave.cpp>
+build_src_filter = +<*> +<../test/v2/hil/i2c_slave/device/i2c_slave.cpp>
 ; This env needs a 1 kHz FreeRTOS tick (CONFIG_FREERTOS_HZ=1000). The accessor's
 ; polling waits are delayMs(1) = one tick; at the IDF-default 100 Hz that is 10 ms,
 ; which dominated the slave's per-transaction response latency and let an
@@ -74,7 +74,7 @@ build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/device/i2c_slave.cpp>
 [env:v2_hil_i2c_slave_device_esp32c61]
 extends = common_esp32_arduino3, common_espidf
 board = esp32-c61-devkitc1
-build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/device/i2c_slave.cpp>
+build_src_filter = +<*> +<../test/v2/hil/i2c_slave/device/i2c_slave.cpp>
 build_flags = -DM5HAL_HIL_I2C_PIN_SDA=5 -DM5HAL_HIL_I2C_PIN_SCL=6
 
 ; ESP32-C6 / ESP32-H2 variants of the register-map slave device, for the
@@ -88,13 +88,13 @@ build_flags = -DM5HAL_HIL_I2C_PIN_SDA=5 -DM5HAL_HIL_I2C_PIN_SCL=6
 [env:v2_hil_i2c_slave_device_esp32c6]
 extends = common_esp32_arduino3, common_espidf
 board = esp32-c6-devkitm-1
-build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/device/i2c_slave.cpp>
+build_src_filter = +<*> +<../test/v2/hil/i2c_slave/device/i2c_slave.cpp>
 build_flags = -DM5HAL_HIL_I2C_PIN_SDA=2 -DM5HAL_HIL_I2C_PIN_SCL=1
 
 [env:v2_hil_i2c_slave_device_esp32h2]
 extends = common_esp32_arduino3, common_espidf
 board = esp32-h2-devkitm-1
-build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/device/i2c_slave.cpp>
+build_src_filter = +<*> +<../test/v2/hil/i2c_slave/device/i2c_slave.cpp>
 build_flags = -DM5HAL_HIL_I2C_PIN_SDA=2 -DM5HAL_HIL_I2C_PIN_SCL=1
 
 ; Classic ESP32 (Core2) variant of the register-map slave device, for the
@@ -110,7 +110,7 @@ build_flags = -DM5HAL_HIL_I2C_PIN_SDA=2 -DM5HAL_HIL_I2C_PIN_SCL=1
 ; Port A pins, distinct from the S3/C6/H2 boards' G2/G1).
 [env:v2_hil_i2c_slave_device_esp32]
 extends = common_esp32dev_espidf5, common_espidf
-build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/device/i2c_slave.cpp>
+build_src_filter = +<*> +<../test/v2/hil/i2c_slave/device/i2c_slave.cpp>
 build_flags = -DM5HAL_HIL_I2C_PIN_SDA=32 -DM5HAL_HIL_I2C_PIN_SCL=33 -DM5HAL_HIL_I2C_SLAVE_ADDR=0x41
 
 ; STREAM echo variant of the same 2-board HIL: drives SlaveBus_espidf through a
@@ -119,20 +119,20 @@ build_flags = -DM5HAL_HIL_I2C_PIN_SDA=32 -DM5HAL_HIL_I2C_PIN_SCL=33 -DM5HAL_HIL_
 ; streaming path (TX ring + TX_EMPTY underrun stretch), the read-direction
 ; counterpart to the RX ring. Same wiring / sdkconfig (1 kHz tick) as the register
 ; device; pair with the ROLE_MASTER -DECHO_MODE bench firmware. Source header has the
-; echo contract: experiments/v2/test/i2c_slave/device/i2c_echo.cpp.
+; echo contract: test/v2/hil/i2c_slave/device/i2c_echo.cpp.
 [env:v2_hil_i2c_slave_echo_device_esp32s3]
 extends = common_esp32s3dev_espidf5, common_espidf
-build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/device/i2c_echo.cpp>
+build_src_filter = +<*> +<../test/v2/hil/i2c_slave/device/i2c_echo.cpp>
 
 ; M5HAL-MASTER half of the echo HIL pair: an ESP32 (Core2) driving the espidf master
 ; backend through MasterAccessor::transfer(Source*, Sink*) against the M5HAL stream
 ; slave above -- "both ends on the Source/Sink design". framework=espidf to match the
 ; slave (espidf master gen5 driver). It sweeps N (to 1 KB) x SCL {100,400,800} kHz
 ; internally and logs OK/BAD per round. Source header has the contract + wiring:
-; experiments/v2/test/i2c_slave/master/i2c_echo_master.cpp.
+; test/v2/hil/i2c_slave/master/i2c_echo_master.cpp.
 [env:v2_hil_i2c_echo_master_esp32]
 extends = common_esp32dev_espidf5, common_espidf
-build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_echo_master.cpp>
+build_src_filter = +<*> +<../test/v2/hil/i2c_slave/master/i2c_echo_master.cpp>
 
 ; SOFTWARE (bit-banged) variant of the M5HAL echo master: same firmware with
 ; -DECHO_MASTER_SOFTWARE, which drives Bus_software (M5_Hal.Gpio bit-bang, no HW FIFO)
@@ -140,7 +140,7 @@ build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_echo_maste
 ; vanishes here, the gap was the HW master's TX-FIFO refill, not the slave.
 [env:v2_hil_i2c_echo_master_sw_esp32]
 extends = common_esp32dev_espidf5, common_espidf
-build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_echo_master.cpp>
+build_src_filter = +<*> +<../test/v2/hil/i2c_slave/master/i2c_echo_master.cpp>
 build_flags = -DECHO_MASTER_SOFTWARE
 
 ; INDEPENDENT verification master for the register-map HIL pair (pairs with
@@ -153,10 +153,10 @@ build_flags = -DECHO_MASTER_SOFTWARE
 ; equivalent write-then-verify length sweep (n=1..64 / k=1..48), at
 ; 100/400/800 kHz, and prints a RESULT line (subsumes the private
 ; i2c_slave_hybrid HIL pair's WTR/SPLIT/WTEST sweeps).
-; Source + wiring: experiments/v2/test/i2c_slave/master/i2c_regmap_sweep_master.cpp.
+; Source + wiring: test/v2/hil/i2c_slave/master/i2c_regmap_sweep_master.cpp.
 [env:v2_hil_i2c_regmap_sweep_master_arduino_esp32]
 extends = common_esp32dev, common_arduino
-build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_regmap_sweep_master.cpp>
+build_src_filter = +<*> +<../test/v2/hil/i2c_slave/master/i2c_regmap_sweep_master.cpp>
 
 ; Same fixture over the ESP-IDF `driver/i2c_master.h` (generation-5) driver
 ; instead of Arduino Wire -- i2c_master_transmit_receive gives it a
@@ -164,7 +164,7 @@ build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_regmap_swe
 ; exercise of the two transports.
 [env:v2_hil_i2c_regmap_sweep_master_idf_esp32]
 extends = common_esp32dev_espidf5, common_espidf
-build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_regmap_sweep_master.cpp>
+build_src_filter = +<*> +<../test/v2/hil/i2c_slave/master/i2c_regmap_sweep_master.cpp>
 
 ; C6 / H2 masters for the cold-boot rig (NanoC6 <-> NanoH2): each board
 ; takes a turn as the sweep master while the other runs the slave device env
@@ -173,13 +173,13 @@ build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_regmap_swe
 [env:v2_hil_i2c_regmap_sweep_master_idf_esp32c6]
 extends = common_esp32_arduino3, common_espidf
 board = esp32-c6-devkitm-1
-build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_regmap_sweep_master.cpp>
+build_src_filter = +<*> +<../test/v2/hil/i2c_slave/master/i2c_regmap_sweep_master.cpp>
 build_flags = -DMASTER_PIN_SDA=2 -DMASTER_PIN_SCL=1
 
 [env:v2_hil_i2c_regmap_sweep_master_idf_esp32h2]
 extends = common_esp32_arduino3, common_espidf
 board = esp32-h2-devkitm-1
-build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_regmap_sweep_master.cpp>
+build_src_filter = +<*> +<../test/v2/hil/i2c_slave/master/i2c_regmap_sweep_master.cpp>
 build_flags = -DMASTER_PIN_SDA=2 -DMASTER_PIN_SCL=1
 
 ; CoreS3 (ESP32-S3) master, for the multi-slave master-role-rotation matrix (each of
@@ -187,7 +187,7 @@ build_flags = -DMASTER_PIN_SDA=2 -DMASTER_PIN_SCL=1
 ; SCL=GPIO1, same convention as the C6/H2 masters above.
 [env:v2_hil_i2c_regmap_sweep_master_idf_esp32s3]
 extends = common_esp32s3dev_espidf5, common_espidf
-build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_regmap_sweep_master.cpp>
+build_src_filter = +<*> +<../test/v2/hil/i2c_slave/master/i2c_regmap_sweep_master.cpp>
 build_flags = -DMASTER_PIN_SDA=2 -DMASTER_PIN_SCL=1
 
 ; INDEPENDENT verification master for the stream-echo HIL pair (pairs with
@@ -199,31 +199,20 @@ build_flags = -DMASTER_PIN_SDA=2 -DMASTER_PIN_SCL=1
 ; M5HAL-served slave via plain Wire" coexistence use case. Sweeps the same
 ; length x pattern matrix as v2_hil_i2c_echo_master_esp32 at 100/400/800 kHz
 ; and prints a RESULT line. Source + wiring:
-; experiments/v2/test/i2c_slave/master/i2c_echo_sweep_master.cpp.
+; test/v2/hil/i2c_slave/master/i2c_echo_sweep_master.cpp.
 [env:v2_hil_i2c_echo_sweep_master_arduino_esp32]
 extends = common_esp32dev, common_arduino
-build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_echo_sweep_master.cpp>
+build_src_filter = +<*> +<../test/v2/hil/i2c_slave/master/i2c_echo_sweep_master.cpp>
 
 ; Same fixture over the ESP-IDF `driver/i2c_master.h` (generation-5) driver.
 [env:v2_hil_i2c_echo_sweep_master_idf_esp32]
 extends = common_esp32dev_espidf5, common_espidf
-build_src_filter = +<*> +<../experiments/v2/test/i2c_slave/master/i2c_echo_sweep_master.cpp>
+build_src_filter = +<*> +<../test/v2/hil/i2c_slave/master/i2c_echo_sweep_master.cpp>
 
 ; SPI slave echo: ESP-IDF spi_slave driver on a CoreS3 (ESP32-S3).
 ; Echo contract: receive N bytes (one CS assertion), then send them back on
 ; the next CS assertion. Port B + Port C straight wiring to a Core2 master.
-; Source: experiments/v2/test/spi_slave/device/spi_echo.cpp.
+; Source: test/v2/hil/spi_slave/device/spi_echo.cpp.
 [env:v2_hil_spi_slave_echo_esp32s3]
 extends = common_esp32s3dev_espidf5, common_espidf
-build_src_filter = +<*> +<../experiments/v2/test/spi_slave/device/spi_echo.cpp>
-
-; GPIO channel identification for Saleae Logic analyzer mapping.
-; Core2 pulses each GROVE pin with a unique count (1..7 pulses per pin).
-; CoreS3 sets all GROVE pins to input (Hi-Z) so Core2 drives them cleanly.
-[env:v2_hil_gpio_ident_core2]
-extends = common_esp32dev_espidf5, common_espidf
-build_src_filter = +<*> +<../experiments/v2/test/gpio_ident/core2/gpio_ident_core2.cpp>
-
-[env:v2_hil_gpio_ident_cores3]
-extends = common_esp32s3dev_espidf5, common_espidf
-build_src_filter = +<*> +<../experiments/v2/test/gpio_ident/cores3/gpio_ident_cores3.cpp>
+build_src_filter = +<*> +<../test/v2/hil/spi_slave/device/spi_echo.cpp>

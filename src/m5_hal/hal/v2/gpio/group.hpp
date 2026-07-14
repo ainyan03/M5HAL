@@ -127,8 +127,8 @@ public:
       straddles the call may be folded into the very next observed
       edge, but no spurious edge is reported for the call itself.
       Rejected with `INVALID_ARGUMENT` when `gpio_num` is invalid /
-      denied, or its local pin falls outside port 0/1 (local pin
-      0..63).
+      denied, or `IGPIO::locatePin()` maps it outside logical port
+      0/1.
      */
     [[nodiscard]] result_t<void> watch(types::gpio_number_t gpio_num);
 
@@ -165,7 +165,9 @@ public:
 
       Bits set in `mask` prevent access to the corresponding pin
       (e.g. Flash SPI pins on ESP32).  Multiple calls replace the
-      mask for the same (slot, port_index) pair.
+      mask for the same (slot, port_index) pair. `port_index` must be
+      an existing IGPIO logical port inside GPIOGroup's supported
+      port 0/1 window; pin-to-port mapping follows `IGPIO::locatePin()`.
      */
     result_t<void> setDenyMask(types::gpio_slot_t slot, uint8_t port_index, uint32_t mask);
 

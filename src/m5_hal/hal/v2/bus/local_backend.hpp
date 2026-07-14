@@ -39,7 +39,7 @@ struct ILocalKindAdapter : public IAllocationKind {
       A re-acquire of the same wiring with a different intent updates the bus's
       recorded intent for the next `commitBuses()` resolution.
      */
-    virtual void retagIntent(IBus& bus, const AllocationRequest& req) const = 0;
+    virtual void retagIntent(IBus& bus, const AllocationRequest& req) = 0;
 
     /*!
       @brief Access the kind's AllocationCore (null for non-intent kinds).
@@ -156,10 +156,10 @@ public:
         return std::shared_ptr<IBus>{facade};
     }
 
-    void retagIntent(IBus& bus, const AllocationRequest& req) const override
+    void retagIntent(IBus& bus, const AllocationRequest& req) override
     {
         const auto& logical = *static_cast<const LogicalBusConfig*>(req.config);
-        static_cast<BusType&>(bus).setIntent(logical);
+        _core.retagIntent(static_cast<BusType&>(bus), logical.intent);
     }
 
     // --- IAllocationKind --------------------------------------------------
@@ -180,17 +180,18 @@ public:
     {
         return static_cast<BusType&>(b);
     }
-    IBus* makePlaceholder(IManagedBus& mb) const override
+    IBus* makePlaceholder(IManagedBus& mb, const types::AllocationIntent& intent) const override
     {
         auto& self = static_cast<BusType&>(mb);
-        return _sw_factory != nullptr ? _sw_factory(self.logicalConfig()) : nullptr;
+        return _sw_factory != nullptr ? _sw_factory(self.logicalConfig(intent)) : nullptr;
     }
-    IBus* makeHardware(IManagedBus& mb, int8_t controller) const override
+    IBus* makeHardware(IManagedBus& mb, const types::AllocationIntent& intent, int8_t controller) const override
     {
         auto& self = static_cast<BusType&>(mb);
-        return _hw_factory != nullptr ? _hw_factory(self.logicalConfig(), controller) : nullptr;
+        return _hw_factory != nullptr ? _hw_factory(self.logicalConfig(intent), controller) : nullptr;
     }
-    result_t<void> commitPlaceholder(IManagedBus& mb, uint32_t timeout_ms) const override
+    result_t<void> commitPlaceholder(IManagedBus& mb, const types::AllocationIntent& intent,
+                                     uint32_t timeout_ms) const override
     {
         auto& self = static_cast<BusType&>(mb);
         // The resolver only routes a bus here while it is CURRENTLY hardware
@@ -206,10 +207,12 @@ public:
         // a swap failure so the rollback factory below runs, rather than
         // silently landing the bus on no backend at all.
         return self.swapBackendWith(
-            timeout_ms, /*allow_null=*/_sw_factory == nullptr, [&]() -> IBus* { return this->makePlaceholder(mb); },
-            [this, &mb, cur]() -> IBus* { return this->makeHardware(mb, cur); });
+            timeout_ms, /*allow_null=*/_sw_factory == nullptr,
+            [&]() -> IBus* { return this->makePlaceholder(mb, intent); },
+            [this, &mb, &intent, cur]() -> IBus* { return this->makeHardware(mb, intent, cur); });
     }
-    result_t<void> commitHardware(IManagedBus& mb, int8_t controller, uint32_t timeout_ms) const override
+    result_t<void> commitHardware(IManagedBus& mb, const types::AllocationIntent& intent, int8_t controller,
+                                  uint32_t timeout_ms) const override
     {
         auto& self = static_cast<BusType&>(mb);
         // The resolver only routes a bus here once it is off hardware (see
@@ -219,8 +222,8 @@ public:
         // for a software-less kind makePlaceholder() itself returns null,
         // which is the correct pending fallback.
         return self.swapBackendWith(
-            timeout_ms, /*allow_null=*/false, [&]() -> IBus* { return this->makeHardware(mb, controller); },
-            [this, &mb]() -> IBus* { return this->makePlaceholder(mb); });
+            timeout_ms, /*allow_null=*/false, [&]() -> IBus* { return this->makeHardware(mb, intent, controller); },
+            [this, &mb, &intent]() -> IBus* { return this->makePlaceholder(mb, intent); });
     }
     bool uniformControllers(void) const override
     {
@@ -234,10 +237,11 @@ public:
     {
         return _topo.opt_in;
     }
-    bool controllerAcceptsBus(const IManagedBus& bus, int8_t controller) const override
+    bool controllerAcceptsBus(const IManagedBus& bus, const types::AllocationIntent& intent,
+                              int8_t controller) const override
     {
         return _topo.pins_allowed != nullptr
-                   ? _topo.pins_allowed(static_cast<const BusType&>(bus).logicalConfig(), controller)
+                   ? _topo.pins_allowed(static_cast<const BusType&>(bus).logicalConfig(intent), controller)
                    : true;
     }
 

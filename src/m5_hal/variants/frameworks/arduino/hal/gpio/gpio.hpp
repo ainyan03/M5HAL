@@ -5,8 +5,8 @@
 // GPIO_arduino implementation for the arduino framework variant — wraps the
 // Arduino API (`pinMode` / `digitalWrite` / `digitalRead`). The
 // encoded value is the gpio_number itself: even on ESP32 boards, the
-// Arduino API addresses by gpio_number, so a single Port_arduino covers
-// everything.
+// Arduino API addresses by gpio_number, so one stateless Port_arduino
+// can serve every logical 32-bit port ordinal.
 // Authoritative spec: spec/design/gpio.md, spec/design/variants.md.
 
 #include "../../../../../hal/v2/gpio/gpio.hpp"
@@ -110,12 +110,15 @@ protected:
     }
 };
 
-// Minimal GPIO_arduino with a single built-in Port_arduino. constexpr singleton —
+// Minimal GPIO_arduino with one stateless Port_arduino shared by all
+// logical 32-bit mask words. constexpr singleton —
 // `getInstance()` returns a `static constexpr` placed in rodata, so
 // there is no guard variable. `_port` is stateless, which keeps the
 // `mutable` + rodata combination free of UB.
 class GPIO_arduino : public gpio::IGPIO {
 public:
+    static constexpr uint8_t portCount = (Port_arduino::kWidth + 31u) >> 5;
+
     gpio::IPort* portForPin(types::gpio_local_pin_t pin_index) const override
     {
         M5HAL_ASSERT(pin_index < static_cast<types::gpio_local_pin_t>(Port_arduino::kWidth), "pin_index out of range");
@@ -123,7 +126,7 @@ public:
     }
     gpio::IPort* getPort(uint8_t portNumber) const override
     {
-        M5HAL_ASSERT(portNumber == 0, "portNumber must be 0");
+        M5HAL_ASSERT(portNumber < portCount, "portNumber out of range");
         return &_port;
     }
     uint16_t getPinCount() const override
@@ -132,7 +135,12 @@ public:
     }
     uint8_t getPortCount() const override
     {
-        return 1;
+        return portCount;
+    }
+    PinLocation locatePin(types::gpio_local_pin_t pin_index) const override
+    {
+        M5HAL_ASSERT(pin_index < static_cast<types::gpio_local_pin_t>(Port_arduino::kWidth), "pin_index out of range");
+        return PinLocation{static_cast<uint8_t>(pin_index >> 5), static_cast<uint8_t>(pin_index & 31u)};
     }
 
     static const GPIO_arduino* getInstance()

@@ -47,7 +47,7 @@ pin の設定手段は 2 つで、 どちらも型安全:
 
 Framework 依存の native handle / port は共通 `IBusConfig` には置かない。 各 variant は共通 config を継承した `BusConfig_<variant>` を**必ず公開**し (offer の勝者が `BusConfig` の短名を取る、 [variants.md](variants.md) §offer 要件)、 `init` は **その型を直接受ける非 virtual メンバ** (`init(const BusConfig_<variant>&)`) として宣言する (基底 `bus::IBus` に virtual `init` は無い。 variant 固有情報が必須な操作を kind 汎用にはできないため)。 variant config はタグ型 ctor を **ctor 継承** (`using IBusConfig::IBusConfig;`) で見せる — pin フィールドを実際に読む variant だけが対象 (pin を読まない variant は見せない。 UART posix が該当、 [uart.md](uart.md))。
 
-- Arduino variant: `TwoWire* wire` を明示する。`init(BusConfig_arduino)` はその `TwoWire` に `begin` / `end` を行い、`attach(TwoWire&)` は caller-owned lifecycle として扱う。
+- Arduino variant: `TwoWire* wire` を明示する。`init(BusConfig_arduino)` はその `TwoWire` に `begin` / `end` を行い、`attach(TwoWire&)` は caller-owned lifecycle として扱う。core の `begin()` が `bool` を返す場合は `false` を `IO_ERROR` として返し、新busを採用しない。`void` を返すcoreは失敗信号を持たないため、呼出完了を成功として扱う。
 - ESP-IDF variant: ESP-IDF driver 世代に応じた `i2c_port` を持つ。pin / buffer など共通にできる値は基底 `IBusConfig` 側に残す。
 - software variant: native handle を持たず固有フィールドが無いため、 `struct BusConfig_software : IBusConfig` の空派生 + ctor 継承で共通 config をそのまま受ける。
 
@@ -181,7 +181,10 @@ auto r = M5_Hal.I2C.commitBuses();                    // 一括解決: HW を優
   `backendKind` / `controllerId` を snapshot し、その固定入力だけで割当計画を作る。事前検出できる
   over-subscription や intent 衝突は swap 前に失敗する。backend swap 自体の失敗は first error を返し、
   終了時に live backend 状態から controller pool を再同期するため、`hardwareInUse()` は観測可能な live
-  state に戻る。
+  state に戻る。同じkindのlogical再acquireによるintent更新とcommitのintent snapshotは短い専用lockで
+  直列化し、snapshot後の更新は進行中のswapには混ぜず**次回commitの入力**になる。計画・pin-domain判定・
+  backend factoryにはsnapshotした同じintentを渡すため、一回のcommit内で新旧intentが混在しない。
+  re-acquireが返った後に開始したcommitは更新後のintentを必ず見る。kindが異なるcommitは独立である。
 - **付け替え (reassign) は実行時**。intent を上げて (再 `acquire` が intent を再タグ) `commitBuses()` を
   呼び直すと、論理バスの backend が**バスロック下で hot-swap** される。不変条件: ① HW 必須は **付け替え免疫**
   (現コントローラを保持し続ける) ② HW の受け渡しは「譲る側を software 化 → コントローラをプール返却 →

@@ -10,7 +10,7 @@ cmake_minimum_required(VERSION 3.16.0)
 #
 # Upstream m5stack/M5HAL supports only the former path. We keep the project
 # bootstrap path as well, because local v0/v2 development relies heavily on
-# build_check + experiments via PlatformIO espidf.
+# build_check + HIL fixtures via PlatformIO espidf.
 
 if(COMMAND idf_component_register)
     # ESP-IDF component manifest for M5HAL.

@@ -70,9 +70,10 @@ private:
     void clearGpioSnapshot();
     result_t<void> appendGpioSnapshot(types::gpio_number_t pin, bool level);
     result_t<void> writeGpioSnapshotEvent(data::MuxFrameEncoder& enc);
+    result_t<void> writeGpioSnapshotThenResponse(data::MuxFrameEncoder& enc, uint8_t seq, data::ConstDataSpan response);
     bool resolveGpioPin(types::gpio_number_t pin, GpioPinRef& ref);
-    static bool decodeGpioPin(types::gpio_number_t pin, types::gpio_slot_t& slot, uint8_t& port_index,
-                              uint32_t& bit_mask);
+    bool decodeGpioPin(types::gpio_number_t pin, types::gpio_slot_t& slot, uint8_t& port_index,
+                       uint32_t& bit_mask) const;
     GpioSubscription* findGpioSubscription(types::gpio_slot_t slot, uint8_t port_index);
     GpioSubscription* firstFreeGpioSubscription();
     GpioMonitorMask* findGpioMonitorMask(types::gpio_slot_t slot, uint8_t port_index);

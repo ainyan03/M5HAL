@@ -48,10 +48,46 @@ constexpr bool attachedControllerMatches(int host, int8_t claimed_controller, ui
            actual == claimed_controller;
 }
 
+// Driver resources must be detached before the worker that services them is
+// stopped. Keeping this small ordering seam outside the ESP_PLATFORM guard
+// lets native tests cover failure paths without faking the ESP-IDF driver.
+struct ReleaseDriverResult {
+    error::error_t error;
+    bool bus_released;
+    bool worker_stopped;
+};
+
+template <typename RemoveDevice, typename FreeBus, typename StopWorker>
+ReleaseDriverResult releaseDriverBeforeWorker(bool owns_bus, bool bus_free_releases_on_error,
+                                              RemoveDevice remove_device, FreeBus free_bus, StopWorker stop_worker)
+{
+    auto err = remove_device();
+    if (error::isError(err)) {
+        return {err, false, false};
+    }
+    if (owns_bus) {
+        err = free_bus();
+        if (error::isError(err)) {
+            if (!bus_free_releases_on_error) {
+                return {err, false, false};
+            }
+            // Arduino-core 2.x's embedded ESP-IDF 4.4 frees the bus even when
+            // a registered destroy callback fails. The worker must not survive
+            // that destructive error, and release must report completion so the
+            // facade does not retain an already-freed backend.
+            stop_worker();
+            return {error::error_t::OK, true, true};
+        }
+    }
+    stop_worker();
+    return {error::error_t::OK, owns_bus, true};
+}
+
 }  // namespace m5::hal::v2::spi::detail_espidf_spi
 
 #if defined(ESP_PLATFORM) && M5HAL_ESPIDF_SPI_HAS_MASTER
 
+#include <atomic>
 #include <driver/spi_master.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -120,10 +156,7 @@ struct BusConfig_espidf : public spi::IBusConfig {
 // and backend includes.
 class Bus_espidf : public spi::IBus {
 public:
-    ~Bus_espidf() override
-    {
-        (void)release();
-    }
+    ~Bus_espidf() override;
 
     // Typed init: takes this variant's BusConfig_espidf. Passing the
     // abstract IBusConfig (or a sibling variant's config) is a
@@ -182,6 +215,8 @@ private:
     static void workerEntry(void* arg);
     void workerLoop(void);
     void waitInFlight(void);
+    void stopWorker(void);
+    void freeDmaBuffers(void);
     // true = the device was (re)created (SCK idle level may need settling).
     result_t<bool> ensureDevice(const spi::MasterAccessConfig& cfg);
     result_t<void> removeDevice(void);
@@ -203,19 +238,20 @@ private:
     static constexpr size_t kMaxDmaChunk = 32768;
     uint8_t* _dma_buf[2]                 = {nullptr, nullptr};
     ::spi_transaction_t _dma_trans[2];
-    TaskHandle_t _worker_task              = nullptr;
-    volatile bool _in_flight               = false;
-    volatile bool _worker_active           = false;
-    volatile error::error_t _worker_status = error::error_t::OK;
-    data::Source* _worker_src              = nullptr;
-    data::Sink* _worker_dst                = nullptr;
-    size_t _worker_remaining               = 0;
+    TaskHandle_t _worker_task = nullptr;
+    std::atomic<bool> _in_flight{false};
+    std::atomic<bool> _worker_active{false};
+    std::atomic<error::error_t> _worker_status{error::error_t::OK};
+    data::Source* _worker_src = nullptr;
+    data::Sink* _worker_dst   = nullptr;
+    size_t _worker_remaining  = 0;
     bus::TransferTotals _transfer_totals{};
     bus::IAccessor* _transfer_owner = nullptr;
     size_t _worker_tx_remaining     = 0;
     size_t _worker_rx_remaining     = 0;
     size_t _worker_front_tx_len     = 0;
     size_t _worker_front_rx_len     = 0;
+    bool _worker_half_duplex        = false;
 };
 
 // Facade backend selection: spi::Bus::init(BusConfig_espidf) -> Bus_espidf.

@@ -203,6 +203,35 @@ TEST(PosixUART, ReadTimesOutWhenIdle)
     EXPECT_EQ(got.value(), static_cast<size_t>(0));
 }
 
+TEST(PosixUART, InitOwnsDevicePathUntilLazyOpen)
+{
+    PtyPair pty;
+    ASSERT_TRUE(pty.open());
+
+    const char* slave_name = ::ptsname(pty.master);
+    ASSERT_NE(slave_name, nullptr);
+    char path[256] = {};
+    ASSERT_LT(::strlen(slave_name), sizeof(path));
+    ::strcpy(path, slave_name);
+
+    uart::BusConfig_posix bus_cfg;
+    bus_cfg.device_path = path;
+    uart::Bus_posix bus;
+    auto initialized = bus.init(bus_cfg);
+    ASSERT_TRUE(initialized.has_value()) << "err=" << error::toString(initialized.error());
+
+    ::strcpy(path, "/invalid");
+    auto cfg = makeConfig();
+    uart::Accessor dev{bus, cfg};
+    const uint8_t tx[] = {0xC3, 0x5A};
+    auto written       = dev.write(data::ConstDataSpan{tx, sizeof(tx)});
+    ASSERT_TRUE(written.has_value()) << "err=" << error::toString(written.error());
+    ASSERT_TRUE(waitReadable(pty.master, 1000));
+    uint8_t got[sizeof(tx)] = {};
+    ASSERT_EQ(::read(pty.master, got, sizeof(got)), static_cast<ssize_t>(sizeof(got)));
+    EXPECT_EQ(::memcmp(got, tx, sizeof(tx)), 0);
+}
+
 // End-to-end Stream adapter checks: the RX accessor consumed as a
 // `Source` (StreamSource) and the TX accessor fed as a `Sink`
 // (StreamSink), over a real posix UART Bus on a pty.

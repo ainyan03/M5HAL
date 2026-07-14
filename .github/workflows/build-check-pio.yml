@@ -30,6 +30,9 @@ jobs:
             run_native_test: "true"
           - name: arduino checks
             envs: -e v0_check_esp32_arduino -e v0_check_esp32s3_arduino -e v2_check_esp32_arduino -e v2_check_esp32s3_arduino
+            # Official PlatformIO Arduino core 2.x bundles ESP-IDF 4.4. These
+            # builds retain its compatibility branches independently of the
+            # direct ESP-IDF component floor.
           # Non-ESP32 Arduino cores (build-check only; no HIL rig for these;
           # — see _checker.hpp's variant allowlist and spec/design/variants.md
           # §arduino variant の対応コア). v0 stays arduino-esp32-only and
@@ -39,9 +42,7 @@ jobs:
           - name: multi-platform arduino checks
             envs: -e v2_check_rp2040_arduino -e v2_check_rp2350_arduino -e v2_check_unor4_minima_arduino -e v2_check_samd51_arduino -e v2_check_stm32f4_arduino -e v2_check_nrf52840_arduino -e v2_check_esp8266_arduino -e v2_check_native_nochrono
           - name: ESP-IDF 5 checks
-            envs: -e v0_check_esp32_espidf -e v0_check_esp32s3_espidf -e v2_check_esp32_espidf -e v2_check_esp32s3_espidf
-          - name: ESP-IDF 4 compatibility checks
-            envs: -e v0_check_esp32_espidf4 -e v2_check_esp32_espidf4
+            envs: -e v0_check_esp32_espidf -e v0_check_esp32s3_espidf -e v2_check_esp32_espidf -e v2_check_esp32_espidf_legacy_i2c -e v2_check_esp32s3_espidf
           # Forward probes against the unreleased IDF 6 toolchain: failures
           # warn but do not gate. Flip soft_fail off once an IDF 6 stable
           # release exists and these envs build green on it.
@@ -54,14 +55,14 @@ jobs:
           - name: coexistence checks
             envs: -e v0v2_check_esp32_arduino -e v0v2_check_esp32s3_arduino -e v0v2_check_esp32_espidf
           - name: examples build
-            envs: -e HowToUse_I2C_esp32 -e HowToUse_I2C_esp32s3 -e HowToUse_SPI_esp32 -e HowToUse_SPI_esp32s3 -e HowToUse_UART_esp32 -e HowToUse_UART_esp32s3 -e HowToUse_UARTEcho_esp32 -e HowToUse_UARTEcho_esp32s3 -e HowToUse_Bytecode_esp32 -e HowToUse_I2SAudio_esp32s3 -e HowToUse_I2SAudio_esp32
+            envs: -e HowToUse_I2C_esp32 -e HowToUse_I2C_esp32s3 -e HowToUse_SPI_esp32 -e HowToUse_SPI_esp32s3 -e HowToUse_UART_esp32 -e HowToUse_UART_esp32s3 -e HowToUse_UARTEcho_esp32 -e HowToUse_UARTEcho_esp32s3 -e HowToUse_I2CRegistry_esp32 -e HowToUse_I2CRegistry_esp32s3 -e HowToUse_I2SAudio_esp32s3 -e HowToUse_I2SAudio_esp32 -e HowToUse_Bytecode_esp32 -e HowToUse_Remote_host -e HowToUse_RemoteI2S_host
           - name: build test (API surface verification)
             envs: -e BuildTest_esp32 -e BuildTest_esp32s3 -e BuildTest_host
           # RemoteServer (device firmware) + RemoteTest (host diagnostic).
           # This entry is the only fence for the arduino-framework socket
           # layer and for the native host menu, so it must not be dropped.
           - name: remote harness build
-            envs: -e RemoteServer_esp32_arduino -e RemoteServer_esp32 -e RemoteTest_host
+            envs: -e RemoteServer_esp32 -e RemoteServer_esp32_host_i2c -e RemoteServer_esp32s3 -e RemoteServer_esp32_arduino -e RemoteServerTCP_esp32 -e RemoteServerTCP_esp32_arduino -e RemoteServerTCP_esp32s3_arduino -e RemoteTest_host
     steps:
       - name: Checkout M5HAL
         uses: actions/checkout@v6
@@ -124,12 +125,7 @@ jobs:
           check_rejection M5HAL.hpp -DM5HAL_TEST_V0_COMPATIBILITY_SHIM=1
 
       - name: Install PlatformIO
-        # The older espressif32@5.4.0 (ESP-IDF 4.4) builder imports
-        # pkg_resources, which ships inside setuptools. Python 3.12+ no longer
-        # bundles setuptools, and setuptools >= 81 dropped pkg_resources
-        # entirely, so pin to < 81 (which still provides it) or the
-        # "ESP-IDF 4 compatibility checks" matrix entry fails to configure.
-        run: pip3 install -U platformio "setuptools<81"
+        run: pip3 install -U platformio
 
       # check envs live in *.ini.cli (kept out of the PlatformIO GUI). Load them
       # via M5HAL_PIO_EXTRA_CONFIG (platformio.ini's ${sysenv.*} hook) — no copy.

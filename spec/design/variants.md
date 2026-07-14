@@ -119,7 +119,7 @@ frameworks 配下は vendor 階層なし (`variants::frameworks::<name>`)。 pla
 
 各 variant は **HAL 層の抽象基底のみに依存** する。 他の variant の具象には直接依存しない (依存性逆転原則)。
 
-例: `variants::frameworks::software` のビットバン I2C を実装する際、 `m5::hal::v2::gpio::IPort` / `m5::hal::v2::gpio::Pin` の抽象に対してコードを書く。 具体的にどの variant の Pin 具象が注入されるかは知らない。 BusConfig は `gpio_number_t` 単一 path で受け取り、 init() 内で `m5::hal::v2::M5_Hal.Gpio.getPin(num)` 経由で Pin を解決する。
+例: `variants::frameworks::software` のビットバン I2C を実装する際、 `m5::hal::v2::gpio::IPort` / `m5::hal::v2::gpio::Pin` の抽象に対してコードを書く。 具体的にどの variant の Pin 具象が注入されるかは知らない。 BusConfig は `gpio_number_t` 単一 path で受け取り、 init() 内で raw config を検証してから `m5::hal::v2::M5_Hal.Gpio.tryGetPin(num)` 経由で Pin を解決する。
 
 Framework variant が SDK native object を必要とする場合は、共通 `IBusConfig` を直接肥大化させず、variant 固有 `BusConfig` を追加する。Arduino なら `TwoWire*` / `SPIClass*` / `HardwareSerial*`、ESP-IDF なら `i2c_port` / `spi_host_device_t` / `uart_port` のように、その framework で意味を持つ値だけを variant 側に置く。これにより、Arduino の `Serial` が USB CDC になるような board/config 差異を M5HAL が暗黙解決しない。
 
@@ -457,10 +457,12 @@ Adafruit コア限定で、 sandeepmistry 系 `ARDUINO_ARCH_NRF5` と mbed 系 N
     固有部分の分離)。 arduino-pico 等も FreeRTOS ヘッダを同梱しうるため検出拡大は他コアへの
     波及確認も要り、 実機検証手段の無い並行性クリティカル変更を避けて本 milestone では
     見送り (下の RP2040 第2コアの項と同じ判断)
-  - `wire_timeout_ms` (I2C) / SCL・SDA・CLK・MISO・MOSI pin 指定は非 ESP32 コアで無言で
-    無視される (`Wire.begin()`/`SPI.begin()` は引数無しのみ呼ぶ)。 呼び出し側が要求した設定と
-    実際の配線が食い違っても検出できない (例外: ESP8266 は I2C の SDA/SCL pin 指定のみ
-    `begin(sda, scl)` で尊重する)
+  - `wire_timeout_ms` (I2C) / SCL・SDA pin 指定は非 ESP32 コアで無言で無視される
+    (`Wire.begin()` は引数無しのみ呼ぶ)。 呼び出し側が要求した設定と実際の配線が食い違っても
+    検出できない (例外: ESP8266 は SDA/SCL pin 指定のみ `begin(sda, scl)` で尊重する)。SPIは
+    同じ縮退を許さず、型指定 `BusConfig_arduino` のCLK・MISO・MOSI指定を`NOT_IMPLEMENTED`で
+    拒否する。board既定配線は三pinを未指定にして選び、任意pinが必要な場合はlogical acquireの
+    software allocationを使う
   - `bus::IdentityKey` (registry.hpp) は pin 番号でバス識別する設計だが、 非 ESP32 コアでは
     pin が物理的に意味を持たないため、 異なる `TwoWire`/`SPIClass` インスタンス
     (`Wire`/`Wire1` 等) を同一識別として扱う、 または同一インスタンスを異なる識別として

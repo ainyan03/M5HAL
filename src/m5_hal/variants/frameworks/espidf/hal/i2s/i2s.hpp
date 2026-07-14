@@ -6,6 +6,24 @@
 #include "../../../../../hal/v2/bus/bus.hpp"
 #include "../../../../../hal/v2/i2s/i2s.hpp"
 
+namespace m5::hal::v2::i2s::detail_espidf_i2s {
+
+// Collapse stereo-shaped 16-bit DMA frames to the physical left slot. I2S HW
+// v1 transposes the two halfwords in each DMA word; later hardware does not.
+// Kept outside the ESP guard so the production primitive is native-testable.
+inline size_t collapseStereo16RxPairsToMonoLeft(uint8_t* dst, const uint8_t* src, size_t physical_frame_count,
+                                                bool hw_version_1)
+{
+    const size_t left_offset = hw_version_1 ? 2u : 0u;
+    for (size_t i = 0; i < physical_frame_count; ++i) {
+        dst[i * 2 + 0] = src[i * 4 + left_offset + 0];
+        dst[i * 2 + 1] = src[i * 4 + left_offset + 1];
+    }
+    return physical_frame_count * 2;
+}
+
+}  // namespace m5::hal::v2::i2s::detail_espidf_i2s
+
 #if defined(ESP_PLATFORM) && M5HAL_ESPIDF_I2S_HAS_STD
 
 #include <atomic>
@@ -117,6 +135,13 @@ private:
     // return, writableBytes, the remote credit built on them) stays in
     // logical mono bytes; _dma_in_flight alone holds physical bytes.
     bool _expand_mono = false;
+
+    // channels==1 RX normalization. HW v1 captures the stereo-shaped frames
+    // used by _expand_mono; HW v2 native MONO+BOTH also exposes adjacent slots
+    // (duplicates when the source drives the same mono sample on L/R) on IDF
+    // 5.5. read() keeps the physical left sample from each pair so the public
+    // buffer remains logical mono without changing TX's native-mono fast path.
+    bool _collapse_mono_rx = false;
 
     // 16-bit stereo on I2S HW v1 (classic ESP32 / ESP32-S2): the silicon packs
     // two 16-bit samples into a 32-bit FIFO word with the halves transposed

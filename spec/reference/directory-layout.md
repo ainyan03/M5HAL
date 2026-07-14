@@ -144,16 +144,16 @@ src/
 
 ## 公開パッケージの除外 (idf_component.yml / library.json)
 
-レジストリへ公開するパッケージには「ライブラリ本体 + 利用者向けドキュメント」 (`src/` + 公開ヘッダ + `CMakeLists.txt` + `README*` + `LICENSE` + `spec/`) を含め、 開発専用物 (test / 実験 sketch / CI 設定など) は除外する。 2 つのエコシステムで **examples の扱いだけ非対称** にする。
+レジストリへ公開するパッケージには「ライブラリ本体 + 利用者向けドキュメント」 (`src/` + 公開ヘッダ + `CMakeLists.txt` + `README*` + `LICENSE` + `spec/`) を含め、 開発専用物 (test / CI 設定など) は除外する。 2 つのエコシステムで **examples の扱いだけ非対称** にする。
 
 | マニフェスト | エコシステム | examples | 除外する主なもの |
 |---|---|---|---|
-| `idf_component.yml` (`files.exclude`) | ESP-IDF Component Registry | **除外** | docs / examples / experiments / test / pio_envs / .github / boards / platformio.ini / library.json / library.properties |
-| `library.json` (`export.exclude`) | PlatformIO Registry | **残す** | experiments / test / pio_envs / .github / platformio.ini / idf_component.yml |
+| `idf_component.yml` (`files.exclude`) | ESP-IDF Component Registry | **除外** | docs / examples / test / pio_envs / .github / boards / platformio.ini / library.json / library.properties |
+| `library.json` (`export.exclude`) | PlatformIO Registry | **残す** | test / pio_envs / .github / platformio.ini / idf_component.yml |
 
 **spec/ を残す理由**: レジストリ経由の利用者が README から仕様文書へ辿れるようにする (除外するとパッケージ内のリンクが行き止まりになる)。 `spec/` は確定仕様のみを置く公開文書ツリーであり、 開発専用物ではない。
 
-**examples を非対称にする理由**: Arduino / PlatformIO では examples がライブラリ体験の一部 (Arduino IDE の File > Examples、 ライブラリマネージャ) なのでパッケージに残す。 ESP-IDF コンポーネントは純粋なビルド対象ソースで examples をビルド・消費しないため除外して lean に保つ (公式 m5stack/M5HAL の `idf_component.yml` も examples を除外している)。 `idf_component.yml` は公式の除外リストをベースに M5HAL 固有の開発ディレクトリ (experiments / pio_envs / platformio.ini) を足して発展させたもの。
+**examples を非対称にする理由**: Arduino / PlatformIO では examples がライブラリ体験の一部 (Arduino IDE の File > Examples、 ライブラリマネージャ) なのでパッケージに残す。 ESP-IDF コンポーネントは純粋なビルド対象ソースで examples をビルド・消費しないため除外して lean に保つ (公式 m5stack/M5HAL の `idf_component.yml` も examples を除外している)。 `idf_component.yml` は公式の除外リストをベースに M5HAL 固有の開発ディレクトリ (`pio_envs` / `platformio.ini`) を足して発展させたもの。
 
 `library.json` は **JSON のためファイル内にコメントを書けない**。 除外方針の根拠は本節を正本とする (`idf_component.yml` 側にも本節を指すコメントを置く)。
 

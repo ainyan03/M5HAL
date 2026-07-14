@@ -188,8 +188,13 @@ result_t<void> GPIOGroup::watch(types::gpio_number_t gpio_num)
     }
     const auto slot    = types::extractSlot(gpio_num);
     const auto local   = types::extractLocalPin(gpio_num);
-    const uint8_t p    = local >> 5;
-    const uint32_t bit = 1u << (local & 31);
+    const Entry* entry = _find(slot);
+    IGPIO::PinLocation location;
+    if (!entry->gpio->tryLocatePin(local, &location)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+    const uint8_t p    = location.port_index;
+    const uint32_t bit = 1u << location.bit_index;
     if (p >= kMaxPortsPerEntry) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
@@ -220,10 +225,15 @@ result_t<void> GPIOGroup::unwatch(types::gpio_number_t gpio_num)
     if (gpio_num < 0) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
-    const auto slot    = types::extractSlot(gpio_num);
-    const auto local   = types::extractLocalPin(gpio_num);
-    const uint8_t p    = local >> 5;
-    const uint32_t bit = 1u << (local & 31);
+    const auto slot  = types::extractSlot(gpio_num);
+    const auto local = types::extractLocalPin(gpio_num);
+    const Entry* e   = _find(slot);
+    IGPIO::PinLocation location;
+    if (e == nullptr || !e->gpio->tryLocatePin(local, &location)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+    const uint8_t p    = location.port_index;
+    const uint32_t bit = 1u << location.bit_index;
     const size_t i     = entryIndexOf(slot);
     if (i >= kMaxEntries || p >= kMaxPortsPerEntry) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
@@ -247,10 +257,15 @@ result_t<void> GPIOGroup::notifyPinStateChanged(types::gpio_number_t gpio_num, b
     if (gpio_num < 0) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
-    const auto slot    = types::extractSlot(gpio_num);
-    const auto local   = types::extractLocalPin(gpio_num);
-    const uint8_t p    = local >> 5;
-    const uint32_t bit = 1u << (local & 31);
+    const auto slot  = types::extractSlot(gpio_num);
+    const auto local = types::extractLocalPin(gpio_num);
+    const Entry* e   = _find(slot);
+    IGPIO::PinLocation location;
+    if (e == nullptr || !e->gpio->tryLocatePin(local, &location)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+    const uint8_t p    = location.port_index;
+    const uint32_t bit = 1u << location.bit_index;
     const size_t i     = entryIndexOf(slot);
     if (i >= kMaxEntries || p >= kMaxPortsPerEntry) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
@@ -285,7 +300,8 @@ bool GPIOGroup::hasGPIO(types::gpio_slot_t slot) const
 result_t<void> GPIOGroup::setDenyMask(types::gpio_slot_t slot, uint8_t port_index, uint32_t mask)
 {
     Entry* e = _findMut(slot);
-    if (e == nullptr || port_index >= kMaxPortsPerEntry) {
+    if (e == nullptr || port_index >= kMaxPortsPerEntry || port_index >= e->gpio->getPortCount() ||
+        e->gpio->getPort(port_index) == nullptr) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
     e->deny_mask[port_index] = mask;
@@ -301,8 +317,12 @@ result_t<GPIOGroup::PortAccess> GPIOGroup::getPort(types::gpio_slot_t slot, uint
     if (port_index >= e->gpio->getPortCount()) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
+    IPort* const port = e->gpio->getPort(port_index);
+    if (port == nullptr) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
     uint32_t deny = port_index < kMaxPortsPerEntry ? e->deny_mask[port_index] : 0;
-    return PortAccess{e->gpio->getPort(port_index), deny};
+    return PortAccess{port, deny};
 }
 
 bool GPIOGroup::isValid(types::gpio_number_t gpio_num) const
@@ -315,11 +335,11 @@ bool GPIOGroup::isValid(types::gpio_number_t gpio_num) const
         return false;
     }
     const auto local = types::extractLocalPin(gpio_num);
-    if (!e->gpio->isValid(local)) {
+    IGPIO::PinLocation location;
+    if (!e->gpio->tryLocatePin(local, &location)) {
         return false;
     }
-    const uint8_t port_idx = local >> 5;
-    if (port_idx < kMaxPortsPerEntry && (e->deny_mask[port_idx] & (1u << (local & 31)))) {
+    if (location.port_index < kMaxPortsPerEntry && (e->deny_mask[location.port_index] & (1u << location.bit_index))) {
         return false;
     }
     return true;
@@ -340,9 +360,11 @@ Pin GPIOGroup::getPin(types::gpio_number_t gpio_num) const
     M5HAL_ASSERT(e != nullptr, "GPIOGroup::getPin: slot unregistered");
     const types::gpio_local_pin_t local = types::extractLocalPin(gpio_num);
     M5HAL_ASSERT(e->gpio->isValid(local), "GPIOGroup::getPin: local pin out of range");
-    const uint8_t port_idx = local >> 5;
-    M5HAL_ASSERT(port_idx >= kMaxPortsPerEntry || !(e->deny_mask[port_idx] & (1u << (local & 31))),
-                 "GPIOGroup::getPin: pin denied");
+    IGPIO::PinLocation location;
+    M5HAL_ASSERT(e->gpio->tryLocatePin(local, &location), "GPIOGroup::getPin: local pin mapping invalid");
+    M5HAL_ASSERT(
+        location.port_index >= kMaxPortsPerEntry || !(e->deny_mask[location.port_index] & (1u << location.bit_index)),
+        "GPIOGroup::getPin: pin denied");
     return e->gpio->getPin(local);
 }
 
@@ -501,8 +523,11 @@ service::ServicePoll GPIOGroup::serviceImpl(const service::ServiceContext& ctx)
                     // (nobody is listening).
                     goto pass_done;
                 }
-                const auto pin =
-                    types::makeGpioNumber(e.slot, static_cast<types::gpio_local_pin_t>((p << 5) | bit_idx));
+                types::gpio_local_pin_t local;
+                if (!e.gpio->localPinForLocation(static_cast<uint8_t>(p), bit_idx, &local)) {
+                    continue;
+                }
+                const auto pin = types::makeGpioNumber(e.slot, local);
                 const bool lvl = (value & bit_mask) != 0;
                 scope.cb(scope.ctx, pin, lvl, lvl ? Edge::Rising : Edge::Falling);
             }

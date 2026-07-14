@@ -62,6 +62,13 @@ bool isHalfDuplexMode(spi::spi_data_mode_t mode)
            mode == spi_data_mode_t::OctalOutput || mode == spi_data_mode_t::OctalIo;
 }
 
+bool isSingleLaneHalfDuplexMode(spi::spi_data_mode_t mode)
+{
+    using spi::spi_data_mode_t;
+    return mode == spi_data_mode_t::HalfDuplex || mode == spi_data_mode_t::HalfDuplexWithDcPin ||
+           mode == spi_data_mode_t::HalfDuplexWithDcBit;
+}
+
 void setPinLevel(types::gpio_number_t pin, bool level)
 {
     if (pin >= 0) {
@@ -98,7 +105,7 @@ size_t minSize(size_t a, size_t b)
 }
 
 result_t<DataChunk> prepareChunk(data::Source* src, size_t& tx_remaining, data::Sink* dst, size_t& rx_remaining,
-                                 uint8_t* dma_buf, size_t max_len)
+                                 uint8_t* dma_buf, size_t max_len, bool sequential)
 {
     data::ConstDataSpan tx_span{};
     const bool can_tx = src != nullptr && tx_remaining > 0 && !src->eof();
@@ -113,7 +120,7 @@ result_t<DataChunk> prepareChunk(data::Source* src, size_t& tx_remaining, data::
 
     size_t tx_chunk = 0;
     size_t rx_chunk = 0;
-    if (can_tx && can_rx) {
+    if (can_tx && can_rx && !sequential) {
         const size_t common = minSize(tx_span.size, minSize(rx_remaining, max_len));
         tx_chunk            = common;
         rx_chunk            = common;
@@ -203,14 +210,15 @@ void Bus_espidf::workerLoop(void)
         int front_rx_idx = impl_espidf::rxBufferIndexForChunk(front, front_tx_idx);
         auto worker_err  = error::error_t::OK;
 
-        while (_in_flight) {
+        while (_in_flight.load(std::memory_order_relaxed)) {
             auto prepare_error = error::error_t::OK;
             impl_espidf::DataChunk next{};
             const int next_tx_idx      = front_tx_idx ^ 1;
             const bool front_uses_both = impl_espidf::chunkUsesBothBuffers(front);
             if (!front_uses_both) {
-                auto prepared = impl_espidf::prepareChunk(_worker_src, _worker_tx_remaining, _worker_dst,
-                                                          _worker_rx_remaining, _dma_buf[next_tx_idx], kMaxDmaChunk);
+                auto prepared =
+                    impl_espidf::prepareChunk(_worker_src, _worker_tx_remaining, _worker_dst, _worker_rx_remaining,
+                                              _dma_buf[next_tx_idx], kMaxDmaChunk, _worker_half_duplex);
                 if (prepared.has_value()) {
                     next = prepared.value();
                 } else {
@@ -232,8 +240,9 @@ void Bus_espidf::workerLoop(void)
             }
 
             if (front_uses_both && worker_err == error::error_t::OK) {
-                auto prepared = impl_espidf::prepareChunk(_worker_src, _worker_tx_remaining, _worker_dst,
-                                                          _worker_rx_remaining, _dma_buf[next_tx_idx], kMaxDmaChunk);
+                auto prepared =
+                    impl_espidf::prepareChunk(_worker_src, _worker_tx_remaining, _worker_dst, _worker_rx_remaining,
+                                              _dma_buf[next_tx_idx], kMaxDmaChunk, _worker_half_duplex);
                 if (prepared.has_value()) {
                     next = prepared.value();
                 } else {
@@ -246,12 +255,12 @@ void Bus_espidf::workerLoop(void)
             }
 
             if (worker_err != error::error_t::OK) {
-                _in_flight = false;
+                _in_flight.store(false, std::memory_order_relaxed);
                 break;
             }
 
             if (next.tx == 0 && next.rx == 0) {
-                _in_flight = false;
+                _in_flight.store(false, std::memory_order_relaxed);
                 break;
             }
 
@@ -260,7 +269,7 @@ void Bus_espidf::workerLoop(void)
                                                             _dma_buf[next_rx_idx], next);
             if (!started.has_value()) {
                 worker_err = started.error();
-                _in_flight = false;
+                _in_flight.store(false, std::memory_order_relaxed);
                 break;
             }
 
@@ -278,32 +287,81 @@ void Bus_espidf::workerLoop(void)
         _worker_rx_remaining = 0;
         _worker_front_tx_len = 0;
         _worker_front_rx_len = 0;
-        _worker_active       = false;
-        _worker_status       = worker_err;
-        _transfer_owner      = nullptr;
+        _worker_half_duplex  = false;
+        // Publish every worker-side state update through one release store.
+        // _worker_active remains true until the consumer observes this terminal
+        // status, so an inactive+ASYNC_RUNNING state only denotes the synchronous
+        // front chunk and can never be mistaken for worker completion.
+        _worker_status.store(worker_err, std::memory_order_release);
     }
 }
 
 void Bus_espidf::waitInFlight(void)
 {
-    if (!_in_flight) {
+    const auto worker_status = _worker_status.load(std::memory_order_acquire);
+    if (worker_status != error::error_t::ASYNC_RUNNING) {
+        _in_flight.store(false, std::memory_order_relaxed);
+        _worker_active.store(false, std::memory_order_relaxed);
+        _transfer_owner = nullptr;
         return;
     }
-    if (_worker_active) {
-        while (_worker_status == error::error_t::ASYNC_RUNNING) {
+    if (_worker_active.load(std::memory_order_relaxed)) {
+        while (_worker_status.load(std::memory_order_acquire) == error::error_t::ASYNC_RUNNING) {
             ::taskYIELD();
         }
+        _in_flight.store(false, std::memory_order_relaxed);
+        _worker_active.store(false, std::memory_order_relaxed);
+        _transfer_owner = nullptr;
+        return;
+    }
+    if (!_in_flight.load(std::memory_order_relaxed)) {
         return;
     }
 
     (void)impl_espidf::endChunk(_device);
-    _in_flight        = false;
-    _transfer_owner   = nullptr;
-    _worker_status    = error::error_t::OK;
-    _worker_active    = false;
+    _in_flight.store(false, std::memory_order_relaxed);
+    _transfer_owner = nullptr;
+    _worker_status.store(error::error_t::OK, std::memory_order_relaxed);
+    _worker_active.store(false, std::memory_order_relaxed);
     _worker_src       = nullptr;
     _worker_dst       = nullptr;
     _worker_remaining = 0;
+}
+
+void Bus_espidf::stopWorker(void)
+{
+    if (_worker_task != nullptr) {
+        ::vTaskDelete(_worker_task);
+        _worker_task = nullptr;
+    }
+}
+
+void Bus_espidf::freeDmaBuffers(void)
+{
+    if (_dma_buf[0] != nullptr) {
+        ::heap_caps_free(_dma_buf[0]);
+        _dma_buf[0] = nullptr;
+    }
+    if (_dma_buf[1] != nullptr) {
+        ::heap_caps_free(_dma_buf[1]);
+        _dma_buf[1] = nullptr;
+    }
+}
+
+Bus_espidf::~Bus_espidf()
+{
+    auto released = release();
+    if (!released.has_value()) {
+        // release() deliberately preserves the worker on driver teardown
+        // failure so an explicit caller does not lose a still-adopted backend.
+        // Destruction cannot preserve it: the task holds `this`, so stop it to
+        // avoid use-after-free. DMA remains allocated while a device may still
+        // be registered because the driver can retain transaction references.
+        stopWorker();
+        if (_device == nullptr) {
+            freeDmaBuffers();
+        }
+    }
 }
 
 error::error_t Bus_espidf::attach(::spi_host_device_t host, int8_t claimed_controller)
@@ -402,36 +460,27 @@ result_t<void> Bus_espidf::release(void)
 {
     waitInFlight();
 
-    if (_worker_task != nullptr) {
-        ::vTaskDelete(_worker_task);
-        _worker_task = nullptr;
-    }
-
-    auto removed = removeDevice();
-    if (!removed.has_value()) {
-        return m5::stl::make_unexpected(removed.error());
-    }
-
-    if (_owns_bus) {
-        auto mapped = impl_espidf::mapEspErr(::spi_bus_free(_host));
-        if (error::isError(mapped)) {
-            return m5::stl::make_unexpected(mapped);
-        }
+    const auto teardown = detail_espidf_spi::releaseDriverBeforeWorker(
+        _owns_bus, ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 0, 0),
+        [this]() {
+            auto removed = removeDevice();
+            return removed.has_value() ? error::error_t::OK : removed.error();
+        },
+        [this]() { return impl_espidf::mapEspErr(::spi_bus_free(_host)); }, [this]() { stopWorker(); });
+    if (teardown.bus_released) {
         _owns_bus = false;
     }
 
-    if (_dma_buf[0] != nullptr) {
-        ::heap_caps_free(_dma_buf[0]);
-        _dma_buf[0] = nullptr;
-    }
-    if (_dma_buf[1] != nullptr) {
-        ::heap_caps_free(_dma_buf[1]);
-        _dma_buf[1] = nullptr;
+    if (teardown.worker_stopped) {
+        freeDmaBuffers();
+        _transaction_active = false;
+        _transfer_totals.clear();
+        _transfer_owner = nullptr;
     }
 
-    _transaction_active = false;
-    _transfer_totals.clear();
-    _transfer_owner = nullptr;
+    if (error::isError(teardown.error)) {
+        return m5::stl::make_unexpected(teardown.error);
+    }
     return {};
 }
 
@@ -472,10 +521,15 @@ result_t<bool> Bus_espidf::ensureDevice(const spi::MasterAccessConfig& cfg)
     dev_config.spics_io_num                    = -1;
     dev_config.queue_size                      = 1;
     const bool half_duplex                     = impl_espidf::isHalfDuplexMode(cfg.spi_data_mode);
-    // このフラグをつけておかないと速度上限を 26.66MHz に制限される
+    // Without this flag ESP-IDF limits the clock to 26.66 MHz.
     dev_config.flags = SPI_DEVICE_NO_DUMMY;
     if (half_duplex) {
         dev_config.flags |= SPI_DEVICE_HALFDUPLEX;
+    }
+    if (_config.pin_miso < 0 && impl_espidf::isSingleLaneHalfDuplexMode(cfg.spi_data_mode)) {
+        // ESP-IDF single-I/O mode routes the MOSI (SPID) signal back as
+        // input during the receive phase.
+        dev_config.flags |= SPI_DEVICE_3WIRE;
     }
     if (cfg.spi_order != 0) {
         dev_config.flags |= SPI_DEVICE_BIT_LSBFIRST;
@@ -536,14 +590,19 @@ result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const spi::MasterAcce
                                     size_t rx_len)
 {
     waitInFlight();
-    if (error::isError(_worker_status)) {
-        const auto err = _worker_status;
-        _worker_status = error::error_t::OK;
+    const auto worker_status = _worker_status.load(std::memory_order_acquire);
+    if (error::isError(worker_status)) {
+        const auto err = worker_status;
+        _worker_status.store(error::error_t::OK, std::memory_order_relaxed);
         return m5::stl::make_unexpected(err);
     }
     if (!_transaction_active || cfg.freq == 0 || _device == nullptr || desc.command_bytes > 4 ||
         desc.address_bytes > 4) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+    if (rx_len > 0 && _config.pin_miso < 0 &&
+        (!impl_espidf::isSingleLaneHalfDuplexMode(cfg.spi_data_mode) || _config.pin_mosi < 0)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
     }
 
     auto dev = ensureDevice(cfg);
@@ -610,9 +669,11 @@ result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const spi::MasterAcce
         impl_espidf::setDC(dc_pin, 1);
     }
 
-    size_t tx_remaining = tx_len;
-    size_t rx_remaining = rx_len;
-    auto first          = impl_espidf::prepareChunk(src, tx_remaining, dst, rx_remaining, _dma_buf[0], kMaxDmaChunk);
+    size_t tx_remaining    = tx_len;
+    size_t rx_remaining    = rx_len;
+    const bool half_duplex = impl_espidf::isSingleLaneHalfDuplexMode(cfg.spi_data_mode);
+    auto first =
+        impl_espidf::prepareChunk(src, tx_remaining, dst, rx_remaining, _dma_buf[0], kMaxDmaChunk, half_duplex);
     if (!first.has_value()) {
         return m5::stl::make_unexpected(first.error());
     }
@@ -627,14 +688,15 @@ result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const spi::MasterAcce
     }
 
     const size_t remaining = tx_remaining > rx_remaining ? tx_remaining : rx_remaining;
-    _in_flight             = true;
-    _worker_status         = error::error_t::ASYNC_RUNNING;
-    _transfer_owner        = owner;
+    _worker_active.store(false, std::memory_order_relaxed);
+    _in_flight.store(true, std::memory_order_relaxed);
+    _worker_status.store(error::error_t::ASYNC_RUNNING, std::memory_order_relaxed);
+    _transfer_owner = owner;
 
     if (remaining == 0) {
-        auto ended      = impl_espidf::endChunk(_device);
-        _in_flight      = false;
-        _worker_status  = error::error_t::OK;
+        auto ended = impl_espidf::endChunk(_device);
+        _in_flight.store(false, std::memory_order_relaxed);
+        _worker_status.store(error::error_t::OK, std::memory_order_relaxed);
         _transfer_owner = nullptr;
         if (!ended.has_value()) {
             return m5::stl::make_unexpected(ended.error());
@@ -648,13 +710,12 @@ result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const spi::MasterAcce
     }
 
     if (_worker_task == nullptr) {
-        // A failed release() can delete the worker task yet leave this
-        // backend adopted (the swap aborts keep-old on a release error);
-        // notifying a null handle would crash. Drain the already-started
-        // first chunk and fail loudly instead.
-        auto ended      = impl_espidf::endChunk(_device);
-        _in_flight      = false;
-        _worker_status  = error::error_t::OK;
+        // A missing worker cannot service a multi-chunk transfer. Drain the
+        // already-started first chunk and fail loudly instead of notifying a
+        // null task handle.
+        auto ended = impl_espidf::endChunk(_device);
+        _in_flight.store(false, std::memory_order_relaxed);
+        _worker_status.store(error::error_t::OK, std::memory_order_relaxed);
         _transfer_owner = nullptr;
         if (!ended.has_value()) {
             return m5::stl::make_unexpected(ended.error());
@@ -668,7 +729,8 @@ result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const spi::MasterAcce
     _worker_remaining    = remaining;
     _worker_front_tx_len = first.value().tx;
     _worker_front_rx_len = first.value().rx;
-    _worker_active       = true;
+    _worker_half_duplex  = half_duplex;
+    _worker_active.store(true, std::memory_order_relaxed);
     ::xTaskNotifyGive(_worker_task);
     return {};
 }
@@ -676,30 +738,40 @@ result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const spi::MasterAcce
 result_t<bus::TransferTotals> Bus_espidf::waitTransfer(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg)
 {
     (void)cfg;
-    if (_in_flight && _transfer_owner != owner) {
+    auto worker_status = _worker_status.load(std::memory_order_acquire);
+    if ((_in_flight.load(std::memory_order_relaxed) || worker_status == error::error_t::ASYNC_RUNNING) &&
+        _transfer_owner != owner) {
         return m5::stl::make_unexpected(error::error_t::BUSY);
     }
 
-    if (_in_flight && !_worker_active) {
+    if (_in_flight.load(std::memory_order_relaxed) && !_worker_active.load(std::memory_order_relaxed) &&
+        worker_status == error::error_t::ASYNC_RUNNING) {
         auto ended = impl_espidf::endChunk(_device);
-        _in_flight = false;
+        _in_flight.store(false, std::memory_order_relaxed);
         if (!ended.has_value()) {
             _transfer_owner = nullptr;
             return m5::stl::make_unexpected(ended.error());
         }
     }
 
-    if (_in_flight && _worker_active) {
-        while (_worker_status == error::error_t::ASYNC_RUNNING) {
+    if (worker_status == error::error_t::ASYNC_RUNNING && _worker_active.load(std::memory_order_relaxed)) {
+        do {
             ::taskYIELD();
-        }
-        _in_flight = false;
+            worker_status = _worker_status.load(std::memory_order_acquire);
+        } while (worker_status == error::error_t::ASYNC_RUNNING);
+        _in_flight.store(false, std::memory_order_relaxed);
     }
 
-    if (error::isError(_worker_status)) {
-        const auto err = _worker_status;
-        _worker_status = error::error_t::OK;
+    worker_status = _worker_status.load(std::memory_order_acquire);
+    if (worker_status != error::error_t::ASYNC_RUNNING) {
+        _in_flight.store(false, std::memory_order_relaxed);
+        _worker_active.store(false, std::memory_order_relaxed);
+    }
+    if (error::isError(worker_status)) {
+        const auto err = worker_status;
+        _worker_status.store(error::error_t::OK, std::memory_order_relaxed);
         _transfer_totals.clear();
+        _transfer_owner = nullptr;
         return m5::stl::make_unexpected(err);
     }
 
@@ -711,7 +783,7 @@ result_t<bus::TransferTotals> Bus_espidf::waitTransfer(bus::IAccessor* owner, co
 
 bool Bus_espidf::transferBusy(bus::IAccessor* owner)
 {
-    return _in_flight && _transfer_owner == owner;
+    return _worker_status.load(std::memory_order_acquire) == error::error_t::ASYNC_RUNNING && _transfer_owner == owner;
 }
 
 }  // namespace m5::hal::v2::spi

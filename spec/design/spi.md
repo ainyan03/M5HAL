@@ -23,8 +23,9 @@ SPI は I2C と同じく `Bus` / `Accessor` / `TransferDesc` / `Source` / `Sink`
 この層を土台に、software bit-bang SPI は同期 transfer と低速実機 wire self-test
 まで実装済み。software SPI は `M5_Hal.Services` の service runner に登録済みで、
 cooperative スケジューリングで駆動される (§software SPI variant の実装方針)。
-ESP-IDF hardware SPI は polling master backend の初版を追加済みで、今後は実機
-smoke を段階的に進める。
+ESP-IDF hardware SPI は実機 wire 受入済み。ESP-IDF の polling API を使い、data phase は
+DMA-capable な二重 bounce buffer と worker task で次 chunk の準備・回収を進める。
+interrupt-driven path は未実装。
 
 ## Bus の入手
 
@@ -49,7 +50,10 @@ native handle / host は各 variant 固有の `BusConfig` に置く。各 varian
 
 - Arduino variant: `SPIClass* spi` を明示する。`init(BusConfig)` はその
   `SPIClass` に `begin` / `end` を行い、`attach(SPIClass&)` は caller-owned
-  lifecycle として扱う。
+  lifecycle として扱う。非 ESP Arduino core の portable `SPIClass` は任意 pin を設定する
+  共通 API を持たないため、型指定された `BusConfig_arduino` で CLK / MOSI / MISO が一つでも
+  指定されていれば、配線を無視せず `NOT_IMPLEMENTED` を返す。三 pin を未指定にした場合だけ、
+  選択した `SPIClass` instance の board 既定配線で `begin()` する。
 - ESP-IDF master variant: `spi_host_device_t host` を持つ。既定値は `SPI2_HOST`。
   これは framework 固有 config が native host を受ける欄であり、共通 slave config の
   `controller` (0 起点のプール index) とは単位が異なる。
@@ -60,8 +64,35 @@ native handle / host は各 variant 固有の `BusConfig` に置く。各 varian
 これにより、Arduino / ESP-IDF / software のどれを選んでも「共通configは共通情報、
 variant configはnative実体」という同じ読み方になる。
 
-コア配線ピンは **タグ型 ctor** で与えられる: `BusConfig{spi::Clk{18}, spi::Mosi{23}, spi::Miso{19}}`
-(MISO 省略で write-only)。i2c (`Scl`/`Sda`) / uart (`Tx`/`Rx`) と同じく順序取り違えがコンパイルエラーになる。
+型指定 acquire (`acquire<BusConfig_arduino>`) は Arduino backend を明示固定するため、失敗後に
+software variantへ切り替えない。任意 pin でsoftware fallbackを許す場合は
+`acquire(LogicalBusConfig{Clk{18}, Mosi{23}, Miso{19}, automatic()})` のようなlogical acquireを
+使い、bus確定時にbackendを選ぶ。`preferHardware()`もfallbackを許し、`software()`はsoftware固定、
+`requireHardware()`はfallback禁止である。
+transfer開始後の`NOT_IMPLEMENTED`を契機とした再実行は、CS区間・Source消費・wire副作用を
+重複させ得るため行わない。
+
+backendの機能要件はbus確定前の`AllocationIntent`へ宣言する。MISO-less half-duplex RXには
+`requireMosiSharedRx(intent)`を使う。このhelperはSPI固有のrequired capabilityを既存intentへ合成し、
+identityには影響しない。`requireMosiSharedRx(preferHardware())`では対応hardwareを優先し、非対応なら
+この機能を実装済みのsoftware SPIへfallbackする。`requireMosiSharedRx(requireHardware())`ではfallbackを
+禁止し、対応controllerがなければ`commitBuses()`がtransfer開始前に`OUT_OF_RESOURCE`を返す。同一identityを
+この要件付きで再acquireした場合も、次のcommitで非対応hardwareからsoftwareへdemoteしてから使用する。
+accessorの`spi_data_mode`をcommit後に見てbackendを切り替える方式は採らない。
+remoteの`BusCreate` wire形式はintent/capabilityを搬送しないため、この要件を指定したremote logical acquireは
+黙って無視せず`NOT_IMPLEMENTED`を返す。peer capability negotiationを追加するまでremote保証には含めない。
+
+このcapabilityはMOSIを入力へ切り替えるRX能力だけを表す。CLK未配線でMOSIだけを波形出力に使う能力は
+別要件であり、現時点では宣言・広告しない。software SPIはCLKを必要とし、ESP-IDFでCLKを`-1`にした
+transferの成立もまだ契約化していないためである。
+
+コア配線ピンは **タグ型 ctor** で与えられる: `BusConfig{spi::Clk{18}, spi::Mosi{23}, spi::Miso{19}}`。
+MISOを省略したbusは既定の`FullDuplex`ではwrite-onlyで、RX要求を`INVALID_STATE`としてwire操作前に拒否する。
+ただし`spi_data_mode`を`HalfDuplex` / `HalfDuplexWithDcPin` / `HalfDuplexWithDcBit`のいずれかへ
+明示設定すると、softwareとESP-IDF variantはMOSIを送受信兼用の単一データ線として扱い、TX phase後に
+入力へ切り替えてRX phaseを実行する。ESP-IDFでは`SPI_DEVICE_3WIRE`に対応する。Arduino `SPIClass`
+variantはportableな方向切替APIを持たないため、このMISO-less half-duplex RXを`NOT_IMPLEMENTED`で拒否する。
+i2c (`Scl`/`Sda`) / uart (`Tx`/`Rx`) と同じく順序取り違えがコンパイルエラーになる。
 QSPI データ線 (`pin_d2..d7`) と `pin_dc`、各 variant の native handle は構築後にフィールド代入する。
 各 variant config は `using IBusConfig::IBusConfig;` でこのタグ ctor を継承する。
 
@@ -95,6 +126,8 @@ LCD 文脈 (D/C ビット内蔵 9-bit) とセンサ文脈 (MOSI/MISO 共有半�
 SPI master の論理割当、standalone SPI slave、外部初期化済み host への `attach()` は、同じ
 ハードウェアコントローラのプールを共有する。プール外の利用者は `SPI::claimController(intent)` で
 external claim を取得し、利用を止めてから `releaseClaimedController(controller)` で返す。
+claim / release は同じkindのaccess/transaction windowを一つも保持していない箇所で呼ぶ。commitは
+allocation lockを保持したままbus lockを待つため、window内からのclaim / releaseはlock順を逆転させる。
 
 `SlaveBusConfig::controller` は claim が返した **0 起点の controller index** を受ける。ESP-IDF の
 生の `spi_host_device_t` ではない。ESP-IDF backend は内部で `SPI2_HOST + controller` へ変換し、
@@ -152,6 +185,19 @@ attach 内で初めて claim すると、それ以前の外部 `spi_bus_initiali
 逆に `Bus_espidf::release()` が claim を返すと、外部 host がまだ初期化済みの窓で pool が再貸与できる。
 そのため claim は外部 host の全寿命を包む caller-owned とする。`SPI1_HOST`、範囲外 host、host と
 controller の不一致は attach を `INVALID_ARGUMENT` で拒否する。
+
+## SPI slave
+
+SPI slave は address phase や clock stretch を持たず、master が無条件に clock を供給する前に slave 側が
+交換バッファを queue する必要がある。このため公開プリミティブは
+`SpiSlaveAccessor::serve(data::Source* tx, data::Sink* rx, size_t len, uint32_t timeout_ms)` の 1 つで、
+1 回の `serve()` が 1 CS 区間の full-duplex 交換を表す。I2C slave のような個別 read / write や
+begin / end transaction seam は持たず、利用側は resident loop で取引ごとに `serve()` を呼ぶ。
+
+`len` は両方向で共有する最大 clock byte 数。`tx` が短いまたは null なら残りの MISO を
+`SlaveBusConfig::tx_fill_byte` で埋め、`rx` が null なら MOSI を破棄する。戻り値は master が実際に clock
+した byte 数で、短い CS 区間では `len` 未満になり得る。待ち時間内に取引が始まらなかった場合は error
+ではなく 0 を返し、queue 済み取引は次の `serve()` で回収する。
 
 ## TransferDesc の役割
 
@@ -361,9 +407,9 @@ CS active 直後に余分な active edge として観測されることがある
 
 ## 将来拡張
 
-- ESP-IDF hardware SPI の実機 smoke 拡充 (§当面の目標)。
-- **ESP-IDF SPI master variant の拡充**: polling master の初版を起点に、DMA 転送・
-  interrupt driven path・バージョン差分吸収を段階的に追加する。
+- ESP-IDF hardware SPI の実機 wire 回帰範囲拡充 (§当面の目標)。
+- **ESP-IDF SPI master variant の拡充**: 現行の polling API + DMA-capable 二重 bounce buffer +
+  worker task を起点に、未実装の interrupt-driven path とバージョン差分吸収を段階的に追加する。
 - **dual/quad/octal 幅・DMA hint**: concrete variant 実装で必要性が固まった時点で
   `TransferDesc` を拡張する。最初から大きな descriptor にせず、実装とテストで
   必要になった語彙だけを追加する。

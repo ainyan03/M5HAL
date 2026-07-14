@@ -12,7 +12,9 @@ opt-in — include `<M5HAL_v2.hpp>` explicitly to try it.
 ## Requirements
 
 - An ESP32-family board. The published packages target the `espressif32`
-  platform (Arduino-ESP32 or ESP-IDF >= 4.4).
+  platform. Direct ESP-IDF component use requires ESP-IDF >= 5.0;
+  Arduino-ESP32 support is versioned independently and includes core 2.x,
+  whose bundled SDK is ESP-IDF 4.4.
 - A compiler with C++17 support.
 - [M5Utility](https://github.com/m5stack/M5Utility) — PlatformIO and the
   ESP-IDF component manager pull it in automatically; in the Arduino IDE,
@@ -33,6 +35,10 @@ opt-in — include `<M5HAL_v2.hpp>` explicitly to try it.
   dependencies:
     m5stack/M5HAL: "*"
   ```
+
+  ESP-IDF 5.0's bundled component manager predates the manifest schema used
+  for newer ESP32-family targets. In an activated ESP-IDF 5.0 environment,
+  upgrade it first with `python -m pip install --upgrade idf-component-manager`.
 
 ## Documentation
 
@@ -291,7 +297,8 @@ library. The entry headers are:
   intermediate library should still make its intended generation explicit
   per TU for readability.
 
-For the inline-namespace default switch (`M5HAL_V0_INLINE`), the
+To make v2 the inline-namespace default, set both
+`M5HAL_V0_INLINE=0` and `M5HAL_V2_INLINE=1`. For the complete switch contract, the
 generation-separated platform macros, and the forward-compatible
 `hal/<vN>/` layout that lets future generations be added without touching
 existing consumers, see

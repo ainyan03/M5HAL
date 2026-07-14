@@ -79,8 +79,8 @@ struct Sda {
 
   Pin fields are global `gpio_number_t` values (`int16_t` opaque IDs).
   The default `-1` is the invalid sentinel; variants resolve a non-
-  negative value through the singleton `GPIOGroup`
-  (e.g. `m5::hal::v2::M5_Hal.Gpio.getPin(num)`).
+  negative value through the singleton `GPIOGroup` using a checked lookup
+  (e.g. `m5::hal::v2::M5_Hal.Gpio.tryGetPin(num)`).
 
   For MCU-internal pins, callers can still pass plain literals such as
   `PIN_SCL = 21` because slot 0 is reserved for the MCU GPIO and its

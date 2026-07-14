@@ -23,3 +23,6 @@ jobs:
 
       - name: Validate compile-time macro inputs and outputs
         run: python3 .github/scripts/check-config-macros.py
+
+      - name: Validate public spec API spellings
+        run: python3 .github/scripts/check-spec-api.py

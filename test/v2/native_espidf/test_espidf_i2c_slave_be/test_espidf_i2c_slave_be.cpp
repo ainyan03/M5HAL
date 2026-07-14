@@ -142,7 +142,7 @@ void countingOnWrite(uint8_t reg, uint8_t value, void* ctx)
 // primes the TX FIFO from reg_file right away only once _hw is set (a no-op
 // otherwise, see rebuildTxRegMapLocked's header contract), matching the
 // real device fixture's own bus.init() -> accessor construction order
-// (experiments/v2/test/i2c_slave/device/i2c_slave.cpp). acc is built in the
+// (test/v2/hil/i2c_slave/device/i2c_slave.cpp). acc is built in the
 // constructor BODY (not a same-class member with in-class initializers) so
 // it runs strictly after bus.init(), not interleaved by member declaration
 // order.

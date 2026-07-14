@@ -433,6 +433,42 @@ TEST(MuxFrameEncoder, WriteDelimiter)
     enc.releaseAll();
 }
 
+TEST(MuxFrameEncoder, OptionalPrefixCannotConsumeRequiredFrameAllocation)
+{
+    memory::Allocator alloc;
+    alloc.setFallback(+[](size_t, memory::usage_t) -> void* { return nullptr; }, +[](void*) {});
+    data::MuxFrameEncoder enc{alloc};
+    std::array<void*, memory::Allocator::tempBlockCount() - 1> held{};
+    for (auto& block : held) {
+        block = alloc.allocate(frame::kMaxFrameSize, memory::usage_t::Temp);
+        ASSERT_NE(block, nullptr);
+    }
+
+    const uint8_t event_payload[]    = {0x11};
+    const uint8_t response_payload[] = {0x22};
+    bool prefix_written              = true;
+    ASSERT_TRUE(enc.writeFrameWithOptionalPrefix(frame::Kind::Event, 1, {event_payload, sizeof(event_payload)},
+                                                 frame::Kind::Response, 2, {response_payload, sizeof(response_payload)},
+                                                 &prefix_written));
+    EXPECT_FALSE(prefix_written);
+    ASSERT_EQ(enc.output().blockCount(), 1u);
+
+    auto bytes = enc.output().peek(frame::kMaxFrameSize);
+    ASSERT_TRUE(bytes.has_value());
+    frame::View view;
+    auto decoded = frame::decode(bytes.value(), view);
+    ASSERT_EQ(decoded.status, frame::DecodeStatus::Ok);
+    EXPECT_EQ(view.kind, frame::Kind::Response);
+    EXPECT_EQ(view.b3, 2u);
+    ASSERT_EQ(view.payload.size, sizeof(response_payload));
+    EXPECT_EQ(view.payload.data[0], response_payload[0]);
+
+    enc.releaseAll();
+    for (auto* block : held) {
+        alloc.deallocate(block);
+    }
+}
+
 // ============================================================================
 // MuxFrameDecoder (frame-pull model, new frame format)
 // ============================================================================

@@ -128,7 +128,7 @@ auto i2c  = M5_Hal.I2C.acquire(m5hal::i2c::BusConfig{m5hal::i2c::Scl{22}, m5hal:
 auto spi  = M5_Hal.SPI.acquire(spi_cfg);    // identity = CLK / MOSI / MISO
 auto uart = M5_Hal.UART.acquire(m5hal::uart::BusConfig{m5hal::uart::Tx{17}, m5hal::uart::Rx{16}});
 auto i2s  = M5_Hal.I2S.acquire(i2s_cfg);    // identity = BCLK / WS / DOUT / DIN
-if (!i2c) { /* INVALID_ARGUMENT (pin 未設定) / backend init 失敗 / OUT_OF_RESOURCE / NOT_CONNECTED (init()/connect() 前の自作 Hal — M5_Hal では発生しない) */ }
+if (!i2c) { /* backend init 失敗 / OUT_OF_RESOURCE / NOT_CONNECTED (init()/connect() 前の自作 Hal — M5_Hal では発生しない) */ }
 m5hal::i2c::MasterAccessor dev{i2c.value(), acc_cfg};  // shared_ptr 直渡し = accessor が bus を co-own
 ```
 
@@ -142,6 +142,10 @@ m5hal::i2c::MasterAccessor dev{i2c.value(), acc_cfg};  // shared_ptr 直渡し =
   設定取り違えを避ける診断であり、既存 bus の再構成はしない。配線の駆動手段そのもの
   (Arduino `Wire*`、POSIX `device_path` 等) は現行 registry identity では表現しないため、初回
   acquire の config が有効である点は変わらない。
+  pin の `-1` sentinel も他の値と同様に identity の一部として比較し、BusView は未指定roleを理由に
+  事前拒否しない。その構成で動作可能かは選択backendの `init()` が判定し、失敗したbusはregistryへ
+  登録されない。これにより、backend既定配線を使う全pin未指定configや、特定roleを物理出力しない
+  backendを共通identity機構の外へ追い出さない。
   *(リモートは実装済み: `Hal::initUart` / `initTcp` で接続した `Hal` インスタンスの
   `hal.<KIND>.acquire` が同型でリモートプロキシを返す — [remote.md](remote.md) §Hal facade。
   接続束縛は排他 = 1 `Hal` は 1 デバイスの窓。)*
@@ -218,9 +222,9 @@ HW コントローラ割当を遅延解決し、ロック下で backend を hot-
 
 UART / I2S も `BusView` の形は I2C / SPI と揃える (実装は共有 — §BusView の実装共有)。つまり
 `commitBuses()` は呼べるが no-op、`hardwareInUse()` は 0 (`BusTraits::MANAGED_ALLOCATION = false`)、
-`acquire(LogicalBusConfig)` は surface と入力 validation だけを持つ。
-有効な logical request は `NOT_IMPLEMENTED`、identity 不正または `AllocationIntent` の require/forbid
-衝突は `INVALID_ARGUMENT`。実際の bus 生成は `acquire<CfgT>(cfg)` が担い、backend は初回 acquire の
+`acquire(LogicalBusConfig)` は surface とintent validationだけを持つ。
+logical request はpin値によらずbackend未提供なら`NOT_IMPLEMENTED`、`AllocationIntent` の
+require/forbid衝突は `INVALID_ARGUMENT`。実際の bus 生成は `acquire<CfgT>(cfg)` が担い、backend は初回 acquire の
 config 型で固定される。将来 UART/I2S に controller allocation policy を入れる場合も、利用者が覚える
 top-level API 名は変えない。
 
@@ -391,65 +395,117 @@ policy (全 accessor sugar が内部で従うものと同一):
 
 ```cpp
 namespace m5::hal::v2::bus {
-    struct IBusConfig { /* 共通基底 (空マーカ) */ };
-    struct IAccessConfig { /* 共通基底 (空マーカ) */ };
-    struct ITransferDesc { /* 共通基底 (空マーカ、 詳細は design/transfer_desc.md) */ };
-
-    class IBus {
-        virtual error_t init(const IBusConfig& cfg)  = 0;
-        virtual void    release()                    = 0;
-        virtual error_t lock(IAccessor* owner, uint32_t timeout_ms = types::TIMEOUT_FOREVER);  // mutex 待ち合わせ、 競合 = TIMEOUT_ERROR
-        virtual error_t unlock(IAccessor* owner);
-        // attach / transfer は kind 別派生 (i2c::IBus / spi::IBus / ...) で定義
-        runtime::Mutex _mutex;   // 常時内蔵 (§排他制御の意味論)
+    // Selected members from the common configuration bases.
+    struct IBusConfig {
+        types::bus_kind_t bus_kind;
+        types::bus_kind_t getBusKind(void) const;
+    protected:
+        explicit constexpr IBusConfig(types::bus_kind_t k);
     };
 
-    class IAccessor {
-        IBus& _bus;
-        size_t _access_depth = 0;
-        error_t beginAccess(uint32_t timeout_ms = types::TIMEOUT_FOREVER);  // 0→1 のみ bus.lock
-        error_t endAccess();                            // 1→0 のみ bus.unlock
-        bool inAccess() const;
+    struct IAccessConfig {
+        types::bus_kind_t bus_kind;
+        types::bus_kind_t getBusKind(void) const;
+    protected:
+        explicit constexpr IAccessConfig(types::bus_kind_t k);
+    };
+
+    struct ITransferDesc { /* 共通基底 (空マーカ、 詳細は design/transfer_desc.md) */ };
+
+    struct IBus {
+        virtual ~IBus() = default;
+        virtual const IBusConfig& getConfig(void) const = 0;
+        types::bus_kind_t getBusKind(void) const;
+
+        // Initialization is not part of the common base. Each concrete bus
+        // declares a non-virtual init taking its variant-specific config type.
+        virtual result_t<void> release(void);
+        virtual result_t<void> lock(
+            IAccessor* owner,
+            uint32_t timeout_ms = types::TIMEOUT_FOREVER);  // mutex 待ち合わせ、 競合 = TIMEOUT_ERROR
+        virtual result_t<void> unlock(IAccessor* owner);
+        // Kind-specific derivations define their transfer entry points.
+    protected:
+        runtime::Mutex _mutex;   // 常時内蔵 (§排他制御の意味論)
+        IAccessor* _lock_owner = nullptr;
+    };
+
+    struct IAccessor {
+        virtual ~IAccessor(void) = default;
+        virtual const IAccessConfig& getConfig(void) const = 0;
+        types::bus_kind_t getBusKind(void) const;
+
+        IAccessor(IBus& bus);
+        explicit IAccessor(std::shared_ptr<IBus> owner);
+        bool isBound(void) const;
+        IBus& getBus(void) const;
+        const IBusConfig& getBusConfig(void) const;
+        result_t<void> beginAccess(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+        result_t<void> endAccess(void);
+        bool inAccess(void) const;
+
+    protected:
+        IAccessor(void) = default;
+        void _bindBus(IBus& bus);
+        IBus* _bus = nullptr;
+        uint32_t _access_depth = 0;
+        std::shared_ptr<IBus> _owner{};
+        IAccessor* _lock_peer = nullptr;
     };
 }
 
 namespace m5::hal::v2::i2c {
-    struct IBusConfig          : public bus::IBusConfig    { /* pin_scl, pin_sda */ };
+    struct IBusConfig : public bus::IBusConfig { /* pin_scl, pin_sda */ };
     struct MasterAccessConfig : public bus::IAccessConfig {
         /* freq, wire_timeout_ms, i2c_addr, address_is_10bit, register_address_bytes, use_restart */
     };
-    struct TransferDesc          : public bus::ITransferDesc { /* inline prefix buffer, 詳細は design/transfer_desc.md */ };
+    struct TransferDesc : public bus::ITransferDesc { /* inline prefix buffer, 詳細は design/transfer_desc.md */ };
 
-    class IBus : public bus::IBus {
-        virtual error_t attach(/* TwoWire&, i2c_master_bus_handle_t, etc */) = 0;
-        virtual result_t<size_t> transfer(
+    struct IBus : public bus::IBus {
+        const IBusConfig& getConfig(void) const override;
+        virtual result_t<void> transfer(
             bus::IAccessor* owner,
             const MasterAccessConfig& cfg,
             const TransferDesc& desc,
-            data::Source* tx,
-            data::Sink*   rx) = 0;
+            data::Source* src,
+            size_t tx_len,
+            data::Sink* dst,
+            size_t rx_len);
+        virtual result_t<bus::TransferTotals> waitTransfer(
+            bus::IAccessor* owner,
+            const MasterAccessConfig& cfg);
+        virtual bool transferBusy(bus::IAccessor* owner);
     };
 
-    class MasterAccessor : public bus::IAccessor {
-        MasterAccessConfig _access_config;
+    struct MasterAccessor : public bus::IAccessor {
         // ctor は IBus& 受け (コンパイル時 kind verify)
-        MasterAccessor(IBus& bus, const MasterAccessConfig& cfg);
+        MasterAccessor(IBus& bus, const MasterAccessConfig& access_config);
 
-        // sugar (全て内部で beginAccess → transfer → endAccess)
-        expected<size_t, error_t> transfer(const TransferDesc& desc, data::ConstDataSpan tx, data::DataSpan rx);
-        expected<size_t, error_t> write(data::ConstDataSpan tx);
-        expected<size_t, error_t> read(data::DataSpan rx);
+        // 明示的 transaction API。transfer の成否と累積 byte 数を分離する。
+        result_t<void> beginTransaction(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+        result_t<void> transfer(
+            const TransferDesc& desc,
+            data::ConstDataSpan src_bytes,
+            data::DataSpan dst_bytes);
+        result_t<bus::TransferTotals> endTransaction(void);
+
+        // sugar (全て内部で beginTransaction → transfer → endTransaction)
+        result_t<size_t> write(data::ConstDataSpan src_bytes);
+        result_t<size_t> read(data::DataSpan dst_bytes);
 
         // register sugar: アドレス幅は register_address_bytes (config) が単一源。reg は値 (型は幅に無関係)。
-        expected<size_t, error_t> writeRegister(int reg, data::ConstDataSpan value);
-        expected<size_t, error_t> writeRegister(int reg, uint8_t value);
-        expected<size_t, error_t> writeRegister(int reg, const uint8_t* tx, size_t len);
-        expected<size_t, error_t> readRegister(int reg, data::DataSpan dst);
-        expected<size_t, error_t> readRegister(int reg, uint8_t* dst, size_t len);
-        expected<uint8_t, error_t> readRegister(int reg);
+        result_t<size_t> writeRegister(int reg, data::ConstDataSpan value);
+        result_t<size_t> writeRegister(int reg, uint8_t value);
+        result_t<size_t> writeRegister(int reg, const uint8_t* src, size_t len);
+        result_t<size_t> readRegister(int reg, data::DataSpan dst);
+        result_t<size_t> readRegister(int reg, uint8_t* dst, size_t len);
+        result_t<uint8_t> readRegister(int reg);
 
         // probe (0-byte write、 device 存在確認、 wire 上で address+W 送出 + ACK チェック)
-        expected<void, error_t> probe();
+        result_t<void> probe(void);
+
+    protected:
+        MasterAccessConfig _access_config;
     };
 }
 ```

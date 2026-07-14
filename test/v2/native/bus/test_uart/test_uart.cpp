@@ -3,8 +3,10 @@
 #include <gtest/gtest.h>
 #include "support/gtest_watchdog.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -105,7 +107,85 @@ public:
     m5::hal::v2::uart::AccessConfig last_cfg;
 };
 
+class ScriptedStreamingBus : public m5::hal::v2::uart::Bus_streaming {
+public:
+    static m5::hal::v2::result_t<size_t> finishWrite(m5::hal::v2::result_t<size_t> accepted,
+                                                     m5::hal::v2::error::error_t completion_error)
+    {
+        return completeWrite(std::move(accepted), completion_error);
+    }
+
+    bool fail_first                             = false;
+    size_t first_count                          = 3;
+    m5::hal::v2::error::error_t following_error = m5::hal::v2::error::error_t::TIMEOUT_ERROR;
+    size_t write_calls                          = 0;
+
+protected:
+    m5::hal::v2::result_t<size_t> rawWrite(const uint8_t*, size_t len, uint32_t) override
+    {
+        ++write_calls;
+        if (fail_first || write_calls > 1) {
+            return m5::stl::make_unexpected(following_error);
+        }
+        return std::min(first_count, len);
+    }
+
+    m5::hal::v2::result_t<size_t> rawRead(uint8_t*, size_t, uint32_t) override
+    {
+        return static_cast<size_t>(0);
+    }
+
+    m5::hal::v2::result_t<size_t> rawReadableBytes() override
+    {
+        return static_cast<size_t>(0);
+    }
+};
+
 }  // namespace
+
+TEST(BusStreamingWrite, ErrorBeforeProgressPropagatesAndKeepsSource)
+{
+    ScriptedStreamingBus bus;
+    bus.fail_first          = true;
+    const uint8_t payload[] = {1, 2, 3, 4, 5, 6};
+    m5::hal::v2::data::MemorySource src{payload, sizeof(payload)};
+
+    auto result = bus.write(nullptr, {}, &src, sizeof(payload));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+    auto remaining = src.peek(sizeof(payload));
+    ASSERT_TRUE(remaining.has_value());
+    EXPECT_EQ(remaining.value().size, sizeof(payload));
+}
+
+TEST(BusStreamingWrite, ErrorAfterProgressReturnsAcceptedPrefix)
+{
+    ScriptedStreamingBus bus;
+    const uint8_t payload[] = {1, 2, 3, 4, 5, 6};
+    m5::hal::v2::data::MemorySource src{payload, sizeof(payload)};
+
+    auto result = bus.write(nullptr, {}, &src, sizeof(payload));
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), 3u);
+    EXPECT_EQ(bus.write_calls, 2u);
+    auto remaining = src.peek(sizeof(payload));
+    ASSERT_TRUE(remaining.has_value());
+    ASSERT_EQ(remaining.value().size, 3u);
+    EXPECT_EQ(remaining.value().data[0], 4u);
+}
+
+TEST(BusStreamingWrite, CompletionErrorUsesAcceptedPrefixAsRetryBoundary)
+{
+    auto partial = ScriptedStreamingBus::finishWrite(m5::hal::v2::result_t<size_t>{3u},
+                                                     m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+    ASSERT_TRUE(partial.has_value());
+    EXPECT_EQ(partial.value(), 3u);
+
+    auto none = ScriptedStreamingBus::finishWrite(m5::hal::v2::result_t<size_t>{0u},
+                                                  m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+    ASSERT_FALSE(none.has_value());
+    EXPECT_EQ(none.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+}
 
 TEST(IBusConfig, DefaultCtorSetsUARTKind)
 {

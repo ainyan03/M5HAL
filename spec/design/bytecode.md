@@ -49,7 +49,7 @@
 - `kind` は `types::bus_kind_t` の値 (I2C/SPI/UART/I2S)。`gpio_num` は統合 `gpio_number_t` 空間 (スロット込み) の u16 表現
 - 0xB4-0xB5 が critical (bit7) なのは、これらを知らない実行環境による黙殺 = 「CS 制御漏れ」を `PROTOCOL_ERROR` で即検出するため
 - `store_id` は応答データのラベル (任意値)。`0xFF` は「読み捨て」
-- GPIO はピン列操作 (0x20-0x26) とポート一括操作 (0x27-0x28) の 2 形式を持つ。ピン列は GPIOGroup → 個別 Pin モデルに対応し、ポート一括は IPort の 32-bit レジスタ操作 (W1TS/W1TC) に対応する。両者の deny_mask は GPIOGroup が管理する
+- GPIO はピン列操作 (0x20-0x26) とポート一括操作 (0x27-0x28) の 2 形式を持つ。ピン列は GPIOGroup → 個別 Pin モデルに対応し、ポート一括は IPort の 32-bit レジスタ操作 (W1TS/W1TC) に対応する。両者の deny_mask は GPIOGroup が管理し、個別pinからport ordinal / bitへの対応には`IGPIO::locatePin()`を使う
 
 ### BusCreate の pin_config payload
 

@@ -44,7 +44,7 @@ backend の ISR / service tick が起こす (polling 固定遅延ではない)�
 ```cpp
 namespace m5::hal::v2::i2c {
 
-enum class TxUnderrun : uint8_t { fill, stretch };
+enum class TxUnderrun : uint8_t { Fill, Stretch };
 
 struct SlaveBusConfig : public bus::IBusConfig {
     types::gpio_number_t pin_scl = -1;
@@ -52,9 +52,9 @@ struct SlaveBusConfig : public bus::IBusConfig {
     uint16_t address             = 0;      // 7-bit address 値
     bool address_is_10bit        = false;  // 形 parity 用。現 backend は true / >0x7F を INVALID_ARGUMENT で reject
     uint32_t timeout_ms          = 1000;   // 低レベル read() のデータ待ち予算 (期限切れ = 0byte の正常短読み)
-    TxUnderrun tx_underrun       = TxUnderrun::fill;
+    TxUnderrun tx_underrun       = TxUnderrun::Fill;
     uint8_t tx_fill_byte         = 0xFF;
-    uint32_t stretch_timeout_ms  = 100;    // tx_underrun=stretch の応答待ち上限 (超過で fill へ)
+    uint32_t stretch_timeout_ms  = 100;    // TxUnderrun::Stretch の応答待ち上限 (超過で TxUnderrun::Fill へ)
     int8_t controller            = -1;     // 占有するハードウェアコントローラ (§コントローラの占有)
 };
 
@@ -134,6 +134,9 @@ master 体系と同じ有限プールを共有する物理資源であり、 台
 コントローラを占有するかを指定する欄で、 正しい値は `bus::BusView::claimController(intent)`
 (既定 = Auto、 最小空きコントローラ) で取得する:
 
+claim / release はI2Cのaccess/transaction windowを一つも保持していない箇所で呼ぶ。commitは
+allocation lockを保持したままbus lockを待つため、window内からのclaim / releaseはlock順を逆転させる。
+
 ```cpp
 auto claim = M5_Hal.I2C.claimController();  // 既定 = Auto
 if (!claim.has_value()) { /* 全コントローラ使用中、または不適格 */ }
@@ -172,7 +175,7 @@ accessor が送る / 受ける」向き。 slave 視点ではなく master 動�
 
 | 引数 | 型 | これが効く master 取引 | slave 側の意味 | `nullptr` のとき |
 |---|---|---|---|---|
-| `src` | `Source*` | master read | slave が**送出**する応答データ | read 応答を作らない → backend の `tx_underrun` policy (fill / stretch) が出る |
+| `src` | `Source*` | master read | slave が**送出**する応答データ | read 応答を作らない → backend の `tx_underrun` policy (`Fill` / `Stretch`) が出る |
 | `dst` | `Sink*` | master write | slave が**受信**する要求データ | write 受信を捨てる → drain しないので有限 `timeout_ms` 必須 (さもないと RX_FULL stretch で wedge) |
 
 **timeout は 3 つあり対象が違う** (いずれも `*timeout*` 名なので取り違え注意):
@@ -181,7 +184,7 @@ accessor が送る / 受ける」向き。 slave 視点ではなく master 動�
 |---|---|---|
 | `serve(…, timeout_ms)` | 取引開始待ち + 取引中の無進展 (stall)。**wall-clock 総時間ではない** | `TIMEOUT_ERROR`。取引中 stall なら残り write を discard して master を完走させる (discard 中も master が無活動のままなら deadline もう 1 回分で取引ごと放棄 — 有限 timeout は必ず返る) |
 | `SlaveBusConfig::timeout_ms` | 低レベル `read()` が現窓の RX byte を待つ予算 | 0 byte の短読み (通常 error ではない) |
-| `SlaveBusConfig::stretch_timeout_ms` | `tx_underrun=stretch` で窓未オープン / 応答未投入の read を stretch 保持する上限 | `tx_fill_byte` 送出へ fallback |
+| `SlaveBusConfig::stretch_timeout_ms` | `tx_underrun=TxUnderrun::Stretch` で窓未オープン / 応答未投入の read を stretch 保持する上限 | `tx_fill_byte` 送出へ fallback |
 
 ## トランザクション窓モデル
 
@@ -196,8 +199,8 @@ repeated start で繋いだ全体、STOP まで)。 「トランザクション 
 - **Tx 自動消滅**: master が STOP したら未送出の応答キューは破棄される。 積み残しが
   次のトランザクションへ混入しないことを構造的に保証する (明示的な取下げ API は無い —
   必要になれば非破壊で追加できる)
-- 窓未オープンで master に読まれたら **`tx_underrun` policy**: `fill` = `tx_fill_byte`
-  を送出 / `stretch` = SCL stretch で slave の `write` を待ち、 `stretch_timeout_ms`
+- 窓未オープンで master に読まれたら **`tx_underrun` policy**: `TxUnderrun::Fill` = `tx_fill_byte`
+  を送出 / `TxUnderrun::Stretch` = SCL stretch で slave の `write` を待ち、 `stretch_timeout_ms`
   超過で fill にフォールバック。 stretch は backend / SoC の capability に依存する
   (software backend は両対応。 ESP32 無印の HW slave は stretch 非対応で
   `TxUnderrun::Stretch` は `init()` が `INVALID_ARGUMENT` で拒否する — 無印の
@@ -217,7 +220,7 @@ repeated start で繋いだ全体、STOP まで)。 「トランザクション 
 - 可変長フレーム / echo / ブリッジ / 独自プロトコル → 基底
   **`SlaveStreamAccessor::serve(Source*, Sink*)`** で能動給仕。
 
-最小 echo (基底 Stream、 完全版は `experiments/v2/test/i2c_slave/device/i2c_echo.cpp`):
+最小 echo (基底 Stream、 完全版は `test/v2/hil/i2c_slave/device/i2c_echo.cpp`):
 
 ```cpp
 uint8_t echo_buf[1024];
@@ -240,7 +243,7 @@ I2C echo は **write 取引で受けた内容を、続く別取引の read で�
 
 **backend = stretch プリミティブ / accessor = 応答ポリシー**: backend が提供する土台は
 「master の read 要求に対しデータが無ければ SCL stretch でバスを保持し、 `write` が来たら
-応答を載せて解除する」プリミティブ (= 窓モデルの `tx_underrun=stretch` 経路)。 stretch を
+応答を載せて解除する」プリミティブ (= 窓モデルの `tx_underrun=TxUnderrun::Stretch` 経路)。 stretch を
 持たない SoC (ESP32 無印) ではこのプリミティブは提供できず、 代わりに backend が
 `bindIsrRegMap` (後述の ISR fast path) を提供する。 この土台の上に
 **アクセサが応答ポリシーを載せる**:
@@ -416,6 +419,8 @@ backend では受信の解釈 (先頭 byte = ポインタ、 以降 = レジス�
   address NACK、 data NACK、 clock stretch timeout、 STOP 時 SDA stuck-low、 read 末尾
   master NACK 観測に加え、 窓の分離・Tx 自動消滅・underrun fill を固定している。
 - 実機向け ESP-IDF backend (`SlaveBus_espidf`) は 2 flavor をコンパイル時に自動選択する:
+  ESP-IDF 5.0付属の`hal/i2c_ll.h`はC++からincludeできないためslave backendを公開せず、
+  ESP-IDF 5.1以降で以下のflavorを提供する (M5HALの他backendとI2C masterは5.0でも利用可能)。
   **LL flavor** (stretch-cause SoC: S2/S3/C3/C6/H2/P4 等) は HW clock stretch で上記
   プリミティブを提供し、 write-then-read を HW 保証する。 **BE (best-effort) flavor**
   (ESP32 無印) は同じ `i2c_ll_*` 直叩き構造 (IDF driver / Kconfig 非依存) で、 stretch の

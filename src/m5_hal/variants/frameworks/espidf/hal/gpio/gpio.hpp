@@ -6,8 +6,8 @@
 // ESP-IDF SDK (`gpio_config` / `gpio_set_level` / `gpio_get_level`
 // from `driver/gpio.h`). Activation: `ESP_PLATFORM`. Even from
 // Arduino-on-IDF builds, this variant can be selected explicitly via
-// its alias. The encoded value is the gpio_number itself (one Port_espidf
-// is enough because `gpio_num_t` already addresses pins directly).
+// its alias. The encoded value is the gpio_number itself, so one
+// stateless Port_espidf can serve every logical 32-bit port ordinal.
 // Authoritative spec: spec/design/gpio.md, spec/design/variants.md.
 
 #include "../../../../../hal/v2/gpio/gpio.hpp"
@@ -73,12 +73,14 @@ protected:
     }
 };
 
-// Minimal GPIO_espidf with a single built-in Port_espidf (one Port_espidf covers every
-// chip because `gpio_num_t` already addresses pins individually).
+// Minimal GPIO_espidf with one stateless Port_espidf shared by all
+// logical 32-bit mask words (`gpio_num_t` addresses pins individually).
 // constexpr singleton — `getInstance()` returns a `static constexpr`
 // placed in rodata, so there is no guard variable.
 class GPIO_espidf : public gpio::IGPIO {
 public:
+    static constexpr uint8_t portCount = (Port_espidf::kWidth + 31u) >> 5;
+
     gpio::IPort* portForPin(types::gpio_local_pin_t pin_index) const override
     {
         M5HAL_ASSERT(pin_index < static_cast<types::gpio_local_pin_t>(Port_espidf::kWidth), "pin_index out of range");
@@ -86,7 +88,7 @@ public:
     }
     gpio::IPort* getPort(uint8_t portNumber) const override
     {
-        M5HAL_ASSERT(portNumber == 0, "portNumber must be 0");
+        M5HAL_ASSERT(portNumber < portCount, "portNumber out of range");
         return &_port;
     }
     uint16_t getPinCount() const override
@@ -95,7 +97,12 @@ public:
     }
     uint8_t getPortCount() const override
     {
-        return 1;
+        return portCount;
+    }
+    PinLocation locatePin(types::gpio_local_pin_t pin_index) const override
+    {
+        M5HAL_ASSERT(pin_index < static_cast<types::gpio_local_pin_t>(Port_espidf::kWidth), "pin_index out of range");
+        return PinLocation{static_cast<uint8_t>(pin_index >> 5), static_cast<uint8_t>(pin_index & 31u)};
     }
 
     static const GPIO_espidf* getInstance()

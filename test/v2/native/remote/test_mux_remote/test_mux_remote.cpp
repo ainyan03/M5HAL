@@ -168,6 +168,26 @@ struct TwoPortMaskGPIO : public gpio::IGPIO {
     mutable PortMaskRecordingPort ports[2];
 };
 
+struct ReorderedPortMaskGPIO : public gpio::IGPIO {
+    gpio::IPort* portForPin(types::gpio_local_pin_t pin) const override
+    {
+        return &ports[pin == 0 ? 1 : 0];
+    }
+    gpio::IPort* getPort(uint8_t port) const override
+    {
+        return &ports[port];
+    }
+    uint16_t getPinCount() const override
+    {
+        return 2;
+    }
+    uint8_t getPortCount() const override
+    {
+        return 2;
+    }
+    mutable PortMaskRecordingPort ports[2];
+};
+
 struct GpioEventCapture {
     struct Event {
         types::gpio_number_t pin = -1;
@@ -1351,6 +1371,17 @@ TEST(RemoteBackend, ProxyLastOwnerBestEffortReleasesPeerBus)
     EXPECT_EQ(h.peer.release_count, 1u);
 }
 
+TEST(RemoteBackend, SpiFeatureIntentIsRejectedBeforeBusCreate)
+{
+    RemoteConfigCompatHarness h;
+    spi::LogicalBusConfig cfg{spi::Clk{18}, spi::Mosi{23}, spi::requireMosiSharedRx()};
+
+    auto acquired = h.hal.SPI.acquire(cfg);
+    ASSERT_FALSE(acquired.has_value());
+    EXPECT_EQ(acquired.error(), error::error_t::NOT_IMPLEMENTED);
+    EXPECT_EQ(h.peer.create_count, 0u);
+}
+
 TEST(RemoteBackend, FailedDestructorReleaseQuarantinesBusId)
 {
     RemoteConfigCompatHarness h;
@@ -1666,6 +1697,32 @@ TEST(RemoteConfigCompat, LogicalI2sThenTypedIgnoresMclkAndNormalizesBuffers)
     EXPECT_EQ(h.peer.create_count, 1u);
 }
 
+TEST(RemoteConfigCompat, TypedI2sRejectsIncompleteStandardWiringBeforeBusCreate)
+{
+    RemoteConfigCompatHarness h;
+    const auto expect_invalid = [&h](i2s::BusConfig_remote cfg) {
+        auto acquired = h.hal.I2S.acquire(cfg);
+        ASSERT_FALSE(acquired.has_value());
+        EXPECT_EQ(acquired.error(), error::error_t::INVALID_ARGUMENT) << "err=" << error::toString(acquired.error());
+        EXPECT_EQ(h.peer.create_count, 0u);
+    };
+
+    i2s::BusConfig_remote missing_bclk;
+    missing_bclk.pin_ws   = 0;
+    missing_bclk.pin_dout = 2;
+    expect_invalid(missing_bclk);
+
+    i2s::BusConfig_remote missing_ws;
+    missing_ws.pin_bclk = 12;
+    missing_ws.pin_din  = 34;
+    expect_invalid(missing_ws);
+
+    i2s::BusConfig_remote missing_data;
+    missing_data.pin_bclk = 12;
+    missing_data.pin_ws   = 0;
+    expect_invalid(missing_data);
+}
+
 TEST(RemoteConfigCompat, TypedUartRejectsDifferentWireBufferUnit)
 {
     RemoteConfigCompatHarness h;
@@ -1789,6 +1846,60 @@ TEST(RemoteServerHandler, GpioPollReadsSubscribedPortOnceAndEmitsPinEvents)
     EXPECT_TRUE(capture.events[0].level);
     EXPECT_EQ(capture.events[1].pin, pins[1]);
     EXPECT_TRUE(capture.events[1].level);
+}
+
+TEST(RemoteServerHandler, GpioSubscriptionUsesIGPIOPortOrdinal)
+{
+    ReorderedPortMaskGPIO device;
+    gpio::GPIOGroup group{&device};
+    remote::RemoteServerHandler handler;
+    handler.gpio_group = &group;
+
+    const auto pin = types::makeGpioNumber(0, 0);  // local 0 belongs to port ordinal 1
+    auto sub       = remote::RemoteServerHandler::gpioSubscribe(&handler, true, &pin, 1);
+    ASSERT_TRUE(sub.has_value()) << "err=" << error::toString(sub.error());
+    auto mode = remote::RemoteServerHandler::gpioModeSet(&handler, pin, types::gpio_mode_t::Input);
+    ASSERT_TRUE(mode.has_value()) << "err=" << error::toString(mode.error());
+
+    device.ports[0].read_port_calls = 0;
+    device.ports[1].read_port_calls = 0;
+    device.ports[1].value           = 1u;
+
+    mem::Allocator& alloc = mem::defaultAllocator();
+    data::MuxFrameEncoder enc{alloc};
+    data::MuxFrameDecoder dec{alloc};
+    uint8_t frame_buf[1024];
+    data::RingFIFO frames;
+    frames.setBuf(frame_buf, sizeof(frame_buf));
+    std::vector<uint8_t> event_body;
+    dec.setFrameHandler(
+        [](void* ctx, const frame::View& view) {
+            if (view.kind == frame::Kind::Event) {
+                auto* body = static_cast<std::vector<uint8_t>*>(ctx);
+                body->assign(view.payload.data, view.payload.data + view.payload.size);
+            }
+        },
+        &event_body);
+
+    auto poll = remote::RemoteServerHandler::poll(&handler, enc);
+    ASSERT_TRUE(poll.has_value()) << "err=" << error::toString(poll.error());
+    EXPECT_EQ(device.ports[0].read_port_calls, 0u);
+    EXPECT_EQ(device.ports[1].read_port_calls, 1u);
+
+    pumpValue(enc);
+    SessionPair::transfer(enc.output(), frames.sink());
+    pumpValue(dec, frames.source());
+    ASSERT_FALSE(event_body.empty());
+
+    bytecode::BytecodeRunner runner{alloc};
+    runner.setReceiveOnly(true);
+    GpioEventCapture capture;
+    runner.setGpioEventHandler(&GpioEventCapture::onEvent, &capture);
+    auto run = runner.runEvent({event_body.data(), event_body.size()});
+    ASSERT_TRUE(run.has_value()) << "err=" << error::toString(run.error());
+    ASSERT_EQ(capture.events.size(), 1u);
+    EXPECT_EQ(capture.events[0].pin, pin);
+    EXPECT_TRUE(capture.events[0].level);
 }
 
 TEST(RemoteServerHandler, GpioPollHandlesSubscribedPortOnePins)
@@ -2032,6 +2143,55 @@ TEST(RemoteServerHandler, GpioSubscribeRequestEmitsInitialSnapshotEvent)
     EXPECT_FALSE(capture.events[1].level);
 }
 
+TEST(RemoteServerHandler, GpioSnapshotYieldsLastEncoderSlotToResponse)
+{
+    TwoPortMaskGPIO device;
+    device.ports[1].value = 1u << 0;
+    gpio::GPIOGroup group{&device};
+
+    uint8_t server_scratch[remote::kMaxScriptSize];
+    remote::Server srv{data::DataSpan{server_scratch, sizeof(server_scratch)}};
+    srv.setGPIOGroup(group);
+
+    remote::RemoteServerHandler handler;
+    handler.server     = &srv;
+    handler.gpio_group = &group;
+    srv.runner().setGpioSubscribeHandler(&remote::RemoteServerHandler::gpioSubscribe, &handler);
+
+    const types::gpio_number_t pin = types::makeGpioNumber(0, 32);
+    uint8_t script_buf[remote::kMaxScriptSize];
+    data::MemorySink script{script_buf, sizeof(script_buf)};
+    bytecode::BytecodeEncoder script_enc{script};
+    auto encoded = script_enc.gpioSubscribe(&pin, 1);
+    if (encoded.has_value()) {
+        encoded = script_enc.end();
+    }
+    ASSERT_TRUE(encoded.has_value()) << "err=" << error::toString(encoded.error());
+
+    SessionPair pair;
+    MuxFrameCapture capture;
+    pair.dec_a.setFrameHandler(&MuxFrameCapture::onFrame, &capture);
+    for (size_t i = 0; i + 1 < data::BlockSource::kMaxBlocks; ++i) {
+        ASSERT_TRUE(pair.enc_b.writeFrame(frame::Kind::Ping, static_cast<uint8_t>(i), {}));
+    }
+    ASSERT_EQ(pair.enc_b.output().blockCount(), data::BlockSource::kMaxBlocks - 1);
+
+    auto handled = remote::RemoteServerHandler::handler(&handler, frame::Kind::Request, 7,
+                                                        {script_buf, script.written()}, pair.enc_b, pair.dec_b);
+    ASSERT_TRUE(handled.has_value()) << "err=" << error::toString(handled.error());
+    EXPECT_EQ(pair.enc_b.output().blockCount(), data::BlockSource::kMaxBlocks);
+
+    pumpEncoderToDecoder(pair.enc_b, pair.wire_ba, pair.dec_a);
+    size_t event_count    = 0;
+    size_t response_count = 0;
+    for (const auto& captured : capture.frames) {
+        event_count += captured.kind == frame::Kind::Event ? 1u : 0u;
+        response_count += captured.kind == frame::Kind::Response && captured.seq == 7 ? 1u : 0u;
+    }
+    EXPECT_EQ(event_count, 0u);
+    EXPECT_EQ(response_count, 1u);
+}
+
 TEST(RemoteServerStreamTransfer, I2SWriteReachesRegisteredBusAndCompletes)
 {
     SessionPair pair;
@@ -2270,15 +2430,16 @@ TEST(RemoteServerStreamTransfer, ReadOnlyI2CBackpressureDoesNotDropPolledData)
 
     auto first_poll = server.poll(pair.enc_b, 100);
     ASSERT_TRUE(first_poll.has_value()) << "err=" << error::toString(first_poll.error());
-    EXPECT_EQ(pair.enc_b.output().blockCount(), data::BlockSource::kMaxBlocks);
-    EXPECT_EQ(device_bus.transfer_calls, data::BlockSource::kMaxBlocks);
-    EXPECT_EQ(device_bus.rx_cursor, frame::kMaxDataPayload * data::BlockSource::kMaxBlocks);
+    constexpr size_t kDataQueueLimit = data::BlockSource::kMaxBlocks - 1;
+    EXPECT_EQ(pair.enc_b.output().blockCount(), kDataQueueLimit);
+    EXPECT_EQ(device_bus.transfer_calls, kDataQueueLimit);
+    EXPECT_EQ(device_bus.rx_cursor, frame::kMaxDataPayload * kDataQueueLimit);
 
     const size_t calls_at_full  = device_bus.transfer_calls;
     const size_t cursor_at_full = device_bus.rx_cursor;
     auto blocked_poll           = server.poll(pair.enc_b, 101);
     ASSERT_TRUE(blocked_poll.has_value()) << "err=" << error::toString(blocked_poll.error());
-    EXPECT_EQ(pair.enc_b.output().blockCount(), data::BlockSource::kMaxBlocks);
+    EXPECT_EQ(pair.enc_b.output().blockCount(), kDataQueueLimit);
     EXPECT_EQ(device_bus.transfer_calls, calls_at_full);
     EXPECT_EQ(device_bus.rx_cursor, cursor_at_full);
 

@@ -184,6 +184,17 @@ error::error_t Bus_arduino::attach(::SPIClass& spi)
 
 result_t<void> Bus_arduino::init(const BusConfig_arduino& config)
 {
+#if !defined(ESP_PLATFORM)
+    // Portable SPIClass only guarantees begin() with the board's default bus
+    // pins. A typed Arduino config explicitly selects this backend, so do not
+    // silently substitute software or ignore a requested wiring assignment.
+    // Callers that need arbitrary pins can use the logical acquire path, whose
+    // allocation policy selects the software backend when no hardware factory
+    // is available.
+    if (config.pin_clk >= 0 || config.pin_miso >= 0 || config.pin_mosi >= 0) {
+        return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
+    }
+#endif
     _config = config;
     if (_spi) {
         (void)release();
@@ -203,8 +214,8 @@ result_t<void> Bus_arduino::init(const BusConfig_arduino& config)
         spi->begin();
     }
 #else
-    // Portable cores fix SCK/MISO/MOSI per SPIClass instance (board variant
-    // file); configured pins cannot be honored here and are ignored.
+    // The preflight above limits this path to the SPIClass instance's board
+    // default SCK/MISO/MOSI assignment.
     spi->begin();
 #endif
     if (_config.pin_dc >= 0) {
@@ -267,14 +278,15 @@ result_t<void> Bus_arduino::transfer(bus::IAccessor* owner, const spi::MasterAcc
     // command/address meta phase is already sent sequentially — the DC
     // demos rely on that); what cannot be honored is half-duplex with
     // BOTH src and dst data, which full-duplex clocking would corrupt.
+    bool half_duplex = false;
     {
         using spi::spi_data_mode_t;
         const auto mode       = cfg.spi_data_mode;
         const bool multi_lane = mode == spi_data_mode_t::DualOutput || mode == spi_data_mode_t::DualIo ||
                                 mode == spi_data_mode_t::QuadOutput || mode == spi_data_mode_t::QuadIo ||
                                 mode == spi_data_mode_t::OctalOutput || mode == spi_data_mode_t::OctalIo;
-        const bool half_duplex = mode == spi_data_mode_t::HalfDuplex || mode == spi_data_mode_t::HalfDuplexWithDcPin ||
-                                 mode == spi_data_mode_t::HalfDuplexWithDcBit;
+        half_duplex = mode == spi_data_mode_t::HalfDuplex || mode == spi_data_mode_t::HalfDuplexWithDcPin ||
+                      mode == spi_data_mode_t::HalfDuplexWithDcBit;
         if (multi_lane ||
             (half_duplex && src != nullptr && tx_len > 0 && !src->eof() && dst != nullptr && rx_len > 0)) {
             return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
@@ -282,6 +294,9 @@ result_t<void> Bus_arduino::transfer(bus::IAccessor* owner, const spi::MasterAcc
     }
     if (_spi == nullptr || desc.command_bytes > 4 || desc.address_bytes > 4) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+    if (rx_len > 0 && _config.pin_miso < 0) {
+        return m5::stl::make_unexpected(half_duplex ? error::error_t::NOT_IMPLEMENTED : error::error_t::INVALID_STATE);
     }
 
     // Per-device D/C override: a non-negative accessor pin_dc beats the

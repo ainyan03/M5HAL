@@ -88,7 +88,7 @@ struct Miso {
   Covers plain SPI as well as QSPI / OSPI configurations. Every pin
   is a `gpio_number_t` (`int16_t`); the default `-1` is the invalid
   sentinel. Variants resolve a non-negative value during `init()`
-  via `m5::hal::v2::M5_Hal.Gpio.getPin(num)` (same singleton
+  via the checked `m5::hal::v2::M5_Hal.Gpio.tryGetPin(num)` lookup (same singleton
   `GPIOGroup` convention as `IBusConfig`).
 
   QSPI / OSPI use `pin_mosi` / `pin_miso` / `pin_d2..d7` as the data
@@ -122,7 +122,7 @@ struct IBusConfig : public bus::IBusConfig {
         : bus::IBusConfig{types::bus_kind_t::SPI}, pin_clk{clk.value}, pin_mosi{mosi.value}, pin_miso{miso.value}
     {
     }
-    /*! @brief MISO-less wiring (write-only display class): MISO stays at -1. */
+    /*! @brief MISO-less wiring: write-only by default; single-lane half duplex may receive on MOSI. */
     constexpr IBusConfig(Clk clk, Mosi mosi)
         : bus::IBusConfig{types::bus_kind_t::SPI}, pin_clk{clk.value}, pin_mosi{mosi.value}
     {
@@ -151,8 +151,8 @@ struct LogicalBusConfig {
         : pin_clk{clk.value}, pin_mosi{mosi.value}, pin_miso{miso.value}, intent{in}
     {
     }
-    /*! @brief MISO-less wiring (write-only display class): the bus is still
-               identified by CLK / MOSI, with MISO left at the -1 sentinel. */
+    /*! @brief MISO-less wiring: the bus is identified by CLK / MOSI, with MISO
+               at -1. It is write-only unless a supported half-duplex mode shares MOSI. */
     constexpr LogicalBusConfig(Clk clk, Mosi mosi, types::AllocationIntent in = {})
         : pin_clk{clk.value}, pin_mosi{mosi.value}, intent{in}
     {
@@ -161,12 +161,13 @@ struct LogicalBusConfig {
 
 /*!
   @namespace m5::hal::v2::spi::caps
-  @brief spi-local backend capability bits. Bit 0 (HARDWARE) is the cross-kind
-         reserved bit; kind-specific caps would start at bit 1. SPI hosts are
-         interchangeable, so HARDWARE is the only capability the resolver sees.
+  @brief SPI backend capability bits. Bits 0-1 are reserved across kinds;
+         SPI-local capabilities start at bit 2.
  */
 namespace caps {
 constexpr types::backend_caps_t HARDWARE = types::backend_caps::HARDWARE;
+/*! @brief Backend can receive on MOSI during a MISO-less half-duplex transfer. */
+constexpr types::backend_caps_t MOSI_SHARED_RX = 1u << 2;
 }  // namespace caps
 
 // --- Allocation-intent helpers (shared builders, defined in bus::) -----------
@@ -180,14 +181,32 @@ using bus::requireHardware;
 using bus::software;
 
 /*!
+  @brief Require MISO-less half-duplex RX on the MOSI pin.
+
+  Composes with the ordinary allocation helpers. For example,
+  `requireMosiSharedRx(preferHardware())` prefers a capable hardware
+  controller and falls back to software, while
+  `requireMosiSharedRx(requireHardware())` forbids that fallback.
+
+  This requirement must be declared when the bus is acquired. Discovering it
+  from an accessor after `commitBuses()` would be too late to choose a backend
+  without replaying a transfer that may already have changed the wire.
+ */
+constexpr types::AllocationIntent requireMosiSharedRx(types::AllocationIntent intent = {})
+{
+    intent.require |= caps::MOSI_SHARED_RX;
+    return intent;
+}
+
+/*!
   @brief Data-path mode of an SPI transfer.
  */
 enum class SpiDataMode {
-    HalfDuplex,           ///< Half duplex.
+    HalfDuplex,           ///< Half duplex; with no MISO, supported backends receive on MOSI.
     FullDuplex,           ///< Full duplex.
-    HalfDuplexWithDcPin,  ///< Half duplex with a separate D/C pin.
+    HalfDuplexWithDcPin,  ///< Half duplex with separate D/C; with no MISO, receive on MOSI.
     FullDuplexWithDcPin,  ///< Full duplex with a separate D/C pin.
-    HalfDuplexWithDcBit,  ///< Half duplex with an in-band D/C bit (9-bit SPI).
+    HalfDuplexWithDcBit,  ///< Half duplex with in-band D/C; with no MISO, receive on MOSI.
     FullDuplexWithDcBit,  ///< Full duplex with an in-band D/C bit (9-bit SPI).
     DualOutput,
     DualIo,
@@ -598,8 +617,11 @@ struct BusTraits {
     using TransferDesc       = spi::TransferDesc;
     using BusType            = Bus;
 
-    static constexpr types::bus_kind_t KIND              = types::bus_kind_t::SPI;
-    static constexpr types::backend_caps_t CAPS_HARDWARE = caps::HARDWARE;
+    static constexpr types::bus_kind_t KIND = types::bus_kind_t::SPI;
+    // The current poolable hardware factory is ESP-IDF SPI master; every host
+    // it exposes supports SPI_DEVICE_3WIRE. A future factory that differs must
+    // supply per-controller caps through LocalKindAdapter::Topology.
+    static constexpr types::backend_caps_t CAPS_HARDWARE = caps::HARDWARE | caps::MOSI_SHARED_RX;
     /*! @brief SPI uses the managed policy: `BusView::hardwareInUse()` forwards
                to the backend (see spec/design/bus_accessor.md §managed policy). */
     static constexpr bool MANAGED_ALLOCATION = true;

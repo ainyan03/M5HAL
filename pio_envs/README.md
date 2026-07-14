@@ -61,9 +61,13 @@ The default ESP32 PlatformIO base is pinned to `espressif32@6.12.0`
 (ESP-IDF 5.x generation) so ordinary check/example envs are reproducible.
 The check env files also expose explicit ESP-IDF major-version probes:
 
-- `*_espidf4`: `espressif32@5.4.0`, legacy ESP-IDF driver compatibility
 - `*_espidf`: default IDF 5.x stable check
+- `*_espidf_legacy_i2c`: IDF 5.x with the legacy command-link I2C backend
 - `*_espidf6`: `espressif32@7.0.1`, forward-compatibility probe
+
+Direct ESP-IDF support starts at 5.0. Arduino-ESP32 is a separate framework
+axis: the Arduino core 2.x checks remain and continue to compile the embedded
+ESP-IDF 4.4 compatibility branches used by that core.
 
 ### Toolchain coexistence in a shared core_dir
 
@@ -73,9 +77,8 @@ unversioned "active" slot and the espidf cmake `tool_version_check` of the
 other generation then fails. To keep both switchable from one `core_dir`,
 `common_esp32_espidf5` / `common_esp32_espidf6` pin their exact toolchain
 via `platform_packages` (`@14.2.0+20241119` / `@15.2.0+20251204`). Keep
-those pins in sync with the platform pins. IDF4 uses a different package
-(`toolchain-xtensa-esp32`) and the arduino framework does not run the
-strict check, so neither needs a pin. (CI runners are per-job isolated, so
+those pins in sync with the platform pins. The arduino framework does not run
+the strict check, so it does not need a pin. (CI runners are per-job isolated, so
 this only matters for local multi-generation builds.)
 
 There are no generated temporary `.ini` files anymore (the env var loads the

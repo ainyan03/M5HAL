@@ -62,6 +62,111 @@ struct TinyGPIO : public ::m5::hal::v2::gpio::IGPIO {
     uint8_t _width;
 };
 
+class ReorderedPort : public ::m5::hal::v2::gpio::IPort {
+protected:
+    void _writePinEncoded(uint32_t encoded_num, bool value) override
+    {
+        const uint32_t bit = 1u << encoded_num;
+        _state             = value ? (_state | bit) : (_state & ~bit);
+    }
+    bool _readPinEncoded(uint32_t encoded_num) override
+    {
+        return (_state & (1u << encoded_num)) != 0;
+    }
+    void _setPinModeEncoded(uint32_t, gpio_mode_t) override
+    {
+    }
+    gpio_local_pin_t _toLocalPin(uint32_t encoded_num) const override
+    {
+        return static_cast<gpio_local_pin_t>(encoded_num);
+    }
+    uint32_t _fromLocalPin(gpio_local_pin_t pin_index) const override
+    {
+        return pin_index;
+    }
+    uint32_t _readPortAll() override
+    {
+        return _state;
+    }
+    void _writePortMasked(uint32_t set_mask, uint32_t clear_mask) override
+    {
+        _state = (_state & ~clear_mask) | set_mask;
+    }
+
+private:
+    uint32_t _state = 0;
+};
+
+// Deliberately maps local pin 0 to port ordinal 1 and local pin 1 to
+// ordinal 0.  This catches code that mistakes a 32-pin bank number for
+// the IGPIO-defined port ordinal.
+struct ReorderedGPIO : public ::m5::hal::v2::gpio::IGPIO {
+    ::m5::hal::v2::gpio::IPort* portForPin(gpio_local_pin_t local_pin) const override
+    {
+        return &_ports[local_pin == 0 ? 1 : 0];
+    }
+    ::m5::hal::v2::gpio::IPort* getPort(uint8_t port_index) const override
+    {
+        return &_ports[port_index];
+    }
+    uint16_t getPinCount() const override
+    {
+        return 2;
+    }
+    uint8_t getPortCount() const override
+    {
+        return 2;
+    }
+
+    mutable ReorderedPort _ports[2];
+};
+
+// Models framework GPIOs whose pin operations share one stateless IPort
+// while deny/watch masks still use two logical 32-bit port ordinals.
+struct SharedPortGPIO : public ::m5::hal::v2::gpio::IGPIO {
+    ::m5::hal::v2::gpio::IPort* portForPin(gpio_local_pin_t) const override
+    {
+        return &_port;
+    }
+    ::m5::hal::v2::gpio::IPort* getPort(uint8_t) const override
+    {
+        return &_port;
+    }
+    uint16_t getPinCount() const override
+    {
+        return 40;
+    }
+    uint8_t getPortCount() const override
+    {
+        return 2;
+    }
+    PinLocation locatePin(gpio_local_pin_t local_pin) const override
+    {
+        return PinLocation{static_cast<uint8_t>(local_pin >> 5), static_cast<uint8_t>(local_pin & 31u)};
+    }
+
+    mutable ReorderedPort _port;
+};
+
+struct NullPortGPIO : public ::m5::hal::v2::gpio::IGPIO {
+    ::m5::hal::v2::gpio::IPort* portForPin(gpio_local_pin_t) const override
+    {
+        return nullptr;
+    }
+    ::m5::hal::v2::gpio::IPort* getPort(uint8_t) const override
+    {
+        return nullptr;
+    }
+    uint16_t getPinCount() const override
+    {
+        return 1;
+    }
+    uint8_t getPortCount() const override
+    {
+        return 1;
+    }
+};
+
 // ----- makeGpioNumber / extract* helpers -----
 
 TEST(MakeGpioNumber, RoundTripSlot0)
@@ -495,8 +600,49 @@ TEST(GPIOGroup, DenyMaskRejectsInvalidPort)
 {
     TinyGPIO mcu{32};
     ::m5::hal::v2::gpio::GPIOGroup g{&mcu};
+    EXPECT_FALSE(g.setDenyMask(0, 1, 0xFFFFFFFF).has_value());
     auto r = g.setDenyMask(0, 2, 0xFFFFFFFF);
     EXPECT_FALSE(r.has_value());
+}
+
+TEST(GPIOGroup, DenyMaskUsesIGPIOPortOrdinal)
+{
+    ReorderedGPIO mcu;
+    ::m5::hal::v2::gpio::GPIOGroup g{&mcu};
+
+    const auto pin0_location = mcu.locatePin(0);
+    EXPECT_EQ(pin0_location.port_index, 1);
+    EXPECT_EQ(pin0_location.bit_index, 0);
+
+    auto deny_pin0 = g.setDenyMask(0, 1, 1u << 0);
+    ASSERT_TRUE(deny_pin0.has_value()) << "err=" << ::m5::hal::v2::error::toString(deny_pin0.error());
+    EXPECT_FALSE(g.isValid(makeGpioNumber(0, 0)));
+    EXPECT_TRUE(g.isValid(makeGpioNumber(0, 1)));
+
+    auto deny_pin1 = g.setDenyMask(0, 0, 1u << 1);
+    ASSERT_TRUE(deny_pin1.has_value()) << "err=" << ::m5::hal::v2::error::toString(deny_pin1.error());
+    EXPECT_FALSE(g.isValid(makeGpioNumber(0, 1)));
+}
+
+TEST(GPIOGroup, DenyMaskUsesLogicalPortAbovePin31)
+{
+    SharedPortGPIO mcu;
+    ::m5::hal::v2::gpio::GPIOGroup g{&mcu};
+
+    auto deny = g.setDenyMask(0, 1, 1u << 8);
+    ASSERT_TRUE(deny.has_value()) << "err=" << ::m5::hal::v2::error::toString(deny.error());
+    EXPECT_TRUE(g.isValid(makeGpioNumber(0, 8)));
+    EXPECT_FALSE(g.isValid(makeGpioNumber(0, 40)));
+}
+
+TEST(GPIOGroup, CheckedMappingRejectsNullPort)
+{
+    NullPortGPIO mcu;
+    ::m5::hal::v2::gpio::GPIOGroup g{&mcu};
+
+    EXPECT_FALSE(g.isValid(makeGpioNumber(0, 0)));
+    EXPECT_FALSE(g.tryGetPin(makeGpioNumber(0, 0)).has_value());
+    EXPECT_FALSE(g.setDenyMask(0, 0, 1u).has_value());
 }
 
 // ----- Port-level operations -----
@@ -677,6 +823,30 @@ TEST(GPIOGroupWatch, PollDispatchesRisingThenFallingWithCorrectArgs)
     ASSERT_TRUE(g.setWatchSink(nullptr, nullptr).has_value());
 }
 
+TEST(GPIOGroupWatch, PollMapsPortOrdinalBackToLocalPin)
+{
+    ReorderedGPIO mcu;
+    GPIOGroup g{&mcu};
+    ServiceRunner runner;
+    g.bindServiceRunner(&runner);
+
+    WatchCapture cap;
+    auto sink = g.setWatchSink(&captureWatchEvent, &cap, 1000);
+    ASSERT_TRUE(sink.has_value()) << "err=" << ::m5::hal::v2::error::toString(sink.error());
+    const auto pin = makeGpioNumber(0, 0);  // local 0 belongs to port ordinal 1
+    auto watched   = g.watch(pin);
+    ASSERT_TRUE(watched.has_value()) << "err=" << ::m5::hal::v2::error::toString(watched.error());
+
+    mcu._ports[1].writePort(1u << 0, 0);
+    EXPECT_TRUE(runner.runOnce(GroupCtx{2000, 0}));
+    EXPECT_EQ(cap.count, 1);
+    EXPECT_EQ(cap.pin, pin);
+    EXPECT_TRUE(cap.level);
+
+    auto clear = g.setWatchSink(nullptr, nullptr);
+    ASSERT_TRUE(clear.has_value()) << "err=" << ::m5::hal::v2::error::toString(clear.error());
+}
+
 // 2. watch() seeds the current level so an unchanged poll reports no
 //    (spurious) event.
 TEST(GPIOGroupWatch, WatchSeedsLevelSoUnchangedPollReportsNoEvent)
@@ -747,13 +917,13 @@ TEST(GPIOGroupWatch, UnwatchStopsFurtherEvents)
 // rejects on port index before ever touching a Port (unlike TinyGPIO,
 // whose single Port_stub caps out at 32 pins).
 struct WideGPIO : public ::m5::hal::v2::gpio::IGPIO {
-    ::m5::hal::v2::gpio::IPort* portForPin(gpio_local_pin_t) const override
+    ::m5::hal::v2::gpio::IPort* portForPin(gpio_local_pin_t pin) const override
     {
-        return nullptr;
+        return getPort(pin >> 5);
     }
-    ::m5::hal::v2::gpio::IPort* getPort(uint8_t) const override
+    ::m5::hal::v2::gpio::IPort* getPort(uint8_t port) const override
     {
-        return nullptr;
+        return port == 0 ? &_port0 : (port == 1 ? &_port1 : &_port2);
     }
     uint16_t getPinCount() const override
     {
@@ -763,6 +933,10 @@ struct WideGPIO : public ::m5::hal::v2::gpio::IGPIO {
     {
         return 3;
     }
+
+    mutable StubPort _port0{32, 0};
+    mutable StubPort _port1{32, 32};
+    mutable StubPort _port2{32, 64};
 };
 
 // 5. watch() rejects a deny-masked pin, a pin past port 0/1 (local >=

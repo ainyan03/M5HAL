@@ -446,7 +446,7 @@ result_t<int8_t> acquirePhysUART(ServerPhysicalBusPool& phys, data::ConstDataSpa
 #endif
 
 // Needs the std I2S driver (IDF5) — mirror createI2S's guard, not just the
-// espidf one, or IDF4 / arduino-core-2.x builds hit BusConfig_espidf missing.
+// espidf one, or arduino-core-2.x builds hit BusConfig_espidf missing.
 #if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ESPIDF_BUS_CONFIG_ && defined(M5HAL_ESPIDF_I2S_HAS_STD) && \
     M5HAL_ESPIDF_I2S_HAS_STD
 result_t<int8_t> acquirePhysI2S(ServerPhysicalBusPool& phys, data::ConstDataSpan pin_config, types::gpio_number_t bclk,
@@ -814,37 +814,36 @@ void releaseUART(UARTSlot* slots, ServerPhysicalBusPool& phys, uint8_t bus_id, b
 result_t<void> createI2S(I2SSlot* slots, ServerPhysicalBusPool& phys, uint8_t bus_id, data::ConstDataSpan pin_config,
                          Server& server, pins_claimed_fn_t pins_claimed_fn, void* pins_claimed_ctx)
 {
+    auto valid = detail::validatePinConfig(pin_config, 11);
+    if (!valid.has_value()) {
+        return valid;
+    }
+    const auto bclk = static_cast<types::gpio_number_t>(detail::readI16LE(pin_config.data));
+    const auto ws   = static_cast<types::gpio_number_t>(detail::readI16LE(pin_config.data + 2));
+    const auto dout = static_cast<types::gpio_number_t>(detail::readI16LE(pin_config.data + 4));
+    const auto din  = static_cast<types::gpio_number_t>(detail::readI16LE(pin_config.data + 6));
+    if (bclk < 0 || ws < 0 || (dout < 0 && din < 0)) {
+        return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
+    }
+
 #if !M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ESPIDF_BUS_CONFIG_ || !defined(M5HAL_ESPIDF_I2S_HAS_STD) || \
     !M5HAL_ESPIDF_I2S_HAS_STD
     (void)slots;
     (void)phys;
     (void)bus_id;
-    (void)pin_config;
     (void)server;
     (void)pins_claimed_fn;
     (void)pins_claimed_ctx;
     return m5::stl::make_unexpected(error_t::NOT_IMPLEMENTED);
 #else
-    auto valid = detail::validatePinConfig(pin_config, 11);
-    if (!valid.has_value()) {
-        return valid;
-    }
     I2SSlot* slot = detail::findFreeBinding(slots);
     if (slot == nullptr) {
         return m5::stl::make_unexpected(error_t::OUT_OF_RESOURCE);
     }
 
-    const auto bclk = static_cast<types::gpio_number_t>(detail::readI16LE(pin_config.data));
-    const auto ws   = static_cast<types::gpio_number_t>(detail::readI16LE(pin_config.data + 2));
-    const auto dout = static_cast<types::gpio_number_t>(detail::readI16LE(pin_config.data + 4));
-    const auto din  = static_cast<types::gpio_number_t>(detail::readI16LE(pin_config.data + 6));
     const auto role = pin_config.data[8];
     const auto txkb = pin_config.data[9];
     const auto rxkb = pin_config.data[10];
-
-    if (dout < 0 && din < 0) {
-        return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
-    }
 
     auto phys_index = detail::acquirePhysI2S(phys, pin_config, bclk, ws, dout, din, role, txkb, rxkb);
     if (!phys_index.has_value()) {

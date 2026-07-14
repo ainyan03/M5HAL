@@ -296,9 +296,8 @@ inline bool pinsAllowedForI2C(const LogicalBusConfig& cfg, int8_t controller)
 
 // GPIO-matrix LP_I2C target (P4, a multi-element pin domain): SDA/SCL may be
 // any RTC/LP GPIO, so there is nothing to auto-fill -- only membership is
-// enforced, and only once both pins are given (an omitted pin is left for
-// the existing identity-derivation `id.valid()` check to reject, same as
-// before this LP_I2C support existed).
+// enforced, and only once both pins are given. An omitted pin remains part of
+// the identity and is left for the selected backend to validate during init.
 inline result_t<void> completeLogicalForI2C(LogicalBusConfig& cfg)
 {
     if ((cfg.intent.require & caps::LOW_POWER) == 0) {

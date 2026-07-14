@@ -6,8 +6,10 @@
 #include <gtest/gtest.h>
 #include "support/gtest_watchdog.hpp"
 
+#include <atomic>
 #include <new>
 #include <string>
+#include <thread>
 #include <vector>
 
 // intent-driven hardware allocation. These tests drive the
@@ -135,8 +137,9 @@ struct I2cIntentHarness {
     Adapter adapter;
     v2::i2c::BusView view;
 
-    I2cIntentHarness(Adapter::SwFactory sw, Adapter::HwFactory hw = nullptr, uint8_t hw_capacity = 0)
-        : adapter{backend.busRegistry(), sw, hw, hw_capacity}, view{&backend}
+    I2cIntentHarness(Adapter::SwFactory sw, Adapter::HwFactory hw = nullptr, uint8_t hw_capacity = 0,
+                     Adapter::Topology topo = {})
+        : adapter{backend.busRegistry(), sw, hw, hw_capacity, topo}, view{&backend}
     {
         backend.registerKind(adapter);
     }
@@ -189,6 +192,131 @@ TEST(I2cBusIntent, TypedAcquireIsNotManagedByCommit)
 {
     I2cIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
     v2::test::bus_contract::expectTypedAcquireIsNotManagedByCommit(h.view, &reqByIndex, &makeTypedFakeConfig);
+}
+
+TEST(I2cBusIntent, TypedReacquireThroughLogicalBecomesManaged)
+{
+    I2cIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
+    v2::test::bus_contract::expectTypedReacquireThroughLogicalBecomesManaged(h.view, &reqByIndex, &makeTypedFakeConfig);
+}
+
+TEST(I2cBusIntent, ConcurrentLogicalRetagAndCommitAreSerialized)
+{
+    I2cIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/1};
+    auto bus = h.view.acquire(reqByIndex(0, v2::bus::automatic()));
+    ASSERT_TRUE(bus.has_value()) << "err=" << v2::error::toString(bus.error());
+
+    constexpr size_t kIterations = 256;
+    std::atomic<bool> start{false};
+    std::atomic<size_t> failures{0};
+    std::thread retagger{[&]() {
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        for (size_t i = 0; i < kIterations; ++i) {
+            const auto intent = (i & 1u) != 0 ? v2::i2c::software() : v2::i2c::requireHardware();
+            auto same         = h.view.acquire(reqByIndex(0, intent));
+            if (!same.has_value() || same.value().get() != bus.value().get()) {
+                failures.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }};
+    std::thread committer{[&]() {
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        for (size_t i = 0; i < kIterations; ++i) {
+            if (!h.view.commitBuses(1000).has_value()) {
+                failures.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }};
+    start.store(true, std::memory_order_release);
+    retagger.join();
+    committer.join();
+    ASSERT_EQ(failures.load(std::memory_order_relaxed), 0u);
+
+    // Once a re-acquire returns, a later commit must observe that intent.
+    auto same = h.view.acquire(reqByIndex(0, v2::i2c::software()));
+    ASSERT_TRUE(same.has_value()) << "err=" << v2::error::toString(same.error());
+    auto committed = h.view.commitBuses();
+    ASSERT_TRUE(committed.has_value()) << "err=" << v2::error::toString(committed.error());
+    EXPECT_EQ(bus.value()->backendKind(), kSw);
+    same = h.view.acquire(reqByIndex(0, v2::i2c::requireHardware()));
+    ASSERT_TRUE(same.has_value()) << "err=" << v2::error::toString(same.error());
+    committed = h.view.commitBuses();
+    ASSERT_TRUE(committed.has_value()) << "err=" << v2::error::toString(committed.error());
+    EXPECT_EQ(bus.value()->backendKind(), kHw);
+}
+
+namespace {
+struct SnapshotOverlapState {
+    std::atomic<bool> eligibility_entered{false};
+    std::atomic<bool> release_eligibility{false};
+    std::atomic<v2::types::backend_caps_t> factory_forbid{0xffffu};
+};
+
+SnapshotOverlapState* g_snapshot_overlap = nullptr;
+
+v2::types::backend_caps_t snapshotControllerCaps(int8_t /*controller*/)
+{
+    return v2::i2c::caps::HARDWARE;
+}
+
+bool blockSnapshotEligibility(const v2::i2c::LogicalBusConfig& /*logical*/, int8_t /*controller*/)
+{
+    g_snapshot_overlap->eligibility_entered.store(true, std::memory_order_release);
+    while (!g_snapshot_overlap->release_eligibility.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    return true;
+}
+
+v2::i2c::IBus* captureSnapshotHwFactory(const v2::i2c::LogicalBusConfig& logical, int8_t controller)
+{
+    g_snapshot_overlap->factory_forbid.store(logical.intent.forbid, std::memory_order_relaxed);
+    return new (std::nothrow) FakeBackend(v2::types::backend_kind_t::Hardware, controller);
+}
+}  // namespace
+
+TEST(I2cBusIntent, RetagAfterSnapshotDoesNotChangeInFlightCommit)
+{
+    SnapshotOverlapState state;
+    g_snapshot_overlap = &state;
+    I2cIntentHarness::Adapter::Topology topo;
+    topo.controller_caps = &snapshotControllerCaps;  // select the eligibility hook path
+    topo.pins_allowed    = &blockSnapshotEligibility;
+    I2cIntentHarness h{&fakeSwFactory, &captureSnapshotHwFactory, /*hw_capacity=*/1, topo};
+
+    auto bus = h.view.acquire(reqByIndex(0, v2::bus::automatic()));
+    ASSERT_TRUE(bus.has_value()) << "err=" << v2::error::toString(bus.error());
+
+    std::atomic<v2::error::error_t> commit_error{v2::error::error_t::UNKNOWN_ERROR};
+    std::thread committer{[&]() {
+        auto committed = h.view.commitBuses();
+        commit_error.store(committed.has_value() ? v2::error::error_t::OK : committed.error(),
+                           std::memory_order_release);
+    }};
+    while (!state.eligibility_entered.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    // The commit already owns its immutable automatic-intent snapshot. This
+    // later retag must return without waiting for the commit's bus swap, and
+    // becomes input to the next commit instead.
+    auto same = h.view.acquire(reqByIndex(0, v2::i2c::software()));
+    ASSERT_TRUE(same.has_value()) << "err=" << v2::error::toString(same.error());
+    state.release_eligibility.store(true, std::memory_order_release);
+    committer.join();
+
+    EXPECT_EQ(commit_error.load(std::memory_order_acquire), v2::error::error_t::OK);
+    EXPECT_EQ(state.factory_forbid.load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(bus.value()->backendKind(), kHw);
+
+    auto committed = h.view.commitBuses();
+    ASSERT_TRUE(committed.has_value()) << "err=" << v2::error::toString(committed.error());
+    EXPECT_EQ(bus.value()->backendKind(), kSw);
+    g_snapshot_overlap = nullptr;
 }
 
 TEST(I2cBusIntent, UnmanagedHardwareBusReservesItsController)
@@ -407,13 +535,17 @@ public:
     {
         return _generation;
     }
-    const v2::types::AllocationIntent& intent(void) const override
+    v2::types::AllocationIntent intent(void) const override
     {
         return _intent;
     }
     bool managed(void) const override
     {
         return true;
+    }
+    void retagIntent(const v2::types::AllocationIntent& intent) override
+    {
+        _intent = intent;
     }
     v2::result_t<void> swapBackend(std::unique_ptr<v2::bus::IBus> backend, uint32_t) override
     {
@@ -471,11 +603,12 @@ public:
     {
         return static_cast<FakeManagedBus&>(bus);
     }
-    v2::bus::IBus* makePlaceholder(v2::bus::IManagedBus&) const override
+    v2::bus::IBus* makePlaceholder(v2::bus::IManagedBus&, const v2::types::AllocationIntent&) const override
     {
         return nullptr;  // software-less: a demoted bus becomes pending
     }
-    v2::bus::IBus* makeHardware(v2::bus::IManagedBus&, int8_t controller) const override
+    v2::bus::IBus* makeHardware(v2::bus::IManagedBus&, const v2::types::AllocationIntent&,
+                                int8_t controller) const override
     {
         return new (std::nothrow) FakeCoreHwBackend(controller);
     }
@@ -483,14 +616,16 @@ public:
     // (the production AllocationKind builds under the lock via swapBackendWith).
     // The fake bus's swapBackend/swapPending still record the result, so the
     // allocation-logic assertions (and failNextSwapBackendAfterApply) are intact.
-    v2::result_t<void> commitPlaceholder(v2::bus::IManagedBus& mb, uint32_t timeout_ms) const override
+    v2::result_t<void> commitPlaceholder(v2::bus::IManagedBus& mb, const v2::types::AllocationIntent& intent,
+                                         uint32_t timeout_ms) const override
     {
-        v2::bus::IBus* raw = makePlaceholder(mb);
+        v2::bus::IBus* raw = makePlaceholder(mb, intent);
         return raw ? mb.swapBackend(std::unique_ptr<v2::bus::IBus>(raw), timeout_ms) : mb.swapPending(timeout_ms);
     }
-    v2::result_t<void> commitHardware(v2::bus::IManagedBus& mb, int8_t controller, uint32_t timeout_ms) const override
+    v2::result_t<void> commitHardware(v2::bus::IManagedBus& mb, const v2::types::AllocationIntent& intent,
+                                      int8_t controller, uint32_t timeout_ms) const override
     {
-        v2::bus::IBus* raw = makeHardware(mb, controller);
+        v2::bus::IBus* raw = makeHardware(mb, intent, controller);
         if (raw == nullptr) {
             return m5::stl::make_unexpected(v2::error::error_t::OUT_OF_RESOURCE);
         }
@@ -648,22 +783,25 @@ public:
     {
         return static_cast<FakeManagedBus&>(bus);
     }
-    v2::bus::IBus* makePlaceholder(v2::bus::IManagedBus&) const override
+    v2::bus::IBus* makePlaceholder(v2::bus::IManagedBus&, const v2::types::AllocationIntent&) const override
     {
         return nullptr;  // software-less: a demoted bus becomes pending
     }
-    v2::bus::IBus* makeHardware(v2::bus::IManagedBus&, int8_t controller) const override
+    v2::bus::IBus* makeHardware(v2::bus::IManagedBus&, const v2::types::AllocationIntent&,
+                                int8_t controller) const override
     {
         return new (std::nothrow) FakeCoreHwBackend(controller);
     }
-    v2::result_t<void> commitPlaceholder(v2::bus::IManagedBus& mb, uint32_t timeout_ms) const override
+    v2::result_t<void> commitPlaceholder(v2::bus::IManagedBus& mb, const v2::types::AllocationIntent& intent,
+                                         uint32_t timeout_ms) const override
     {
-        v2::bus::IBus* raw = makePlaceholder(mb);
+        v2::bus::IBus* raw = makePlaceholder(mb, intent);
         return raw ? mb.swapBackend(std::unique_ptr<v2::bus::IBus>(raw), timeout_ms) : mb.swapPending(timeout_ms);
     }
-    v2::result_t<void> commitHardware(v2::bus::IManagedBus& mb, int8_t controller, uint32_t timeout_ms) const override
+    v2::result_t<void> commitHardware(v2::bus::IManagedBus& mb, const v2::types::AllocationIntent& intent,
+                                      int8_t controller, uint32_t timeout_ms) const override
     {
-        v2::bus::IBus* raw = makeHardware(mb, controller);
+        v2::bus::IBus* raw = makeHardware(mb, intent, controller);
         if (raw == nullptr) {
             return m5::stl::make_unexpected(v2::error::error_t::OUT_OF_RESOURCE);
         }
@@ -849,7 +987,8 @@ class FakePinDomainKind : public FakeOptInKind {
 public:
     using FakeOptInKind::FakeOptInKind;
 
-    bool controllerAcceptsBus(const v2::bus::IManagedBus& bus, int8_t controller) const override
+    bool controllerAcceptsBus(const v2::bus::IManagedBus& bus, const v2::types::AllocationIntent&,
+                              int8_t controller) const override
     {
         if (controller != 2) {
             return true;  // plain hardware controllers accept any wiring
@@ -1032,15 +1171,18 @@ TEST(I2cBusIntent, LowPowerLogicalAcquireRejectsMismatchedExplicitPins)
     EXPECT_EQ(bus.error(), v2::error::error_t::INVALID_ARGUMENT);
 }
 
-TEST(I2cBusIntent, NonLowPowerLogicalAcquireStillRequiresExplicitPins)
+TEST(I2cBusIntent, NonLowPowerLogicalAcquirePreservesUnsetPins)
 {
-    // requireHardware() never triggers auto-fill: an omitted pin pair is
-    // rejected exactly as it always was (id.valid() catches it).
+    // requireHardware() never triggers auto-fill. Identity preserves the
+    // omitted roles and this test backend deliberately accepts them; a real
+    // backend may instead reject the same config during initialization.
     I2cLpHarness h;
     v2::i2c::LogicalBusConfig req{v2::i2c::Scl{-1}, v2::i2c::Sda{-1}, v2::i2c::requireHardware()};
     auto bus = h.view.acquire(req);
-    ASSERT_FALSE(bus.has_value());
-    EXPECT_EQ(bus.error(), v2::error::error_t::INVALID_ARGUMENT);
+    ASSERT_TRUE(bus.has_value()) << "err=" << v2::error::toString(bus.error());
+    const auto& cfg = static_cast<const v2::i2c::IBusConfig&>(bus.value()->getConfig());
+    EXPECT_EQ(cfg.pin_scl, -1);
+    EXPECT_EQ(cfg.pin_sda, -1);
 }
 
 TEST(I2cBusIntent, AutoClaimAvoidsOptInLowPowerController)
@@ -1224,6 +1366,44 @@ TEST(I2cBusIntentSwapRollback, DemoteFailureRollsBackToSameHardwareController)
     // B's promote this pass -- not a double lease, just no controller freed.
     EXPECT_EQ(b.value()->backendKind(), kSw);
     EXPECT_EQ(h.adapter.allocationCore()->hardwareInUse(), 1u);  // only A's controller 0
+}
+
+TEST(I2cBusIntentSwapRollback, DemoteRollbackAlsoFailingLeavesPendingAndReleasesController)
+{
+    ScopedFakeState guard;
+    I2cIntentHarness h{&orderedSwFactory, &orderedHwFactory, /*hw_capacity=*/1};
+
+    auto x = h.view.acquire(reqByIndex(0, v2::bus::automatic()));
+    ASSERT_TRUE(x.has_value()) << "err=" << v2::error::toString(x.error());
+    auto committed = h.view.commitBuses();
+    ASSERT_TRUE(committed.has_value()) << "err=" << v2::error::toString(committed.error());
+    ASSERT_EQ(x.value()->backendKind(), kHw);
+    ASSERT_EQ(x.value()->controllerId(), 0);
+
+    // Retag the same logical bus for software so this commit demotes it. Both
+    // the placeholder build and the old-hardware reconstruction then fail:
+    // the facade must report the error and settle on pending, while the final
+    // live-state resync returns controller 0 to the pool.
+    auto same = h.view.acquire(reqByIndex(0, v2::i2c::software()));
+    ASSERT_TRUE(same.has_value()) << "err=" << v2::error::toString(same.error());
+    ASSERT_EQ(same.value().get(), x.value().get());
+    guard.state.fail_next_sw = true;
+    guard.state.fail_next_hw = true;
+    auto res                 = h.view.commitBuses();
+    ASSERT_FALSE(res.has_value());
+    EXPECT_EQ(res.error(), v2::error::error_t::OUT_OF_RESOURCE);
+    EXPECT_EQ(x.value()->backendKind(), kSw);  // safe default query answer for "no backend"
+    EXPECT_EQ(x.value()->controllerId(), -1);
+    EXPECT_EQ(h.adapter.allocationCore()->hardwareInUse(), 0u);
+
+    // A later hardware request rebuilds the backend normally after the
+    // one-shot failures have been consumed.
+    same = h.view.acquire(reqByIndex(0, v2::i2c::requireHardware()));
+    ASSERT_TRUE(same.has_value()) << "err=" << v2::error::toString(same.error());
+    committed = h.view.commitBuses();
+    ASSERT_TRUE(committed.has_value()) << "err=" << v2::error::toString(committed.error());
+    EXPECT_EQ(x.value()->backendKind(), kHw);
+    EXPECT_EQ(x.value()->controllerId(), 0);
 }
 
 TEST(I2cBusIntentSwapRollback, PromoteFailureKeepsPlaceholderAndControllerIsNotLeaked)

@@ -103,13 +103,18 @@ result_t<void> RemoteServerHandler::handler(void* ctx, frame::Kind kind, uint8_t
             const bool deferred = h->server->responseDeferred();
             h->server->endFrameRequest();
 
-            if (status.has_value()) {
-                auto snapshot = h->writeGpioSnapshotEvent(enc);
+            if (status.has_value() && (deferred || (seq & 0x80) != 0)) {
+                // A deferred terminal Response owns the final encoder slot.
+                // Its snapshot remains best-effort and must not consume that
+                // reservation. Fire-and-forget requests have no such frame.
+                const bool response_slot_available = enc.output().blockCount() + 1 < data::BlockSource::kMaxBlocks;
+                auto snapshot =
+                    (!deferred || response_slot_available) ? h->writeGpioSnapshotEvent(enc) : result_t<void>{};
                 h->clearGpioSnapshot();
-                if (!snapshot.has_value()) {
+                if (!snapshot.has_value() && !deferred) {
                     return m5::stl::make_unexpected(snapshot.error());
                 }
-            } else {
+            } else if (!status.has_value()) {
                 h->clearGpioSnapshot();
             }
 
@@ -122,8 +127,9 @@ result_t<void> RemoteServerHandler::handler(void* ctx, frame::Kind kind, uint8_t
             if (!status.has_value()) {
                 return writeError(enc, seq, status.error());
             }
-            enc.writeFrame(frame::Kind::Response, seq, {resp_buf, resp_sink.written()});
-            return {};
+            auto response = h->writeGpioSnapshotThenResponse(enc, seq, {resp_buf, resp_sink.written()});
+            h->clearGpioSnapshot();
+            return response;
         }
 
         default:
@@ -232,7 +238,7 @@ result_t<void> RemoteServerHandler::gpioModeSet(void* ctx, types::gpio_number_t 
     types::gpio_slot_t slot = 0;
     uint8_t port_index      = 0;
     uint32_t bit_mask       = 0;
-    if (!decodeGpioPin(pin, slot, port_index, bit_mask)) {
+    if (!h->decodeGpioPin(pin, slot, port_index, bit_mask)) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
 
@@ -261,7 +267,7 @@ void RemoteServerHandler::gpioPinsClaimed(void* ctx, const types::gpio_number_t*
         types::gpio_slot_t slot = 0;
         uint8_t port_index      = 0;
         uint32_t bit_mask       = 0;
-        if (!decodeGpioPin(pins[i], slot, port_index, bit_mask)) {
+        if (!h->decodeGpioPin(pins[i], slot, port_index, bit_mask)) {
             continue;
         }
         auto* mon = h->findGpioMonitorMask(slot, port_index);
@@ -285,6 +291,11 @@ result_t<void> RemoteServerHandler::poll(void* ctx, data::MuxFrameEncoder& enc)
         auto stream = h->server->poll(enc, static_cast<uint32_t>(m5::utility::millis()));
         if (!stream.has_value()) {
             return m5::stl::make_unexpected(stream.error());
+        }
+        if (h->server->responseDeferred()) {
+            // Best-effort GPIO events yield while a request still owes its
+            // terminal Response.
+            return {};
         }
     }
     if (h->gpio_group == nullptr) {
@@ -329,8 +340,12 @@ result_t<void> RemoteServerHandler::poll(void* ctx, data::MuxFrameEncoder& enc)
             if (changed_count >= kMaxGpioSubscriptions) {
                 return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
             }
-            changed_pins[changed_count] = types::makeGpioNumber(
-                sub.slot, static_cast<types::gpio_local_pin_t>((static_cast<uint16_t>(sub.port_index) << 5) | bit));
+            const gpio::IGPIO* device_gpio = h->gpio_group->getGPIO(sub.slot);
+            types::gpio_local_pin_t local;
+            if (device_gpio == nullptr || !device_gpio->localPinForLocation(sub.port_index, bit, &local)) {
+                return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+            }
+            changed_pins[changed_count]   = types::makeGpioNumber(sub.slot, local);
             changed_levels[changed_count] = (value & mask) != 0;
             ++changed_count;
         }
@@ -417,6 +432,38 @@ result_t<void> RemoteServerHandler::writeGpioSnapshotEvent(data::MuxFrameEncoder
     return {};
 }
 
+result_t<void> RemoteServerHandler::writeGpioSnapshotThenResponse(data::MuxFrameEncoder& enc, uint8_t seq,
+                                                                  data::ConstDataSpan response)
+{
+    if (gpio_snapshot_count == 0) {
+        if (!enc.writeFrame(frame::Kind::Response, seq, response)) {
+            return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
+        }
+        return {};
+    }
+
+    uint8_t script_buf[kMaxScriptSize];
+    data::MemorySink script{script_buf, sizeof(script_buf)};
+    bytecode::BytecodeEncoder script_enc{script};
+    auto r = script_enc.evtGpioState(gpio_snapshot_pins, gpio_snapshot_levels, gpio_snapshot_count);
+    if (r.has_value()) {
+        r = script_enc.end();
+    }
+    if (!r.has_value()) {
+        return m5::stl::make_unexpected(r.error());
+    }
+
+    bool event_written = false;
+    if (!enc.writeFrameWithOptionalPrefix(frame::Kind::Event, gpio_event_seq, {script_buf, script.written()},
+                                          frame::Kind::Response, seq, response, &event_written)) {
+        return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
+    }
+    if (event_written) {
+        ++gpio_event_seq;
+    }
+    return {};
+}
+
 bool RemoteServerHandler::resolveGpioPin(types::gpio_number_t pin, GpioPinRef& ref)
 {
     if (pin < 0 || gpio_group == nullptr) {
@@ -426,11 +473,19 @@ bool RemoteServerHandler::resolveGpioPin(types::gpio_number_t pin, GpioPinRef& r
     if (!resolved.has_value()) {
         return false;
     }
-    ref.pin        = pin;
-    ref.slot       = types::extractSlot(pin);
-    ref.local      = types::extractLocalPin(pin);
-    ref.port_index = ref.local >> 5;
-    ref.bit_mask   = 1u << (ref.local & 31);
+    ref.pin                        = pin;
+    ref.slot                       = types::extractSlot(pin);
+    ref.local                      = types::extractLocalPin(pin);
+    const gpio::IGPIO* device_gpio = gpio_group->getGPIO(ref.slot);
+    if (device_gpio == nullptr) {
+        return false;
+    }
+    gpio::IGPIO::PinLocation location;
+    if (!device_gpio->tryLocatePin(ref.local, &location)) {
+        return false;
+    }
+    ref.port_index = location.port_index;
+    ref.bit_mask   = 1u << location.bit_index;
     auto pa        = gpio_group->getPort(ref.slot, ref.port_index);
     if (!pa.has_value()) {
         return false;
@@ -440,15 +495,20 @@ bool RemoteServerHandler::resolveGpioPin(types::gpio_number_t pin, GpioPinRef& r
 }
 
 bool RemoteServerHandler::decodeGpioPin(types::gpio_number_t pin, types::gpio_slot_t& slot, uint8_t& port_index,
-                                        uint32_t& bit_mask)
+                                        uint32_t& bit_mask) const
 {
-    if (pin < 0) {
+    if (pin < 0 || gpio_group == nullptr) {
         return false;
     }
-    const auto local = types::extractLocalPin(pin);
-    slot             = types::extractSlot(pin);
-    port_index       = local >> 5;
-    bit_mask         = 1u << (local & 31);
+    const auto local               = types::extractLocalPin(pin);
+    slot                           = types::extractSlot(pin);
+    const gpio::IGPIO* device_gpio = gpio_group->getGPIO(slot);
+    gpio::IGPIO::PinLocation location;
+    if (device_gpio == nullptr || !device_gpio->tryLocatePin(local, &location)) {
+        return false;
+    }
+    port_index = location.port_index;
+    bit_mask   = 1u << location.bit_index;
     return true;
 }
 

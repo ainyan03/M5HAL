@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
 #include <M5HAL_v2.hpp>
+#include <m5_hal/variants/frameworks/espidf/hal/i2s/i2s.hpp>
 #include <gtest/gtest.h>
 #include "support/gtest_watchdog.hpp"
 
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -12,6 +14,46 @@ namespace {
         auto result_ok = (expr);                                                                         \
         ASSERT_TRUE(result_ok.has_value()) << "err=" << m5::hal::v2::error::toString(result_ok.error()); \
     } while (false)
+
+TEST(I2sEspIdfPcmPrimitive, CollapsesHwV2PairsToLeftSlot)
+{
+    const uint8_t physical[] = {0x10, 0x11, 0x20, 0x21, 0x30, 0x31, 0x40, 0x41};
+    uint8_t logical[4]       = {};
+
+    const size_t written = m5::hal::v2::i2s::detail_espidf_i2s::collapseStereo16RxPairsToMonoLeft(
+        logical, physical, 2, /*hw_version_1=*/false);
+
+    EXPECT_EQ(written, sizeof(logical));
+    const uint8_t expected[] = {0x10, 0x11, 0x30, 0x31};
+    EXPECT_EQ(0, std::memcmp(logical, expected, sizeof(expected)));
+}
+
+TEST(I2sEspIdfPcmPrimitive, CollapsesTransposedHwV1PairsToPhysicalLeftSlot)
+{
+    // HW v1 DMA order is R,L within each 32-bit word.
+    const uint8_t physical[] = {0x20, 0x21, 0x10, 0x11, 0x40, 0x41, 0x30, 0x31};
+    uint8_t logical[4]       = {};
+
+    const size_t written = m5::hal::v2::i2s::detail_espidf_i2s::collapseStereo16RxPairsToMonoLeft(
+        logical, physical, 2, /*hw_version_1=*/true);
+
+    EXPECT_EQ(written, sizeof(logical));
+    const uint8_t expected[] = {0x10, 0x11, 0x30, 0x31};
+    EXPECT_EQ(0, std::memcmp(logical, expected, sizeof(expected)));
+}
+
+TEST(I2sEspIdfPcmPrimitive, ZeroFramesLeaveDestinationUntouched)
+{
+    const uint8_t physical[] = {0x10, 0x11, 0x20, 0x21};
+    uint8_t logical[]        = {0xA5, 0x5A};
+
+    const size_t written = m5::hal::v2::i2s::detail_espidf_i2s::collapseStereo16RxPairsToMonoLeft(
+        logical, physical, 0, /*hw_version_1=*/false);
+
+    EXPECT_EQ(written, 0u);
+    EXPECT_EQ(logical[0], 0xA5);
+    EXPECT_EQ(logical[1], 0x5A);
+}
 
 // -------------------------------------------------------------------------
 // Stub I2S bus that records all calls for inspection.

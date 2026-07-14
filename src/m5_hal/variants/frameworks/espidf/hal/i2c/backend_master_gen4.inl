@@ -92,7 +92,10 @@ result_t<void> Bus_espidf::init(const BusConfig_espidf& config)
     // adopting the new config first would delete the wrong driver and
     // leak the old one.
     if (_installed) {
-        (void)release();
+        auto released = release();
+        if (!released.has_value()) {
+            return m5::stl::make_unexpected(released.error());
+        }
     }
     _config = config;
     _port   = config.i2c_port;

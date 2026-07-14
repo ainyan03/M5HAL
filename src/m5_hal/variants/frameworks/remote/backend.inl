@@ -33,6 +33,12 @@ result_t<std::shared_ptr<bus::IBus>> RemoteBackend::acquireBusLogical(types::bus
                                                                       const bus::IdentityKey& id,
                                                                       const bus::AllocationRequest& req)
 {
+    // AllocationIntent is local resolver metadata and is not carried by the
+    // BusCreate wire format. Do not silently drop an SPI protocol guarantee:
+    // remote feature negotiation must be added before a peer can promise it.
+    if (kind == types::bus_kind_t::SPI && (req.intent.require & spi::caps::MOSI_SHARED_RX) != 0) {
+        return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
+    }
     uint8_t pin_buf[16];
     auto pin_r = extractPinConfigFromLogical(kind, req.config, pin_buf, sizeof(pin_buf));
     if (!pin_r.has_value()) {
@@ -445,6 +451,9 @@ result_t<size_t> RemoteBackend::extractPinConfig(types::bus_kind_t kind, const b
                 return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
             }
             const auto& c = static_cast<const i2s::IBusConfig&>(cfg);
+            if (c.pin_bclk < 0 || c.pin_ws < 0 || (c.pin_dout < 0 && c.pin_din < 0)) {
+                return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+            }
             detail::putI16LE(out, c.pin_bclk);
             detail::putI16LE(out + 2, c.pin_ws);
             detail::putI16LE(out + 4, c.pin_dout);

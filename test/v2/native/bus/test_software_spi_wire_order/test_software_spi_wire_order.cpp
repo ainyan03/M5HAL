@@ -83,7 +83,7 @@ public:
     }
     uint16_t getPinCount() const override
     {
-        return 4;
+        return 5;
     }
     uint8_t getPortCount() const override
     {
@@ -99,6 +99,7 @@ constexpr uint32_t kPinClk             = 0;
 constexpr uint32_t kPinMosi            = 1;
 constexpr uint32_t kPinMiso            = 2;
 constexpr uint32_t kPinCs              = 3;
+constexpr uint32_t kPinDc              = 4;
 
 bool bitAt(const uint8_t* bytes, size_t bit_index)
 {
@@ -140,9 +141,8 @@ void assertMosiValidOnEveryEdge(const std::vector<PinEvent>& log, uint8_t spi_mo
                 if (bit_index >= bit_count) {
                     break;  // trailing idle-park edge after the data
                 }
-                EXPECT_EQ(bitAt(tx, bit_index), mosi)
-                    << "MOSI not valid at CLK transition " << transition << " (mode " << unsigned(spi_mode) << ", bit "
-                    << bit_index << ")";
+                EXPECT_EQ(bitAt(tx, bit_index), mosi) << "MOSI not valid at CLK transition " << transition << " (mode "
+                                                      << unsigned(spi_mode) << ", bit " << bit_index << ")";
                 // CPHA=0 samples on odd transitions, CPHA=1 on even ones;
                 // the cell is consumed once its sample transition passed.
                 const bool sample_transition = cpha ? (transition % 2 == 0) : (transition % 2 == 1);
@@ -163,7 +163,8 @@ TEST(SoftwareSpiWireOrder, MosiValidOnLaunchAndSampleEdgesAllModes)
     std::vector<PinEvent> log;
     RecordingPort port{log};
     RecordingGPIO gpio{port};
-    ASSERT_TRUE(v2::M5_Hal.Gpio.addGPIO(&gpio, kSlot).has_value());
+    auto added = v2::M5_Hal.Gpio.addGPIO(&gpio, kSlot);
+    ASSERT_TRUE(added.has_value()) << "err=" << v2::error::toString(added.error());
 
     const uint8_t tx[2] = {0xA5, 0x3C};
 
@@ -194,6 +195,60 @@ TEST(SoftwareSpiWireOrder, MosiValidOnLaunchAndSampleEdgesAllModes)
     }
 
     ASSERT_TRUE(v2::M5_Hal.Gpio.removeGPIO(kSlot).has_value());
+}
+
+TEST(SoftwareSpiWireOrder, PhaseSpecificDcOverridesLegacyLevel)
+{
+    std::vector<PinEvent> log;
+    RecordingPort port{log};
+    RecordingGPIO gpio{port};
+    ASSERT_TRUE(v2::M5_Hal.Gpio.addGPIO(&gpio, kSlot).has_value());
+
+    v2::spi::Bus_software bus;
+    v2::spi::BusConfig_software cfg;
+    cfg.pin_clk      = v2::types::makeGpioNumber(kSlot, kPinClk);
+    cfg.pin_mosi     = v2::types::makeGpioNumber(kSlot, kPinMosi);
+    cfg.pin_miso     = v2::types::makeGpioNumber(kSlot, kPinMiso);
+    cfg.pin_dc       = v2::types::makeGpioNumber(kSlot, kPinDc);
+    auto initialized = bus.init(cfg);
+    ASSERT_TRUE(initialized.has_value()) << "err=" << v2::error::toString(initialized.error());
+
+    v2::spi::MasterAccessConfig mcfg;
+    mcfg.pin_cs = v2::types::makeGpioNumber(kSlot, kPinCs);
+    mcfg.freq   = 1000000;
+    v2::spi::MasterAccessor dev{bus, mcfg};
+
+    v2::spi::TransferDesc desc;
+    desc.command          = 0x2A;
+    desc.command_bytes    = 1;
+    desc.command_dc_level = 0;
+    desc.data_dc_level    = -1;
+    desc.dc_level_valid   = true;
+    desc.dc_level         = false;  // Legacy value must not override a phase-specific directive.
+
+    const uint8_t tx = 0xA5;
+    log.clear();
+    auto begun = dev.beginTransaction();
+    ASSERT_TRUE(begun.has_value()) << "err=" << v2::error::toString(begun.error());
+    auto result = dev.transfer(desc, v2::data::ConstDataSpan{&tx, 1}, v2::data::DataSpan{});
+    ASSERT_TRUE(result.has_value()) << "err=" << v2::error::toString(result.error());
+    auto ended = dev.endTransaction();
+    ASSERT_TRUE(ended.has_value()) << "err=" << v2::error::toString(ended.error());
+
+    std::vector<bool> dc_levels;
+    for (const auto& event : log) {
+        if (event.pin == kPinDc) {
+            dc_levels.push_back(event.level);
+        }
+    }
+    ASSERT_GE(dc_levels.size(), 2u) << "recorded D/C writes=" << dc_levels.size();
+    EXPECT_FALSE(dc_levels.front());  // command phase (idle High was already cached by init)
+    EXPECT_TRUE(dc_levels.back());    // unspecified data phase falls back to High
+
+    auto released = bus.release();
+    ASSERT_TRUE(released.has_value()) << "err=" << v2::error::toString(released.error());
+    auto removed = v2::M5_Hal.Gpio.removeGPIO(kSlot);
+    ASSERT_TRUE(removed.has_value()) << "err=" << v2::error::toString(removed.error());
 }
 
 }  // namespace

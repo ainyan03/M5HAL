@@ -23,7 +23,9 @@ namespace m5::hal::v2::uart {
     - Error:   make_unexpected(error_t). Timeouts that the caller must
                see MUST be returned as make_unexpected(TIMEOUT_ERROR),
                not as zero (zero means "no data right now", not "timed
-               out"). The base loop propagates errors immediately.
+               out"). Before any progress the base loop propagates the
+               error. After progress it returns the accepted prefix as a
+               short success so retry cannot duplicate those bytes.
 
   Subclasses may override write()/read()/readableBytes() when the
   default loop is insufficient (e.g. applyConfig, post-write drain
@@ -36,6 +38,12 @@ public:
     result_t<size_t> readableBytes(bus::IAccessor* owner, const AccessConfig& cfg) override;
 
 protected:
+    // Merge a post-write completion/drain status with the accepted byte
+    // count. result_t<size_t> cannot carry both; an accepted prefix wins so
+    // callers have an unambiguous retry boundary. With zero accepted bytes,
+    // the completion error remains visible.
+    static result_t<size_t> completeWrite(result_t<size_t>&& accepted, error::error_t completion_error);
+
     virtual result_t<size_t> rawWrite(const uint8_t* data, size_t len, uint32_t timeout_ms) = 0;
     virtual result_t<size_t> rawRead(uint8_t* buf, size_t len, uint32_t timeout_ms)         = 0;
     virtual result_t<size_t> rawReadableBytes()                                             = 0;

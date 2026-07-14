@@ -10,11 +10,13 @@ namespace m5::hal::v2::i2s {
 
 result_t<void> Bus_remote::init(const BusConfig_remote& config)
 {
+    if (config.pin_bclk < 0 || config.pin_ws < 0 || (config.pin_dout < 0 && config.pin_din < 0)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
     bus::BusLifecycle::Operation operation{*_lifecycle};
     if (!operation) {
         return m5::stl::make_unexpected(operation.error());
     }
-    (void)config;
     if (_session == nullptr) {
         return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
     }

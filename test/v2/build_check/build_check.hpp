@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
+#include <utility>
 
 namespace m5hal_build_check::v2 {
 namespace detail {
@@ -29,6 +30,26 @@ namespace i2c   = ::m5::hal::v2::i2c;
 namespace spi   = ::m5::hal::v2::spi;
 namespace types = ::m5::hal::v2::types;
 namespace uart  = ::m5::hal::v2::uart;
+
+template <typename T, typename = void>
+struct has_kind_generic_init : std::false_type {};
+
+template <typename T>
+struct has_kind_generic_init<T, std::void_t<decltype(std::declval<T&>().init(std::declval<const bus::IBusConfig&>()))>>
+    : std::true_type {};
+
+static_assert(!has_kind_generic_init<bus::IBus>::value, "bus::IBus must not expose a kind-generic init(IBusConfig)");
+static_assert(std::is_same<decltype(std::declval<bus::IBus&>().release()), ::m5::hal::v2::result_t<void>>::value,
+              "bus::IBus::release must return result_t<void>");
+
+// Public spellings reproduced in spec/design/{memory,i2c_slave,bus_accessor}.md.
+// Keeping them in the common build fence makes a declaration rename fail every
+// target instead of leaving a stale, plausible-looking snippet in the spec.
+constexpr auto kSpecMemoryTemp       = ::m5::hal::v2::memory::usage_t::Temp;
+constexpr auto kSpecMemoryPersistent = ::m5::hal::v2::memory::usage_t::Persistent;
+constexpr auto kSpecMemorySlow       = ::m5::hal::v2::memory::usage_t::PersistentSlow;
+constexpr auto kSpecI2cFill          = ::m5::hal::v2::i2c::TxUnderrun::Fill;
+constexpr auto kSpecI2cStretch       = ::m5::hal::v2::i2c::TxUnderrun::Stretch;
 
 class DummyI2cBus : public i2c::IBus {
 public:

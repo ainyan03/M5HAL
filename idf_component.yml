@@ -5,18 +5,17 @@ license: MIT
 version: "1.0.0-dev"
 
 dependencies:
-  idf: ">=4.4"
+  idf: ">=5.0"
   m5stack/M5Utility:
     git: https://github.com/m5stack/M5Utility.git
     # Pin a released tag instead of `main` so component builds are
     # reproducible (library.json requires >=0.1.0 for the same reason).
     # Resolution is verified consumer-side by test/idf_consumer_build.
-    # NOTE: at tag 0.1.0 M5Utility's manifest still restricts `targets:`,
-    # so consumers on chips absent from that list (e.g. esp32c5) fail to
-    # resolve even though M5HAL declares them; fixed upstream-side by
-    # removing the restriction (pending merge/release), then advance this
-    # pin and add those chips to the consumer check.
-    version: "0.1.0"
+    # 0.1.1 was the first tag without a `targets:` restriction in
+    # M5Utility's manifest. Pin the current 0.2.0 release, which retains
+    # that fix; 0.1.0 and older fail to resolve for consumers on chips
+    # absent from their list (e.g. esp32c5) even though M5HAL declares them.
+    version: "0.2.0"
 
 targets:
   - esp32
@@ -47,7 +46,6 @@ files:
   exclude:
     - "docs/**"
     - "examples/**"
-    - "experiments/**"
     - "test/**"
     - "pio_envs/**"
     - ".github/**"

@@ -4,14 +4,14 @@
 //
 // Verifies that bytes sent from the host through the M5HAL posix UART variant
 // reach a real ESP32 running the paired echo firmware
-// (experiments/v2/test/uart_echo/device/uart_echo.cpp) and come back byte-exact.
+// (test/v2/hil/uart_echo/device/uart_echo.cpp) and come back byte-exact.
 //
 // This is a gtest binary built and run via `pio run` (not `pio test`): see
-// experiments/v2/test/README.md. The serial port comes from M5HAL_POSIX_UART_PORT
+// test/v2/hil/README.md. The serial port comes from M5HAL_POSIX_UART_PORT
 // (and optional M5HAL_POSIX_UART_BAUD, default 115200); the test SKIPs when the
 // port is unset, so building without hardware is harmless.
 //
-// Run (or use experiments/v2/test/hil-run.sh uart_echo [port] [baud]):
+// Run (or use test/v2/hil/hil-run.sh uart_echo [port] [baud]):
 //   export M5HAL_PIO_EXTRA_CONFIG=pio_envs/v2/hil.ini.cli
 //   pio run -e v2_hil_uart_echo_device_esp32 -t upload      # flash the device
 //   pio run -e v2_hil_uart_echo_host                        # build the host

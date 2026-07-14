@@ -9,9 +9,10 @@
 # public compile fences across selected Arduino / ESP-IDF generations; this
 # workflow covers official component integration for all supported chip targets.
 #
-# Coverage: the 10 official chips on TWO framework generations (release-v5.5 =
-# current stable baseline, release-v6.0 = newest), plus the two preview-status
-# SoCs (esp32h21, esp32h4) on v6.0 via `idf.py --preview`. esp32h4 REQUIRES v6.0
+# Coverage: the declared floor (v5.0 + esp32), the 10 official chips on TWO
+# framework generations (release-v5.5 = current stable baseline, release-v6.0 =
+# newest), plus the two preview-status SoCs (esp32h21, esp32h4) on v6.0 via
+# `idf.py --preview`. esp32h4 REQUIRES v6.0
 # (its esp_driver_i2c/spi are header-only in v5.5 — compiles, then link-fails);
 # esp32h21 builds from v5.5 but rides the v6.0 preview lane for one toolchain.
 #
@@ -46,6 +47,10 @@ jobs:
         idf: ['release-v5.5', 'release-v6.0']
         target: [esp32, esp32s2, esp32s3, esp32c2, esp32c3, esp32c5, esp32c6, esp32c61, esp32h2, esp32p4]
         include:
+          # Minimum declared ESP-IDF version. One baseline target is enough to
+          # catch accidental use of APIs introduced after the public floor.
+          - idf: 'v5.0'
+            target: esp32
           # Preview-status SoCs need `idf.py --preview`. esp32h4 REQUIRES v6.0;
           # esp32h21 rides the same v6.0 preview lane.
           - idf: 'release-v6.0'

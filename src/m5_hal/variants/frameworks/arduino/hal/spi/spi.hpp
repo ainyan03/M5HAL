@@ -21,6 +21,9 @@ struct BusConfig_arduino : public spi::IBusConfig {
 
     ::SPIClass* spi = nullptr;
 
+    // On non-ESP Arduino cores, SPIClass has no portable pin-routing API.
+    // Leave CLK/MOSI/MISO unset to use the selected instance's board defaults;
+    // init() rejects explicit core pins instead of silently ignoring them.
     constexpr BusConfig_arduino(void) : spi::IBusConfig{}
     {
     }

@@ -147,6 +147,9 @@ refcount が 0 に戻っても解体せず保持する)。
 - `(bus_kind, bus_id)` は静的登録バス一覧 (`n` 件)。動的バスプールのみの server は `n = 0` を返す
 - `flags` bit0 が立つときのみ末尾に `[gpio_port_count:1][gpio_pin_count:u16 LE]` が続く
 - 末尾へのフィールド追加は前方互換とする (受信側は既知部分だけ読み、残りを無視する)
+- protocol v1 の hello は board ID を運ばず、backend の `variant_id_t` に board を混在させない。将来
+  device 固有情報が必要になった場合も、既存フィールドの意味を変えず hello 末尾の独立した
+  device descriptor として additive に追加できる
 - host 側のデコードは `detail::decodeHelloCaps`、結果は `Capabilities` 構造体に格納する
 
 ### request / response
@@ -191,6 +194,10 @@ remote proxyは4 kind共通で、wire正規形にした実効`AccessConfig`が�
 各transferで渡されるaccessorの`AccessConfig`が実効設定の正本である。server側の動的バス作成時に
 置くaccessor初期値は最初のconfigureまでのfallbackとなる。`TransferDesc`側のmetadataは設定cacheと
 別に毎transfer送る。
+
+SPI の `BusConfigure` では `pin_cs == -1` / `pin_dc == -1` を「server 登録時の物理 pin 設定を保持する」
+sentinel として扱う。remote host は device の物理配線を知らないため、既定値を送って CS / D/C を無効化
+してはならない。非負値だけが server 側設定を明示 override する。
 
 ### BusStreamTransfer + attachStream
 
@@ -247,7 +254,10 @@ host の GPIO read は通信せずキャッシュを読む。device 側で購読
 - **初期 snapshot は subscribe request の成功処理中に送る**: `GpioSubscribe` を含む request が成功すると、
   server は response の前に購読対象 pin の現在値を `Event` frame として送る。host は接続時に event handler
   を設定してから subscribe するため、この snapshot で cache を更新できる。snapshot は host cache の seed
-  であり、`GpioSetMode` 監視マスクではフィルタしない
+  であり、`GpioSetMode` 監視マスクではフィルタしない。encoderのqueueまたは一時allocatorが輻輳して両frameを
+  保持できない場合は、terminal `Response` のblockを先に予約してsnapshot `Event` を省略する。これにより
+  subscribeの成立可否は必ず`Response`でhostへ届き、best-effort eventがhost timeoutを引き起こさない。
+  stream transferでResponseが遅延する間もencoderの最終1枠をResponse用に空け、GPIO eventは保留せず省略する
 - **通知はベストエフォート**: event は応答確認を持たず、送信失敗時の再送もない
 - **観測対象ピンの入力有効化は利用者の責務**: subscribe / port read はピンの pad 設定を**暗黙に変更しない**
   (ユーザーが指示していない GPIO モード変更を勝手に行わないという設計方針)。
@@ -277,8 +287,8 @@ host の GPIO read は通信せずキャッシュを読む。device 側で購読
 ### 意味論
 
 - `slot` は `GPIOGroup` の GPIO スロット (登録済み `IGPIO` を識別)
-- `port_index` は `IGPIO` 内のポート番号 (ESP32 では port0 = GPIO0-31、port1 = GPIO32-39)
-- **deny_mask**: `GPIOGroup` が管理。`GpioPortRead` は読み出し値を `~deny_mask` でマスク。`GpioPortWrite` は set_mask / clear_mask 両方を `~deny_mask` でマスクしてから適用
+- `port_index` は`IGPIO::getPort()`のlogical port ordinal。個別pinとの対応は`IGPIO::locatePin()`が決める (ESP32ではport0 = GPIO0-31、port1 = GPIO32以降)
+- **deny_mask**: `GPIOGroup` が`(slot, port_index)`ごとに管理。個別pinのsubscribe/monitorとport opcodeは同じ`locatePin()` mappingを使う。`GpioPortRead`は読み出し値を`~deny_mask`でマスクし、`GpioPortWrite`はset_mask / clear_maskの両方を`~deny_mask`でマスクしてから適用する
 - ESP32 実装: `readPort()` は `GPIO_IN_REG` 直読み、`writePort()` は `W1TS`/`W1TC` レジスタへの直書き (read-modify-write なしのアトミック操作)
 
 ## 動的バス生成 (BusCreate / BusRelease)

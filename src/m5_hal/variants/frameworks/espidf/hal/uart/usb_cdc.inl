@@ -189,10 +189,7 @@ result_t<size_t> Bus_espidf_usb_cdc::write(bus::IAccessor* owner, const AccessCo
     auto result = Bus_streaming::write(owner, cfg, src, len);
     if (_installed) {
         esp_err_t err = tinyusb_cdcacm_write_flush(_itf, ticks(cfg.write_timeout_ms));
-        if (err != ESP_OK && result.has_value()) {
-            return m5::stl::make_unexpected(err == ESP_ERR_TIMEOUT ? error::error_t::TIMEOUT_ERROR
-                                                                   : error::error_t::IO_ERROR);
-        }
+        return completeWrite(std::move(result), mapEspErr(err));
     }
     return result;
 }
@@ -207,9 +204,9 @@ result_t<size_t> Bus_espidf_usb_cdc::rawWrite(const uint8_t* data, size_t len, u
         return static_cast<size_t>(0);
     }
     esp_err_t flush_err = tinyusb_cdcacm_write_flush(_itf, ticks(timeout_ms));
-    if (flush_err != ESP_OK && flush_err != ESP_ERR_TIMEOUT) {
-        return m5::stl::make_unexpected(error::error_t::IO_ERROR);
-    }
+    // The queue already owns this prefix. Completion failure is reconciled by
+    // write() after the base loop advances Source by the accepted byte count.
+    (void)flush_err;
     return queued;
 }
 

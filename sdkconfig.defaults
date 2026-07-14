@@ -3,7 +3,7 @@
 # applies ONLY when M5HAL is the PlatformIO project; consumers that pull M5HAL in
 # as a library/component keep their own sdkconfig.
 #
-# CONFIG_FREERTOS_HZ=1000: the I2C slave HIL device (experiments/v2/test/i2c_slave)
+# CONFIG_FREERTOS_HZ=1000: the I2C slave HIL device (test/v2/hil/i2c_slave)
 # serves its accessor event-driven (the espidf backend's waitForActivity blocks on
 # an ISR notification), but the wait's safety timeout and the base accessor's
 # delayMs(1) polling fallback both resolve in FreeRTOS ticks. At the IDF default

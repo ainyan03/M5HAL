@@ -127,9 +127,20 @@ namespace m5::hal::v2::gpio {
 
 class IGPIO {
 public:
+    struct PinLocation {
+        uint8_t port_index;
+        uint8_t bit_index;
+    };
+
     // dispatch / 解決
     virtual IPort* portForPin(types::gpio_local_pin_t local_pin) const = 0;
     virtual IPort* getPort(uint8_t port_index) const                   = 0;
+
+    // local pin と 32-bit port mask の対応
+    virtual PinLocation locatePin(types::gpio_local_pin_t local_pin) const;
+    bool tryLocatePin(types::gpio_local_pin_t local_pin, PinLocation* out) const;
+    bool localPinForLocation(uint8_t port_index, uint8_t bit_index,
+                             types::gpio_local_pin_t* out) const;
 
     // 容量
     virtual uint16_t getPinCount() const  = 0;
@@ -167,8 +178,11 @@ protected:
 
 - **`portForPin(local_pin)`** — variant 内部で dispatch。 複数 IPort を持つ variant (ESP32-S3 等 `SOC_GPIO_PIN_COUNT > 32`) はここで bank dispatch。 範囲外は variant 実装で assert
 - **`getPort(port_index)`** — 旧 API 仕様踏襲 (port 番号で直接取得)
+- **`locatePin(local_pin)`** — local pin を `getPort()` のordinalと、そのportの32-bit mask上のbitへ写像する。defaultは`portForPin()`と`getPort()`のpointer一致からordinalを求め、bitを`local_pin & 31`とする。1個のstateless `IPort`を複数のlogical portで共有するvariantや、別のbit配置を持つexpanderはoverrideする
+- **mappingの一意性** — validな各local pinは一意な`(port_index, bit_index)`を持ち、`port_index < getPortCount()`、`bit_index < 32`、`portForPin(local) == getPort(port_index)`を満たす。`tryLocatePin()`がこの境界をcheckedに検証する
+- **`localPinForLocation()`** — `(port_index, bit_index)`からlocal pinを逆引きする。追加RAMを持たず、最大256個のlocal pinを走査する。watchの変化bitをglobal pinへ戻す経路で使用する
 - **`getPinCount()`** — variant が知る pin 総数 (例: ESP32 = `SOC_GPIO_PIN_COUNT`、 Arduino = `NUM_DIGITAL_PINS`)
-- **`getPortCount()`** — 内蔵 Port 数
+- **`getPortCount()`** — `getPort()` で参照できるlogical port数。1個のstateless `IPort`を複数ordinalで共有する場合も、pin mappingに必要なlogical port数を返す
 - **`isValid(local_pin)`** — default は `local_pin < getPinCount()` (`gpio_local_pin_t` は unsigned なので下限チェック不要)。 IGPIO 自身の **ローカル空間内** での判定のみを担う (グローバル空間判定は `GPIOGroup::isValid` の責務)
 - **`getPin(local_pin)`** — default は `portForPin(local_pin)->getPin(local_pin)`。 IGPIO はローカル空間 (0〜pin_count-1) を扱う、 グローバル `gpio_number_t` 解決は `GPIOGroup` 経由
 - **`hasPushEvents()`** — default `false`。 `GPIOGroup` の watch poll pass がこの IGPIO を対象にするかの申告。 `true` を返す IGPIO (remote GPIO 等) は poll pass が完全にスキップし、 状態は `GPIOGroup::notifyPinStateChanged` 経由でのみ届く (単一ソース規約、 §GPIOGroup の watcher API を参照)
@@ -289,7 +303,7 @@ private:
 - **MCU GPIO は ctor で slot 0 に load**
 - **slot の `IGPIO*` は `const IGPIO*`**
 - **watcher API** — `bindServiceRunner` で service runner に接続し、`setWatchSink` / `watch` / `unwatch` / `clearWatchers` / `notifyPinStateChanged` で GPIO 変化通知を扱う (§watcher API 参照)。remote GPIO push event はこの watch 基盤を使う
-- **deny mask** — `setDenyMask(slot, port_index, mask)` が port ごとの禁止 bit を登録する。`isValid` / `tryGetPin` と port 一括操作は deny bit を公開不可 pin として扱う
+- **deny mask** — `setDenyMask(slot, port_index, mask)` がGPIOGroupの対応範囲であるlogical port 0/1の禁止bitを登録する。存在しないportまたはport 2以降は`INVALID_ARGUMENT`。`isValid` / `tryGetPin`、watch、port一括操作は`IGPIO::locatePin()`と同じmappingでdeny bitを公開不可 pinとして扱う
 - **PortAccess** — `getPort(slot, port_index)` は `IPort*` と `deny_mask` をまとめて返し、remote の `GpioPortRead` / `GpioPortWrite` がポート一括操作時に deny mask を適用できるようにする
 
 ### `addGPIO` 規約
@@ -305,7 +319,7 @@ private:
 ### dispatch ロジック
 
 - **`getPin(gpio_num)`**: `extractSlot` + `extractLocalPin` で slot / local を抽出し、 `_find(slot)` で密配列を線形探索して得た IGPIO の `getPin(local)` に委譲する
-- **`isValid(gpio_num)`**: 負値即 false、 `_find(slot)` が未登録なら false、 deny mask 対象なら false、 valid なら当該 IGPIO の `isValid(local)` に委譲
+- **`isValid(gpio_num)`**: 負値即 false、 `_find(slot)` が未登録なら false、`tryLocatePin()`でmappingが不正ならfalse、deny mask対象ならfalse
 - **`tryGetPin(gpio_num)`**: `isValid` + `getPin` の合成。 invalid 入力は `expected<Pin, error_t>` の error path で recover
 
 ### checked / unchecked 境界
@@ -342,7 +356,7 @@ private:
   保証できない)。呼び出し側はリトライ可
 - **`unwatch` は in-flight 完了を待たない**: 呼び出しが戻った直後にも、当該ピンの飛行中
   イベントが 1 回届きうる (待つのは sink 解除のみ)
-- **監視可能 pin は port 0/1 (local pin 0..63)**: それを超える pin、または deny mask 対象 pin
+- **監視可能 pin はlogical port 0/1**: `locatePin()`がそれ以外のportへ写像するpin、またはdeny mask対象pin
   の `watch()` は `INVALID_ARGUMENT`
 - **poll 周期はグループ単一** (`setWatchSink` の `poll_interval_us`、 0 は `kDefaultWatchIntervalUs`
   に丸める)。per-pin 周期・debounce は提供しない (必要なら sink 側 / 上層で実装する)
@@ -372,6 +386,10 @@ private:
 1. `num >= 0` チェック (`INVALID_ARGUMENT` を返す)
 2. `m5::hal::v2::M5_Hal.Gpio.getPin(num)` で `Pin` 値型を解決
 3. 必要なら Pin / Port 経由で `setMode` 等を実施
+
+config が `Pin` handle ではなく global `gpio_number_t` を保持することで、MCU pin と登録済み expander pin を
+同じ宣言的な値で表し、backend は `init()` 時に解決した `Pin` を hot path 用に保持できる。番号と `Pin` の
+dual path は優先順位と初期化分岐を生むため提供しない。
 
 ### expander pin を SCL/SDA に使う場合
 

@@ -13,7 +13,7 @@
 // I2C bit-bang implementation. Drives SCL / SDA through the
 // `m5::hal::v2::gpio::Pin` value type; callers populate
 // `IBusConfig::pin_scl` / `pin_sda` with `gpio_number_t` values.
-// `Bus::init` resolves them via `m5::hal::v2::M5_Hal.Gpio.getPin(num)`
+// `Bus::init` resolves them via `m5::hal::v2::M5_Hal.Gpio.tryGetPin(num)`
 // (global lookup through the `M5HALCore` singleton) and stores the
 // resulting `IPort` / `Pin` in members. Any `gpio_number_t` is
 // accepted, including pins behind an I/O expander.

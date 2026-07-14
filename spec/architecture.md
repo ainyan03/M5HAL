@@ -71,6 +71,14 @@ exact-instance の唯一所有 handle を消費する。詳細は [design/remote
 内部シングルトン (caller は直接使わない)。caller は `m5::hal::v2::M5_Hal.Gpio.*` のように各
 sub-object にアクセスする。
 
+`Hal` は copy / move ともに不可。ローカル singleton を移動させず、remote connection や proxy cache の
+非自明な状態を複製・移送しないためである。関数へは `Hal&` で渡し、所有が必要なら
+`std::unique_ptr<Hal>` を使う。
+
+M5HAL は board ID や board preset catalog を持たない。board 固有の pin / bus preset は M5Unified や
+BSP 等の上位層がデータとして保持し、既存の `BusConfig` へ供給する。`variant_id_t` は backend 実装を
+識別する型であり、board 識別子を同じ番号空間へ混在させない。
+
 `m5::hal::v2::<kind>::*` 配下の勝者バインドされた関数 (例: `gpio::getGPIO()`) は `M5HALCore` ctor が bootstrap seam として内部利用するため、 caller が直接呼ぶ必要はない (詳細は [design/gpio.md](design/gpio.md) §caller 向け唯一の entry point)。
 
 namespace-scope initializer や他ライブラリの global ctor から触る場合は `getM5_Hal()` を使う (`Hal&` を返す。 `M5_Hal` alias は eager-init のため lazy-safe ではない、 lazy-safe accessor は `getM5_Hal()` のみ)。
@@ -84,6 +92,9 @@ namespace-scope initializer や他ライブラリの global ctor から触る場
 - cross-cuttingな型もAPI世代に属する間は`m5::hal::vN::*`配下に置く。現行`error_t`は
   `m5::hal::v2::error::*`で、世代非依存の`m5::hal::*`直下へはまだ置かない
 - variant 機構は `m5::variants::*` に置く
+- ライブラリは global な短縮 namespace alias `m5hal` を定義しない。例や利用コードで使う場合は
+  `namespace m5hal = m5::hal::v2;` のように caller 自身のスコープで定義する。取り消しにくい global 名を
+  公式 API として予約せず、世代の既定切替は inline namespace の仕組みに委ねる
 
 v0/v2共存による物理namespace (`m5::hal::v2::<kind>`等) とinline展開の詳細は
 [design/v0_v2_coexistence.md](design/v0_v2_coexistence.md) §namespace 配置 を参照。

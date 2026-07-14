@@ -106,11 +106,22 @@ constexpr types::AllocationIntent preferLowPower(void)
 struct IManagedBus {
     virtual ~IManagedBus(void) = default;
 
-    /*! @brief The acquire intent recorded for this bus (commit-time resolver). */
-    virtual const types::AllocationIntent& intent(void) const = 0;
+    /*! @brief Snapshot the acquire intent recorded for this bus (commit-time resolver). */
+    virtual types::AllocationIntent intent(void) const = 0;
 
     /*! @brief Whether this bus opted into intent-driven management. */
     virtual bool managed(void) const = 0;
+
+    /*!
+      @brief Replace the recorded intent while the allocation core is serialized.
+
+      Internal resolver seam. Logical re-acquire routes through
+      `AllocationCore::retagIntent`, which serializes this short update against
+      the commit-time intent snapshot; callers must not invoke this hook
+      without that guard. A retag after the snapshot belongs to the next
+      commit.
+     */
+    virtual void retagIntent(const types::AllocationIntent& intent) = 0;
 
     /*! @brief Hot-swap to a real (non-null) backend under the bus lock. */
     virtual result_t<void> swapBackend(std::unique_ptr<IBus> new_backend,
@@ -155,34 +166,44 @@ struct IAllocationKind {
 
       i2c returns a software (bit-bang) backend; a software-less kind (i2s)
       returns null, which the resolver turns into a pending bus.
+      `intent` is the immutable commit snapshot, not a later live re-tag.
      */
-    virtual IBus* makePlaceholder(IManagedBus& bus) const = 0;
+    virtual IBus* makePlaceholder(IManagedBus& bus, const types::AllocationIntent& intent) const = 0;
 
-    /*! @brief Build a hardware backend for `controller`; null on a build with no hardware. */
-    virtual IBus* makeHardware(IManagedBus& bus, int8_t controller) const = 0;
+    /*!
+      @brief Build a hardware backend for `controller`; null on failure.
+
+      `intent` is the immutable commit snapshot used to choose `controller`.
+     */
+    virtual IBus* makeHardware(IManagedBus& bus, const types::AllocationIntent& intent, int8_t controller) const = 0;
 
     /*!
       @brief Build the placeholder backend and swap it in UNDER THE BUS LOCK.
 
       `makePlaceholder` + adopt, but the build (and its `init()`) runs inside the
       bus lock so it cannot race an in-flight transfer on the old backend.
+      `intent` is the immutable commit snapshot threaded through the build and
+      any rollback reconstruction.
       A null placeholder from a software-less kind is its intentional
       pending detach; a null from a kind WITH a software factory is a build
       failure — the swap rolls back to a re-made hardware backend on the
       controller being given up and returns the error. Release errors
       propagate.
      */
-    virtual result_t<void> commitPlaceholder(IManagedBus& bus, uint32_t timeout_ms) const = 0;
+    virtual result_t<void> commitPlaceholder(IManagedBus& bus, const types::AllocationIntent& intent,
+                                             uint32_t timeout_ms) const = 0;
 
     /*!
       @brief Build the hardware backend for `controller` and swap it in UNDER THE BUS LOCK.
 
       `makeHardware` + adopt, but the build (and its `init()`) runs inside the
-      bus lock. A null result (no hardware factory) is
+      bus lock. `intent` is the immutable commit snapshot used by planning,
+      pin eligibility, the build, and any rollback. A null result is
       `OUT_OF_RESOURCE`; the swap rolls back to a re-made placeholder
       (or pending for a software-less kind). Release errors propagate.
      */
-    virtual result_t<void> commitHardware(IManagedBus& bus, int8_t controller, uint32_t timeout_ms) const = 0;
+    virtual result_t<void> commitHardware(IManagedBus& bus, const types::AllocationIntent& intent, int8_t controller,
+                                          uint32_t timeout_ms) const = 0;
 
     /*!
       @brief Whether all controllers offer identical capabilities.
@@ -235,14 +256,17 @@ struct IAllocationKind {
       IOMUX pad pair, or wired through a GPIO matrix that only reaches a
       restricted pin set. The resolver consults this AFTER the capability
       filter, so it only ever runs on a controller already eligible on caps.
+      `intent` is the same immutable snapshot used by the rest of the commit.
 
       Defaulted to always-true (no pin restriction), so existing kinds and
       test fakes need no change. A uniform kind is NEVER asked -- the
       eligibility filter short-circuits before reaching this check.
      */
-    virtual bool controllerAcceptsBus(const IManagedBus& bus, int8_t controller) const
+    virtual bool controllerAcceptsBus(const IManagedBus& bus, const types::AllocationIntent& intent,
+                                      int8_t controller) const
     {
         (void)bus;
+        (void)intent;
         (void)controller;
         return true;
     }

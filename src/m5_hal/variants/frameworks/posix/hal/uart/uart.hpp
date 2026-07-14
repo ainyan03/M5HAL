@@ -98,11 +98,11 @@ private:
 
     static constexpr size_t kCoalesceCapacity = 4096;
 
-    const char* _device_path = nullptr;
-    size_t _tx_coalesce      = 0;  // from BusConfig_posix::tx_coalesce_bytes (the base _config slices)
-    int _fd                  = -1;
-    bool _owns_fd            = false;
-    bool _begun              = false;
+    char* _device_path  = nullptr;
+    size_t _tx_coalesce = 0;  // from BusConfig_posix::tx_coalesce_bytes (the base _config slices)
+    int _fd             = -1;
+    bool _owns_fd       = false;
+    bool _begun         = false;
     uart::AccessConfig _applied_cfg;
     size_t _co_used = 0;
     uint8_t _co_buf[kCoalesceCapacity];

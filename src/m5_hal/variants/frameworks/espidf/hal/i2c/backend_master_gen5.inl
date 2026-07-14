@@ -125,7 +125,10 @@ error::error_t Bus_espidf::attach(::i2c_master_bus_handle_t bus_handle)
         return error::error_t::INVALID_ARGUMENT;
     }
     if (_bus_handle != nullptr) {
-        (void)release();
+        auto released = release();
+        if (!released.has_value()) {
+            return released.error();
+        }
     }
     _bus_handle = bus_handle;
     _owns_bus   = false;
@@ -134,13 +137,16 @@ error::error_t Bus_espidf::attach(::i2c_master_bus_handle_t bus_handle)
 
 result_t<void> Bus_espidf::init(const BusConfig_espidf& config)
 {
-    _config = config;
-    if (_config.pin_scl < 0 || _config.pin_sda < 0) {
+    if (config.pin_scl < 0 || config.pin_sda < 0) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
     if (_bus_handle != nullptr) {
-        (void)release();
+        auto released = release();
+        if (!released.has_value()) {
+            return m5::stl::make_unexpected(released.error());
+        }
     }
+    _config = config;
 
     _controller_port                     = config.i2c_port;  // cached for controllerId()
     ::i2c_master_bus_config_t bus_config = {};

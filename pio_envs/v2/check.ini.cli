@@ -16,7 +16,7 @@
 ; 使い方:
 ;   pio run -e v2_check_native
 ;   pio run -e v2_check_esp32_espidf
-;   pio run -e v2_check_esp32_espidf4
+;   pio run -e v2_check_esp32_espidf_legacy_i2c
 ;   pio run -e v2_check_esp32_espidf6
 ;   pio run -e v2_check_native_inline      (inline flip fence)
 ; =============================================================================
@@ -39,8 +39,11 @@ build_src_filter = +<*> +<../test/v2/stub/build_check_arduino.cpp>
 extends = common_esp32dev_espidf5, common_espidf
 build_src_filter = +<*> +<../test/v2/stub/build_check_espidf.cpp>
 
-[env:v2_check_esp32_espidf4]
-extends = common_esp32dev_espidf4, common_espidf
+[env:v2_check_esp32_espidf_legacy_i2c]
+extends = common_esp32dev_espidf5, common_espidf
+build_flags =
+    ${common_esp32.build_flags}
+    -DM5HAL_CONFIG_ESPIDF_I2C_MASTER_LEGACY_DRIVER=1
 build_src_filter = +<*> +<../test/v2/stub/build_check_espidf.cpp>
 
 [env:v2_check_esp32_espidf6]

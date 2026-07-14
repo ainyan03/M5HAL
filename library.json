@@ -34,7 +34,6 @@
     "license": "MIT",
     "export": {
         "exclude": [
-            "experiments",
             "test",
             "pio_envs",
             ".github",
