@@ -9,41 +9,52 @@
 
 #include <cstdint>
 
+#include "../../../../../hal/v2/error.hpp"
 #include "time.hpp"
+
+#if !configSUPPORT_STATIC_ALLOCATION
+#error "M5HAL FreeRTOS runtime requires configSUPPORT_STATIC_ALLOCATION=1"
+#endif
+#if !defined(INCLUDE_vTaskSuspend) || !INCLUDE_vTaskSuspend
+#error "M5HAL FreeRTOS Mutex requires INCLUDE_vTaskSuspend=1 for TIMEOUT_FOREVER"
+#endif
 
 namespace m5::variants::frameworks::freertos::hal::v2::runtime {
 
 class Mutex {
 public:
-#if configSUPPORT_STATIC_ALLOCATION
     Mutex(void) : _handle{xSemaphoreCreateMutexStatic(&_buffer)}
     {
     }
-#else
-    Mutex(void) : _handle{xSemaphoreCreateMutex()}
-    {
-    }
-#endif
     ~Mutex(void)
     {
-        vSemaphoreDelete(_handle);
+        if (_handle != nullptr) {
+            vSemaphoreDelete(_handle);
+        }
     }
     Mutex(const Mutex&)            = delete;
     Mutex& operator=(const Mutex&) = delete;
 
-    bool lock(uint32_t timeout_ms)
+    ::m5::hal::v2::result_t<void> lock(uint32_t timeout_ms)
     {
-        return xSemaphoreTake(_handle, ::m5::hal::v2::detail::timeoutMsToTicksRoundUp(timeout_ms)) == pdTRUE;
+        if (_handle == nullptr) {
+            return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::INVALID_STATE);
+        }
+        if (xSemaphoreTake(_handle, ::m5::hal::v2::detail::timeoutMsToTicksRoundUp(timeout_ms)) != pdTRUE) {
+            return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+        }
+        return {};
     }
-    void unlock(void)
+    ::m5::hal::v2::result_t<void> unlock(void)
     {
-        (void)xSemaphoreGive(_handle);
+        if (_handle == nullptr || xSemaphoreGive(_handle) != pdTRUE) {
+            return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::INVALID_STATE);
+        }
+        return {};
     }
 
 private:
-#if configSUPPORT_STATIC_ALLOCATION
     StaticSemaphore_t _buffer{};
-#endif
     SemaphoreHandle_t _handle;
 };
 

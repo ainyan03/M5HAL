@@ -9,7 +9,7 @@ M5HAL v2 API の全体構造と設計原則を示す。 個別の設計は [desi
 - **組み込みファースト** — RTTI / 例外に依存しない
 - **シンプル優先** — 状態機械や補助状態は必要最小限にとどめる
 - **宣言と実装の分離** — ヘッダは宣言を中心に置き、 重い実装は `.inl` 等に分離する
-- **同期 API を正本とする** — 非同期は将来拡張として扱う
+- **同期 API を正本とする** — 非同期機構を追加する場合も同期契約を正本として維持する
 - **テストで契約を担保する** — 抽象基底の契約はユニットテストで検証する
 - **無駄を省く最適化は迷わず行う** — 不要なコピーや不要な状態を省けば、 実装は単純になり速度も上がる (§最適化の判断)
 - **汎用性や単純さを犠牲にする最適化は、 要件を満たせないと実測で示せたときだけ** (§最適化の判断)
@@ -58,18 +58,33 @@ variants      層を横断するメタ機構                                    
 
 ## HAL object 層
 
-**v2 caller の正本入口は `m5::hal::v2::M5_Hal` object** (`m5::hal::v2::Hal&` 型)。 `m5::hal::v2::Hal` はローカルとリモートで共通の public facade で、 sub-object (`Gpio` / `I2C` / `SPI` / `UART` / `I2S` / `Services` / `Memory`) を束ねる。
+**既定の v2 caller 入口は `m5::hal::v2::M5_Hal` object** (`m5::hal::v2::Hal&` 型)。
+`Hal` はローカルとリモートで共通の public facade で、sub-object (`Gpio` / `I2C` / `SPI` /
+`UART` / `I2S` / `Services` / `Memory`) を束ねる。ローカル資源の所有単位はcopy可能な
+`ResourceDomain` facadeのco-owned stateであり、`BusRegistry`、`GPIOGroup`、`ServiceRunner`、
+`Allocator`を一つのidentity namespaceに置く。`Hal()`は独立domainを作り、`Hal(domain)`は指定domainを
+共有する。`init()` / `connect("local")` はそのHalのdomainへlocal backendとadapterを束縛する。
+
+同一domainの同一`ResourceKey`は同じBus/lockへinternされ、別domainではkey値が同じでも別Busになる。
+`ResourceKey`のproduction ABIは全対応targetで32 B固定とし、target幅でidentity表現やregistry layoutを
+分岐させない。
+Busとfactoryはdomain stateをco-ownするため、取得済みBusはstack上の`Hal` / `ResourceDomain` facadeより
+長生きできる。`M5_Hal`はこの一般形のdefault-domain便利入口であり、local Halをprocess内一個に限定しない。
 
 リモート `Hal` は接続確立後に同型 API を提供する: `Hal remote; remote.connect(endpoint)` で接続する
 (endpoint = `"uart:<path>"` / `"tcp:<host>:<port>"`。typed API `remote.initUart(port)` /
 `remote.initTcp("host:port")` も存続)。以降は同じ `remote.I2C.acquire(cfg)` /
 `remote.SPI.acquire(cfg)` の形で proxy bus を取得でき、ローカル `Hal` と同一のコード面で使える。
 1 `Hal` は 1 接続先に束縛され、reconnect は旧 session を失効させる。旧 proxy は connection を
-延命せず `CLOSED` を返し、同一 session の RPC は session gate で直列化される。明示 release は
+延命せず `CLOSED` を返し、同一 session の RPC は session gate で直列化される。明示closeは
 exact-instance の唯一所有 handle を消費する。詳細は [design/remote.md](design/remote.md) と
-[design/bus_accessor.md](design/bus_accessor.md) を参照。`M5HALCore` はローカル backend を所有する
-内部シングルトン (caller は直接使わない)。caller は `m5::hal::v2::M5_Hal.Gpio.*` のように各
-sub-object にアクセスする。
+[design/bus_accessor.md](design/bus_accessor.md) を参照。`M5HALCore` はdefault `M5_Hal` facadeを構築する
+bootstrap singletonで、個々のlocal backendは各`Hal`のlocal connection stateが所有する。default利用では
+従来どおり`m5::hal::v2::M5_Hal.Gpio.*`の形で各sub-objectへアクセスする。
+
+取得済みBusは全kind共通の`capabilities()`で、現在のinstanceが実装するoperation、数値limit、
+backend/session generationの固定長snapshotを返す。local/remoteのgeneric preflightはこのsnapshotを正本とする。
+詳細は[design/bus_capabilities.md](design/bus_capabilities.md)。
 
 `Hal` は copy / move ともに不可。ローカル singleton を移動させず、remote connection や proxy cache の
 非自明な状態を複製・移送しないためである。関数へは `Hal&` で渡し、所有が必要なら
@@ -79,7 +94,9 @@ M5HAL は board ID や board preset catalog を持たない。board 固有の pi
 BSP 等の上位層がデータとして保持し、既存の `BusConfig` へ供給する。`variant_id_t` は backend 実装を
 識別する型であり、board 識別子を同じ番号空間へ混在させない。
 
-`m5::hal::v2::<kind>::*` 配下の勝者バインドされた関数 (例: `gpio::getGPIO()`) は `M5HALCore` ctor が bootstrap seam として内部利用するため、 caller が直接呼ぶ必要はない (詳細は [design/gpio.md](design/gpio.md) §caller 向け唯一の entry point)。
+`m5::hal::v2::<kind>::*` 配下の勝者バインドされた関数 (例: `gpio::getGPIO()`) はlocal connectionの
+bootstrap seamとして内部利用するため、callerが直接呼ぶ必要はない (詳細は
+[design/gpio.md](design/gpio.md) §caller 向けentry point)。
 
 namespace-scope initializer や他ライブラリの global ctor から触る場合は `getM5_Hal()` を使う (`Hal&` を返す。 `M5_Hal` alias は eager-init のため lazy-safe ではない、 lazy-safe accessor は `getM5_Hal()` のみ)。
 
@@ -101,16 +118,16 @@ v0/v2共存による物理namespace (`m5::hal::v2::<kind>`等) とinline展開�
 
 ### ディレクトリ配置
 
-- ライブラリ実装は `src/m5_hal/` 配下に置く
-- `hal/` は `m5::hal::*`、 `variants/` は `m5::variants::*` に対応させる
-- **例外 (variant 公開型)**: variant が提供する公開型 (`Bus_<variant>` / `BusConfig_<variant>` / gpio の `Port_<variant>` 等) は、 物理ファイルを `variants/` 配下に置いたまま **namespace は `m5::hal::v2::<kind>` 直下**に定義する ([design/variants.md](design/variants.md) §offer 要件)。 suffix が variant の出自を示し、 勝者選択は無印名への型 alias で行う。 variant 固有の内部構造 (service 群・レジスタ層・固有ユーティリティ) は従来どおり `m5::variants::*` に置く
-- `m5::hal::v2::<kind>::*` 直下の variant 由来 free function (例: `gpio::getGPIO()`) は bootstrap 用の内部 seam として位置付ける。 v2 caller が直接呼ぶ主入口ではない
-- `src/m5_hal/hal/v2/m5_hal.hpp` は HAL object 層を提供する
-- 詳細な配置規約は [reference/directory-layout.md](reference/directory-layout.md) を参照
+物理配置は namespace に対応させる。配置、include 形式、主要ファイルの検索先は
+[reference/directory-layout.md](reference/directory-layout.md) を正本とする。variant が公開する
+provider symbolだけは、物理ファイルを`variants/`配下に置いたまま`m5::hal::v2::<kind>`へ公開する。
+この例外の意味論と公開symbolは[design/variants.md](design/variants.md)
+§offer 要件 (facade bus kind)を参照。
 
 ## 参照
 
 - [design/bus_accessor.md](design/bus_accessor.md)
+- [design/bus_capabilities.md](design/bus_capabilities.md)
 - [design/runtime.md](design/runtime.md)
 - [design/data_io.md](design/data_io.md)
 - [design/transfer_desc.md](design/transfer_desc.md)

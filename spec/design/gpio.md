@@ -4,7 +4,7 @@
 
 M5HAL v2 の GPIO 抽象は `Pin`、 `IPort`、 `IGPIO`、 `GPIOGroup` で構成する。 caller には `gpio_number_t` 空間と `Pin` 値型を提供し、 encoded 表現は variant 実装側に閉じ込める。
 
-## caller 向け唯一の entry point
+## caller 向け entry point
 
 ```cpp
 // Pin 取得 (唯一の path)
@@ -12,10 +12,17 @@ m5::hal::v2::gpio::Pin pin = m5::hal::v2::M5_Hal.Gpio.getPin(gpio_num);
 
 // checked variant (外部入力 / 起動時構成依存など valid か不明な場合)
 auto result = m5::hal::v2::M5_Hal.Gpio.tryGetPin(gpio_num);
+
+// 独立local domain
+m5::hal::v2::ResourceDomain domain;
+m5::hal::v2::Hal hal{domain};
+auto isolated = hal.Gpio.tryGetPin(gpio_num);
 ```
 
-- `M5_Hal.Gpio` は `GPIOGroup` singleton。 MCU + expander を統合するグローバル resolver
-- **旧 `getGPIOGroup()` / `gpio::pin()` free function は廃止**。 `M5_Hal.Gpio.getPin` を唯一の path として使う
+- `M5_Hal.Gpio` はdefault domainの`GPIOGroup`。任意の`Hal`では`hal.Gpio`、domain直接参照は
+  `domain.gpio()`を使い、各instanceがMCU + expanderを統合する
+- **旧 `getGPIOGroup()` / `gpio::pin()` free function は廃止**。Pin解決は選択した
+  `GPIOGroup` instanceの`getPin` / `tryGetPin`に統一する
 - `M5_Hal` は eager-init alias。 namespace-scope initializer や他 lib の global ctor から使う場合は lazy-safe な `getM5_Hal().Gpio.getPin(num)` を経由する
 - `M5_Hal` object 層の位置づけ (ライフサイクル・singleton 初期化) は [architecture.md](../architecture.md) §HAL object 層 を参照。 expander の登録と pin-path への載せ方は本ファイル §expander pin を SCL/SDA に使う場合 を参照
 
@@ -194,7 +201,8 @@ variant が `m5::hal::v2::gpio` 直下に `getGPIO_<variant>()` の inline defin
 
 - `m5::hal::v2::gpio::getGPIO()` — MCU 内蔵 GPIO (`const IGPIO*`) を返す (ローカル空間)。 `M5HALCore` ctor が slot 0 bootstrap source として使用する seam
 
-グローバル resolver は `M5_Hal.Gpio` singleton (`GPIOGroup&`) に統一する。 expander 登録 / 解除もこの instance に対して行う。 caller 向け entry point は本ファイル冒頭の §caller 向け唯一の entry point を参照。
+default resolverは`M5_Hal.Gpio` (`GPIOGroup&`) で、expander登録 / 解除もdefault利用ではこのinstanceへ
+行う。独立`Hal`ではその`hal.Gpio`へ登録する。caller向けentry pointは本ファイル冒頭を参照。
 
 ## GPIOGroup (グローバル resolver)
 
@@ -253,8 +261,7 @@ public:
     result_t<void> unwatch(types::gpio_number_t gpio_num);
     void clearWatchers();
 
-    [[nodiscard]] result_t<void>
-    notifyPinStateChanged(types::gpio_number_t gpio_num, bool level);
+    result_t<void> notifyPinStateChanged(types::gpio_number_t gpio_num, bool level);
 
     // 問い合わせ (checked)
     const IGPIO* getGPIO(types::gpio_slot_t slot) const;
@@ -271,9 +278,8 @@ public:
 
     bool         isValid(types::gpio_number_t gpio_num) const;
 
-    // Pin 解決 (checked sugar、 [[nodiscard]] で expected の握り潰し防止)
-    [[nodiscard]] result_t<Pin>
-    tryGetPin(types::gpio_number_t gpio_num) const;
+    // Pin 解決 (checked sugar)
+    result_t<Pin> tryGetPin(types::gpio_number_t gpio_num) const;
 
     // Pin 解決 (unchecked fast path、 contract violation 時 assert/UB)
     Pin getPin(types::gpio_number_t gpio_num) const;
@@ -320,7 +326,7 @@ private:
 
 - **`getPin(gpio_num)`**: `extractSlot` + `extractLocalPin` で slot / local を抽出し、 `_find(slot)` で密配列を線形探索して得た IGPIO の `getPin(local)` に委譲する
 - **`isValid(gpio_num)`**: 負値即 false、 `_find(slot)` が未登録なら false、`tryLocatePin()`でmappingが不正ならfalse、deny mask対象ならfalse
-- **`tryGetPin(gpio_num)`**: `isValid` + `getPin` の合成。 invalid 入力は `expected<Pin, error_t>` の error path で recover
+- **`tryGetPin(gpio_num)`**: `isValid` + `getPin` の合成。invalid入力は`result_t<Pin>`のerror pathでrecover
 
 ### checked / unchecked 境界
 
@@ -369,7 +375,10 @@ private:
 - runtime には read-only access と watcher dispatch が走る。`addGPIO` / `removeGPIO` / `setDenyMask` は startup 時に確定させる
 - 規約違反 (runtime register / 走査中 register / 走査中 mask 変更) の動作は未定義
 - **Hal 管理 remote slot の例外**: `Hal::connect` / `initUart` / `initTcp` は watcher と connection
-  service を外した切替区間で remote `IGPIO` を内部的に remove/add する。caller が runtime に
+  service を外した切替区間で remote `IGPIO` を内部的に remove/add する。登録先は既存 remote slot を
+  reclaim 可能とみなした slot key 0〜127 の lowest-free とし、事前に pin count 1〜256 と dense storage
+  容量 (`kMaxEntries` = 16) を検証する。事前検証の失敗は `INVALID_ARGUMENT` で、旧 connection と登録を
+  変更しない。caller が runtime に
   `GPIOGroup::removeGPIO` してよいという意味ではない。切替前に取得済みの `Pin` / `PortAccess` は
   raw `IPort*` を含むため、旧 remote port storage はその `Hal` の破棄まで保持される。旧 handle は
   close 済みなので新 peer へ付け替わらず、read は最終 cache、write / mode 変更は no-op となる
@@ -378,13 +387,16 @@ private:
 - watch サービスは `ServiceRunner` に登録して駆動される。sink コールバックの実行コンテキスト・
   再入可否・ロック外呼び出しの一般契約は [service.md](service.md) の R6 (コールバック契約) /
   R7 (ロック階層) を参照 (上記の watcher 固有規約はその具体化)
+- `ResourceDomain`の`GPIOGroup`へ登録したwatcherはdomain stateに属する。個々の`Hal` facade破棄では
+  解除されず、明示解除またはdomain stateの最終破棄時に停止する。callback contextの寿命が短い場合、
+  callerはその破棄前に`setWatchSink(nullptr, ...)`または`clearWatchers()`で解除する
 
 ## IBusConfig との関係
 
 `*BusConfig` の `pin_*` フィールドは `gpio_number_t` 単一 path (default = -1 invalid)。 variant の `init()` 内で:
 
 1. `num >= 0` チェック (`INVALID_ARGUMENT` を返す)
-2. `m5::hal::v2::M5_Hal.Gpio.getPin(num)` で `Pin` 値型を解決
+2. Bus生成時に注入された`LocalResourceContext.gpio`の`tryGetPin(num)`で`Pin`値型を解決
 3. 必要なら Pin / Port 経由で `setMode` 等を実施
 
 config が `Pin` handle ではなく global `gpio_number_t` を保持することで、MCU pin と登録済み expander pin を
@@ -402,18 +414,19 @@ m5::hal::v2::M5_Hal.Gpio.addGPIO(&pca9554_gpio, EXPANDER_SLOT);
 m5::hal::v2::i2c::IBusConfig bus_cfg{
     m5::hal::v2::types::makeGpioNumber(EXPANDER_SLOT, 0),   // expander local pin 0 = SCL
     m5::hal::v2::types::makeGpioNumber(EXPANDER_SLOT, 1)};  // expander local pin 1 = SDA
-i2c_bus.init(bus_cfg);   // software bit-bang variant が M5_Hal.Gpio.getPin で Pin 解決して driving
+i2c_bus.init(bus_cfg);   // software bit-bang variant が束縛domainのGPIOGroupでPin解決してdriving
 ```
 
 ## PinBackup（ピン退避・復元）
 
-I2C / SPI 等のペリフェラルに割り当て済みの MCU ピンへ、 特殊デバイス向けの GPIO 制御を **一時的に割り込ませる**ためのユーティリティ。 ピンのルーティング状態（GPIO マトリクス + IO_MUX を構成するレジスタ群）を退避し、 制御後に元のペリフェラル役割へ完全復元する。
+I2C / SPI 等のペリフェラルに割り当て済みの MCU ピンへ、 特殊デバイス向けの GPIO 制御を **一時的に割り込ませる**ためのユーティリティ。 ピンのルーティング状態（GPIO マトリクス + IO_MUX を構成するレジスタ群）を退避し、 制御後に元のペリフェラル役割へ復元する。
 
 - **公開名**: `m5::hal::v2::gpio::PinBackup`（v2 のみ。 `<M5HAL_v2.hpp>`）
 - **配置**: Espressif platform variant（`variants/platforms/espressif/esp32/hal/gpio/pin_backup.hpp`）から `using` 宣言で公開名へ注入する
 - **なぜ platform 注入か**: PinBackup は HAL kind 実装（`IPort` 等）ではなく chip capability（チップ固有ユーティリティ）であるため、 GPIO 勝者選択（offer スキャン）とは独立に platform 層から明示注入する。 これにより、 将来 framework variant が GPIO 勝者になっても ESP32 ファミリ全機種で同じ公開名から到達できる（「HAL kind は勝者総取り、 追加型の chip capability は platform から明示公開」という棲み分け）
 - **対象**: MCU ピンのみ（slot 0）。 invalid（負値）や expander（slot≠0）は no-op
-- **退避レジスタ**（LovyanGFX `gpio::pin_backup_t` と同一）: `IO_MUX_GPIOn_REG` / `GPIO_PINn_REG` / `GPIO_FUNCn_OUT_SEL_CFG_REG` / `GPIO_FUNCn_IN_SEL_CFG_REG` / `GPIO_ENABLE(1)_REG` の該当ビット
+- **退避レジスタ**: `IO_MUX_GPIOn_REG` / `GPIO_PINn_REG` / `GPIO_FUNCn_OUT_SEL_CFG_REG` / `GPIO_ENABLE(1)_REG` の該当ビット、および対称signalの `GPIO_FUNCn_IN_SEL_CFG_REG`
+- **input route の範囲**: output signal index と同じ index の input signalだけを候補とし、そのIN_SELが対象GPIO番号を指す場合に保存・復元する。outputと異なるsignal indexから同じpinを読むroute、および同じpinを読む複数routeは走査しない。この限定により固定サイズ・単一レジスタの処理を維持する
 - **`restore()` 安全性**: `backup()` が実際に退避できた場合のみレジスタを書き戻す。 `captured()` で退避状態の有無を確認できる
 
 **明示退避 API** （コンストラクタはピンを記録するだけ。 退避は `backup()` で行う）:

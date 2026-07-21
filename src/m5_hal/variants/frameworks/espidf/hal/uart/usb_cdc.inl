@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "usb_cdc.hpp"
+#include "error.hpp"
 
 #if defined(ESP_PLATFORM) && defined(SOC_USB_OTG_SUPPORTED) && SOC_USB_OTG_SUPPORTED && \
     defined(CONFIG_TINYUSB_CDC_ENABLED) && CONFIG_TINYUSB_CDC_ENABLED && __has_include(<tinyusb.h>)
@@ -93,10 +94,14 @@ void Bus_espidf_usb_cdc::onRxReady()
 
 result_t<void> Bus_espidf_usb_cdc::init(tinyusb_cdcacm_itf_t itf)
 {
+    if (!initializationAllowed(false)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+
     if (_installed) {
-        auto released = release();
-        if (!released.has_value()) {
-            return m5::stl::make_unexpected(released.error());
+        auto closed = teardownBackend();
+        if (closed.disposition != bus::CloseDisposition::Success) {
+            return m5::stl::make_unexpected(closed.error_code);
         }
     }
 
@@ -107,7 +112,7 @@ result_t<void> Bus_espidf_usb_cdc::init(tinyusb_cdcacm_itf_t itf)
     if (err == ESP_OK) {
         _driver_owned = true;
     } else if (err != ESP_ERR_INVALID_STATE) {
-        return m5::stl::make_unexpected(mapEspErr(err));
+        return m5::stl::make_unexpected(impl_espidf::mapEspErr(err));
     }
 
     tinyusb_config_cdcacm_t cdc_cfg = {};
@@ -119,7 +124,7 @@ result_t<void> Bus_espidf_usb_cdc::init(tinyusb_cdcacm_itf_t itf)
             tinyusb_driver_uninstall();
             _driver_owned = false;
         }
-        return m5::stl::make_unexpected(mapEspErr(err));
+        return m5::stl::make_unexpected(impl_espidf::mapEspErr(err));
     }
 
     _rx_sem = xSemaphoreCreateBinary();
@@ -136,24 +141,26 @@ result_t<void> Bus_espidf_usb_cdc::init(tinyusb_cdcacm_itf_t itf)
     s_usb_cdc_instances[static_cast<int>(_itf)] = this;
     portEXIT_CRITICAL_SAFE(&s_usb_cdc_mux);
 
-    _installed = true;
+    _installed       = true;
+    auto initialized = markInitializationSucceeded(false);
+    if (!initialized) {
+        (void)teardownBackend();
+        return initialized;
+    }
     return {};
 }
 
-// If release() returns TIMEOUT_ERROR, RX notifications are already stopped and
-// release() must be called again to finish teardown. Resources are deliberately
-// left allocated in that case: leaking a semaphore beats freeing one a callback
-// still holds.
+// If teardownBackend() returns TIMEOUT_ERROR, RX notifications are already
+// stopped and teardownBackend() must be called again to finish. Resources are
+// deliberately left allocated in that case: leaking a semaphore beats freeing
+// one a callback still holds.
 //
-// The destructor cannot honor that contract — it discards the result, so an
-// in-flight callback that outlives the drain budget still reaches a destroyed
-// object. Clearing the global pointer bounds the exposure to callbacks that had
-// already loaded it; no new callback can enter. Closing the remaining window
-// would require blocking a destructor indefinitely.
-result_t<void> Bus_espidf_usb_cdc::release()
+// The destructor retries this bounded operation until callback drain completes;
+// it therefore never frees the object while a callback still owns `this`.
+bus::CloseOutcome Bus_espidf_usb_cdc::teardownBackend(void)
 {
     if (!_installed) {
-        return {};
+        return bus::CloseOutcome::success();
     }
 
     const int itf = static_cast<int>(_itf);
@@ -164,7 +171,7 @@ result_t<void> Bus_espidf_usb_cdc::release()
     portEXIT_CRITICAL_SAFE(&s_usb_cdc_mux);
 
     if (!waitUsbCdcRxCallbacksDrained(itf)) {
-        return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+        return bus::CloseOutcome::partialOrUnknown(error::error_t::TIMEOUT_ERROR);
     }
 
     tinyusb_cdcacm_deinit(itf);
@@ -180,16 +187,16 @@ result_t<void> Bus_espidf_usb_cdc::release()
     }
 
     _installed = false;
-    return {};
+    return bus::CloseOutcome::success();
 }
 
-result_t<size_t> Bus_espidf_usb_cdc::write(bus::IAccessor* owner, const AccessConfig& cfg, data::Source* src,
-                                           size_t len)
+result_t<size_t> Bus_espidf_usb_cdc::writeBackend(bus::OperationContext<AccessConfig>& context, data::Source* src,
+                                                  size_t len)
 {
-    auto result = Bus_streaming::write(owner, cfg, src, len);
+    auto result = Bus_streaming::writeBackend(context, src, len);
     if (_installed) {
-        esp_err_t err = tinyusb_cdcacm_write_flush(_itf, ticks(cfg.write_timeout_ms));
-        return completeWrite(std::move(result), mapEspErr(err));
+        esp_err_t err = tinyusb_cdcacm_write_flush(_itf, ticks(context.config.write_timeout_ms));
+        return completeWrite(std::move(result), impl_espidf::mapEspErr(err));
     }
     return result;
 }
@@ -218,7 +225,7 @@ result_t<size_t> Bus_espidf_usb_cdc::rawRead(uint8_t* buf, size_t len, uint32_t 
     size_t rx_size = 0;
     esp_err_t err  = tinyusb_cdcacm_read(_itf, buf, len, &rx_size);
     if (err != ESP_OK && err != ESP_FAIL) {
-        return m5::stl::make_unexpected(mapEspErr(err));
+        return m5::stl::make_unexpected(impl_espidf::mapEspErr(err));
     }
     if (rx_size > 0) {
         return rx_size;
@@ -226,7 +233,7 @@ result_t<size_t> Bus_espidf_usb_cdc::rawRead(uint8_t* buf, size_t len, uint32_t 
     if (_rx_sem != nullptr && xSemaphoreTake(_rx_sem, ticks(timeout_ms)) == pdTRUE) {
         err = tinyusb_cdcacm_read(_itf, buf, len, &rx_size);
         if (err != ESP_OK && err != ESP_FAIL) {
-            return m5::stl::make_unexpected(mapEspErr(err));
+            return m5::stl::make_unexpected(impl_espidf::mapEspErr(err));
         }
         return rx_size;
     }
@@ -239,23 +246,6 @@ result_t<size_t> Bus_espidf_usb_cdc::rawReadableBytes()
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
     return static_cast<size_t>(tud_cdc_n_available(static_cast<uint8_t>(_itf)));
-}
-
-error::error_t Bus_espidf_usb_cdc::mapEspErr(esp_err_t err)
-{
-    switch (err) {
-        case ESP_OK:
-            return error::error_t::OK;
-        case ESP_ERR_INVALID_ARG:
-        case ESP_ERR_INVALID_STATE:
-            return error::error_t::INVALID_ARGUMENT;
-        case ESP_ERR_TIMEOUT:
-            return error::error_t::TIMEOUT_ERROR;
-        case ESP_ERR_NO_MEM:
-            return error::error_t::OUT_OF_RESOURCE;
-        default:
-            return error::error_t::IO_ERROR;
-    }
 }
 
 }  // namespace m5::hal::v2::uart

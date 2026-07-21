@@ -6,14 +6,12 @@
 
 namespace m5::hal::v2::data {
 
-MuxFrameEncoder::MuxFrameEncoder(memory::Allocator& alloc) : _output{alloc}, _alloc{&alloc}
+MuxFrameEncoder::MuxFrameEncoder() : MuxFrameEncoder{memory::defaultAllocator()}
 {
 }
 
-void MuxFrameEncoder::setAllocator(memory::Allocator& alloc)
+MuxFrameEncoder::MuxFrameEncoder(memory::Allocator& alloc) : _output{alloc}, _alloc{&alloc}
 {
-    _alloc = &alloc;
-    _output.setAllocator(alloc);
 }
 
 bool MuxFrameEncoder::attach(uint8_t stream_id, Source& src)
@@ -230,15 +228,14 @@ void MuxFrameEncoder::releaseAll()
     }
 }
 
-MuxFrameDecoder::MuxFrameDecoder(memory::Allocator& alloc) : _alloc{&alloc}
+MuxFrameDecoder::MuxFrameDecoder() : MuxFrameDecoder{memory::defaultAllocator()}
 {
 }
 
-void MuxFrameDecoder::setAllocator(memory::Allocator& alloc)
+MuxFrameDecoder::MuxFrameDecoder(memory::Allocator& alloc) : _alloc{&alloc}
 {
-    _alloc = &alloc;
     for (auto& s : _streams) {
-        s.blocks.setAllocator(alloc);
+        s.blocks.bindAllocatorOnce(alloc);
     }
 }
 
@@ -297,7 +294,6 @@ Source* MuxFrameDecoder::createBlockStream(uint8_t stream_id)
     if (s.active) {
         return s.block_mode ? static_cast<Source*>(&s.blocks) : static_cast<Source*>(&s.ring.source());
     }
-    s.blocks.setAllocator(*_alloc);
     s.direct_sink = nullptr;
     s.block_mode  = true;
     s.active      = true;
@@ -663,12 +659,11 @@ bool MuxFrameDecoder::deliverBlockData(MuxFrameDecoder::Stream& s, ConstDataSpan
     if (_alloc == nullptr || payload.size > memory::Allocator::tempBlockSize()) {
         return false;
     }
-    const size_t before = _alloc->usedBlocks();
-    auto* block         = static_cast<uint8_t*>(_alloc->allocate(payload.size, memory::usage_t::Temp));
+    auto* block = static_cast<uint8_t*>(_alloc->allocate(payload.size, memory::usage_t::Temp));
     if (block == nullptr) {
         return false;
     }
-    if (_alloc->usedBlocks() == before) {
+    if (!_alloc->isTempPoolAllocation(block)) {
         _alloc->deallocate(block);
         return false;
     }

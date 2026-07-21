@@ -48,6 +48,8 @@ namespace は `m5::hal::v2::data` で統一 (namespace 表記の規約は [../ar
 
 Span は constexpr の軽量 helper を持つ: `empty()` / `begin()` / `end()` (range-for 可) / `first(n)` / `subspan(offset, count)`。 `first` / `subspan` は範囲外を **clamp** する (UB にしない)。
 
+Span の well-formed 条件は、`size != 0` なら `data` が少なくとも `size` byte の有効範囲を指すこと。`size == 0` のときだけ `data == nullptr` を許容する。default empty Span の `begin()` / `end()` / `first()` / `subspan()` は null を保存し、null pointer arithmetic を行わない。
+
 ## 向き (direction) の規約
 
 `src` / `dst` の命名は **subject-free**。 「master」 や 「ワイヤ」 を基準にせず、 **その API を通るバイトの動き** だけで決まる:
@@ -117,7 +119,7 @@ public:
 - **`commit(N)`**: 通常は直前の `reserve` で返した DataSpan に書き込んだ量を報告する。 `N ≤ reserve size` であること
 - **契約違反は未定義動作 (UB)** — `commit size > reserve size`、 `reserve` なしで `commit`、 等は派生実装に依存し一般に未定義。 派生実装は size 検証ロジックを **持たなくてよい** (任意で debug assert を持つことを推奨)
 - **`closed()`**: 「これ以上書き込めない」 final state の問い合わせ
-- **`partialCommitAccepted()` (部分 commit の受理数)**: ほとんどの派生では `commit(N)` は atomic (成功なら N 全量、 失敗なら 0) だが、 `commit` 自体が内部でブロッキング I/O を行う派生 (`StreamSink` が transport `write` をラップする場合など) は、 その I/O が N より短いプレフィックスだけ受理してからエラーを返し得る。 `partialCommitAccepted()` は直近の失敗した `commit()` が実際に受理したバイト数を返す。 デフォルト実装は 0 で、 commit が atomic な派生 (`MemorySink`/`RingFIFO::SinkView` 等) はこれで正しい。 デコレータ (`LimitedSink`) は base の受理数を転送する。`StdioSink` は `fwrite` の短い戻りまたは `fflush` 失敗を `IO_ERROR` として返し、`fwrite` が受理したプレフィックス長を `partialCommitAccepted()` で公開する。 `Source`/`Sink` を介して転送を中継する caller (§stream 系: `remote::detail::drainToSink` 等) は、 `commit` 失敗時にこの値だけ upstream の `Source::advance` を呼ぶことで、 「受理済みバイトを二度と再送しない・未受理バイトを捨てない (残りは次回の pump で再開)」 という中継契約を実装する
+- **`partialCommitAccepted()` (部分 commit の受理数)**: ほとんどの派生では `commit(N)` は atomic (成功なら N 全量、 失敗なら 0) だが、 `commit` 自体が内部でブロッキング I/O を行う派生 (`StreamSink` が transport `write` をラップする場合など) は、 その I/O が N より短いプレフィックスだけ受理してからエラーを返し得る。 `partialCommitAccepted()` は直近の失敗した `commit()` が実際に受理したバイト数を返す。 デフォルト実装は 0 で、 commit が atomic な派生 (`MemorySink`/`RingFIFO::SinkView` 等) はこれで正しい。 デコレータ (`LimitedSink`) は base の受理数を転送する。`StreamWriter` にも同じ理由で `partialWriteAccepted()` があり、`StreamSink` は hard error 前に writer が受理した prefix を転送する。`StdioSink` は `fwrite` の短い戻りまたは `fflush` 失敗を `IO_ERROR` として返し、`fwrite` が受理したプレフィックス長を `partialCommitAccepted()` で公開する。 `Source`/`Sink` を介して転送を中継する caller (§stream 系: `remote::detail::drainToSink` 等) は、 `commit` 失敗時にこの値だけ upstream の `Source::advance` を呼ぶことで、「受理済みバイトを二度と再送しない・未受理バイトを捨てない」という中継契約を実装する。`StreamSink`のshort-write `TIMEOUT_ERROR`はretryable backpressureとしてwould-blockへ変換し、tailを次回pumpに残す。`IO_ERROR` / `CLOSED`等はprefix反映後もhard errorとして返す。open な空 Source/Sinkはwould-block、closed/drainedは終端として区別する
 
 ## Source と Sink の意図的な非対称性
 
@@ -132,15 +134,15 @@ public:
 
 ## error path の責務
 
-Source / Sink の 4 つの core API (`peek` / `advance` / `reserve` / `commit`) は全て `result_t<...>` を返す。 これは **将来の stream 通信派生 (TCP/UDP/network ringbuffer/DMA/remote bus 等、 真の I/O error を発生させ得る派生) を視野に入れた抽象基底の規約**。 typical な同期メモリ系派生 (`MemorySource` / `MemorySink`) が現状 error を返さないのは **派生実装の現状であり、 抽象基底の規約ではない**。`LimitedSource` / `LimitedSink` は自ら新しい error を生成しないが、base の error はそのまま伝播する。
+Source / Sink の 4 つの core API (`peek` / `advance` / `reserve` / `commit`) は全て `result_t<...>` を返す。 これは **stream / network / DMA / remote 等、実 I/O error を発生させ得る派生を受け入れる抽象基底の規約**。 typical な同期メモリ系派生 (`MemorySource` / `MemorySink`) が現状 error を返さないのは **派生実装の現状であり、 抽象基底の規約ではない**。`LimitedSource` / `LimitedSink` は自ら新しい error を生成しないが、base の error はそのまま伝播する。
 
 ### caller 側の遵守事項
 
 `Source*` / `Sink*` を受け取る一般 API (例: `IBus::transfer(..., Source*, Sink*)`) を実装する側、 もしくは Source / Sink を直接利用する caller は以下を遵守:
 
 - **4 API すべての戻り値で `has_value()` チェックを行い、 error 時の path を持つ**
-- 「現状 error を返さない派生 (`MemorySource` 等) を渡している」 を根拠に caller 側で error path を **省略してはいけない**。 同じ caller 関数が将来 stream 派生を渡されたとき、 error path 不在は silent fail を生む
-- `IBus::transfer` のように渡される派生を限定しない契約の API では、 caller の error path 整備は必須。 派生型を限定して compile-time に省略可能と判断する path は、 将来別途 trait / template ベースで設計余地があるが、 現状の virtual API ではサポート対象外
+- 「現状 error を返さない派生 (`MemorySource` 等) を渡している」 を根拠に caller 側で error path を **省略してはいけない**。 同じ caller 関数へI/O-backed派生を渡したとき、 error path 不在は silent fail を生む
+- `IBus::transfer` のように渡される派生を限定しない契約の API では、 caller の error path 整備は必須。現行virtual APIは、派生型を限定したcompile-timeなerror path省略をサポートしない
 
 ### 派生実装者の責務
 
@@ -148,9 +150,9 @@ Source / Sink の 4 つの core API (`peek` / `advance` / `reserve` / `commit`) 
 
 - error を返す condition (どの I/O event で何の `error_t` を返すか、 もしくは「error を返さない」 の明示宣言)
 - error 後の cursor / 内部状態 (`advance` / `commit` を続けてよいか、 reset 規約、 二度目以降の呼び出しでも同 error を返すか)
-- 現状 error を返さない派生でも「**caller は error path を省略しない**」 旨を docstring に書く (将来 stream 派生を念頭に置いた抽象規約)
+- 現状 error を返さない派生でも「**caller は error path を省略しない**」 旨を docstring に書く (I/O-backed派生も受け入れる抽象規約)
 
-### 将来の stream 派生で想定する error_t
+### I/O-backed派生の error_t
 
 参考想定 (`error_t` 細分化の検討余地と整合):
 
@@ -169,7 +171,7 @@ stream / frame / remote 系で必要になる粒度は v2 `error_t` に追加済
 |---|---|
 | `Chunk` (lifetime 管理 + frame hint) | I2C / SPI register access 中心のスコープで過剰。 所有権移譲が必要になったら別途 `OwnedSpan` 等で導入 |
 | `TransferResult` (`{transferred, error}`) | 既存 `result_t<size_t>` で十分。 「途中まで成功」 を細かく表現する必要が出てきたら別途検討 |
-| `Completion` (非同期 handle) | sync 通信前提。 非同期サポートは将来の拡張余地として残す |
+| `Completion` (非同期 handle) | 現行はsync通信が正本。非同期機構を追加しても別APIとし、sync契約を変えない |
 | NVI (Non-Virtual Interface) パターン | 素直な virtual API を採る ([../style/coding_style.md](../style/coding_style.md) 参照) |
 
 ## 派生具象一覧
@@ -201,11 +203,12 @@ transport 側は以下の最小能力だけを実装する:
 
 ```cpp
 struct StreamReader {   // pull 側
-    expected<size_t, error_t> read(DataSpan dst);   // 実装側の timeout 規約でブロック。 0 = 期限内に未着
-    expected<size_t, error_t> readableBytes();      // ブロックせず読める byte 数
+    result_t<size_t> read(DataSpan dst);   // 実装側の timeout 規約でブロック。 0 = 期限内に未着
+    result_t<size_t> readableBytes();      // ブロックせず読める byte 数
 };
 struct StreamWriter {   // push 側
-    expected<size_t, error_t> write(ConstDataSpan src);  // 受理 byte 数を返す (timeout で短い write があり得る)
+    result_t<size_t> write(ConstDataSpan src);  // 受理 byte 数を返す (timeout で短い write があり得る)
+    size_t partialWriteAccepted() const;        // failing write前に受理したprefix。default 0
 };
 ```
 
@@ -219,7 +222,8 @@ UART の split accessor (`TxAccessor` / `RxAccessor`、 [uart.md](uart.md)) は�
 - **ブロッキング規約**: 要求 (`max_len`) をバッファで満たせない `peek` は、 不足分を実装側 read で 1 回ブロックして補充する (UART なら first_byte / inter_byte timeout 準拠)。要求が既にバッファ内にあれば即座に返る。 ブロックさせたくない caller は先に `readableBytes` を確認し、 その分だけ peek する
 - **peek 上限 = scratch 容量**: `peek(max_len)` は scratch 容量までしか返さない (契約は「最大 max_len」 なので適合)。 consumer は短い peek を前提に書く
 - **skip 予約**: バッファを超える `advance` は超過分を予約として保持し、 readable な分を即時読み捨て、 残りは後続の `peek` / `advance` が自動消費する (§Source の stream 系規約)
-- **`StreamSink` はパススルー**: `reserve` は scratch を貸し出し (連続 reserve は同一 span で冪等)、 `commit(N)` が scratch 先頭 N byte を `write` する。 writer が N byte 未満しか受理しなかった場合は `TIMEOUT_ERROR` (retryable。 short write の支配的要因は writer 自身の write timeout で、 fatal に見せる `IO_ERROR` より read 側と対称な TIMEOUT_ERROR が適切 — `stream.inl` 参照)。 detached (null writer) への `commit` は黙って捨てず `CLOSED` を返す。 このとき writer が実際に受理した prefix 長は `partialCommitAccepted()` (§Sink の契約) 経由で読める — 中継 caller はこれで受理済み分だけ upstream を進め、 未受理分を次回に残す
+- **`StreamSink` はパススルー**: `reserve` は scratch を貸し出し (連続 reserve は同一 span で冪等)、 `commit(N)` が scratch 先頭 N byte を `write` する。 writer が N byte 未満しか受理しなかった場合は `TIMEOUT_ERROR` (retryable。 short write の支配的要因は writer 自身の write timeout で、 fatal に見せる `IO_ERROR` より read 側と対称な TIMEOUT_ERROR が適切 — `stream.inl` 参照)。 detached (null writer) への `commit` は黙って捨てず `CLOSED` を返す。short writeだけでなくhard error前にwriterが受理したprefixも`partialWriteAccepted()`から取り込み、`partialCommitAccepted()` (§Sink の契約) 経由で公開する。中継 caller はこれで受理済み分だけ upstream を進め、未受理分を再送しない
+- **過大報告はadapter fault**: `read(dst)` が `dst.size` より大きい値、`write(src)` または `partialWriteAccepted()` が `src.size` より大きい値を返すのはtransport実装の契約違反。cursor・buffered・accepted countを更新する前に検査し、debugではassert、releaseでは`IO_ERROR`を返す。そのadapterは以後も`IO_ERROR`を返し、回復には再構築を要する。値をclampして継続しない
 - **接続開始時の flush**: `StreamSource::discardBuffered()` がアダプタ内のバッファ済みバイトと skip 予約を破棄する (相手のブートノイズや前回接続の残骸を次の peek に持ち越さないための入口。 TCP server の接続受入が利用 — [remote.md](remote.md) §TCP トランスポート、 実装 = `variants/frameworks/bsd/hal/remote/tcp_server.inl`)。 transport 側の受信キューは対象外 — 完全な flush が要る場合は transport レベル (posix なら `tcflush`) と併用する。 過去の peek で借用した span は無効化される
 
 ### Tap 装飾 (観測ミラー)

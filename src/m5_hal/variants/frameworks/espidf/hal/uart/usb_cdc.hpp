@@ -11,6 +11,8 @@
 #if defined(SOC_USB_OTG_SUPPORTED) && SOC_USB_OTG_SUPPORTED && defined(CONFIG_TINYUSB_CDC_ENABLED) && \
     CONFIG_TINYUSB_CDC_ENABLED && __has_include(<tinyusb.h>)
 
+#include "../../../freertos/hal/runtime/time.hpp"
+
 #include <esp_err.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -48,27 +50,45 @@ class Bus_espidf_usb_cdc : public uart::Bus_streaming {
 public:
     ~Bus_espidf_usb_cdc() override
     {
-        (void)release();
+        // teardownBackend() is bounded and may leave callback-
+        // owned state alive on TIMEOUT_ERROR. Object destruction cannot return
+        // while such a callback still holds `this`, so retry until teardown
+        // completes instead of freeing the object behind it.
+        while (_installed) {
+            (void)teardownBackend();
+        }
     }
 
     result_t<void> init(tinyusb_cdcacm_itf_t itf = TINYUSB_CDC_ACM_0);
-    result_t<void> release() override;
-
-    result_t<size_t> write(bus::IAccessor* owner, const uart::AccessConfig& cfg, data::Source* src,
-                           size_t len) override;
+    result_t<void> close(void)
+    {
+        return bus::IBus::close();
+    }
+    types::backend_kind_t backendKind(void) const override
+    {
+        return types::backend_kind_t::Hardware;
+    }
 
 protected:
+    result_t<size_t> writeBackend(bus::OperationContext<uart::AccessConfig>& context, data::Source* src,
+                                  size_t len) override;
+
+    bus::CloseOutcome closeBackend(void) override
+    {
+        return teardownBackend();
+    }
+
     result_t<size_t> rawWrite(const uint8_t* data, size_t len, uint32_t timeout_ms) override;
     result_t<size_t> rawRead(uint8_t* buf, size_t len, uint32_t timeout_ms) override;
     result_t<size_t> rawReadableBytes() override;
 
 private:
+    bus::CloseOutcome teardownBackend(void);
     void onRxReady();
 
-    static error::error_t mapEspErr(esp_err_t err);
     static TickType_t ticks(uint32_t timeout_ms)
     {
-        return pdMS_TO_TICKS(timeout_ms);
+        return ::m5::hal::v2::detail::timeoutMsToTicks(timeout_ms);
     }
 
     tinyusb_cdcacm_itf_t _itf = TINYUSB_CDC_ACM_0;

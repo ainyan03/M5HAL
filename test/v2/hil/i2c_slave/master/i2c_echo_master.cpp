@@ -100,11 +100,10 @@ extern "C" void app_main(void)
     // is the only difference between the HW (espidf) and bit-banged (software) masters
     // -- MasterAccessor::transfer() drives either through the same IBus interface.
 #if defined(ECHO_MASTER_SOFTWARE)
-    m5hal::i2c::BusConfig_software bus_cfg{m5hal::i2c::Scl{PIN_SCL}, m5hal::i2c::Sda{PIN_SDA}};
+    m5hal::i2c::BusConfig bus_cfg{m5hal::i2c::Scl{PIN_SCL}, m5hal::i2c::Sda{PIN_SDA}};
     m5hal::i2c::Bus_software bus;
 #else
-    m5hal::i2c::BusConfig_espidf bus_cfg{m5hal::i2c::Scl{PIN_SCL}, m5hal::i2c::Sda{PIN_SDA}};
-    bus_cfg.i2c_port = 0;
+    m5hal::i2c::BusConfig bus_cfg{m5hal::i2c::Scl{PIN_SCL}, m5hal::i2c::Sda{PIN_SDA}};
     m5hal::i2c::Bus_espidf bus;
 #endif
     auto bus_init = bus.init(bus_cfg);

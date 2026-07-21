@@ -119,17 +119,10 @@ struct Rx {
   RTS / CTS and the buffer sizes stay at their defaults and are set by
   field assignment when needed.
 
-  This tag one-liner is for the MCU variants (`BusConfig_espidf` /
-  `BusConfig_arduino`, which inherit it). The POSIX host variant
-  (`BusConfig_posix`) deliberately omits the pin ctor — its endpoint selector
-  is a `device_path` (which serial device to open), not pins, so it is built
-  by field assignment (`cfg.device_path = "/dev/ttyUSB0";`) to avoid a pin
-  one-liner that looks complete while leaving `device_path` unset. Note that
-  `device_path` is a backend endpoint selector, NOT the shared-registry bus
-  identity (which is the TX/RX pin pair — see `identityFromConfig` below);
-  path-keyed acquire through the shared registry is not supported. `uart::BusConfig` resolves to
-  the active build's variant, so the pin one-liner above compiles on an MCU
-  build but not on a native/POSIX build (see spec/design/uart.md §pin).
+  The portable config always uses this tag one-liner. Native endpoints such as
+  a POSIX device path are supplied separately through an explicit native
+  ownership policy; they are not part of the shared-registry bus identity
+  (which is the TX/RX pin pair — see `identityFromConfig` below).
  */
 struct IBusConfig : public bus::IBusConfig {
     types::gpio_number_t pin_tx  = -1;
@@ -151,6 +144,9 @@ struct IBusConfig : public bus::IBusConfig {
     {
     }
 };
+
+/*! @brief Variant-independent portable UART bus configuration. */
+using BusConfig = IBusConfig;
 
 /*!
   @brief Pin + intent acquire request for the unified BusView surface.
@@ -180,9 +176,10 @@ struct LogicalBusConfig {
 
   Reads wait `first_byte_timeout_ms` for the first byte and
   `inter_byte_timeout_ms` between subsequent bytes; expiry is a normal
-  short read, not an error. `write_timeout_ms` bounds the write/drain
-  wait (the backends differ in what "drained" means — the contract
-  table is in spec/design/uart.md). Channel-lock acquisition is NOT a
+  short read, not an error. `write_timeout_ms` bounds backend write waits;
+  an `endAccess(timeout_ms)` budget bounds completion work such as a
+  physical drain (the backend contract table is in spec/design/uart.md).
+  Channel-lock acquisition is NOT a
   config concern: it is a per-call argument of `beginAccess` on the TX
   or RX channel accessor (default: wait forever).
  */
@@ -206,17 +203,11 @@ struct IBus;
 /*!
   @brief TX-side accessor; locks only the TX channel.
 
-  TX and RX are independent channel locks, so one owner can write
-  while another reads. `beginAccess` / `endAccess` (TX channel) nest
-  through a depth counter (like `Accessor::beginAccess`), and the write
-  sugars open the window themselves when needed.
-
-  A UART transaction is a TX channel exclusion scope plus byte-count
-  aggregation; it has no physical CS or bus-occupancy side effect. Accessors
-  must not be shared between threads. The transaction depth is only for
-  same-owner reentry, while sharing the Bus through separate accessors is
-  supported. `setConfig` fails with `INVALID_STATE` while an access window is
-  open.
+  TX and RX are independent channel locks, so one owner can write while
+  another reads. An Access is non-nestable. `beginAccess` locks the TX
+  channel and invokes the backend operation-start hook; `endAccess` invokes
+  the matching operation-end hook and releases the channel. Write sugars
+  borrow an active Access or open and close a temporary one.
  */
 struct TxAccessor : public bus::IAccessor, public data::StreamWriter {
     TxAccessor(IBus& bus, const AccessConfig& access_config);
@@ -224,65 +215,57 @@ struct TxAccessor : public bus::IAccessor, public data::StreamWriter {
     TxAccessor(std::shared_ptr<IBus> bus, const AccessConfig& access_config);
 
     /*! @name Unbound construction + typed bind (gate: `beginAccess` on TX channel). @{ */
-    TxAccessor(void) = default;
-    explicit TxAccessor(const AccessConfig& access_config) : _access_config{access_config}
+    TxAccessor(void) : _context{makeOperationContext(AccessConfig{})}
+    {
+    }
+    explicit TxAccessor(const AccessConfig& access_config) : _context{makeOperationContext(access_config)}
     {
     }
     /*! @brief Bind (or rebind) to a UART bus; rejected while the TX window is open. */
-    result_t<void> bind(IBus& bus);
+    [[nodiscard]] result_t<void> bind(IBus& bus);
     /*! @} */
 
-    // Non-copyable: an accessor carries lock/depth state and (as one half of
+    // Non-copyable: an accessor carries operation state and (as one half of
     // a combined `Accessor`) a lock-peer identity; a copy would alias both.
     TxAccessor(const TxAccessor&)            = delete;
     TxAccessor& operator=(const TxAccessor&) = delete;
 
     const AccessConfig& getConfig(void) const override
     {
-        return _access_config;
+        return _context.config;
     }
     IBus& getBus(void) const;
 
-    result_t<void> setConfig(const AccessConfig& cfg);
-    result_t<void> beginAccess(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
-    result_t<void> endAccess(void);
+    [[nodiscard]] result_t<void> setConfig(const AccessConfig& cfg);
+    [[nodiscard]] result_t<void> beginAccess(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+    [[nodiscard]] result_t<void> endAccess(uint32_t timeout_ms = 1000);
     bool inAccess(void) const
     {
-        return _tx_access_depth > 0;
+        return _inOperationAccess();
     }
 
-    result_t<void> beginTransaction(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
-    result_t<bus::TransferTotals> endTransaction(void);
-    bool inTransaction(void) const
-    {
-        return _tx_txn_depth > 0;
-    }
+    result_t<bus::TransferStatus> getLastTransferStatus(void) const;
 
     result_t<size_t> write(data::ConstDataSpan src_bytes) override;
     result_t<size_t> write(data::Source& src, size_t len);
     result_t<size_t> write(const uint8_t* src, size_t len);
 
-protected:
-    AccessConfig _access_config;
-
 private:
-    uint32_t _tx_access_depth = 0;
-    uint32_t _tx_txn_depth    = 0;
-    bus::TransferTotals _tx_txn_totals;
+    friend struct Accessor;
+    void beginTransferStatus(void);
+    void finishTransferStatus(result_t<size_t>& result, size_t requested);
+
+    bus::OperationContext<AccessConfig> _context;
+    bus::TransferStatus _last_transfer_status;
+    uint32_t _next_transfer_id = 0;
 };
 
 /*!
   @brief RX-side accessor; locks only the RX channel.
 
-  The mirror of `TxAccessor`: independent channel lock, depth
-  counter via `beginAccess` / `endAccess` (RX channel), and `setConfig`
-  fails with `INVALID_STATE` while an access window is open.
-
-  A UART transaction is an RX channel exclusion scope plus byte-count
-  aggregation; it has no physical CS or bus-occupancy side effect. Accessors
-  must not be shared between threads. The transaction depth is only for
-  same-owner reentry, while sharing the Bus through separate accessors is
-  supported.
+  The mirror of `TxAccessor`: a non-nestable operation scope on the RX
+  channel. Read sugars borrow an active Access or open and close a temporary
+  one. `setConfig` fails while an Access is active.
  */
 struct RxAccessor : public bus::IAccessor, public data::StreamReader {
     RxAccessor(IBus& bus, const AccessConfig& access_config);
@@ -290,12 +273,14 @@ struct RxAccessor : public bus::IAccessor, public data::StreamReader {
     RxAccessor(std::shared_ptr<IBus> bus, const AccessConfig& access_config);
 
     /*! @name Unbound construction + typed bind (gate: `beginAccess` on RX channel). @{ */
-    RxAccessor(void) = default;
-    explicit RxAccessor(const AccessConfig& access_config) : _access_config{access_config}
+    RxAccessor(void) : _context{makeOperationContext(AccessConfig{})}
+    {
+    }
+    explicit RxAccessor(const AccessConfig& access_config) : _context{makeOperationContext(access_config)}
     {
     }
     /*! @brief Bind (or rebind) to a UART bus; rejected while the RX window is open. */
-    result_t<void> bind(IBus& bus);
+    [[nodiscard]] result_t<void> bind(IBus& bus);
     /*! @} */
 
     // Non-copyable: see TxAccessor.
@@ -304,24 +289,19 @@ struct RxAccessor : public bus::IAccessor, public data::StreamReader {
 
     const AccessConfig& getConfig(void) const override
     {
-        return _access_config;
+        return _context.config;
     }
     IBus& getBus(void) const;
 
-    result_t<void> setConfig(const AccessConfig& cfg);
-    result_t<void> beginAccess(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
-    result_t<void> endAccess(void);
+    [[nodiscard]] result_t<void> setConfig(const AccessConfig& cfg);
+    [[nodiscard]] result_t<void> beginAccess(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+    [[nodiscard]] result_t<void> endAccess(uint32_t timeout_ms = 1000);
     bool inAccess(void) const
     {
-        return _rx_access_depth > 0;
+        return _inOperationAccess();
     }
 
-    result_t<void> beginTransaction(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
-    result_t<bus::TransferTotals> endTransaction(void);
-    bool inTransaction(void) const
-    {
-        return _rx_txn_depth > 0;
-    }
+    result_t<bus::TransferStatus> getLastTransferStatus(void) const;
 
     result_t<size_t> read(data::DataSpan dst_bytes) override;
     result_t<size_t> read(data::Sink& dst, size_t len);
@@ -341,13 +321,14 @@ struct RxAccessor : public bus::IAccessor, public data::StreamReader {
 
     result_t<size_t> readableBytes(void) override;
 
-protected:
-    AccessConfig _access_config;
-
 private:
-    uint32_t _rx_access_depth = 0;
-    uint32_t _rx_txn_depth    = 0;
-    bus::TransferTotals _rx_txn_totals;
+    friend struct Accessor;
+    void beginTransferStatus(void);
+    void finishTransferStatus(result_t<size_t>& result, size_t requested);
+
+    bus::OperationContext<AccessConfig> _context;
+    bus::TransferStatus _last_transfer_status;
+    uint32_t _next_transfer_id = 0;
 };
 
 /*!
@@ -377,7 +358,7 @@ struct Accessor {
         wireLockPeers();
     }
     /*! @brief Bind (or rebind) both channel accessors; rejected while either window is open. */
-    result_t<void> bind(IBus& bus);
+    [[nodiscard]] result_t<void> bind(IBus& bus);
     /*! @} */
 
     // Non-copyable: the TX/RX children point at EACH OTHER through
@@ -410,13 +391,15 @@ struct Accessor {
         return _rx;
     }
 
-    result_t<void> setConfig(const AccessConfig& cfg);
-    result_t<void> beginAccess(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
-    result_t<void> endAccess(void);
+    [[nodiscard]] result_t<void> setConfig(const AccessConfig& cfg);
+    [[nodiscard]] result_t<void> beginAccess(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+    [[nodiscard]] result_t<void> endAccess(uint32_t timeout_ms = 1000);
     bool inAccess(void) const
     {
         return _tx.inAccess() || _rx.inAccess();
     }
+
+    result_t<bus::TransferStatus> getLastTransferStatus(void) const;
 
     result_t<size_t> write(data::ConstDataSpan src_bytes);
     result_t<size_t> write(data::Source& src, size_t len);
@@ -435,11 +418,13 @@ struct Accessor {
     result_t<size_t> readableBytes(void);
 
 private:
+    void adoptTransferStatus(const result_t<bus::TransferStatus>& before, const result_t<bus::TransferStatus>& after);
+
     /*!
       @brief Cross-wire `_tx` / `_rx` as each other's lock peer
-             (bus::IAccessor::lockPeer) so the reconfiguration quiescence
-             gate recognizes the two channel accessors as one logical
-             holder. Called from every ctor (the bus-ref / shared_ptr
+             (bus::IAccessor::lockPeer) so the reconfiguration gate can
+             recognize a peer hold and reject a divergent config without a
+             same-task try-lock. Called from every ctor (the bus-ref / shared_ptr
              ctors below call it from their .inl bodies).
      */
     void wireLockPeers(void)
@@ -451,6 +436,9 @@ private:
 protected:
     TxAccessor _tx;
     RxAccessor _rx;
+    bool _combined_active = false;
+    bus::TransferStatus _last_transfer_status;
+    uint32_t _next_transfer_id = 0;
 };
 
 /*!
@@ -470,8 +458,11 @@ struct IBus : public bus::IBus {
         return _config;
     }
 
-    virtual result_t<size_t> write(bus::IAccessor* owner, const AccessConfig& cfg, data::Source* src, size_t len);
-    virtual result_t<size_t> read(bus::IAccessor* owner, const AccessConfig& cfg, data::Sink* dst, size_t len);
+    result_t<void> beginOperation(bus::OperationContext<AccessConfig>& context);
+    result_t<void> endOperation(bus::OperationContext<AccessConfig>& context);
+
+    result_t<size_t> write(bus::OperationContext<AccessConfig>& context, data::Source* src, size_t len);
+    result_t<size_t> read(bus::OperationContext<AccessConfig>& context, data::Sink* dst, size_t len);
     /*!
       @brief Transfer bytes in both independent UART directions.
 
@@ -482,15 +473,65 @@ struct IBus : public bus::IBus {
       it. If either step fails, the error is returned immediately, and bytes
       from the earlier step may already have moved.
      */
-    virtual result_t<bus::TransferTotals> transfer(bus::IAccessor* owner, const AccessConfig& cfg, data::Source* src,
-                                                   size_t tx_len, data::Sink* dst, size_t rx_len);
-    virtual result_t<size_t> readableBytes(bus::IAccessor* owner, const AccessConfig& cfg);
+    result_t<bus::TransferTotals> transfer(bus::OperationContext<AccessConfig>& tx_context,
+                                           bus::OperationContext<AccessConfig>& rx_context, data::Source* src,
+                                           size_t tx_len, data::Sink* dst, size_t rx_len);
+    result_t<size_t> readableBytes(bus::OperationContext<AccessConfig>& context);
 
-    result_t<void> lock(bus::IAccessor* owner, uint32_t timeout_ms = types::TIMEOUT_FOREVER) override;
-    result_t<void> unlock(bus::IAccessor* owner) override;
-    virtual result_t<void> lockChannel(bus::IAccessor* owner, Channel ch, uint32_t timeout_ms = types::TIMEOUT_FOREVER);
-    virtual result_t<void> unlockChannel(bus::IAccessor* owner, Channel ch);
+protected:
+    virtual result_t<void> beginOperationBackend(bus::OperationContext<AccessConfig>& context);
+    virtual result_t<void> endOperationBackend(bus::OperationContext<AccessConfig>& context);
+    virtual result_t<size_t> writeBackend(bus::OperationContext<AccessConfig>& context, data::Source* src, size_t len);
+    virtual result_t<size_t> readBackend(bus::OperationContext<AccessConfig>& context, data::Sink* dst, size_t len);
+    virtual result_t<bus::TransferTotals> transferBackend(bus::OperationContext<AccessConfig>& tx_context,
+                                                          bus::OperationContext<AccessConfig>& rx_context,
+                                                          data::Source* src, size_t tx_len, data::Sink* dst,
+                                                          size_t rx_len);
+    virtual result_t<size_t> readableBytesBackend(bus::OperationContext<AccessConfig>& context);
 
+    static result_t<void> beginOperationOn(IBus& backend, bus::OperationContext<AccessConfig>& context)
+    {
+        return backend.beginOperationBackend(context);
+    }
+    static result_t<void> endOperationOn(IBus& backend, bus::OperationContext<AccessConfig>& context)
+    {
+        return backend.endOperationBackend(context);
+    }
+    static result_t<size_t> writeOn(IBus& backend, bus::OperationContext<AccessConfig>& context, data::Source* src,
+                                    size_t len)
+    {
+        return backend.writeBackend(context, src, len);
+    }
+    static result_t<size_t> readOn(IBus& backend, bus::OperationContext<AccessConfig>& context, data::Sink* dst,
+                                   size_t len)
+    {
+        return backend.readBackend(context, dst, len);
+    }
+    static result_t<bus::TransferTotals> transferOn(IBus& backend, bus::OperationContext<AccessConfig>& tx_context,
+                                                    bus::OperationContext<AccessConfig>& rx_context, data::Source* src,
+                                                    size_t tx_len, data::Sink* dst, size_t rx_len)
+    {
+        return backend.transferBackend(tx_context, rx_context, src, tx_len, dst, rx_len);
+    }
+    static result_t<size_t> readableBytesOn(IBus& backend, bus::OperationContext<AccessConfig>& context)
+    {
+        return backend.readableBytesBackend(context);
+    }
+
+    bus::OperationSlot* operationSlot(bus::OperationContext<AccessConfig>& context);
+    const bus::OperationSlot* operationSlot(const bus::OperationContext<AccessConfig>& context) const;
+    bus::IAccessor* operationOwner(bus::OperationContext<AccessConfig>& context);
+
+    friend struct TxAccessor;
+    friend struct RxAccessor;
+    result_t<void> acquireAccessLock(bus::IAccessor& owner, uint32_t timeout_ms = types::TIMEOUT_FOREVER) override;
+    result_t<void> releaseAccessLock(bus::IAccessor& owner) override;
+    virtual result_t<void> lockChannel(bus::IAccessor& owner, Channel ch, uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+    virtual result_t<void> unlockChannel(bus::IAccessor& owner, Channel ch);
+    result_t<void> tryAcquireCloseBarrier(void) override;
+    result_t<void> releaseCloseBarrier(void) override;
+
+public:
     /*!
       @brief Reconfiguration quiescence gate: try to prove BOTH channels are
              idle for `owner` before a variant backend re-applies a changed
@@ -502,19 +543,15 @@ struct IBus : public bus::IBus {
       `Channel::Rx`); `Channel::TxRx` / `Channel::None` is never granted, and
       neither is a `nullptr` owner.
 
-      Granted means: the opposite channel is unheld and this call took it
-      through a non-blocking try-lock, OR the opposite channel's holder is
-      `owner` itself, or `owner`'s lock peer (`bus::IAccessor::lockPeer` --
-      the combined-accessor plumbing letting `uart::Accessor`'s TX/RX
-      children recognize each other as one logical holder). An opposite
-      channel held by some OTHER, unrelated accessor running on the SAME
-      task as the caller is treated as busy (not granted) -- see the
-      same-task step below for why it is never attempted.
+      Granted means that the opposite channel was unheld and this call took
+      it through a non-blocking try-lock. Any existing holder, including
+      `owner` itself or its combined-accessor lock peer, is not quiescent for
+      a line reconfiguration and is therefore not granted.
 
       Implementation note (not caller-visible, but load-bearing): the checks
       run in this order:
         1. Self/peer hold: the opposite channel's lock owner equals `owner`
-           or `owner->lockPeer()` -- granted, nothing to unlock.
+           or `owner->lockPeer()` -- not granted, and no try-lock attempted.
         2. Same-task guard: the opposite channel's lock TASK equals the
            calling task (via `runtime::currentTaskId()`), but its owner is
            neither `owner` nor `owner`'s peer (some unrelated accessor on
@@ -535,7 +572,7 @@ struct IBus : public bus::IBus {
 
       On a granted result the caller MUST call `releaseOppositeChannel`
       after the (re)configuration completes -- on every exit path, including
-      error returns; `must_unlock == false` makes that call a no-op.
+      error returns.
      */
     QuiescenceGrant tryAcquireOppositeChannel(bus::IAccessor* owner, Channel entered);
     /*!
@@ -550,7 +587,7 @@ protected:
     // UART splits the bus lock into independent TX / RX channels, so it
     // carries one runtime::Mutex per channel (the composite txrx lock
     // takes both, TX first); the base Bus mutex stays unused here. Lock
-    // semantics per channel match Bus::lock: wait up to timeout_ms,
+    // semantics per channel match IBus::acquireAccessLock: wait up to timeout_ms,
     // TIMEOUT_ERROR on expiry, non-recursive, task context only.
     //
     // Variant backends (Bus_espidf / Bus_posix / Bus_arduino) additionally
@@ -577,6 +614,8 @@ protected:
     // std::timed_mutex -- see that method's doc comment).
     std::atomic<void*> _tx_lock_task{nullptr};
     std::atomic<void*> _rx_lock_task{nullptr};
+    bus::OperationSlot _tx_operation_slot;
+    bus::OperationSlot _rx_operation_slot;
 };
 
 //-------------------------------------------------------------------------
@@ -609,15 +648,8 @@ inline result_t<void> Accessor::bind(IBus& bus)
     return {};
 }
 
-/*!
-  @brief Maps a variant BusConfig_<variant> to its backend Bus_<variant>.
-
-  Undefined primary on purpose: passing a config type without a
-  specialization to Bus::init is a compile error. Each variant header
-  specializes this next to its Bus_<variant>.
- */
-template <class CfgT>
-struct BackendFor;
+template <class Policy>
+struct NativeProvider;
 
 struct Bus;  // the facade, defined just below
 
@@ -625,9 +657,9 @@ struct Bus;  // the facade, defined just below
   @brief Per-kind Traits for the shared `bus::FacadeCore` and BusView.
 
   UART's `Bus` shares the base spine (backend ownership + `init` +
-  `release` + the query mirror). Its plain `BusView` uses the same traits for
-  typed acquire identity: concrete kind `IBus`, the bus-level config base, the
-  variant selector (`FacadeCore`), the public `BusType`, kind tag, and the 2-pin
+  `close` + the query mirror). Its plain `BusView` uses the same traits for
+  portable acquire identity: concrete kind `IBus`, the bus-level config base,
+  the public `BusType`, kind tag, and the 2-pin
   (TX/RX) identity projection. UART has no intent / hot-swap surface,
   so the master-only Traits members are intentionally absent.
   `Bus` is forward-declared at namespace scope so `BusType` names the public
@@ -638,8 +670,8 @@ struct BusTraits {
     using IBusConfig       = uart::IBusConfig;
     using LogicalBusConfig = uart::LogicalBusConfig;
     using BusType          = Bus;
-    template <class CfgT>
-    using BackendFor = uart::BackendFor<CfgT>;
+    template <class Policy>
+    using NativeProvider = uart::NativeProvider<Policy>;
 
     static constexpr types::bus_kind_t KIND = types::bus_kind_t::UART;
     /*! @brief UART uses the static-backend policy: `BusView::hardwareInUse()`
@@ -657,13 +689,13 @@ struct BusTraits {
     // acquire path -- use distinct pins, or a future dedicated API. (Validating
     // backend-specific fields on a registry hit is a possible future safety
     // net.)
-    static bus::IdentityKey identityFromConfig(const IBusConfig& cfg)
+    static bus::ResourceKey identityFromConfig(const IBusConfig& cfg)
     {
-        return bus::IdentityKey::fromPins({cfg.pin_tx, cfg.pin_rx});
+        return bus::ResourceKey::fromPins(KIND, {cfg.pin_tx, cfg.pin_rx});
     }
-    static bus::IdentityKey identityFromLogical(const LogicalBusConfig& req)
+    static bus::ResourceKey identityFromLogical(const LogicalBusConfig& req)
     {
-        return bus::IdentityKey::fromPins({req.pin_tx, req.pin_rx});
+        return bus::ResourceKey::fromPins(KIND, {req.pin_tx, req.pin_rx});
     }
     static bool configCompatible(const IBusConfig& current, const IBusConfig& requested)
     {
@@ -676,7 +708,7 @@ struct BusTraits {
 /*!
   @brief Runtime facade for a UART bus (the unsuffixed uart::Bus).
 
-  All of the backend spine -- the `unique_ptr`-held backend, `init`, `release`,
+  All of the backend spine -- the `unique_ptr`-held backend, `init`, `close`,
   and the lock-free backend-query mirror -- lives in
   `bus::FacadeCore<BusTraits>`. This derived type adds only the UART data-path
   forwards (write / read / readableBytes). The TX / RX channel locks
@@ -688,32 +720,46 @@ struct BusTraits {
   extensions.
  */
 struct Bus : public bus::FacadeCore<BusTraits> {
-    result_t<size_t> write(bus::IAccessor* owner, const AccessConfig& cfg, data::Source* src, size_t len) override
+    [[nodiscard]] result_t<void> init(const IBusConfig& config);
+
+protected:
+    result_t<void> beginOperationBackend(bus::OperationContext<AccessConfig>& context) override
     {
-        return forwardBackend([&](IBus& b) { return b.write(owner, cfg, src, len); });
+        return forwardBackend([&](IBus& b) { return beginOperationOn(b, context); });
     }
 
-    result_t<size_t> read(bus::IAccessor* owner, const AccessConfig& cfg, data::Sink* dst, size_t len) override
+    result_t<void> endOperationBackend(bus::OperationContext<AccessConfig>& context) override
     {
-        return forwardBackend([&](IBus& b) { return b.read(owner, cfg, dst, len); });
+        return forwardBackend([&](IBus& b) { return endOperationOn(b, context); });
     }
 
-    result_t<bus::TransferTotals> transfer(bus::IAccessor* owner, const AccessConfig& cfg, data::Source* src,
-                                           size_t tx_len, data::Sink* dst, size_t rx_len) override
+    result_t<size_t> writeBackend(bus::OperationContext<AccessConfig>& context, data::Source* src, size_t len) override
     {
-        return forwardBackend([&](IBus& b) { return b.transfer(owner, cfg, src, tx_len, dst, rx_len); });
+        return forwardBackend([&](IBus& b) { return writeOn(b, context, src, len); });
     }
 
-    result_t<size_t> readableBytes(bus::IAccessor* owner, const AccessConfig& cfg) override
+    result_t<size_t> readBackend(bus::OperationContext<AccessConfig>& context, data::Sink* dst, size_t len) override
     {
-        return forwardBackend([&](IBus& b) { return b.readableBytes(owner, cfg); });
+        return forwardBackend([&](IBus& b) { return readOn(b, context, dst, len); });
+    }
+
+    result_t<bus::TransferTotals> transferBackend(bus::OperationContext<AccessConfig>& tx_context,
+                                                  bus::OperationContext<AccessConfig>& rx_context, data::Source* src,
+                                                  size_t tx_len, data::Sink* dst, size_t rx_len) override
+    {
+        return forwardBackend([&](IBus& b) { return transferOn(b, tx_context, rx_context, src, tx_len, dst, rx_len); });
+    }
+
+    result_t<size_t> readableBytesBackend(bus::OperationContext<AccessConfig>& context) override
+    {
+        return forwardBackend([&](IBus& b) { return readableBytesOn(b, context); });
     }
 };
 
 /*!
   @brief Typed UART view delegating registry access to the HAL backend.
 
-  Shares the acquire / logical-acquire / commit / release spine with every
+  Shares the acquire / logical-acquire / commit / close spine with every
   other kind through `bus::BusViewCore<BusTraits>` (see bus/bus_view.hpp);
   this derived type adds only the UART-specific `createBusConfig()` pin
   overloads. Parity with i2c::BusView: UART buses are interned by the HAL

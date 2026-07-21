@@ -14,6 +14,7 @@ namespace {
 
 using m5::hal::v2::getM5_Hal;
 using m5::hal::v2::memory::Allocator;
+using m5::hal::v2::memory::FallbackOps;
 using m5::hal::v2::memory::TempBuffer;
 using m5::hal::v2::memory::usage_t;
 
@@ -75,11 +76,60 @@ TEST(MemoryAllocator, ZeroSizeReturnsNull)
     EXPECT_EQ(alloc.allocate(0), nullptr);
 }
 
+TEST(MemoryAllocator, CopiesFallbackFamilyAtConstruction)
+{
+    FallbackCounters::reset();
+    FallbackOps ops{&FallbackCounters::mallocFn, &FallbackCounters::freeFn};
+    Allocator alloc{ops};
+    ops = {};
+
+    void* ptr = alloc.allocate(8, usage_t::Persistent);
+    ASSERT_NE(ptr, nullptr);
+    EXPECT_EQ(FallbackCounters::malloc_count, 1u);
+    alloc.deallocate(ptr);
+    EXPECT_EQ(FallbackCounters::free_count, 1u);
+}
+
+#if !defined(NDEBUG)
+TEST(MemoryAllocatorDeathTest, InvalidFallbackFamilyAsserts)
+{
+    EXPECT_DEATH(([] { Allocator alloc{FallbackOps{&FallbackCounters::mallocFn, nullptr}}; }()),
+                 "requires a malloc/free pair");
+}
+#else
+TEST(MemoryAllocator, InvalidFallbackFamilyUsesStandardFamily)
+{
+    FallbackCounters::reset();
+    Allocator alloc{FallbackOps{&FallbackCounters::mallocFn, nullptr}};
+    void* ptr = alloc.allocate(8, usage_t::Persistent);
+    ASSERT_NE(ptr, nullptr);
+    EXPECT_EQ(FallbackCounters::malloc_count, 0u);
+    alloc.deallocate(ptr);
+}
+#endif
+
+TEST(ResourceDomain, CopiesShareConstructionTimeAllocator)
+{
+    FallbackCounters::reset();
+    m5::hal::v2::ResourceDomain domain{FallbackOps{&FallbackCounters::mallocFn, &FallbackCounters::freeFn}};
+    auto copy = domain;
+    m5::hal::v2::Hal hal{domain};
+    EXPECT_TRUE(domain.sharesStateWith(copy));
+
+    void* first  = copy.memory().allocate(8, usage_t::Persistent);
+    void* second = hal.Memory.allocate(8, usage_t::Persistent);
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(FallbackCounters::malloc_count, 2u);
+    domain.memory().deallocate(first);
+    hal.Memory.deallocate(second);
+    EXPECT_EQ(FallbackCounters::free_count, 2u);
+}
+
 TEST(MemoryAllocator, ZeroSizeDoesNotCallFallback)
 {
-    Allocator alloc;
+    Allocator alloc{FallbackOps{&FallbackCounters::mallocFn, &FallbackCounters::freeFn}};
     FallbackCounters::reset();
-    alloc.setFallback(&FallbackCounters::mallocFn, &FallbackCounters::freeFn);
 
     EXPECT_EQ(alloc.allocate(0), nullptr);
     EXPECT_EQ(FallbackCounters::malloc_count, 0u);
@@ -149,9 +199,8 @@ TEST(MemoryAllocator, FullPoolAllocationUsesAllBlocks)
 
 TEST(MemoryAllocator, OversizeTempFallsBack)
 {
-    Allocator alloc;
+    Allocator alloc{FallbackOps{&FallbackCounters::mallocFn, &FallbackCounters::freeFn}};
     FallbackCounters::reset();
-    alloc.setFallback(&FallbackCounters::mallocFn, &FallbackCounters::freeFn);
 
     void* p = alloc.allocate(Allocator::tempPoolSize() + 1u, usage_t::Temp);
     ASSERT_NE(p, nullptr);
@@ -165,9 +214,8 @@ TEST(MemoryAllocator, OversizeTempFallsBack)
 
 TEST(MemoryAllocator, PoolExhaustionFallsBack)
 {
-    Allocator alloc;
+    Allocator alloc{FallbackOps{&FallbackCounters::mallocFn, &FallbackCounters::freeFn}};
     FallbackCounters::reset();
-    alloc.setFallback(&FallbackCounters::mallocFn, &FallbackCounters::freeFn);
 
     void* full = alloc.allocate(Allocator::tempPoolSize());
     ASSERT_NE(full, nullptr);
@@ -183,11 +231,30 @@ TEST(MemoryAllocator, PoolExhaustionFallsBack)
     EXPECT_EQ(alloc.usedBlocks(), 0u);
 }
 
+TEST(MemoryAllocator, IdentifiesOnlyLiveTempPoolAllocationStarts)
+{
+    Allocator alloc{FallbackOps{&FallbackCounters::mallocFn, &FallbackCounters::freeFn}};
+    FallbackCounters::reset();
+
+    auto* pool = static_cast<unsigned char*>(alloc.allocate(Allocator::tempBlockSize()));
+    ASSERT_NE(pool, nullptr);
+    void* fallback = alloc.allocate(1, usage_t::Persistent);
+    ASSERT_NE(fallback, nullptr);
+
+    EXPECT_TRUE(alloc.isTempPoolAllocation(pool));
+    EXPECT_FALSE(alloc.isTempPoolAllocation(pool + 1));
+    EXPECT_FALSE(alloc.isTempPoolAllocation(fallback));
+    EXPECT_FALSE(alloc.isTempPoolAllocation(nullptr));
+
+    alloc.deallocate(pool);
+    EXPECT_FALSE(alloc.isTempPoolAllocation(pool));
+    alloc.deallocate(fallback);
+}
+
 TEST(MemoryAllocator, RepeatedSmallAllocationsExhaustPoolThenFallback)
 {
-    Allocator alloc;
+    Allocator alloc{FallbackOps{&FallbackCounters::mallocFn, &FallbackCounters::freeFn}};
     FallbackCounters::reset();
-    alloc.setFallback(&FallbackCounters::mallocFn, &FallbackCounters::freeFn);
 
     std::array<void*, Allocator::tempBlockCount()> blocks{};
     for (auto& block : blocks) {
@@ -213,9 +280,8 @@ TEST(MemoryAllocator, RepeatedSmallAllocationsExhaustPoolThenFallback)
 
 TEST(MemoryAllocator, PersistentBypassesPool)
 {
-    Allocator alloc;
+    Allocator alloc{FallbackOps{&FallbackCounters::mallocFn, &FallbackCounters::freeFn}};
     FallbackCounters::reset();
-    alloc.setFallback(&FallbackCounters::mallocFn, &FallbackCounters::freeFn);
 
     void* p = alloc.allocate(16, usage_t::Persistent);
     ASSERT_NE(p, nullptr);
@@ -229,9 +295,8 @@ TEST(MemoryAllocator, PersistentBypassesPool)
 
 TEST(MemoryAllocator, PersistentReallocateUsesFallbackReallocator)
 {
-    Allocator alloc;
+    Allocator alloc{FallbackOps{&FallbackCounters::mallocFn, &FallbackCounters::reallocFn, &FallbackCounters::freeFn}};
     FallbackCounters::reset();
-    alloc.setFallback(&FallbackCounters::mallocFn, &FallbackCounters::reallocFn, &FallbackCounters::freeFn);
 
     auto* p = static_cast<unsigned char*>(alloc.allocate(16, usage_t::Persistent));
     ASSERT_NE(p, nullptr);
@@ -254,9 +319,8 @@ TEST(MemoryAllocator, PersistentReallocateUsesFallbackReallocator)
 
 TEST(MemoryAllocator, PoolPointerReallocAcrossUsageMovesOutOfPool)
 {
-    Allocator alloc;
+    Allocator alloc{FallbackOps{&FallbackCounters::mallocFn, &FallbackCounters::reallocFn, &FallbackCounters::freeFn}};
     FallbackCounters::reset();
-    alloc.setFallback(&FallbackCounters::mallocFn, &FallbackCounters::reallocFn, &FallbackCounters::freeFn);
 
     auto* p = static_cast<unsigned char*>(alloc.allocate(16, usage_t::Temp));
     ASSERT_NE(p, nullptr);
@@ -282,9 +346,8 @@ TEST(MemoryAllocator, PoolPointerReallocAcrossUsageMovesOutOfPool)
 
 TEST(MemoryAllocator, PoolMoveOutClampsCopyToBlockRun)
 {
-    Allocator alloc;
+    Allocator alloc{FallbackOps{&FallbackCounters::mallocFn, &FallbackCounters::reallocFn, &FallbackCounters::freeFn}};
     FallbackCounters::reset();
-    alloc.setFallback(&FallbackCounters::mallocFn, &FallbackCounters::reallocFn, &FallbackCounters::freeFn);
 
     auto* p = static_cast<unsigned char*>(alloc.allocate(16, usage_t::Temp));
     ASSERT_NE(p, nullptr);
@@ -317,9 +380,8 @@ TEST(MemoryAllocator, DeallocateNullIsSafe)
 
 TEST(MemoryAllocator, DeallocateNullDoesNotCallFallback)
 {
-    Allocator alloc;
+    Allocator alloc{FallbackOps{&FallbackCounters::mallocFn, &FallbackCounters::freeFn}};
     FallbackCounters::reset();
-    alloc.setFallback(&FallbackCounters::mallocFn, &FallbackCounters::freeFn);
 
     alloc.deallocate(nullptr);
     EXPECT_EQ(FallbackCounters::free_count, 0u);
@@ -332,9 +394,8 @@ TEST(MemoryAllocator, DeallocateNullDoesNotCallFallback)
 #if !defined(NDEBUG)
 TEST(MemoryAllocatorDeathTest, InteriorPoolPointerAsserts)
 {
-    Allocator alloc;
+    Allocator alloc{FallbackOps{&FallbackCounters::mallocFn, &FallbackCounters::freeNoop}};
     FallbackCounters::reset();
-    alloc.setFallback(&FallbackCounters::mallocFn, &FallbackCounters::freeNoop);
 
     auto* p = static_cast<unsigned char*>(alloc.allocate(Allocator::tempBlockSize()));
     ASSERT_NE(p, nullptr);
@@ -348,9 +409,8 @@ TEST(MemoryAllocatorDeathTest, InteriorPoolPointerAsserts)
 
 TEST(MemoryAllocatorDeathTest, DoubleFreeOfPoolBlockAsserts)
 {
-    Allocator alloc;
+    Allocator alloc{FallbackOps{&FallbackCounters::mallocFn, &FallbackCounters::freeNoop}};
     FallbackCounters::reset();
-    alloc.setFallback(&FallbackCounters::mallocFn, &FallbackCounters::freeNoop);
 
     auto* p = static_cast<unsigned char*>(alloc.allocate(Allocator::tempBlockSize()));
     ASSERT_NE(p, nullptr);
@@ -363,9 +423,8 @@ TEST(MemoryAllocatorDeathTest, DoubleFreeOfPoolBlockAsserts)
 #else
 TEST(MemoryAllocator, NonBoundaryPoolPointerIgnoredWithoutFallbackFree)
 {
-    Allocator alloc;
+    Allocator alloc{FallbackOps{&FallbackCounters::mallocFn, &FallbackCounters::freeNoop}};
     FallbackCounters::reset();
-    alloc.setFallback(&FallbackCounters::mallocFn, &FallbackCounters::freeNoop);
 
     auto* p = static_cast<unsigned char*>(alloc.allocate(Allocator::tempBlockSize()));
     ASSERT_NE(p, nullptr);
@@ -436,9 +495,8 @@ TEST(MemoryAllocator, FragmentedPoolCanAllocateFromAnotherRun)
 
 TEST(MemoryAllocator, FragmentedPoolFallsBackWhenNoContiguousRunFits)
 {
-    Allocator alloc;
+    Allocator alloc{FallbackOps{&FallbackCounters::mallocFn, &FallbackCounters::freeFn}};
     FallbackCounters::reset();
-    alloc.setFallback(&FallbackCounters::mallocFn, &FallbackCounters::freeFn);
 
     std::array<unsigned char*, Allocator::tempBlockCount()> blocks{};
     for (auto& block : blocks) {
@@ -484,9 +542,8 @@ TEST(MemoryAllocator, ReallocateGrowsPoolBlockInPlaceWhenTailIsFree)
 
 TEST(MemoryAllocator, ReallocateMovesPoolBlockWhenTailIsOccupied)
 {
-    Allocator alloc;
+    Allocator alloc{FallbackOps{&FallbackCounters::mallocFn, &FallbackCounters::freeFn}};
     FallbackCounters::reset();
-    alloc.setFallback(&FallbackCounters::mallocFn, &FallbackCounters::freeFn);
 
     auto* p       = static_cast<unsigned char*>(alloc.allocate(Allocator::tempBlockSize()));
     void* tail    = alloc.allocate(Allocator::tempBlockSize());

@@ -11,6 +11,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "../../../../../hal/v2/error.hpp"
+
 // This header is always compiled (the unconditional runtime fallback — see
 // hal/v2/runtime/runtime.hpp), including on bare-metal Arduino cores with no
 // RTOS (RP2040 / SAMD51: see _checker.hpp's variant allowlist), where
@@ -19,7 +21,10 @@
 // gates on). Only pull in <thread> where it actually works.
 #if !defined(ARDUINO) || defined(ESP_PLATFORM)
 #define M5HAL_STUB_RUNTIME_HAS_STD_THREAD_ 1
+#include <new>
+#include <system_error>
 #include <thread>
+#include "../../../detail/thread_create_error.hpp"
 #else
 #define M5HAL_STUB_RUNTIME_HAS_STD_THREAD_ 0
 // yield() below calls the portable Arduino ::yield() free function; this
@@ -98,18 +103,22 @@ public:
     Mutex(const Mutex&)            = delete;
     Mutex& operator=(const Mutex&) = delete;
 
-    bool lock(uint32_t timeout_ms)
+    ::m5::hal::v2::result_t<void> lock(uint32_t timeout_ms)
     {
         (void)timeout_ms;
         if (_locked) {
-            return false;
+            return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::TIMEOUT_ERROR);
         }
         _locked = true;
-        return true;
+        return {};
     }
-    void unlock(void)
+    ::m5::hal::v2::result_t<void> unlock(void)
     {
+        if (!_locked) {
+            return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::INVALID_STATE);
+        }
         _locked = false;
+        return {};
     }
 
 private:
@@ -120,8 +129,8 @@ private:
   @brief Single-task fake satisfying the runtime::Event contract.
 
   With no other task around to notify, blocking can never end — like
-  the stub Mutex, wait() never blocks: a pending notify is consumed
-  (true), otherwise it returns false immediately whatever the timeout
+  the stub Mutex, wait() never blocks: a pending notify is consumed with
+  success, otherwise it returns TIMEOUT_ERROR immediately whatever the timeout
   (including types::TIMEOUT_FOREVER — the documented stub exception).
   The latch itself is real, so notify-then-wait works single-task.
  */
@@ -131,14 +140,14 @@ public:
     Event(const Event&)            = delete;
     Event& operator=(const Event&) = delete;
 
-    bool wait(uint32_t timeout_ms)
+    ::m5::hal::v2::result_t<void> wait(uint32_t timeout_ms)
     {
         (void)timeout_ms;
         if (!_signaled) {
-            return false;
+            return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::TIMEOUT_ERROR);
         }
         _signaled = false;
-        return true;
+        return {};
     }
     void notify(void)
     {
@@ -147,6 +156,45 @@ public:
 
 private:
     bool _signaled = false;
+};
+
+/*!
+  @brief Task implementation for targets with no usable thread creator.
+
+  This concrete helper is available to provider tests even when the selected
+  host stub uses std::thread. Bare Arduino aliases Task to it below.
+ */
+class ThreadlessTask {
+public:
+    using entry_fn_t = void (*)(void*);
+
+    ThreadlessTask(void)                             = default;
+    ThreadlessTask(const ThreadlessTask&)            = delete;
+    ThreadlessTask& operator=(const ThreadlessTask&) = delete;
+
+    ::m5::hal::v2::result_t<void> start(entry_fn_t fn, void* arg, const char* name = nullptr, size_t stack_size = 4096,
+                                        int priority = 1,
+                                        int core     = -1 /* types::TASK_CORE_ANY; placement ignored by this backend */)
+    {
+        (void)arg;
+        (void)name;
+        (void)stack_size;
+        (void)priority;
+        (void)core;
+        if (fn == nullptr) {
+            return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::INVALID_ARGUMENT);
+        }
+        return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::UNSUPPORTED);
+    }
+
+    void join(void)
+    {
+    }
+
+    bool joinable(void) const
+    {
+        return false;
+    }
 };
 
 #if M5HAL_STUB_RUNTIME_HAS_STD_THREAD_
@@ -168,18 +216,33 @@ public:
     Task(const Task&)            = delete;
     Task& operator=(const Task&) = delete;
 
-    bool start(entry_fn_t fn, void* arg, const char* name = nullptr, size_t stack_size = 4096, int priority = 1,
-               int core = -1 /* types::TASK_CORE_ANY; placement ignored by this backend */)
+    ::m5::hal::v2::result_t<void> start(entry_fn_t fn, void* arg, const char* name = nullptr, size_t stack_size = 4096,
+                                        int priority = 1,
+                                        int core     = -1 /* types::TASK_CORE_ANY; placement ignored by this backend */)
     {
         (void)name;
         (void)stack_size;
         (void)priority;
         (void)core;
-        if (joinable() || fn == nullptr) {
-            return false;
+        if (fn == nullptr) {
+            return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::INVALID_ARGUMENT);
         }
-        _thread = std::thread{fn, arg};
-        return true;
+        if (joinable()) {
+            return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::INVALID_STATE);
+        }
+#if !defined(__cpp_exceptions)
+        (void)arg;
+        return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::UNSUPPORTED);
+#else
+        try {
+            _thread = std::thread{fn, arg};
+        } catch (const std::bad_alloc&) {
+            return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::OUT_OF_RESOURCE);
+        } catch (const std::system_error& e) {
+            return ::m5::stl::make_unexpected(::m5::variants::frameworks::detail::mapThreadCreateError(e.code()));
+        }
+#endif
+        return {};
     }
 
     void join(void)
@@ -207,35 +270,7 @@ private:
   backend for these cores would need cooperative scheduling (e.g. a
   second RP2040 core) and does not exist yet.
  */
-class Task {
-public:
-    using entry_fn_t = void (*)(void*);
-
-    Task(void)                   = default;
-    Task(const Task&)            = delete;
-    Task& operator=(const Task&) = delete;
-
-    bool start(entry_fn_t fn, void* arg, const char* name = nullptr, size_t stack_size = 4096, int priority = 1,
-               int core = -1 /* types::TASK_CORE_ANY; placement ignored by this backend */)
-    {
-        (void)fn;
-        (void)arg;
-        (void)name;
-        (void)stack_size;
-        (void)priority;
-        (void)core;
-        return false;
-    }
-
-    void join(void)
-    {
-    }
-
-    bool joinable(void) const
-    {
-        return false;
-    }
-};
+using Task = ThreadlessTask;
 #endif  // M5HAL_STUB_RUNTIME_HAS_STD_THREAD_
 
 }  // namespace m5::variants::frameworks::stub::hal::v2::runtime

@@ -10,6 +10,8 @@
 #include <sdkconfig.h>
 #if defined(CONFIG_SOC_USB_SERIAL_JTAG_SUPPORTED)
 
+#include "../../../freertos/hal/runtime/time.hpp"
+
 #include <driver/usb_serial_jtag.h>
 #include <esp_err.h>
 #include <string.h>
@@ -32,29 +34,45 @@ namespace m5::hal::v2::uart {
     cdc.init();
  */
 class Bus_espidf_usb_jtag : public uart::Bus_streaming {
+    friend class Bus_console;
+
 public:
     ~Bus_espidf_usb_jtag() override
     {
-        (void)release();
+        (void)teardownBackend();
     }
 
     result_t<void> init();
-    result_t<void> release() override;
+    result_t<void> close(void)
+    {
+        return bus::IBus::close();
+    }
+    types::backend_kind_t backendKind(void) const override
+    {
+        return types::backend_kind_t::Hardware;
+    }
 
 protected:
+    bus::CloseOutcome closeBackend(void) override
+    {
+        return teardownBackend();
+    }
+
     result_t<size_t> rawWrite(const uint8_t* data, size_t len, uint32_t timeout_ms) override;
     result_t<size_t> rawRead(uint8_t* buf, size_t len, uint32_t timeout_ms) override;
     result_t<size_t> rawReadableBytes() override;
 
 private:
+    bus::CloseOutcome teardownBackend(void);
+    result_t<void> initWithBufferSizes(uint32_t rx_buffer_size, uint32_t tx_buffer_size, bool attach_existing);
+
     static constexpr uint32_t kRxDriverBufferSize = 8192;
     static constexpr uint32_t kTxDriverBufferSize = 2048;
     static constexpr size_t kRxCacheSize          = 512;
 
-    static error::error_t mapEspErr(esp_err_t err);
     static TickType_t ticks(uint32_t timeout_ms)
     {
-        return pdMS_TO_TICKS(timeout_ms);
+        return ::m5::hal::v2::detail::timeoutMsToTicks(timeout_ms);
     }
 
     void clearRxCache();
@@ -62,7 +80,8 @@ private:
     void pumpRxCache();
     size_t popRxCache(uint8_t* dst, size_t max_len);
 
-    bool _installed = false;
+    bool _installed    = false;
+    bool _driver_owned = false;
     uint8_t _rx_cache[kRxCacheSize];
     size_t _rx_head  = 0;
     size_t _rx_count = 0;

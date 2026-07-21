@@ -95,6 +95,15 @@ protected:
 
 #if M5_HAL_VARIANTS_FRAMEWORKS_ARDUINO_GPIO_HAS_ESPIDF_PULL_
         const auto gpio_num = static_cast<gpio_num_t>(encoded_num);
+        // Arduino-ESP32's OUTPUT modes disable the input path.  M5HAL's GPIO
+        // contract keeps it enabled so read()/remote watch can observe the
+        // actual pad level while the pin is driven, matching the ESP-IDF
+        // variant.  Apply this after pinMode(), which otherwise overwrites the
+        // direction selected here.
+        if (value & bits::output) {
+            gpio_set_direction(gpio_num,
+                               (value & bits::open_drain) ? GPIO_MODE_INPUT_OUTPUT_OD : GPIO_MODE_INPUT_OUTPUT);
+        }
         (value & bits::pull_up) ? gpio_pullup_en(gpio_num) : gpio_pullup_dis(gpio_num);
         (value & bits::pull_down) ? gpio_pulldown_en(gpio_num) : gpio_pulldown_dis(gpio_num);
 #endif

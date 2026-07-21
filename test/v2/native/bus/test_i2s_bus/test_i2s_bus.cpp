@@ -2,6 +2,7 @@
 #include "../static_bus_view_contract.hpp"
 
 #include <M5HAL_v2.hpp>
+#include <m5_hal/hal/v2/bus/local_backend.hpp>
 #include <gtest/gtest.h>
 #include "support/gtest_watchdog.hpp"
 
@@ -25,12 +26,9 @@
 
 namespace m5::hal::v2::i2s {
 
-// Test-only config + backend. Defining a BackendFor specialization for a
-// test-local config keeps the production variant landscape unchanged
-// (I2S = espidf only) while letting Bus::init / BusView::acquire run natively.
-struct FakeBusConfig : public IBusConfig {
-    using IBusConfig::IBusConfig;
-};
+// Test-only portable provider keeps the production variant landscape
+// unchanged while letting BusView acquire run natively.
+using FakeBusConfig = IBusConfig;
 
 class FakeBus : public IBus {
 public:
@@ -46,13 +44,13 @@ public:
     // Drains the source into an internal FIFO and reports the bytes accepted, so
     // the facade's write-forwarding is observable and a later read() returns the
     // same bytes (the loopback used by the full-duplex test).
-    m5::hal::v2::result_t<size_t> write(bus::IAccessor* /*owner*/, const AccessConfig& /*cfg*/, data::Source* src,
-                                        size_t len) override
+    m5::hal::v2::result_t<size_t> writeBackend(bus::OperationContext<AccessConfig>&, data::Source* src,
+                                               size_t len) override
     {
         // Mirror the espidf direction guard: writing on an RX-only bus (no DOUT)
-        // is not supported, so the wrong-direction guard (F2) is exercised here.
+        // is not supported, so the wrong-direction guard is exercised here.
         if (_config.pin_dout < 0) {
-            return m5::stl::make_unexpected(m5::hal::v2::error::error_t::NOT_IMPLEMENTED);
+            return m5::stl::make_unexpected(m5::hal::v2::error::error_t::UNSUPPORTED);
         }
         size_t done = 0;
         if (src != nullptr) {
@@ -71,9 +69,9 @@ public:
         return done;
     }
 
-    m5::hal::v2::result_t<size_t> writableBytes(bus::IAccessor* /*owner*/, const AccessConfig& /*cfg*/) override
+    m5::hal::v2::result_t<size_t> writableBytesBackend(bus::OperationContext<AccessConfig>&) override
     {
-        // RX-only bus (no DOUT): nothing is writable (mirrors espidf F2 guard).
+        // RX-only bus (no DOUT): nothing is writable (mirrors the espidf guard).
         if (_config.pin_dout < 0) {
             return static_cast<size_t>(0);
         }
@@ -82,13 +80,13 @@ public:
 
     // Pushes up to `len` FIFO bytes into the sink and reports the count drained,
     // so the facade's read-forwarding is observable.
-    m5::hal::v2::result_t<size_t> read(bus::IAccessor* /*owner*/, const AccessConfig& /*cfg*/, data::Sink* dst,
-                                       size_t len) override
+    m5::hal::v2::result_t<size_t> readBackend(bus::OperationContext<AccessConfig>&, data::Sink* dst,
+                                              size_t len) override
     {
         // Mirror the espidf direction guard: reading on a TX-only bus (no DIN)
-        // is not supported, so the wrong-direction guard (F2) is exercised here.
+        // is not supported, so the wrong-direction guard is exercised here.
         if (_config.pin_din < 0) {
-            return m5::stl::make_unexpected(m5::hal::v2::error::error_t::NOT_IMPLEMENTED);
+            return m5::stl::make_unexpected(m5::hal::v2::error::error_t::UNSUPPORTED);
         }
         size_t done = 0;
         if (dst != nullptr) {
@@ -111,9 +109,9 @@ public:
         return done;
     }
 
-    m5::hal::v2::result_t<size_t> readableBytes(bus::IAccessor* /*owner*/, const AccessConfig& /*cfg*/) override
+    m5::hal::v2::result_t<size_t> readableBytesBackend(bus::OperationContext<AccessConfig>&) override
     {
-        // TX-only bus (no DIN): nothing is readable (mirrors espidf F2 guard).
+        // TX-only bus (no DIN): nothing is readable (mirrors the espidf guard).
         if (_config.pin_din < 0) {
             return static_cast<size_t>(0);
         }
@@ -124,9 +122,37 @@ private:
     std::vector<uint8_t> _fifo;
 };
 
-template <>
-struct BackendFor<FakeBusConfig> {
-    using type = FakeBus;
+result_t<std::unique_ptr<IBus>> makeFakeBackend(const bus::LocalResourceContext&, const IBusConfig& cfg)
+{
+    std::unique_ptr<FakeBus> backend{new (std::nothrow) FakeBus()};
+    if (!backend) {
+        return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+    }
+    auto initialized = backend->init(cfg);
+    if (!initialized.has_value()) {
+        return m5::stl::make_unexpected(initialized.error());
+    }
+    return std::unique_ptr<IBus>{std::move(backend)};
+}
+
+result_t<void> initFakeFacade(Bus& facade, const IBusConfig& cfg)
+{
+    auto backend = makeFakeBackend({}, cfg);
+    if (!backend.has_value()) {
+        return m5::stl::make_unexpected(backend.error());
+    }
+    return facade.adoptPortableBackend(std::move(backend.value()), cfg);
+}
+
+struct FakeHal {
+    bus::LocalBackend backend;
+    bus::LocalPortableProvider<BusTraits> provider{&makeFakeBackend};
+    BusView I2S{&backend};
+
+    FakeHal()
+    {
+        backend.registerPortableProvider(provider);
+    }
 };
 
 }  // namespace m5::hal::v2::i2s
@@ -145,7 +171,7 @@ TEST(I2sBusFacade, InitWithFakeBackendSucceeds)
     cfg.pin_ws   = 5;
     cfg.pin_dout = 6;
     cfg.pin_din  = 7;
-    auto r       = facade.init(cfg);
+    auto r       = v2::i2s::initFakeFacade(facade, cfg);
     ASSERT_TRUE(r.has_value());
 }
 
@@ -153,7 +179,7 @@ TEST(I2sBusFacade, InitRejectsIncompleteStandardWiring)
 {
     const auto expect_invalid = [](v2::i2s::FakeBusConfig cfg) {
         v2::i2s::Bus facade;
-        auto r = facade.init(cfg);
+        auto r = v2::i2s::initFakeFacade(facade, cfg);
         ASSERT_FALSE(r.has_value());
         EXPECT_EQ(r.error(), v2::error::error_t::INVALID_ARGUMENT) << "err=" << v2::error::toString(r.error());
     };
@@ -182,12 +208,13 @@ TEST(I2sBusFacade, WriteForwardedToBackend)
     cfg.pin_bclk = 4;
     cfg.pin_ws   = 5;
     cfg.pin_dout = 6;
-    ASSERT_TRUE(facade.init(cfg).has_value());
+    ASSERT_TRUE(v2::i2s::initFakeFacade(facade, cfg).has_value());
 
     const uint8_t payload[] = {0x01, 0x02, 0x03, 0x04};
     v2::data::MemorySource src{v2::data::ConstDataSpan{payload, sizeof(payload)}};
     v2::i2s::AccessConfig acc;
-    auto r = facade.write(nullptr, acc, &src, sizeof(payload));
+    v2::i2s::TxAccessor tx{facade, acc};
+    auto r = tx.write(src, sizeof(payload));
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r.value(), sizeof(payload));
 }
@@ -200,10 +227,11 @@ TEST(I2sBusFacade, WritableBytesForwardedToBackend)
     cfg.pin_ws         = 5;
     cfg.pin_dout       = 6;  // TX wired so writableBytes is meaningful
     cfg.tx_buffer_size = 4096;
-    ASSERT_TRUE(facade.init(cfg).has_value());
+    ASSERT_TRUE(v2::i2s::initFakeFacade(facade, cfg).has_value());
 
     v2::i2s::AccessConfig acc;
-    auto r = facade.writableBytes(nullptr, acc);
+    v2::i2s::TxAccessor tx{facade, acc};
+    auto r = tx.writableBytes();
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r.value(), 4096u);
 }
@@ -221,7 +249,7 @@ TEST(I2sBusFacade, QueryApiBeforeInitReturnsDefaults)
 
 TEST(I2sBusView, SamePinsReturnSameInstance)
 {
-    auto& hal = v2::getM5_Hal();
+    v2::i2s::FakeHal hal;
 
     v2::i2s::FakeBusConfig cfg;
     cfg.pin_bclk = 8;
@@ -240,7 +268,7 @@ TEST(I2sBusView, SamePinsReturnSameInstance)
 
 TEST(I2sBusView, SameIdentityWithDifferentRoleIsRejected)
 {
-    auto& hal = v2::getM5_Hal();
+    v2::i2s::FakeHal hal;
 
     v2::i2s::FakeBusConfig cfg_a;
     cfg_a.pin_bclk = 20;
@@ -262,7 +290,7 @@ TEST(I2sBusView, SameIdentityWithDifferentRoleIsRejected)
 
 TEST(I2sBusView, DifferentBclkPinsReturnDistinctInstances)
 {
-    auto& hal = v2::getM5_Hal();
+    v2::i2s::FakeHal hal;
 
     v2::i2s::FakeBusConfig cfg_a;
     cfg_a.pin_bclk = 12;
@@ -285,7 +313,7 @@ TEST(I2sBusView, DifferentBclkPinsReturnDistinctInstances)
 
 TEST(I2sBusView, TypedAcquireRejectsIncompleteStandardWiring)
 {
-    auto& hal = v2::getM5_Hal();
+    v2::i2s::FakeHal hal;
 
     const auto expect_invalid = [&hal](v2::i2s::FakeBusConfig cfg) {
         auto r = hal.I2S.acquire(cfg);
@@ -312,7 +340,7 @@ TEST(I2sBusView, TypedAcquireRejectsIncompleteStandardWiring)
 
 TEST(I2sBusView, AcquiredBusReturnsKindI2S)
 {
-    auto& hal = v2::getM5_Hal();
+    v2::i2s::FakeHal hal;
 
     v2::i2s::FakeBusConfig cfg;
     cfg.pin_bclk = 17;
@@ -327,13 +355,13 @@ TEST(I2sBusView, AcquiredBusReturnsKindI2S)
 
 TEST(I2sBusView, StaticPolicyCommitIsNoop)
 {
-    auto& hal = v2::getM5_Hal();
+    v2::i2s::FakeHal hal;
     v2::test::bus_contract::expectStaticCommitSurface(hal.I2S);
 }
 
 TEST(I2sBusView, LogicalAcquireSurfaceExistsButIsStaticPolicy)
 {
-    auto& hal = v2::getM5_Hal();
+    v2::i2s::FakeHal hal;
     v2::i2s::LogicalBusConfig req;
     req.pin_bclk                        = 21;
     req.pin_ws                          = 22;
@@ -349,7 +377,7 @@ TEST(I2sBusView, LogicalAcquireSurfaceExistsButIsStaticPolicy)
 // so the shared_ptr ctor must forward through the multiple-inheritance base).
 TEST(I2sBusViewCoOwn, AccessorOutlivesAcquireTemporary)
 {
-    auto& hal = v2::getM5_Hal();
+    v2::i2s::FakeHal hal;
     v2::i2s::FakeBusConfig cfg;
     cfg.pin_bclk = 8;
     cfg.pin_ws   = 9;
@@ -373,17 +401,18 @@ TEST(I2sBusFacade, ReadForwardedToBackend)
     cfg.pin_ws   = 5;
     cfg.pin_dout = 6;  // TX wired to prime the loopback FIFO
     cfg.pin_din  = 7;  // RX wired so the read path is supported
-    ASSERT_TRUE(facade.init(cfg).has_value());
+    ASSERT_TRUE(v2::i2s::initFakeFacade(facade, cfg).has_value());
 
     // Prime the FIFO via a write, then read it back through the facade.
     const uint8_t payload[] = {0x10, 0x20, 0x30, 0x40};
     v2::data::MemorySource src{v2::data::ConstDataSpan{payload, sizeof(payload)}};
     v2::i2s::AccessConfig acc;
-    ASSERT_TRUE(facade.write(nullptr, acc, &src, sizeof(payload)).has_value());
+    v2::i2s::Accessor io{facade, acc};
+    ASSERT_TRUE(io.write(src, sizeof(payload)).has_value());
 
     uint8_t out[sizeof(payload)] = {};
     v2::data::MemorySink sink{v2::data::DataSpan{out, sizeof(out)}};
-    auto r = facade.read(nullptr, acc, &sink, sizeof(out));
+    auto r = io.read(sink, sizeof(out));
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r.value(), sizeof(payload));
     EXPECT_EQ(0, std::memcmp(payload, out, sizeof(payload)));
@@ -397,24 +426,25 @@ TEST(I2sBusFacade, ReadableBytesForwardedToBackend)
     cfg.pin_ws   = 5;
     cfg.pin_dout = 6;  // TX wired to prime the loopback FIFO
     cfg.pin_din  = 7;  // RX wired so readableBytes is meaningful
-    ASSERT_TRUE(facade.init(cfg).has_value());
+    ASSERT_TRUE(v2::i2s::initFakeFacade(facade, cfg).has_value());
 
     v2::i2s::AccessConfig acc;
+    v2::i2s::Accessor io{facade, acc};
     // Empty FIFO -> 0 readable.
-    auto r0 = facade.readableBytes(nullptr, acc);
+    auto r0 = io.readableBytes();
     ASSERT_TRUE(r0.has_value());
     EXPECT_EQ(r0.value(), 0u);
 
     const uint8_t payload[] = {0x01, 0x02, 0x03};
     v2::data::MemorySource src{v2::data::ConstDataSpan{payload, sizeof(payload)}};
-    ASSERT_TRUE(facade.write(nullptr, acc, &src, sizeof(payload)).has_value());
+    ASSERT_TRUE(io.write(src, sizeof(payload)).has_value());
 
-    auto r1 = facade.readableBytes(nullptr, acc);
+    auto r1 = io.readableBytes();
     ASSERT_TRUE(r1.has_value());
     EXPECT_EQ(r1.value(), sizeof(payload));
 }
 
-// ---- Wrong-direction guards (F2): no lazy channel for the unwired direction --
+// ---- Wrong-direction guards: no lazy channel for the unwired direction ----
 
 // TX-only bus (DOUT wired, DIN = -1): the read path is not supported and the
 // readable-bytes query reports zero. On espidf these return BEFORE ensureChannel
@@ -427,16 +457,17 @@ TEST(I2sBusFacade, TxOnlyRejectsReadAndReportsZeroReadable)
     cfg.pin_ws   = 5;
     cfg.pin_dout = 6;
     cfg.pin_din  = -1;  // TX-only wiring
-    ASSERT_TRUE(facade.init(cfg).has_value());
+    ASSERT_TRUE(v2::i2s::initFakeFacade(facade, cfg).has_value());
 
     v2::i2s::AccessConfig acc;
+    v2::i2s::RxAccessor rx{facade, acc};
     uint8_t out[4] = {};
     v2::data::MemorySink sink{v2::data::DataSpan{out, sizeof(out)}};
-    auto rd = facade.read(nullptr, acc, &sink, sizeof(out));
+    auto rd = rx.read(sink, sizeof(out));
     ASSERT_FALSE(rd.has_value());
-    EXPECT_EQ(rd.error(), v2::error::error_t::NOT_IMPLEMENTED);
+    EXPECT_EQ(rd.error(), v2::error::error_t::UNSUPPORTED);
 
-    auto rb = facade.readableBytes(nullptr, acc);
+    auto rb = rx.readableBytes();
     ASSERT_TRUE(rb.has_value());
     EXPECT_EQ(rb.value(), 0u);
 }
@@ -452,16 +483,17 @@ TEST(I2sBusFacade, RxOnlyRejectsWriteAndReportsZeroWritable)
     cfg.pin_ws   = 5;
     cfg.pin_dout = -1;  // RX-only wiring
     cfg.pin_din  = 6;
-    ASSERT_TRUE(facade.init(cfg).has_value());
+    ASSERT_TRUE(v2::i2s::initFakeFacade(facade, cfg).has_value());
 
     v2::i2s::AccessConfig acc;
+    v2::i2s::TxAccessor tx{facade, acc};
     const uint8_t payload[] = {0x01, 0x02, 0x03, 0x04};
     v2::data::MemorySource src{v2::data::ConstDataSpan{payload, sizeof(payload)}};
-    auto wr = facade.write(nullptr, acc, &src, sizeof(payload));
+    auto wr = tx.write(src, sizeof(payload));
     ASSERT_FALSE(wr.has_value());
-    EXPECT_EQ(wr.error(), v2::error::error_t::NOT_IMPLEMENTED);
+    EXPECT_EQ(wr.error(), v2::error::error_t::UNSUPPORTED);
 
-    auto wb = facade.writableBytes(nullptr, acc);
+    auto wb = tx.writableBytes();
     ASSERT_TRUE(wb.has_value());
     EXPECT_EQ(wb.value(), 0u);
 }
@@ -476,7 +508,7 @@ TEST(I2sRxAccessor, ReadDrainsBus)
     cfg.pin_ws   = 5;
     cfg.pin_dout = 6;
     cfg.pin_din  = 7;
-    ASSERT_TRUE(facade.init(cfg).has_value());
+    ASSERT_TRUE(v2::i2s::initFakeFacade(facade, cfg).has_value());
 
     v2::i2s::AccessConfig acc;
     // Prime the FIFO directly through a TX accessor, then drain via RX accessor.
@@ -500,7 +532,7 @@ TEST(I2sRxAccessor, ReadableBytesReportsBuffered)
     cfg.pin_ws   = 5;
     cfg.pin_dout = 6;
     cfg.pin_din  = 7;
-    ASSERT_TRUE(facade.init(cfg).has_value());
+    ASSERT_TRUE(v2::i2s::initFakeFacade(facade, cfg).has_value());
 
     v2::i2s::AccessConfig acc;
     v2::i2s::RxAccessor rx{facade, acc};
@@ -522,7 +554,7 @@ TEST(I2sRxAccessor, ReadableBytesReportsBuffered)
 // through the StreamReader multiple-inheritance base, like the TX co-own test).
 TEST(I2sRxBusViewCoOwn, AccessorOutlivesAcquireTemporary)
 {
-    auto& hal = v2::getM5_Hal();
+    v2::i2s::FakeHal hal;
     v2::i2s::FakeBusConfig cfg;
     cfg.pin_bclk = 30;
     cfg.pin_ws   = 31;
@@ -543,7 +575,7 @@ TEST(I2sFullDuplex, WriteThenReadRoundTrips)
     cfg.pin_ws   = 41;
     cfg.pin_dout = 42;  // full-duplex wiring: both DOUT and DIN
     cfg.pin_din  = 43;
-    ASSERT_TRUE(facade.init(cfg).has_value());
+    ASSERT_TRUE(v2::i2s::initFakeFacade(facade, cfg).has_value());
 
     v2::i2s::AccessConfig acc;
     v2::i2s::TxAccessor tx{facade, acc};
@@ -577,7 +609,7 @@ TEST(I2sFullDuplex, BundledAccessorRoundTrips)
     cfg.pin_ws   = 45;
     cfg.pin_dout = 46;
     cfg.pin_din  = 47;
-    ASSERT_TRUE(facade.init(cfg).has_value());
+    ASSERT_TRUE(v2::i2s::initFakeFacade(facade, cfg).has_value());
 
     v2::i2s::AccessConfig acc;
     v2::i2s::Accessor dev{facade, acc};
@@ -596,7 +628,7 @@ TEST(I2sFullDuplex, BundledAccessorRoundTrips)
 
 TEST(I2sRole, RoleRidesOnAcquiredBusConfig)
 {
-    auto& hal = v2::getM5_Hal();
+    v2::i2s::FakeHal hal;
     v2::i2s::FakeBusConfig cfg;
     cfg.pin_bclk = 50;
     cfg.pin_ws   = 51;

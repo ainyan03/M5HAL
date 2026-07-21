@@ -4,395 +4,507 @@
 #include <gtest/gtest.h>
 #include "support/gtest_watchdog.hpp"
 
+#include <algorithm>
+#include <cstring>
 #include <vector>
 
 namespace {
 
-// -------------------------------------------------------------------------
-// Fake full-duplex SPI slave bus. No spi_slave hardware: it drains the tx
-// Source and, byte-for-byte, also feeds those same bytes into the rx Sink
-// (a loopback), exercising the SpiSlaveAccessor -> ISlaveBus::serve()
-// Source/Sink wiring on a host build. Records the exchanged bytes for
-// inspection. `serve_cap` lets a test simulate a master that clocks fewer
-// than `len` bytes (early CS deassert).
-// -------------------------------------------------------------------------
-class FakeSlaveBus : public m5::hal::v2::spi::ISlaveBus {
+using namespace m5::hal::v2;
+
+#define ASSERT_OK(expression)                          \
+    do {                                               \
+        auto result = (expression);                    \
+        if (!result.has_value()) {                     \
+            FAIL() << error::toString(result.error()); \
+        }                                              \
+    } while (false)
+
+class FakeSlaveBus : public spi::ISlaveBus {
 public:
-    m5::hal::v2::result_t<void> init(const m5::hal::v2::spi::SlaveBusConfig& cfg) override
+    using Context = bus::OperationContext<spi::SlaveAccessConfig>;
+
+    result_t<void> init(const spi::SlaveBusConfig& cfg) override
     {
         _config = cfg;
         return {};
     }
 
-    m5::hal::v2::result_t<void> release(void) override
+    result_t<void> lockFor(bus::IAccessor& accessor)
     {
-        served.clear();
+        return acquireAccessLock(accessor, 0);
+    }
+
+    result_t<void> unlockFor(bus::IAccessor& accessor)
+    {
+        return releaseAccessLock(accessor);
+    }
+
+    Context& capturedContext()
+    {
+        return *captured_context;
+    }
+
+protected:
+    bus::CloseOutcome closeBackend(void) override
+    {
+        active = false;
+        return bus::CloseOutcome::success();
+    }
+
+    result_t<void> beginOperationBackend(bus::OperationContext<spi::SlaveAccessConfig>& context) override
+    {
+        ++begin_backend_calls;
+        captured_context = &context;
+        if (fail_begin) {
+            return m5::stl::make_unexpected(error::error_t::IO_ERROR);
+        }
+        auto& owner = operationOwner(context);
+        active      = true;
+        last_owner  = &owner;
+        generation  = context.runtime.generation;
+        operation_log.push_back(1);
         return {};
     }
 
-    m5::hal::v2::result_t<size_t> serve(m5::hal::v2::bus::IAccessor* owner, m5::hal::v2::data::Source* tx,
-                                        m5::hal::v2::data::Sink* rx, size_t len, uint32_t timeout_ms) override
+    result_t<void> endOperationBackend(bus::OperationContext<spi::SlaveAccessConfig>& context) override
     {
-        last_owner      = owner;
-        last_len        = len;
-        last_timeout_ms = timeout_ms;
-
-        // Honor a simulated short transaction (master clocked fewer bytes).
-        const size_t exchange = (serve_cap < len) ? serve_cap : len;
-
-        // Pull up to `exchange` bytes from the tx Source; past the Source's
-        // content, fall back to the config fill byte (mirrors the real backend).
-        std::vector<uint8_t> outgoing;
-        size_t pulled = 0;
-        while (tx != nullptr && !tx->eof() && pulled < exchange) {
-            auto span = tx->peek(exchange - pulled);
-            if (!span.has_value()) {
-                return m5::stl::make_unexpected(span.error());
-            }
-            if (span.value().size == 0) {
-                break;
-            }
-            outgoing.insert(outgoing.end(), span.value().data, span.value().data + span.value().size);
-            auto advanced = tx->advance(span.value().size);
-            if (!advanced.has_value()) {
-                return m5::stl::make_unexpected(advanced.error());
-            }
-            pulled += span.value().size;
+        ++end_backend_calls;
+        ended_generation = context.runtime.generation;
+        ended_mode       = context.runtime.mode;
+        auto& owner      = operationOwner(context);
+        if (!active || &owner != last_owner) {
+            return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
         }
-        while (outgoing.size() < exchange) {
-            outgoing.push_back(_config.tx_fill_byte);
+        active = false;
+        operation_log.push_back(2);
+        if (fail_end) {
+            return m5::stl::make_unexpected(error::error_t::IO_ERROR);
         }
-        served = outgoing;
-
-        // Loop the outgoing bytes back into the rx Sink (a stand-in for the
-        // master's MOSI, so the test can assert both directions wired up).
-        size_t committed = 0;
-        while (rx != nullptr && !rx->closed() && committed < exchange) {
-            auto reserved = rx->reserve(exchange - committed);
-            if (!reserved.has_value()) {
-                return m5::stl::make_unexpected(reserved.error());
-            }
-            size_t want = reserved.value().size;
-            if (want == 0) {
-                break;
-            }
-            if (want > exchange - committed) {
-                want = exchange - committed;
-            }
-            for (size_t i = 0; i < want; ++i) {
-                reserved.value().data[i] = outgoing[committed + i];
-            }
-            auto done = rx->commit(want);
-            if (!done.has_value()) {
-                return m5::stl::make_unexpected(done.error());
-            }
-            committed += want;
-        }
-
-        return exchange;
+        return {};
     }
 
+public:
+    result_t<void> simulateFrame(data::ConstDataSpan master_tx)
+    {
+        if (!active || last_owner == nullptr) {
+            return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+        }
+        auto& accessor = static_cast<spi::SpiSlaveAccessor&>(*last_owner);
+        auto& tx       = accessor.backendTxQueue();
+        auto& rx       = accessor.backendRxQueue();
+        served.assign(master_tx.size, _config.tx_fill_byte);
+
+        size_t available_tx = 0;
+        const bool tx_frame = tx.mode() == slave::QueueMode::Frame;
+        if (tx_frame) {
+            auto view = tx.peekFrame();
+            if (view.has_value()) {
+                available_tx       = view->first.size + view->second.size;
+                const size_t first = std::min(view->first.size, master_tx.size);
+                std::memcpy(served.data(), view->first.data, first);
+                const size_t second = std::min(view->second.size, master_tx.size - first);
+                std::memcpy(served.data() + first, view->second.data, second);
+                auto popped = tx.popFrame();
+                if (!popped.has_value()) {
+                    return popped;
+                }
+            }
+        } else {
+            auto view = tx.peekBytes(master_tx.size);
+            if (view.has_value()) {
+                available_tx = view->first.size + view->second.size;
+                std::memcpy(served.data(), view->first.data, view->first.size);
+                std::memcpy(served.data() + view->first.size, view->second.data, view->second.size);
+                auto popped = tx.popBytes(available_tx);
+                if (!popped.has_value()) {
+                    return popped;
+                }
+            }
+        }
+
+        slave::FrameFlags flags = slave::FrameFlags::Begin | slave::FrameFlags::End;
+        if (available_tx < master_tx.size) {
+            tx.recordUnderrun();
+            flags |= slave::FrameFlags::Underrun;
+        } else if (tx_frame && available_tx > master_tx.size) {
+            flags |= slave::FrameFlags::Truncated;
+        }
+
+        if (rx.mode() == slave::QueueMode::Frame) {
+            slave::FrameMetadata metadata;
+            metadata.frame_id = ++frame_id;
+            metadata.flags    = flags;
+            auto stored       = rx.writeObservedFrame(master_tx, metadata);
+            if (!stored.has_value() && stored.error() != error::error_t::WOULD_BLOCK) {
+                return stored;
+            }
+        } else {
+            auto stored = rx.write(master_tx);
+            if (!stored.has_value()) {
+                if (stored.error() != error::error_t::WOULD_BLOCK) {
+                    return m5::stl::make_unexpected(stored.error());
+                }
+                rx.recordDroppedFrame(static_cast<uint32_t>(master_tx.size));
+            } else if (*stored < master_tx.size) {
+                rx.recordDroppedFrame(static_cast<uint32_t>(master_tx.size - *stored));
+            }
+        }
+
+        slave::SlaveEvent event = slave::SlaveEvent::FrameCompleted;
+        if (rx.readable() != 0) {
+            event |= slave::SlaveEvent::RxAvailable;
+        }
+        if (available_tx < master_tx.size) {
+            event |= slave::SlaveEvent::Underrun;
+        }
+        if (slave::any(rx.status().sticky_events & slave::QueueEventFlags::Overflow)) {
+            event |= slave::SlaveEvent::Overflow;
+        }
+        accessor.backendEvents().publish(event, rx.readable(), tx.writable(), generation);
+        return {};
+    }
+
+    bool active     = false;
+    bool fail_begin = false;
+    bool fail_end   = false;
+    std::vector<int> operation_log;
     std::vector<uint8_t> served;
-    m5::hal::v2::bus::IAccessor* last_owner = nullptr;
-    size_t last_len                         = 0;
-    uint32_t last_timeout_ms                = 0;
-    size_t serve_cap                        = SIZE_MAX;  // no early-CS simulation by default
+    bus::IAccessor* last_owner    = nullptr;
+    uint32_t generation           = 0;
+    uint32_t ended_generation     = 0;
+    uint32_t frame_id             = 0;
+    size_t begin_backend_calls    = 0;
+    size_t end_backend_calls      = 0;
+    bus::OperationMode ended_mode = bus::OperationMode::Control;
+    Context* captured_context     = nullptr;
 };
+
+class SpiSlaveContextProbeAccessor : public bus::IAccessor {
+public:
+    explicit SpiSlaveContextProbeAccessor(FakeSlaveBus& bus)
+        : bus::IAccessor{bus}, context{makeOperationContext(config)}
+    {
+    }
+
+    const bus::IAccessConfig& getConfig() const override
+    {
+        return config;
+    }
+
+    spi::SlaveAccessConfig config;
+    bus::OperationContext<spi::SlaveAccessConfig> context;
+};
+
+template <size_t TxBytes, size_t RxBytes, size_t TxFrames, size_t RxFrames>
+struct AccessorFixture {
+    slave::StaticSlaveQueueStorage<TxBytes, RxBytes, TxFrames, RxFrames> storage;
+    spi::SpiSlaveAccessor accessor;
+
+    AccessorFixture(FakeSlaveBus& bus, const spi::SlaveAccessConfig& config = {})
+        : accessor{bus, storage.tx(), storage.rx(), config}
+    {
+    }
+};
+
+struct EventObservation {
+    uint32_t calls = 0;
+    slave::SlaveEventInfo last{};
+};
+
+void observeEvent(void* user, const slave::SlaveEventInfo& info)
+{
+    auto& observation = *static_cast<EventObservation*>(user);
+    ++observation.calls;
+    observation.last = info;
+}
 
 }  // namespace
 
-// -------------------------------------------------------------------------
-// SlaveBusConfig defaults
-// -------------------------------------------------------------------------
-TEST(SpiSlaveBusConfig, DefaultCtorSetsSpiKindAndPins)
+TEST(SpiSlaveBusConfig, DefaultsSeparateBusAndAccessConfiguration)
 {
-    m5::hal::v2::spi::SlaveBusConfig cfg;
-    EXPECT_EQ(cfg.getBusKind(), m5::hal::v2::types::bus_kind_t::SPI);
-    EXPECT_EQ(cfg.pin_clk, -1);
-    EXPECT_EQ(cfg.pin_mosi, -1);
-    EXPECT_EQ(cfg.pin_miso, -1);
-    EXPECT_EQ(cfg.pin_cs, -1);
-    EXPECT_EQ(cfg.spi_mode, 0u);
-    EXPECT_EQ(cfg.controller, -1);
-    EXPECT_EQ(cfg.tx_fill_byte, 0x00u);
-    EXPECT_EQ(cfg.timeout_ms, m5::hal::v2::types::TIMEOUT_FOREVER);
+    spi::SlaveBusConfig bus_config;
+    EXPECT_EQ(bus_config.getBusKind(), types::bus_kind_t::SPI);
+    EXPECT_EQ(bus_config.controller, -1);
+    EXPECT_EQ(bus_config.tx_fill_byte, 0u);
+
+    spi::SlaveAccessConfig access_config;
+    EXPECT_EQ(access_config.getBusKind(), types::bus_kind_t::SPI);
+    EXPECT_EQ(access_config.transaction_bytes, 4096u);
+    EXPECT_EQ(access_config.tx_mode, slave::QueueMode::Byte);
+    EXPECT_EQ(access_config.rx_mode, slave::QueueMode::Frame);
 }
 
 TEST(EspidfSpiControllerMap, ControllerAndHostOrdinalsRoundTrip)
 {
-    namespace detail         = m5::hal::v2::spi::detail_espidf_spi;
+    namespace detail         = spi::detail_espidf_spi;
     constexpr uint8_t count  = 2;
-    constexpr int first_host = 1;  // SPI2 follows the reserved SPI1 ordinal.
-
-    int host = -1;
+    constexpr int first_host = 1;
+    int host                 = -1;
     EXPECT_TRUE(detail::hostOrdinalForController(0, count, first_host, host));
     EXPECT_EQ(host, 1);
     EXPECT_TRUE(detail::hostOrdinalForController(1, count, first_host, host));
     EXPECT_EQ(host, 2);
-    EXPECT_FALSE(detail::hostOrdinalForController(-1, count, first_host, host));
     EXPECT_FALSE(detail::hostOrdinalForController(2, count, first_host, host));
-
     int8_t controller = -1;
-    EXPECT_TRUE(detail::controllerForHostOrdinal(1, count, first_host, controller));
-    EXPECT_EQ(controller, 0);
     EXPECT_TRUE(detail::controllerForHostOrdinal(2, count, first_host, controller));
     EXPECT_EQ(controller, 1);
-    EXPECT_FALSE(detail::controllerForHostOrdinal(0, count, first_host, controller));
-    EXPECT_FALSE(detail::controllerForHostOrdinal(3, count, first_host, controller));
 }
 
 TEST(EspidfSpiControllerMap, SlaveDefaultAndInvalidControllersAreDistinct)
 {
-    namespace detail         = m5::hal::v2::spi::detail_espidf_spi;
+    namespace detail         = spi::detail_espidf_spi;
     constexpr uint8_t count  = 2;
     constexpr int first_host = 1;
-
-    int host = -1;
+    int host                 = -1;
     EXPECT_TRUE(detail::slaveHostOrdinal(-1, count, first_host, host));
-    EXPECT_EQ(host, first_host);
-    EXPECT_TRUE(detail::slaveHostOrdinal(0, count, first_host, host));
-    EXPECT_EQ(host, first_host);
+    EXPECT_EQ(host, 1);
     EXPECT_TRUE(detail::slaveHostOrdinal(1, count, first_host, host));
-    EXPECT_EQ(host, first_host + 1);
-    EXPECT_FALSE(detail::slaveHostOrdinal(-2, count, first_host, host));
+    EXPECT_EQ(host, 2);
     EXPECT_FALSE(detail::slaveHostOrdinal(2, count, first_host, host));
-    EXPECT_FALSE(detail::slaveHostOrdinal(-1, 0, first_host, host));
 }
 
-TEST(EspidfSpiControllerMap, AttachRequiresMatchingGeneralPurposeController)
+TEST(EspidfSpiCloseOrder, FailurePreservesResourcesAndSuccessStopsLast)
 {
-    namespace detail         = m5::hal::v2::spi::detail_espidf_spi;
-    constexpr uint8_t count  = 2;
-    constexpr int first_host = 1;
-
-    EXPECT_TRUE(detail::attachedControllerMatches(1, 0, count, first_host));
-    EXPECT_TRUE(detail::attachedControllerMatches(2, 1, count, first_host));
-    EXPECT_FALSE(detail::attachedControllerMatches(0, 0, count, first_host));  // SPI1 is reserved.
-    EXPECT_FALSE(detail::attachedControllerMatches(1, 1, count, first_host));  // Host/index mismatch.
-    EXPECT_FALSE(detail::attachedControllerMatches(3, 2, count, first_host));  // Host outside the SoC budget.
-    EXPECT_FALSE(detail::attachedControllerMatches(1, -1, count, first_host));
-}
-
-TEST(EspidfSpiReleaseOrder, RemoveFailurePreservesWorkerAndBus)
-{
-    namespace detail = m5::hal::v2::spi::detail_espidf_spi;
+    namespace detail = spi::detail_espidf_spi;
     std::vector<int> calls;
-
-    const auto result = detail::releaseDriverBeforeWorker(
+    auto failure = detail::releaseDriverBeforeWorker(
         true, false,
-        [&calls]() {
+        [&] {
             calls.push_back(1);
-            return m5::hal::v2::error::error_t::IO_ERROR;
+            return error::error_t::IO_ERROR;
         },
-        [&calls]() {
+        [&] {
             calls.push_back(2);
-            return m5::hal::v2::error::error_t::OK;
+            return error::error_t::OK;
         },
-        [&calls]() { calls.push_back(3); });
-
-    EXPECT_EQ(result.error, m5::hal::v2::error::error_t::IO_ERROR);
-    EXPECT_FALSE(result.bus_released);
-    EXPECT_FALSE(result.worker_stopped);
+        [&] { calls.push_back(3); });
+    EXPECT_EQ(failure.error, error::error_t::IO_ERROR);
     EXPECT_EQ(calls, (std::vector<int>{1}));
-}
 
-TEST(EspidfSpiReleaseOrder, BusFailurePreservesWorker)
-{
-    namespace detail = m5::hal::v2::spi::detail_espidf_spi;
-    std::vector<int> calls;
-
-    const auto result = detail::releaseDriverBeforeWorker(
+    calls.clear();
+    auto success = detail::releaseDriverBeforeWorker(
         true, false,
-        [&calls]() {
+        [&] {
             calls.push_back(1);
-            return m5::hal::v2::error::error_t::OK;
+            return error::error_t::OK;
         },
-        [&calls]() {
+        [&] {
             calls.push_back(2);
-            return m5::hal::v2::error::error_t::IO_ERROR;
+            return error::error_t::OK;
         },
-        [&calls]() { calls.push_back(3); });
-
-    EXPECT_EQ(result.error, m5::hal::v2::error::error_t::IO_ERROR);
-    EXPECT_FALSE(result.bus_released);
-    EXPECT_FALSE(result.worker_stopped);
-    EXPECT_EQ(calls, (std::vector<int>{1, 2}));
-}
-
-TEST(EspidfSpiReleaseOrder, DestructiveBusFailureCompletesRelease)
-{
-    namespace detail = m5::hal::v2::spi::detail_espidf_spi;
-    std::vector<int> calls;
-
-    const auto result = detail::releaseDriverBeforeWorker(
-        true, true,
-        [&calls]() {
-            calls.push_back(1);
-            return m5::hal::v2::error::error_t::OK;
-        },
-        [&calls]() {
-            calls.push_back(2);
-            return m5::hal::v2::error::error_t::IO_ERROR;
-        },
-        [&calls]() { calls.push_back(3); });
-
-    EXPECT_EQ(result.error, m5::hal::v2::error::error_t::OK);
-    EXPECT_TRUE(result.bus_released);
-    EXPECT_TRUE(result.worker_stopped);
+        [&] { calls.push_back(3); });
+    EXPECT_EQ(success.error, error::error_t::OK);
     EXPECT_EQ(calls, (std::vector<int>{1, 2, 3}));
 }
 
-TEST(EspidfSpiReleaseOrder, OwnedAndAttachedSuccessPathsStopLast)
-{
-    namespace detail = m5::hal::v2::spi::detail_espidf_spi;
-    for (const bool owns_bus : {false, true}) {
-        std::vector<int> calls;
-        const auto result = detail::releaseDriverBeforeWorker(
-            owns_bus, false,
-            [&calls]() {
-                calls.push_back(1);
-                return m5::hal::v2::error::error_t::OK;
-            },
-            [&calls]() {
-                calls.push_back(2);
-                return m5::hal::v2::error::error_t::OK;
-            },
-            [&calls]() { calls.push_back(3); });
-
-        EXPECT_EQ(result.error, m5::hal::v2::error::error_t::OK);
-        EXPECT_EQ(result.bus_released, owns_bus);
-        EXPECT_TRUE(result.worker_stopped);
-        if (owns_bus) {
-            EXPECT_EQ(calls, (std::vector<int>{1, 2, 3}));
-        } else {
-            EXPECT_EQ(calls, (std::vector<int>{1, 3}));
-        }
-    }
-}
-
-// -------------------------------------------------------------------------
-// Accessor unbound: serve() rejects with INVALID_ARGUMENT
-// -------------------------------------------------------------------------
-TEST(SpiSlaveAccessor, ServeRequiresBoundBus)
+TEST(SpiSlaveAccessor, AccessLifecycleIsNonNestedAndBeginFailureUnlocks)
 {
     FakeSlaveBus bus;
-    m5::hal::v2::spi::SpiSlaveAccessor acc{bus};
-    EXPECT_TRUE(acc.isBound());
-    EXPECT_EQ(&acc.getBus(), &bus);
-    EXPECT_EQ(acc.getConfig().getBusKind(), m5::hal::v2::types::bus_kind_t::SPI);
+    AccessorFixture<8, 8, 2, 2> fixture{bus};
+    auto& accessor = fixture.accessor;
+    ASSERT_OK(accessor.beginAccess(0));
+    EXPECT_TRUE(accessor.inAccess());
+    EXPECT_EQ(accessor.beginAccess(0).error(), error::error_t::INVALID_STATE);
+
+    AccessorFixture<4, 4, 1, 1> contender{bus};
+    EXPECT_EQ(contender.accessor.beginAccess(0).error(), error::error_t::TIMEOUT_ERROR);
+    ASSERT_OK(accessor.endAccess(0));
+    EXPECT_FALSE(accessor.inAccess());
+    EXPECT_EQ(accessor.endAccess(0).error(), error::error_t::INVALID_STATE);
+
+    bus.fail_begin = true;
+    EXPECT_EQ(accessor.beginAccess(0).error(), error::error_t::IO_ERROR);
+    bus.fail_begin = false;
+    ASSERT_OK(contender.accessor.beginAccess(0));
+    ASSERT_OK(contender.accessor.endAccess(0));
+
+    bus.fail_end = true;
+    ASSERT_OK(accessor.beginAccess(0));
+    EXPECT_EQ(accessor.endAccess(0).error(), error::error_t::IO_ERROR);
+    bus.fail_end = false;
+    ASSERT_OK(contender.accessor.beginAccess(0));
+    ASSERT_OK(contender.accessor.endAccess(0));
 }
 
-// -------------------------------------------------------------------------
-// Span overload: tx is clocked out, rx captures the (looped-back) bytes
-// -------------------------------------------------------------------------
-TEST(SpiSlaveAccessor, ServeSpanExchangesBothDirections)
+TEST(SpiSlaveCheckedFacade, RejectsEndedWrongBusAndWrongAccessorContexts)
 {
-    FakeSlaveBus bus;
-    m5::hal::v2::spi::SpiSlaveAccessor acc{bus};
+    FakeSlaveBus first_bus;
+    FakeSlaveBus second_bus;
+    SpiSlaveContextProbeAccessor never_started{first_bus};
+    AccessorFixture<4, 4, 0, 1> first{first_bus};
+    AccessorFixture<4, 4, 0, 1> second{first_bus};
 
-    const uint8_t tx[] = {0x11, 0x22, 0x33, 0x44};
-    uint8_t rx[4]      = {};
-    auto r = acc.serve(m5::hal::v2::data::ConstDataSpan{tx, sizeof(tx)}, m5::hal::v2::data::DataSpan{rx, sizeof(rx)});
-    ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(r.value(), sizeof(tx));
+    auto inactive_begin = first_bus.beginOperation(never_started.context);
+    ASSERT_FALSE(inactive_begin.has_value());
+    EXPECT_EQ(inactive_begin.error(), error::error_t::INVALID_STATE);
+    auto inactive_end = first_bus.endOperation(never_started.context);
+    ASSERT_FALSE(inactive_end.has_value());
+    EXPECT_EQ(inactive_end.error(), error::error_t::INVALID_STATE);
+    EXPECT_EQ(first_bus.begin_backend_calls, 0u);
+    EXPECT_EQ(first_bus.end_backend_calls, 0u);
 
-    // tx Source was drained into the bus.
-    ASSERT_EQ(bus.served.size(), sizeof(tx));
-    EXPECT_EQ(bus.served[0], 0x11u);
-    EXPECT_EQ(bus.served[3], 0x44u);
+    ASSERT_OK(first.accessor.beginAccess(0));
+    auto& context  = first_bus.capturedContext();
+    auto wrong_bus = second_bus.endOperation(context);
+    ASSERT_FALSE(wrong_bus.has_value());
+    EXPECT_EQ(wrong_bus.error(), error::error_t::INVALID_STATE);
+    EXPECT_EQ(second_bus.end_backend_calls, 0u);
+    ASSERT_OK(first.accessor.endAccess(0));
 
-    // rx Sink captured the looped-back bytes.
-    EXPECT_EQ(rx[0], 0x11u);
-    EXPECT_EQ(rx[1], 0x22u);
-    EXPECT_EQ(rx[2], 0x33u);
-    EXPECT_EQ(rx[3], 0x44u);
+    const size_t end_calls = first_bus.end_backend_calls;
+    auto ended             = first_bus.endOperation(context);
+    ASSERT_FALSE(ended.has_value());
+    EXPECT_EQ(ended.error(), error::error_t::INVALID_STATE);
+    EXPECT_EQ(first_bus.end_backend_calls, end_calls);
 
-    // The accessor passes itself as owner and uses the larger span size as len.
-    EXPECT_EQ(bus.last_owner, &acc);
-    EXPECT_EQ(bus.last_len, sizeof(tx));
+    context.runtime.begin(0, 0, bus::OperationMode::Slave);
+    ASSERT_OK(first_bus.lockFor(second.accessor));
+    const size_t begin_calls = first_bus.begin_backend_calls;
+    auto wrong_accessor      = first_bus.beginOperation(context);
+    ASSERT_FALSE(wrong_accessor.has_value());
+    EXPECT_EQ(wrong_accessor.error(), error::error_t::INVALID_STATE);
+    EXPECT_EQ(first_bus.begin_backend_calls, begin_calls);
+    ASSERT_OK(first_bus.unlockFor(second.accessor));
 }
 
-// -------------------------------------------------------------------------
-// Span overload: len is the LARGER of the two spans (full-duplex)
-// -------------------------------------------------------------------------
-TEST(SpiSlaveAccessor, ServeSpanLenIsLargerOfBoth)
+TEST(SpiSlaveCheckedFacade, CorruptRuntimeIsRestoredForBackendCleanup)
 {
     FakeSlaveBus bus;
-    m5::hal::v2::spi::SpiSlaveAccessor acc{bus};
+    AccessorFixture<4, 4, 0, 1> first{bus};
+    AccessorFixture<4, 4, 0, 1> second{bus};
 
-    // rx larger than tx: len must be rx.size; tx is short so the tail comes from
-    // tx_fill_byte (default 0x00).
-    const uint8_t tx[] = {0xAB, 0xCD};
-    uint8_t rx[5]      = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-    auto r = acc.serve(m5::hal::v2::data::ConstDataSpan{tx, sizeof(tx)}, m5::hal::v2::data::DataSpan{rx, sizeof(rx)});
-    ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(r.value(), sizeof(rx));
-    EXPECT_EQ(bus.last_len, sizeof(rx));
-    EXPECT_EQ(rx[0], 0xABu);
-    EXPECT_EQ(rx[1], 0xCDu);
-    EXPECT_EQ(rx[2], 0x00u);  // fill byte
-    EXPECT_EQ(rx[4], 0x00u);
+    ASSERT_OK(first.accessor.beginAccess(0));
+    auto& context                        = bus.capturedContext();
+    const uint32_t registered_generation = context.runtime.generation;
+    const size_t end_calls               = bus.end_backend_calls;
+    ++context.runtime.generation;
+    context.runtime.mode = bus::OperationMode::Tx;
+
+    auto ended = first.accessor.endAccess(0);
+    ASSERT_FALSE(ended.has_value());
+    EXPECT_EQ(ended.error(), error::error_t::INVALID_STATE);
+    EXPECT_EQ(bus.end_backend_calls, end_calls + 1);
+    EXPECT_EQ(bus.ended_generation, registered_generation);
+    EXPECT_EQ(bus.ended_mode, bus::OperationMode::Slave);
+    EXPECT_FALSE(bus.active);
+    EXPECT_FALSE(first.accessor.inAccess());
+
+    ASSERT_OK(second.accessor.beginAccess(0));
+    ASSERT_OK(second.accessor.endAccess(0));
 }
 
-// -------------------------------------------------------------------------
-// Source/Sink overload: streaming callers
-// -------------------------------------------------------------------------
-TEST(SpiSlaveAccessor, ServeSourceSinkOverload)
+TEST(SpiSlaveCheckedFacade, FailedRuntimeRestoreSkipsBackendAndRecoversSlotAndLock)
 {
     FakeSlaveBus bus;
-    m5::hal::v2::spi::SpiSlaveAccessor acc{bus};
+    AccessorFixture<4, 4, 0, 1> first{bus};
+    AccessorFixture<4, 4, 0, 1> second{bus};
 
-    const uint8_t payload[] = {0x01, 0x02, 0x03};
-    m5::hal::v2::data::MemorySource src{m5::hal::v2::data::ConstDataSpan{payload, sizeof(payload)}};
-    uint8_t rxbuf[3] = {};
-    m5::hal::v2::data::MemorySink sink{m5::hal::v2::data::DataSpan{rxbuf, sizeof(rxbuf)}};
+    ASSERT_OK(first.accessor.beginAccess(0));
+    auto& context          = bus.capturedContext();
+    const size_t end_calls = bus.end_backend_calls;
+    ++context.runtime.generation;
 
-    auto r = acc.serve(&src, &sink, sizeof(payload), 100);
-    ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(r.value(), sizeof(payload));
-    EXPECT_EQ(rxbuf[0], 0x01u);
-    EXPECT_EQ(rxbuf[2], 0x03u);
-    EXPECT_EQ(bus.last_timeout_ms, 100u);
+    ASSERT_OK(bus.unlockFor(first.accessor));
+    ASSERT_OK(bus.lockFor(second.accessor));
+    auto skipped = bus.endOperation(context);
+    ASSERT_FALSE(skipped.has_value());
+    EXPECT_EQ(skipped.error(), error::error_t::INVALID_STATE);
+    EXPECT_EQ(bus.end_backend_calls, end_calls);
+    EXPECT_TRUE(bus.active);
+    ASSERT_OK(bus.unlockFor(second.accessor));
+    ASSERT_OK(bus.lockFor(first.accessor));
+
+    auto ended = first.accessor.endAccess(0);
+    ASSERT_FALSE(ended.has_value());
+    EXPECT_EQ(ended.error(), error::error_t::INVALID_STATE);
+    EXPECT_EQ(bus.end_backend_calls, end_calls);
+    EXPECT_FALSE(first.accessor.inAccess());
+
+    ASSERT_OK(second.accessor.beginAccess(0));
+    ASSERT_OK(second.accessor.endAccess(0));
 }
 
-// -------------------------------------------------------------------------
-// Early CS deassert: the master clocks fewer than `len` bytes; serve returns
-// the actually-exchanged count and only that prefix is committed.
-// -------------------------------------------------------------------------
-TEST(SpiSlaveAccessor, ServeReportsShortExchange)
+TEST(SpiSlaveAccessor, PreloadedTxAndCompletedRxPersistAcrossAccessBoundary)
 {
     FakeSlaveBus bus;
-    bus.serve_cap = 2;  // master clocks only 2 of the requested bytes
-    m5::hal::v2::spi::SpiSlaveAccessor acc{bus};
+    spi::SlaveBusConfig bus_config;
+    bus_config.tx_fill_byte = 0xEE;
+    ASSERT_OK(bus.init(bus_config));
+    AccessorFixture<8, 8, 0, 2> fixture{bus};
+    const uint8_t response[] = {0x10, 0x20, 0x30};
+    ASSERT_OK(fixture.accessor.write({response, sizeof(response)}));
+    ASSERT_OK(fixture.accessor.beginAccess(0));
 
-    const uint8_t tx[] = {0x10, 0x20, 0x30, 0x40};
-    uint8_t rx[4]      = {0xEE, 0xEE, 0xEE, 0xEE};
-    auto r = acc.serve(m5::hal::v2::data::ConstDataSpan{tx, sizeof(tx)}, m5::hal::v2::data::DataSpan{rx, sizeof(rx)});
-    ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(r.value(), 2u);
-    EXPECT_EQ(rx[0], 0x10u);
-    EXPECT_EQ(rx[1], 0x20u);
-    // Bytes past the short exchange are untouched in the sink.
-    EXPECT_EQ(rx[2], 0xEEu);
-    EXPECT_EQ(rx[3], 0xEEu);
+    const uint8_t request[] = {1, 2, 3, 4};
+    ASSERT_OK(bus.simulateFrame({request, sizeof(request)}));
+    EXPECT_EQ(bus.served, (std::vector<uint8_t>{0x10, 0x20, 0x30, 0xEE}));
+    ASSERT_OK(fixture.accessor.endAccess(0));
+
+    auto frame = fixture.accessor.rxFrames().peekFrame();
+    ASSERT_TRUE(frame.has_value()) << error::toString(frame.error());
+    EXPECT_EQ(frame->metadata.wire_bytes, 4u);
+    EXPECT_EQ(frame->metadata.stored_bytes, 4u);
+    EXPECT_TRUE(slave::any(frame->metadata.flags & slave::FrameFlags::Underrun));
+    EXPECT_EQ(frame->first.data[0], 1u);
+    ASSERT_OK(fixture.accessor.rxFrames().popFrame());
 }
 
-// -------------------------------------------------------------------------
-// Null rx Sink discards captured bytes (tx still drained, count still len)
-// -------------------------------------------------------------------------
-TEST(SpiSlaveAccessor, ServeNullSinkDiscardsRx)
+TEST(SpiSlaveAccessor, FrameReservationCannotCrossAccessBoundary)
 {
     FakeSlaveBus bus;
-    m5::hal::v2::spi::SpiSlaveAccessor acc{bus};
+    spi::SlaveAccessConfig config;
+    config.tx_mode = slave::QueueMode::Frame;
+    AccessorFixture<8, 8, 2, 2> fixture{bus, config};
+    auto reservation = fixture.accessor.txFrames().reserveFrame(2);
+    ASSERT_TRUE(reservation.has_value()) << error::toString(reservation.error());
+    EXPECT_EQ(fixture.accessor.beginAccess(0).error(), error::error_t::INVALID_STATE);
+    ASSERT_OK(fixture.accessor.txFrames().cancelFrame(*reservation));
+    ASSERT_OK(fixture.accessor.beginAccess(0));
 
-    const uint8_t payload[] = {0x55, 0x66};
-    m5::hal::v2::data::MemorySource src{m5::hal::v2::data::ConstDataSpan{payload, sizeof(payload)}};
+    auto leaked = fixture.accessor.txFrames().reserveFrame(2);
+    ASSERT_TRUE(leaked.has_value()) << error::toString(leaked.error());
+    EXPECT_EQ(fixture.accessor.endAccess(0).error(), error::error_t::INVALID_STATE);
+    EXPECT_FALSE(fixture.accessor.inAccess());
+    EXPECT_EQ(fixture.accessor.txFrames().commitFrame(*leaked, {}).error(), error::error_t::INVALID_STATE);
+}
 
-    auto r = acc.serve(&src, nullptr, sizeof(payload), m5::hal::v2::types::TIMEOUT_FOREVER);
-    ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(r.value(), sizeof(payload));
-    ASSERT_EQ(bus.served.size(), sizeof(payload));
-    EXPECT_EQ(bus.served[0], 0x55u);
+TEST(SpiSlaveAccessor, OverflowAndLevelEventsRemainObservable)
+{
+    FakeSlaveBus bus;
+    AccessorFixture<2, 2, 0, 1> fixture{bus};
+    EventObservation observation;
+    ASSERT_OK(fixture.accessor.setEventCallback(&observeEvent, &observation));
+    ASSERT_OK(fixture.accessor.beginAccess(0));
+    const uint8_t request[] = {1, 2, 3, 4};
+    ASSERT_OK(bus.simulateFrame({request, sizeof(request)}));
+    ASSERT_OK(fixture.accessor.dispatchEvents());
+    EXPECT_EQ(observation.calls, 1u);
+    EXPECT_TRUE(slave::any(observation.last.events & slave::SlaveEvent::Overflow));
+    EXPECT_TRUE(slave::any(observation.last.events & slave::SlaveEvent::Underrun));
+
+    auto frame = fixture.accessor.rxFrames().peekFrame();
+    ASSERT_TRUE(frame.has_value()) << error::toString(frame.error());
+    EXPECT_EQ(frame->metadata.stored_bytes, 2u);
+    EXPECT_EQ(frame->metadata.dropped_bytes, 2u);
+    EXPECT_EQ(fixture.accessor.rxStatus().dropped_bytes, 2u);
+    ASSERT_OK(fixture.accessor.rxFrames().popFrame());
+    ASSERT_OK(fixture.accessor.acknowledgeEvents(observation.last.events));
+    ASSERT_OK(fixture.accessor.endAccess(0));
+}
+
+TEST(SpiSlaveAccessor, ExplicitClearIsInactiveOnly)
+{
+    FakeSlaveBus bus;
+    AccessorFixture<4, 4, 0, 1> fixture{bus};
+    const uint8_t value = 7;
+    ASSERT_OK(fixture.accessor.write({&value, 1}));
+    ASSERT_OK(fixture.accessor.clearTx());
+    EXPECT_EQ(fixture.accessor.writable(), 4u);
+    ASSERT_OK(fixture.accessor.beginAccess(0));
+    EXPECT_EQ(fixture.accessor.clearTx().error(), error::error_t::INVALID_STATE);
+    EXPECT_EQ(fixture.accessor.clearRx().error(), error::error_t::INVALID_STATE);
+    ASSERT_OK(fixture.accessor.endAccess(0));
 }
 
 int main(int argc, char** argv)

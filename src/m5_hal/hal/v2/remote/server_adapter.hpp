@@ -5,6 +5,7 @@
 #include "../service/service.hpp"
 #include "./credit_notifier.hpp"
 #include "./remote.hpp"
+#include "./wire_drain.hpp"
 
 namespace m5::hal::v2::remote {
 
@@ -52,7 +53,7 @@ public:
     result_t<size_t> service();
     result_t<void> pumpWire();
     result_t<void> flushTx();
-    void drainTx();
+    result_t<detail::DrainProgress> drainTx();
 
 private:
     static void frameHandlerThunk(void* ctx, const frame::View& view);
@@ -85,7 +86,7 @@ public:
 
 private:
     service::ServicePoll serviceImpl(const service::ServiceContext& ctx) override;
-    void drainTx();
+    result_t<detail::DrainProgress> drainTx();
 
     data::MuxFrameEncoder* _enc;
     data::MuxFrameDecoder* _dec;

@@ -36,12 +36,34 @@ build_flags =
 extends = common_native, test_fw
 build_src_filter = +<*> +<../test/v2/hil/uart_echo/host/uart_echo.cpp>
 
+; ESP UART console readableBytes — the device echoes only input first reported
+; by Bus_console::readableBytes(). The existing uart_echo host drives it.
+[env:v2_hil_console_readable_device_esp32]
+extends = common_esp32dev_espidf5, common_espidf
+build_src_filter = +<*> +<../test/v2/hil/console_readable/device/console_readable.cpp>
+
 ; -----------------------------------------------------------------------------
-; I2C slave (D8 stretch backend) — 2-board HIL: a CoreS3SE (ESP32-S3) slave
+; Arduino adopted-bus ownership — Core2 remote server borrows externally
+; initialised Wire/HSPI objects; a POSIX host repeatedly creates, transfers,
+; releases and recreates each logical bus. Wiring and two-phase responder
+; commands: test/v2/hil/remote_adopt/README.md.
+[env:v2_hil_remote_adopt_device_arduino_esp32]
+extends = common_esp32dev, common_arduino
+build_src_filter = +<*> +<../test/v2/hil/remote_adopt/device/remote_adopt.cpp>
+build_flags =
+    ${common_esp32.build_flags}
+    -DCORE_DEBUG_LEVEL=0
+
+[env:v2_hil_remote_adopt_host]
+extends = common_native
+build_src_filter = +<*> +<../test/v2/hil/remote_adopt/host/remote_adopt.cpp>
+
+; -----------------------------------------------------------------------------
+; I2C slave (clock-stretch backend) — 2-board HIL: a CoreS3SE (ESP32-S3) slave
 ; driven through the public M5HAL API (SlaveBus_espidf + SlaveStreamAccessor)
 ; against a Core2 verification master. Unlike uart_echo there is NO POSIX host:
-; the master is a second board (a companion bench firmware kept in the project's
-; private experiments tree, ROLE_MASTER), and acceptance is read from the
+; the master is a second board running one of the public master fixtures below,
+; and acceptance is read from the
 ; master's serial (BAD=0 across the WTR/SPLIT/WTEST x {100,400,800} kHz matrix).
 ; This env builds the device only, so check_hil()'s compile fence covers it
 ; without the master tree.
@@ -65,7 +87,7 @@ build_src_filter = +<*> +<../test/v2/hil/i2c_slave/device/i2c_slave.cpp>
 ; stretch-cause SoC, wired SDA=GPIO5 / SCL=GPIO6 to a BASIC/Core2 master's
 ; Port A. This is the slave-clock-fix cross-chip smoke target (the C61 boot code does not
 ; yet gate the I2C functional clock, so it also runs UNFIXED builds -- a PASS
-; here is a regression check, not the decisive D1 cold-boot proof; that needs
+; here is a regression check, not the decisive cold-boot proof; that needs
 ; C6/H2). Board def + platform mirror the ESP32_I2C_slave_example rig: the C61
 ; board is unknown to espressif32@6.12.0, so this env rides the pioarduino
 ; platform pin (common_esp32_arduino3 supplies only the platform zip; the
@@ -80,7 +102,7 @@ build_flags = -DM5HAL_HIL_I2C_PIN_SDA=5 -DM5HAL_HIL_I2C_PIN_SCL=6
 ; ESP32-C6 / ESP32-H2 variants of the register-map slave device, for the
 ; controller-clock cold-boot proof (the decisive rig): the C6/H2 boot code
 ; explicitly gates the I2C functional clock off (PCR i2c_sclk_en), so a build with
-; -DM5HAL_DEBUG_ESPIDF_I2C_SLAVE_NO_CONTROLLER_CLOCK=1 (the pre-D1 behavior, injected via
+; -DM5HAL_DEBUG_ESPIDF_I2C_SLAVE_NO_CONTROLLER_CLOCK=1 (the pre-fix behavior, injected via
 ; PLATFORMIO_BUILD_FLAGS) must be dead on cold boot while the fixed build works.
 ; Rig = M5 NanoC6 <-> NanoH2, Port A cross-wired, both SDA=GPIO2 / SCL=GPIO1
 ; (the device fixture's defaults, stated here explicitly anyway). Same
@@ -124,6 +146,19 @@ build_flags = -DM5HAL_HIL_I2C_PIN_SDA=32 -DM5HAL_HIL_I2C_PIN_SCL=33 -DM5HAL_HIL_
 extends = common_esp32s3dev_espidf5, common_espidf
 build_src_filter = +<*> +<../test/v2/hil/i2c_slave/device/i2c_echo.cpp>
 
+; QUEUE-DRIVEN I2C slave lifecycle HIL. A CoreS3 uses the public
+; i2c::SlaveAccessor with caller-owned Byte/Byte queues, TX preload, Fill
+; underrun, finite endAccess, and release/init/reuse. Pair it with the Core2
+; independent ESP-IDF master below. Protocol and acceptance:
+; test/v2/hil/i2c_slave/README.md.
+[env:v2_hil_i2c_slave_queue_device_esp32s3]
+extends = common_esp32s3dev_espidf5, common_espidf
+build_src_filter = +<*> +<../test/v2/hil/i2c_slave/device/i2c_slave_queue.cpp>
+
+[env:v2_hil_i2c_slave_queue_master_idf_esp32]
+extends = common_esp32dev_espidf5, common_espidf
+build_src_filter = +<*> +<../test/v2/hil/i2c_slave/master/i2c_slave_queue_master.cpp>
+
 ; M5HAL-MASTER half of the echo HIL pair: an ESP32 (Core2) driving the espidf master
 ; backend through MasterAccessor::transfer(Source*, Sink*) against the M5HAL stream
 ; slave above -- "both ends on the Source/Sink design". framework=espidf to match the
@@ -151,8 +186,7 @@ build_flags = -DECHO_MASTER_SOFTWARE
 ; SPLIT / WTR / window-base / repeat-read / 0xFF wrap / 96B long read+write /
 ; a 200-round zero-gap stress, PLUS a WTR read / SPLIT read / WRITETEST-
 ; equivalent write-then-verify length sweep (n=1..64 / k=1..48), at
-; 100/400/800 kHz, and prints a RESULT line (subsumes the private
-; i2c_slave_hybrid HIL pair's WTR/SPLIT/WTEST sweeps).
+; 100/400/800 kHz, and prints a RESULT line covering the WTR/SPLIT/WTEST sweeps.
 ; Source + wiring: test/v2/hil/i2c_slave/master/i2c_regmap_sweep_master.cpp.
 [env:v2_hil_i2c_regmap_sweep_master_arduino_esp32]
 extends = common_esp32dev, common_arduino
@@ -209,10 +243,10 @@ build_src_filter = +<*> +<../test/v2/hil/i2c_slave/master/i2c_echo_sweep_master.
 extends = common_esp32dev_espidf5, common_espidf
 build_src_filter = +<*> +<../test/v2/hil/i2c_slave/master/i2c_echo_sweep_master.cpp>
 
-; SPI slave echo: ESP-IDF spi_slave driver on a CoreS3 (ESP32-S3).
-; Echo contract: receive N bytes (one CS assertion), then send them back on
-; the next CS assertion. Port B + Port C straight wiring to a Core2 master.
-; Source: test/v2/hil/spi_slave/device/spi_echo.cpp.
+; SPI slave HIL: public SpiSlaveBus_espidf + SpiSlaveAccessor on a CoreS3.
+; A Core2 bench master clocks a continuous ramp; the first transaction is a
+; synchronization capture and the next 100 must be continuous. Wiring and
+; acceptance: test/v2/hil/spi_slave/README.md.
 [env:v2_hil_spi_slave_echo_esp32s3]
 extends = common_esp32s3dev_espidf5, common_espidf
 build_src_filter = +<*> +<../test/v2/hil/spi_slave/device/spi_echo.cpp>

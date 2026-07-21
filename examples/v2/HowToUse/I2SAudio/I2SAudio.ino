@@ -229,13 +229,7 @@ static void i2sAudioInit(void)
     LOG_PRINTLN("M5HAL HowToUseI2SAudio — board: " BOARD_NAME);
 
     // ---- Amplifier init (acquire I2C just for bring-up, then let go) ----
-#ifdef ARDUINO
-    Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-    m5hal::i2c::BusConfig_arduino i2c_bus_cfg{m5hal::i2c::Scl{PIN_I2C_SCL}, m5hal::i2c::Sda{PIN_I2C_SDA}};
-    i2c_bus_cfg.wire = &Wire;
-#else
     m5hal::i2c::BusConfig i2c_bus_cfg{m5hal::i2c::Scl{PIN_I2C_SCL}, m5hal::i2c::Sda{PIN_I2C_SDA}};
-#endif
     auto acquired = m5hal::M5_Hal.I2C.acquire(i2c_bus_cfg);
     if (!acquired.has_value()) {
         printError("I2C acquire", acquired.error());
@@ -243,7 +237,7 @@ static void i2sAudioInit(void)
     }
     initAmplifier(acquired.value());
     LOG_PRINTLN("Amplifier init OK");
-    // `acquired` (and its bus) is released at the end of init: playback uses I2S only.
+    // `acquired` (and its bus) is destroyed at the end of init: playback uses I2S only.
 
     // ---- I2S bus init ----
     i2s_bus_cfg.pin_bclk       = PIN_I2S_BCK;

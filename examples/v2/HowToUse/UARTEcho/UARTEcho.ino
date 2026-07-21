@@ -67,10 +67,9 @@ void setup()
 
     // Tag-typed pins: either order is correct (no swapped-pin accidents).
     m5hal::uart::BusConfig bus_cfg{m5hal::uart::Tx{PIN_UART_TX}, m5hal::uart::Rx{PIN_UART_RX}};
-    bus_cfg.setSerial(Serial1);
 
-    // Acquire the interned bus. This shared handle owns its lifetime.
-    auto acquired = m5hal::M5_Hal.UART.acquire(bus_cfg);
+    // Select the caller-owned Arduino serial object through the common native policy.
+    auto acquired = m5hal::M5_Hal.UART.acquire(bus_cfg, m5hal::native::borrowed(Serial1));
     if (!acquired.has_value()) {
         printError("uart bus acquire", acquired.error());
         return;
@@ -82,12 +81,26 @@ void setup()
     acc_cfg.inter_byte_timeout_ms = 5;
     acc_cfg.write_timeout_ms      = 100;
 
-    // Bind the reused accessors to the acquired bus once. bind / setConfig only
-    // fail while an access window is open, which never happens here.
-    const bool bound = uart_tx.bind(*uart_bus).has_value() && uart_tx.setConfig(acc_cfg).has_value() &&
-                       uart_rx.bind(*uart_bus).has_value() && uart_rx.setConfig(acc_cfg).has_value();
-    if (!bound) {
-        Serial.println("uart accessor bind failed");
+    // Bind the reused accessors to the acquired bus once, reporting the exact
+    // setup stage if the bus or configuration is rejected.
+    auto tx_bind = uart_tx.bind(*uart_bus);
+    if (!tx_bind.has_value()) {
+        printError("uart TX bind", tx_bind.error());
+        return;
+    }
+    auto tx_config = uart_tx.setConfig(acc_cfg);
+    if (!tx_config.has_value()) {
+        printError("uart TX config", tx_config.error());
+        return;
+    }
+    auto rx_bind = uart_rx.bind(*uart_bus);
+    if (!rx_bind.has_value()) {
+        printError("uart RX bind", rx_bind.error());
+        return;
+    }
+    auto rx_config = uart_rx.setConfig(acc_cfg);
+    if (!rx_config.has_value()) {
+        printError("uart RX config", rx_config.error());
         return;
     }
 

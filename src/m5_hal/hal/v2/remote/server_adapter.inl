@@ -18,7 +18,10 @@ result_t<size_t> RemoteServerAdapter::service()
         }
     }
     if (!_external_poll) {
-        drainTx();
+        auto drained = drainTx();
+        if (!drained.has_value()) {
+            return m5::stl::make_unexpected(drained.error());
+        }
     }
     if (!_external_poll) {
         auto pumped = pumpWire();
@@ -45,7 +48,10 @@ result_t<size_t> RemoteServerAdapter::service()
 
 result_t<void> RemoteServerAdapter::pumpWire()
 {
-    drainTx();
+    auto drained = drainTx();
+    if (!drained.has_value()) {
+        return m5::stl::make_unexpected(drained.error());
+    }
     auto decoded = _dec->pump(*_wire_rx);
     if (!decoded.has_value()) {
         return m5::stl::make_unexpected(decoded.error());
@@ -60,13 +66,16 @@ result_t<void> RemoteServerAdapter::flushTx()
     if (!encoded.has_value()) {
         return m5::stl::make_unexpected(encoded.error());
     }
-    drainTx();
+    auto drained = drainTx();
+    if (!drained.has_value()) {
+        return m5::stl::make_unexpected(drained.error());
+    }
     return {};
 }
 
-void RemoteServerAdapter::drainTx()
+result_t<detail::DrainProgress> RemoteServerAdapter::drainTx()
 {
-    detail::drainToSink(_enc->output(), *_wire_tx);
+    return detail::drainToSink(_enc->output(), *_wire_tx);
 }
 
 void RemoteServerAdapter::frameHandlerThunk(void* ctx, const frame::View& view)
@@ -97,7 +106,10 @@ void RemoteServerAdapter::sendCreditIfChanged()
 service::ServicePoll RemoteWireService::serviceImpl(const service::ServiceContext& ctx)
 {
     (void)ctx;
-    drainTx();
+    auto drained = drainTx();
+    if (!drained.has_value()) {
+        return service::ServiceResult::Error;
+    }
     auto decoded = _dec->pump(*_wire_rx);
     if (!decoded.has_value()) {
         return service::ServiceResult::Error;
@@ -107,13 +119,16 @@ service::ServicePoll RemoteWireService::serviceImpl(const service::ServiceContex
     if (!encoded.has_value()) {
         return service::ServiceResult::Error;
     }
-    drainTx();
+    drained = drainTx();
+    if (!drained.has_value()) {
+        return service::ServiceResult::Error;
+    }
     return service::ServiceResult::Progress;
 }
 
-void RemoteWireService::drainTx()
+result_t<detail::DrainProgress> RemoteWireService::drainTx()
 {
-    detail::drainToSink(_enc->output(), *_wire_tx);
+    return detail::drainToSink(_enc->output(), *_wire_tx);
 }
 
 }  // namespace m5::hal::v2::remote

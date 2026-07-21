@@ -4,7 +4,7 @@
 
 // runtime kind for the arduino framework variant: time through the
 // Arduino core API, mutex through the shared FreeRTOS detail
-// (arduino-esp32 is a FreeRTOS environment, [026] E4).
+// (arduino-esp32 is a FreeRTOS environment).
 // Authoritative contract: spec/design/runtime.md.
 
 #if defined(ARDUINO)

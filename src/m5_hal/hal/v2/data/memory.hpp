@@ -48,7 +48,7 @@ public:
     {
         size_t remain = (_cursor < _data.size) ? (_data.size - _cursor) : 0;
         size_t take   = std::min(max_len, remain);
-        return ConstDataSpan{_data.data + _cursor, take};
+        return ConstDataSpan{_cursor == 0 ? _data.data : _data.data + _cursor, take};
     }
 
     m5::hal::v2::result_t<void> advance(size_t N) override
@@ -104,7 +104,7 @@ public:
     {
         size_t remain = (_cursor < _buf.size) ? (_buf.size - _cursor) : 0;
         size_t take   = std::min(max_len, remain);
-        return DataSpan{_buf.data + _cursor, take};
+        return DataSpan{_cursor == 0 ? _buf.data : _buf.data + _cursor, take};
     }
 
     m5::hal::v2::result_t<void> commit(size_t N) override

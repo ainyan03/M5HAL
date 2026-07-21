@@ -28,6 +28,20 @@ size_t pumpValue(data::MuxFrameEncoder& enc)
     return r.value();
 }
 
+TEST(MuxAllocatorBinding, ConstructorsFixAllocatorForLifetime)
+{
+    memory::Allocator custom;
+    data::MuxFrameEncoder default_encoder;
+    data::MuxFrameDecoder default_decoder;
+    data::MuxFrameEncoder custom_encoder{custom};
+    data::MuxFrameDecoder custom_decoder{custom};
+
+    EXPECT_EQ(default_encoder.allocator(), &memory::defaultAllocator());
+    EXPECT_EQ(default_decoder.allocator(), &memory::defaultAllocator());
+    EXPECT_EQ(custom_encoder.allocator(), &custom);
+    EXPECT_EQ(custom_decoder.allocator(), &custom);
+}
+
 size_t pumpValue(data::MuxFrameDecoder& dec, data::Source& src)
 {
     auto r = dec.pump(src);
@@ -251,12 +265,33 @@ void countingFree(void* p)
     std::free(p);
 }
 
+memory::Allocator* g_pool_change_alloc = nullptr;
+void* g_pool_change_held               = nullptr;
+size_t g_pool_change_fallback_allocs   = 0;
+size_t g_pool_change_fallback_frees    = 0;
+
+void* poolChangingMalloc(size_t size, memory::usage_t)
+{
+    ++g_pool_change_fallback_allocs;
+    if (g_pool_change_alloc != nullptr && g_pool_change_held != nullptr) {
+        g_pool_change_alloc->deallocate(g_pool_change_held);
+        g_pool_change_held = nullptr;
+    }
+    return std::malloc(size);
+}
+
+void poolChangingFree(void* p)
+{
+    ++g_pool_change_fallback_frees;
+    std::free(p);
+}
+
 TEST(MuxFrameEncoder, IdleOpenStreamPumpDoesNotAllocate)
 {
     // Regression anchor: pump() used to allocate (and free) one Temp block
     // per idle stream on every call before discovering there was nothing
     // to send — steady-state churn on every open-but-quiet stream.
-    static memory::Allocator alloc;  // fresh pool, no fallback yet
+    static memory::Allocator alloc{memory::FallbackOps{countingMalloc, countingFree}};
     data::MuxFrameEncoder enc{alloc};
 
     IdleOpenSource idle;
@@ -267,7 +302,6 @@ TEST(MuxFrameEncoder, IdleOpenStreamPumpDoesNotAllocate)
     // to std::malloc, so "allocate until nullptr" would never terminate;
     // the first counted fallback call is the "pool is full" signal).
     g_fallback_allocs = 0;
-    alloc.setFallback(countingMalloc, countingFree);
     std::vector<void*> held;
     while (g_fallback_allocs == 0) {
         void* p = alloc.allocate(64);
@@ -435,8 +469,8 @@ TEST(MuxFrameEncoder, WriteDelimiter)
 
 TEST(MuxFrameEncoder, OptionalPrefixCannotConsumeRequiredFrameAllocation)
 {
-    memory::Allocator alloc;
-    alloc.setFallback(+[](size_t, memory::usage_t) -> void* { return nullptr; }, +[](void*) {});
+    memory::Allocator alloc{
+        memory::FallbackOps{+[](size_t, memory::usage_t) -> void* { return nullptr; }, +[](void*) {}}};
     data::MuxFrameEncoder enc{alloc};
     std::array<void*, memory::Allocator::tempBlockCount() - 1> held{};
     for (auto& block : held) {
@@ -814,6 +848,51 @@ TEST(MuxFrameDecoder, BlockStreamUsesTempBlocksUntilConsumed)
     EXPECT_EQ(::memcmp(p.value().data, d2, sizeof(d2)), 0);
     ASSERT_TRUE(src->advance(p.value().size).has_value());
     EXPECT_EQ(alloc.usedBlocks(), before);
+
+    dec.releaseAll();
+}
+
+TEST(MuxFrameDecoder, BlockStreamRejectsFallbackDespiteIndependentPoolUsageChange)
+{
+    memory::Allocator alloc{memory::FallbackOps{poolChangingMalloc, poolChangingFree}};
+    data::MuxFrameDecoder dec{alloc};
+
+    auto* src = dec.createBlockStream(2);
+    ASSERT_NE(src, nullptr);
+
+    uint8_t wire[frame::kMaxFrameSize];
+    const uint8_t payload[] = {0x42};
+    auto encoded            = frame::encodeData({wire, sizeof(wire)}, 2, {payload, sizeof(payload)});
+    ASSERT_TRUE(encoded.has_value()) << "err=" << m5::hal::v2::error::toString(encoded.error());
+    const size_t used = encoded.value();
+    data::MemorySource wire_src{wire, used};
+
+    void* held = alloc.allocate(memory::Allocator::tempPoolSize());
+    ASSERT_NE(held, nullptr);
+    ASSERT_TRUE(alloc.isTempPoolAllocation(held));
+    g_pool_change_alloc           = &alloc;
+    g_pool_change_held            = held;
+    g_pool_change_fallback_allocs = 0;
+    g_pool_change_fallback_frees  = 0;
+
+    // The fallback hook releases an unrelated pool allocation between the
+    // old before/after counter observations, without changing where the
+    // newly returned pointer came from.
+    const size_t pumped  = pumpValue(dec, wire_src);
+    void* remaining_held = g_pool_change_held;
+    g_pool_change_alloc  = nullptr;
+    g_pool_change_held   = nullptr;
+    if (remaining_held != nullptr) {
+        alloc.deallocate(remaining_held);
+    }
+
+    EXPECT_EQ(pumped, 0u);
+    EXPECT_EQ(g_pool_change_fallback_allocs, 1u);
+    EXPECT_EQ(g_pool_change_fallback_frees, 1u);
+    EXPECT_EQ(alloc.usedBlocks(), 0u);
+    auto peeked = src->peek(1);
+    ASSERT_TRUE(peeked.has_value());
+    EXPECT_EQ(peeked.value().size, 0u);
 
     dec.releaseAll();
 }

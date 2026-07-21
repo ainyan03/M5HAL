@@ -4,8 +4,11 @@
 #define M5_HAL_BUS_REGISTRY_HPP_
 
 #include "./bus.hpp"  // IBus, runtime::Mutex, types, error, result_t, M5Utility
+#include "./native_binding.hpp"
+#include "./resource_key.hpp"  // ResourceKey, RegistryEntryToken
 
-#include <initializer_list>
+#include <cstdlib>
+#include <limits>
 #include <memory>
 #include <utility>
 
@@ -16,80 +19,21 @@
 namespace m5::hal::v2::bus {
 
 /*!
-  @brief Physical-wiring identity tag (pins only).
-
-  Two configs that name the same pins denote the same physical bus and
-  intern to one instance (identity = the wiring, NOT which
-  backend / controller drives it, NOT the per-accessor frequency). The
-  roles are positional and fixed, so no order normalization is needed --
-  swapping pins is a different bus. Each kind puts its core signal roles in
-  order: I2C = {SCL, SDA}; SPI = {CLK, MOSI, MISO}
-  (the 3-wire core; quad/octal data lines and DC are NOT identity -- the
-  same core wires are the same physical bus); UART = {TX, RX}; I2S =
-  {BCLK, WS, DOUT, DIN}. `kMaxPins` covers the widest of these.
-
-  Limiting identity to the core wires is deliberate: including the extra
-  bus-level pins a backend may also drive (SPI quad data, UART RTS/CTS, I2S
-  MCLK) would split the same core wiring used in two modes into two buses
-  with two locks -- breaking the "one physical bus, one lock" guarantee. The
-  trade-off is that those extra pins are FIRST-CONFIG-WINS: a later acquire
-  of the same core wiring shares the first bus and ignores any differing
-  extra-pin config (set them on the first acquire).
- */
-struct IdentityKey {
-    static constexpr size_t kMaxPins = 6;
-    // Keep the initializer element count equal to kMaxPins (the -1 sentinel
-    // must reach every slot; a short brace list would zero the rest, and 0
-    // is a valid pin number).
-    types::gpio_number_t pins[kMaxPins] = {-1, -1, -1, -1, -1, -1};
-
-    /*!
-      @brief Build a key from a kind's identity pins in role order.
-
-      The single shared identity projection: each kind passes its signal roles
-      exactly as the per-kind layout doc above. Any unset role stays at the
-      `-1` sentinel, including a leading role; identity compares that sentinel
-      like any other value and does not validate whether a backend can operate
-      with the requested wiring. A list longer than `kMaxPins` is clamped (a
-      kind never exceeds it).
-     */
-    static IdentityKey fromPins(std::initializer_list<types::gpio_number_t> role_pins)
-    {
-        IdentityKey key;
-        size_t i = 0;
-        for (types::gpio_number_t pin : role_pins) {
-            if (i >= kMaxPins) {
-                break;
-            }
-            key.pins[i++] = pin;
-        }
-        return key;
-    }
-
-    bool operator==(const IdentityKey& other) const
-    {
-        for (size_t i = 0; i < kMaxPins; ++i) {
-            if (pins[i] != other.pins[i]) {
-                return false;
-            }
-        }
-        return true;
-    }
-};
-
-/*!
   @brief All-kind weak registry: interns buses by (kind, identity).
 
-  One physical wiring maps to one shared instance, so a board-support
-  layer and user code that name the same pins share a single bus (and its
+  Within one ResourceDomain, one exact ResourceKey maps to one shared instance,
+  so a board-support layer and user code that name the same resource share a single bus (and its
   single lock) -- the correctness requirement the registry enforces. The registry
-  holds `weak_ptr`, so a bus is released (its `Bus` dtor runs, freeing the
+  holds `weak_ptr`, so a bus is destroyed (its `Bus` dtor runs, freeing the
   backend) once the last `shared_ptr` holder drops it. For an externally
-  backed bus whose natural release is still pending or has failed, the slot
+  backed bus whose natural close is still pending or has failed, the slot
   keeps its lifecycle tombstone and identity until close; reacquisition then
   returns `BUSY` rather than aliasing an uncertain peer resource. A single
-  mutex serializes `acquireOrFind` so two concurrent acquires
-  of one identity cannot create two instances. Lookups never sit on a
+  mutex serializes reservation/publication. A miss becomes `Constructing`,
+  the factory runs outside the mutex, and a competing acquire returns BUSY;
+  two concurrent acquires cannot create two instances. Generation-bearing
+  registration metadata closes stale-ticket and destructor weak-expiry ABA.
+  Lookups never sit on a
   transfer hot path (accessors hold the bus directly), so the lock is free.
 
   Per-kind access goes through a typed view (e.g. `i2c::BusView`, exposed
@@ -99,28 +43,28 @@ struct IdentityKey {
   resource pool.
  */
 class BusRegistry {
-    enum class SlotState : uint8_t { Live, Releasing };
+    enum class SlotState : uint8_t { Empty, Constructing, Live, Closing, Quarantined };
 
 public:
     /*! @brief Total live buses across all kinds (RAM budget). */
     static constexpr size_t kCapacity = 16;
 
     struct ReleaseTicket {
-        size_t slot            = kCapacity;
-        types::bus_kind_t kind = types::bus_kind_t::Unknown;
-        IdentityKey id;
-        const IBus* expected = nullptr;
+        RegistryEntryToken entry;
+        ResourceKey key;
+        const IBus* expected     = nullptr;
+        bool retrying_quarantine = false;
 
         ReleaseTicket(void) = default;
-        ReleaseTicket(size_t slot_index, types::bus_kind_t bus_kind, const IdentityKey& identity,
-                      const IBus* expected_bus)
-            : slot{slot_index}, kind{bus_kind}, id{identity}, expected{expected_bus}
+        ReleaseTicket(RegistryEntryToken token, const ResourceKey& identity, const IBus* expected_bus,
+                      bool retrying = false)
+            : entry{token}, key{identity}, expected{expected_bus}, retrying_quarantine{retrying}
         {
         }
 
         bool valid(void) const
         {
-            return slot < kCapacity && expected != nullptr;
+            return entry.valid() && entry.slot < kCapacity && expected != nullptr;
         }
     };
 
@@ -131,19 +75,23 @@ public:
     /*!
       @brief Return the bus for (kind, id), creating it via `make` on a miss.
 
-      Atomic under the registry mutex. A hit returns the existing instance,
-      so a second acquire of the same wiring shares it -- the FIRST backend
-      choice wins and a later differing config is ignored (a managed reassign
-      changes a live bus's backend instead). A miss calls `make` and interns
-      the result. `make` is `() -> result_t<shared_ptr<IBus>>`; its error is
+      Reservation and publication are atomic under the registry mutex. The
+      potentially allocating or platform-calling `make` callback runs outside
+      that mutex while the matching identity remains `Constructing`; another
+      acquire of that identity returns `BUSY`. A hit returns the existing
+      instance only after its exact provider/native binding and the caller's
+      kind-specific configuration validator both accept it. A managed
+      reassignment changes a live bus through its separate commit path. A miss
+      calls `make` and interns the result. `make` is
+      `() -> result_t<shared_ptr<IBus>>`; its error is
       propagated WITHOUT interning (a failed bus is never registered).
       Returns `OUT_OF_RESOURCE` when all `kCapacity` slots hold live buses.
      */
     template <class MakeFn>
-    result_t<std::shared_ptr<IBus>> acquireOrFind(types::bus_kind_t kind, const IdentityKey& id, MakeFn&& make)
+    result_t<std::shared_ptr<IBus>> acquireOrFind(const ResourceKey& key, MakeFn&& make)
     {
         return acquireOrFind(
-            kind, id, [](const std::shared_ptr<IBus>&) -> result_t<void> { return {}; }, std::forward<MakeFn>(make));
+            key, [](const std::shared_ptr<IBus>&) -> result_t<void> { return {}; }, std::forward<MakeFn>(make));
     }
 
     /*!
@@ -154,17 +102,52 @@ public:
       that must not race a release/reacquire of the same identity.
      */
     template <class ValidateFn, class MakeFn>
-    result_t<std::shared_ptr<IBus>> acquireOrFind(types::bus_kind_t kind, const IdentityKey& id, ValidateFn&& validate,
-                                                  MakeFn&& make)
+    result_t<std::shared_ptr<IBus>> acquireOrFind(const ResourceKey& key, ValidateFn&& validate, MakeFn&& make)
     {
-        Guard guard{_mutex};
-        int free_slot = -1;
-        for (size_t i = 0; i < kCapacity; ++i) {
-            Slot& s = _slots[i];
-            if (auto live = s.bus.lock()) {
-                if (s.kind == kind && s.id == id) {
-                    if (s.state == SlotState::Releasing) {
+        return acquireOrFind(key, BindingDescriptor{}, std::forward<ValidateFn>(validate), std::forward<MakeFn>(make));
+    }
+
+    /*!
+      @brief Acquire with an exact provider/native binding descriptor.
+
+      A live identity may be reused only when the complete binding matches.
+      This comparison is performed under the registry lock before the
+      kind-specific portable-config validator.
+     */
+    template <class ValidateFn, class MakeFn>
+    result_t<std::shared_ptr<IBus>> acquireOrFind(const ResourceKey& key, const BindingDescriptor& binding,
+                                                  ValidateFn&& validate, MakeFn&& make)
+    {
+        if (!key.isValid()) {
+            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+        }
+        RegistryEntryToken reservation;
+        {
+            Guard guard{_mutex};
+            int free_slot = -1;
+            for (size_t i = 0; i < kCapacity; ++i) {
+                Slot& s = _slots[i];
+                if (s.state != SlotState::Empty && s.key == key) {
+                    if (s.state != SlotState::Live) {
                         return m5::stl::make_unexpected(error::error_t::BUSY);
+                    }
+                    auto live = s.bus.lock();
+                    if (!live) {
+                        // A final owner can already have released its strong
+                        // count while its destructor has not yet reserved
+                        // Closing. Never create a second instance in that gap.
+                        if (!s.destructor_managed &&
+                            (!s.lifecycle || s.lifecycle->state() == BusLifecycle::State::Closed)) {
+                            clearSlot(s);
+                            if (s.generation != std::numeric_limits<uint32_t>::max() && free_slot < 0) {
+                                free_slot = static_cast<int>(i);
+                            }
+                            continue;
+                        }
+                        return m5::stl::make_unexpected(error::error_t::BUSY);
+                    }
+                    if (!(s.binding == binding)) {
+                        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
                     }
                     auto valid = validate(live);
                     if (!valid.has_value()) {
@@ -172,38 +155,74 @@ public:
                     }
                     return live;  // hit: the first backend wins
                 }
-                continue;
-            }
-            // An externally-backed bus may already have lost its last strong
-            // owner while its destructor is still releasing the peer object.
-            // Keep the identity tombstoned until that lifecycle is Closed.
-            if (s.lifecycle && s.lifecycle->state() != BusLifecycle::State::Closed) {
-                if (s.kind == kind && s.id == id) {
-                    return m5::stl::make_unexpected(error::error_t::BUSY);
+
+                if (s.state == SlotState::Empty) {
+                    if (s.generation != std::numeric_limits<uint32_t>::max() && free_slot < 0) {
+                        free_slot = static_cast<int>(i);
+                    }
+                    continue;
                 }
-                continue;
+
+                // A non-matching ordinary local entry can be reclaimed once
+                // its owner is gone. Externally-backed entries retain their
+                // tombstone until lifecycle close is certain.
+                if (s.state == SlotState::Live && !s.destructor_managed && s.bus.expired() &&
+                    (!s.lifecycle || s.lifecycle->state() == BusLifecycle::State::Closed)) {
+                    clearSlot(s);
+                    if (s.generation != std::numeric_limits<uint32_t>::max() && free_slot < 0) {
+                        free_slot = static_cast<int>(i);
+                    }
+                }
             }
-            // Expired (or never used): reclaim lazily and remember as free.
-            s.lifecycle.reset();
-            s.kind  = types::bus_kind_t::Unknown;
-            s.state = SlotState::Live;
             if (free_slot < 0) {
-                free_slot = static_cast<int>(i);
+                return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
             }
+            Slot& s = _slots[static_cast<size_t>(free_slot)];
+            ++s.generation;
+            s.key       = key;
+            s.binding   = binding;
+            s.state     = SlotState::Constructing;
+            reservation = {static_cast<uint16_t>(free_slot), 0, s.generation};
         }
-        if (free_slot < 0) {
+
+        ReservationRollback rollback{*this, reservation, key};
+        auto made = make();
+
+        Guard guard{_mutex};
+        Slot* s = reservedSlot(reservation, key, SlotState::Constructing);
+        if (s == nullptr) {
+            return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+        }
+        if (!made.has_value()) {
+            const auto err = made.error();
+            clearSlot(*s);
+            rollback.dismiss();
+            return m5::stl::make_unexpected(err);
+        }
+        if (!made.value()) {
+            clearSlot(*s);
+            rollback.dismiss();
             return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
         }
-        auto made = make();
-        if (!made.has_value()) {
-            return m5::stl::make_unexpected(made.error());
+        auto lifecycle = made.value()->lifecycleHandle();
+        const bool destructor_managed =
+            made.value()->bindRegistryRegistration(*this, key, reservation.slot, reservation.generation);
+        // weak_ptr expires before the object's destructor begins. Publishing a
+        // bus with neither a destructor callback nor an external lifecycle
+        // tombstone would therefore permit same-resource recreation during
+        // teardown. Refuse that unsafe extension shape.
+        if (!destructor_managed && (!lifecycle || lifecycle->state() == BusLifecycle::State::Closed)) {
+            clearSlot(*s);
+            rollback.dismiss();
+            return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
         }
-        Slot& s     = _slots[static_cast<size_t>(free_slot)];
-        s.bus       = made.value();  // stored as weak_ptr
-        s.lifecycle = made.value()->lifecycleHandle();
-        s.kind      = kind;
-        s.id        = id;
-        s.state     = SlotState::Live;
+        made.value()->markRegistryBound();
+        s->destructor_managed = destructor_managed;
+        s->bus                = made.value();  // stored as weak_ptr
+        s->expected           = made.value().get();
+        s->lifecycle          = std::move(lifecycle);
+        s->state              = SlotState::Live;
+        rollback.dismiss();
         return made.value();
     }
 
@@ -227,10 +246,10 @@ public:
             Guard guard{_mutex};
             for (size_t i = 0; i < kCapacity; ++i) {
                 Slot& s = _slots[i];
-                if (s.kind != kind) {
+                if (s.key.kind != kind) {
                     continue;
                 }
-                if (s.state == SlotState::Releasing) {
+                if (s.state != SlotState::Live) {
                     continue;
                 }
                 if (auto live = s.bus.lock()) {
@@ -248,16 +267,19 @@ public:
 
       Returns a strong `shared_ptr` if a live bus matching (kind, id)
       exists in the registry, or `nullptr` if no match is found. Used by
-      `releaseBus` in RemoteBackend to retrieve the proxy object and read
+      `closeBus` in RemoteBackend to retrieve the proxy object and read
       back its remote bus_id before clearing the slot.
      */
-    std::shared_ptr<IBus> findByIdentity(types::bus_kind_t kind, const IdentityKey& id) const
+    std::shared_ptr<IBus> findByIdentity(const ResourceKey& key) const
     {
+        if (!key.isValid()) {
+            return nullptr;
+        }
         Guard guard{_mutex};
         for (size_t i = 0; i < kCapacity; ++i) {
             const Slot& s = _slots[i];
-            if (s.kind == kind && s.id == id) {
-                if (s.state == SlotState::Releasing) {
+            if (s.key == key) {
+                if (s.state != SlotState::Live) {
                     return nullptr;
                 }
                 return s.bus.lock();
@@ -266,20 +288,20 @@ public:
         return nullptr;
     }
 
-    result_t<ReleaseTicket> beginRelease(types::bus_kind_t kind, const IdentityKey& id,
-                                         const std::shared_ptr<IBus>& expected)
+    result_t<ReleaseTicket> beginRelease(const ResourceKey& key, const std::shared_ptr<IBus>& expected)
     {
-        if (!expected) {
+        if (!key.isValid() || !expected) {
             return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
         }
         Guard guard{_mutex};
         for (size_t i = 0; i < kCapacity; ++i) {
             Slot& s = _slots[i];
-            if (s.kind == kind && s.id == id) {
-                if (s.state == SlotState::Releasing) {
+            if (s.key == key) {
+                if (s.state != SlotState::Live && s.state != SlotState::Quarantined) {
                     return m5::stl::make_unexpected(error::error_t::BUSY);
                 }
-                auto live = s.bus.lock();
+                const bool retrying_quarantine = s.state == SlotState::Quarantined;
+                auto live                      = s.bus.lock();
                 if (!live || live.get() != expected.get()) {
                     return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
                 }
@@ -288,8 +310,9 @@ public:
                 if (live.use_count() != 2) {
                     return m5::stl::make_unexpected(error::error_t::BUSY);
                 }
-                s.state = SlotState::Releasing;
-                return ReleaseTicket{i, kind, id, expected.get()};
+                s.state = SlotState::Closing;
+                return ReleaseTicket{
+                    {static_cast<uint16_t>(i), 0, s.generation}, key, expected.get(), retrying_quarantine};
             }
         }
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
@@ -302,11 +325,7 @@ public:
         if (s == nullptr) {
             return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
         }
-        s->bus.reset();
-        s->lifecycle.reset();
-        s->kind  = types::bus_kind_t::Unknown;
-        s->id    = IdentityKey{};
-        s->state = SlotState::Live;
+        clearSlot(*s);
         return {};
     }
 
@@ -317,8 +336,59 @@ public:
         if (s == nullptr) {
             return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
         }
-        s->state = SlotState::Live;
+        s->state = ticket.retrying_quarantine ? SlotState::Quarantined : SlotState::Live;
         return {};
+    }
+
+    result_t<void> quarantineRelease(const ReleaseTicket& ticket)
+    {
+        Guard guard{_mutex};
+        Slot* s = releaseSlot(ticket);
+        if (s == nullptr) {
+            return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+        }
+        s->state = SlotState::Quarantined;
+        return {};
+    }
+
+    bool beginAbandon(RegistryEntryToken token, const ResourceKey& key, const IBus* expected)
+    {
+        if (!token.valid() || !key.isValid() || expected == nullptr || token.slot >= kCapacity) {
+            return false;
+        }
+        Guard guard{_mutex};
+        Slot& s = _slots[token.slot];
+        // A destructor-managed local bus may be dropped after an explicit
+        // partial close without the caller retrying. Its destructor gets one
+        // final teardown attempt; reserve both Live and Quarantined slots so
+        // confirmed success can reclaim the identity. External-lifecycle
+        // tombstones have destructor_managed=false and remain quarantined.
+        if (s.generation != token.generation || (s.state != SlotState::Live && s.state != SlotState::Quarantined) ||
+            !(s.key == key) || s.expected != expected || !s.destructor_managed) {
+            return false;
+        }
+        s.state = SlotState::Closing;
+        return true;
+    }
+
+    void finishAbandon(RegistryEntryToken token, const ResourceKey& key, const IBus* expected, bool success)
+    {
+        if (!token.valid() || !key.isValid() || expected == nullptr || token.slot >= kCapacity) {
+            return;
+        }
+        Guard guard{_mutex};
+        Slot& s = _slots[token.slot];
+        if (s.generation != token.generation || s.state != SlotState::Closing || !(s.key == key) ||
+            s.expected != expected || !s.destructor_managed) {
+            return;
+        }
+        if (success) {
+            clearSlot(s);
+        } else {
+            s.bus.reset();
+            s.expected = nullptr;
+            s.state    = SlotState::Quarantined;
+        }
     }
 
     /*!
@@ -334,7 +404,9 @@ public:
         size_t n = 0;
         for (size_t i = 0; i < kCapacity; ++i) {
             const Slot& s = _slots[i];
-            if (!s.bus.expired() || (s.lifecycle && s.lifecycle->state() != BusLifecycle::State::Closed)) {
+            if (s.state != SlotState::Empty &&
+                (s.state != SlotState::Live || s.destructor_managed || !s.bus.expired() ||
+                 (s.lifecycle && s.lifecycle->state() != BusLifecycle::State::Closed))) {
                 ++n;
             }
         }
@@ -342,21 +414,80 @@ public:
     }
 
 private:
+    friend struct BusRegistryTestAccess;
+
     struct Slot {
         std::weak_ptr<IBus> bus;
         std::shared_ptr<BusLifecycle> lifecycle;
-        types::bus_kind_t kind = types::bus_kind_t::Unknown;
-        IdentityKey id;
-        SlotState state = SlotState::Live;
+        ResourceKey key;
+        BindingDescriptor binding;
+        const IBus* expected    = nullptr;
+        uint32_t generation     = 0;
+        SlotState state         = SlotState::Empty;
+        bool destructor_managed = false;
     };
+
+    static void clearSlot(Slot& s)
+    {
+        s.bus.reset();
+        s.lifecycle.reset();
+        s.key                = {};
+        s.binding            = {};
+        s.expected           = nullptr;
+        s.state              = SlotState::Empty;
+        s.destructor_managed = false;
+    }
+
+    class ReservationRollback {
+    public:
+        ReservationRollback(BusRegistry& registry, RegistryEntryToken token, const ResourceKey& key)
+            : _registry{&registry}, _token{token}, _key{key}
+        {
+        }
+        ~ReservationRollback()
+        {
+            if (_registry != nullptr) {
+                _registry->rollbackReservation(_token, _key);
+            }
+        }
+        void dismiss(void)
+        {
+            _registry = nullptr;
+        }
+
+    private:
+        BusRegistry* _registry;
+        RegistryEntryToken _token;
+        ResourceKey _key;
+    };
+
+    void rollbackReservation(RegistryEntryToken token, const ResourceKey& key)
+    {
+        Guard guard{_mutex};
+        if (auto* s = reservedSlot(token, key, SlotState::Constructing)) {
+            clearSlot(*s);
+        }
+    }
+
+    Slot* reservedSlot(RegistryEntryToken token, const ResourceKey& key, SlotState state)
+    {
+        if (!token.valid() || token.slot >= kCapacity) {
+            return nullptr;
+        }
+        Slot& s = _slots[token.slot];
+        if (s.generation != token.generation || s.state != state || !(s.key == key)) {
+            return nullptr;
+        }
+        return &s;
+    }
 
     Slot* releaseSlot(const ReleaseTicket& ticket)
     {
         if (!ticket.valid()) {
             return nullptr;
         }
-        Slot& s = _slots[ticket.slot];
-        if (s.state != SlotState::Releasing || s.kind != ticket.kind || !(s.id == ticket.id)) {
+        Slot& s = _slots[ticket.entry.slot];
+        if (s.generation != ticket.entry.generation || s.state != SlotState::Closing || !(s.key == ticket.key)) {
             return nullptr;
         }
         auto live = s.bus.lock();
@@ -366,20 +497,7 @@ private:
         return &s;
     }
 
-    // Minimal RAII guard over runtime::Mutex (bool lock(timeout) / void unlock()).
-    struct Guard {
-        runtime::Mutex& m;
-        explicit Guard(runtime::Mutex& mtx) : m{mtx}
-        {
-            (void)m.lock(types::TIMEOUT_FOREVER);
-        }
-        ~Guard(void)
-        {
-            m.unlock();
-        }
-        Guard(const Guard&)            = delete;
-        Guard& operator=(const Guard&) = delete;
-    };
+    using Guard = runtime::MutexGuard;
 
     Slot _slots[kCapacity];
     mutable runtime::Mutex _mutex;  // mutable: const observers (liveCount) take it too

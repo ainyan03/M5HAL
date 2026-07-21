@@ -9,6 +9,7 @@
 #include "bus_lease.hpp"
 #include "hal/i2c/i2c.hpp"
 #include "hal/i2s/i2s.hpp"
+#include "hal/pdm/pdm.hpp"
 #include "hal/spi/spi.hpp"
 #include "hal/uart/uart.hpp"
 #include "session.hpp"
@@ -43,15 +44,25 @@ public:
         return _caps;
     }
 
-    result_t<std::shared_ptr<bus::IBus>> acquireBusTyped(types::bus_kind_t kind, const bus::IdentityKey& id,
-                                                         const bus::IBusConfig& cfg) override;
-    result_t<std::shared_ptr<bus::IBus>> acquireBusLogical(types::bus_kind_t kind, const bus::IdentityKey& id,
+    bus::BusRegistry& busRegistry(void) override
+    {
+        return _registry;
+    }
+    const bus::BusRegistry& busRegistry(void) const override
+    {
+        return _registry;
+    }
+
+    result_t<std::shared_ptr<bus::IBus>> acquireBusPortable(types::bus_kind_t kind, const bus::ResourceKey& id,
+                                                            const bus::IBusConfig& cfg) override;
+    result_t<std::shared_ptr<bus::IBus>> acquireBusLogical(types::bus_kind_t kind, const bus::ResourceKey& id,
                                                            const bus::AllocationRequest& req) override;
     result_t<void> commitBuses(types::bus_kind_t kind, uint32_t timeout_ms) override;
-    result_t<void> releaseBus(types::bus_kind_t kind, const bus::IdentityKey& id,
-                              const std::shared_ptr<bus::IBus>& expected) override;
+    result_t<void> closeBus(types::bus_kind_t kind, const bus::ResourceKey& id,
+                            const std::shared_ptr<bus::IBus>& expected) override;
 
 private:
+    result_t<bus::ResourceKey> sessionResourceKey(types::bus_kind_t kind, const bus::ResourceKey& target) const;
     static uint8_t extractBusId(types::bus_kind_t kind, const std::shared_ptr<bus::IBus>& bus);
     static std::shared_ptr<RemoteBusLease> extractBusLease(types::bus_kind_t kind,
                                                            const std::shared_ptr<bus::IBus>& bus);
@@ -62,7 +73,10 @@ private:
                                                          const bus::IBusConfig& cfg);
     result_t<std::shared_ptr<bus::IBus>> createRemoteBusFromLogical(types::bus_kind_t kind,
                                                                     data::ConstDataSpan pin_config);
-    result_t<void> sendCreateBus(types::bus_kind_t kind, uint8_t bus_id, data::ConstDataSpan pin_config);
+    result_t<bus::BusCapabilities> sendCreateBus(types::bus_kind_t kind, uint8_t bus_id,
+                                                 data::ConstDataSpan pin_config);
+    void setProxyCapabilities(types::bus_kind_t kind, const std::shared_ptr<bus::IBus>& proxy,
+                              const bus::BusCapabilities& capabilities) const;
     result_t<std::shared_ptr<bus::IBus>> makeProxyBus(types::bus_kind_t kind, uint8_t bus_id,
                                                       const bus::IBusConfig& cfg,
                                                       const std::shared_ptr<RemoteBusLease>& bus_lease);
@@ -78,6 +92,7 @@ private:
     void freeBusId(types::bus_kind_t kind, uint8_t bus_id);
 
     std::shared_ptr<RemoteSessionHandle> _session;
+    bus::BusRegistry _registry;
     std::shared_ptr<RemoteBusIdState> _bus_ids = std::make_shared<RemoteBusIdState>();
     Capabilities _caps;
 };

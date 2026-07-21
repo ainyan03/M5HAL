@@ -4,7 +4,9 @@
 #include "support/gtest_watchdog.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -19,26 +21,59 @@ namespace {
 
 class RecordingIBus : public m5::hal::v2::uart::IBus {
 public:
-    // Typed init: the fake adds no fields, so it takes the
-    // abstract kind config.
+    // The fake uses the same portable kind config as production providers.
     m5::hal::v2::result_t<void> init(const m5::hal::v2::uart::IBusConfig& config)
     {
         _config = config;
         return {};
     }
 
-    m5::hal::v2::result_t<void> release(void) override
+    m5::hal::v2::result_t<void> lockFor(m5::hal::v2::bus::IAccessor& owner, m5::hal::v2::uart::Channel channel)
+    {
+        return lockChannel(owner, channel, 0);
+    }
+
+    m5::hal::v2::result_t<void> unlockFor(m5::hal::v2::bus::IAccessor& owner, m5::hal::v2::uart::Channel channel)
+    {
+        return unlockChannel(owner, channel);
+    }
+
+protected:
+    m5::hal::v2::bus::CloseOutcome closeBackend(void) override
     {
         tx_recorded.clear();
         rx_queue.clear();
+        return m5::hal::v2::bus::CloseOutcome::success();
+    }
+
+public:
+    m5::hal::v2::result_t<void> beginOperationBackend(
+        m5::hal::v2::bus::OperationContext<m5::hal::v2::uart::AccessConfig>& context) override
+    {
+        const bool tx = context.runtime.mode == m5::hal::v2::bus::OperationMode::Tx;
+        lifecycle_order.push_back(tx ? 'T' : 'R');
+        if ((tx && fail_begin_tx) || (!tx && fail_begin_rx)) {
+            return m5::stl::make_unexpected(m5::hal::v2::error::error_t::BUSY);
+        }
+        tx ? ++active_tx : ++active_rx;
         return {};
     }
 
-    m5::hal::v2::result_t<size_t> write(m5::hal::v2::bus::IAccessor* owner, const m5::hal::v2::uart::AccessConfig& cfg,
-                                        m5::hal::v2::data::Source* tx, size_t len) override
+    m5::hal::v2::result_t<void> endOperationBackend(
+        m5::hal::v2::bus::OperationContext<m5::hal::v2::uart::AccessConfig>& context) override
     {
-        last_owner  = owner;
-        last_cfg    = cfg;
+        const bool tx = context.runtime.mode == m5::hal::v2::bus::OperationMode::Tx;
+        lifecycle_order.push_back(tx ? 't' : 'r');
+        tx ? --active_tx : --active_rx;
+        return {};
+    }
+
+    m5::hal::v2::result_t<size_t> writeBackend(
+        m5::hal::v2::bus::OperationContext<m5::hal::v2::uart::AccessConfig>& context, m5::hal::v2::data::Source* tx,
+        size_t len) override
+    {
+        last_owner  = operationOwner(context);
+        last_cfg    = context.config;
         size_t done = 0;
         while (tx != nullptr && !tx->eof() && done < len) {
             auto span = tx->peek(len - done);
@@ -59,11 +94,12 @@ public:
         return done;
     }
 
-    m5::hal::v2::result_t<size_t> read(m5::hal::v2::bus::IAccessor* owner, const m5::hal::v2::uart::AccessConfig& cfg,
-                                       m5::hal::v2::data::Sink* rx, size_t len) override
+    m5::hal::v2::result_t<size_t> readBackend(
+        m5::hal::v2::bus::OperationContext<m5::hal::v2::uart::AccessConfig>& context, m5::hal::v2::data::Sink* rx,
+        size_t len) override
     {
-        last_owner  = owner;
-        last_cfg    = cfg;
+        last_owner  = operationOwner(context);
+        last_cfg    = context.config;
         size_t done = 0;
         while (rx != nullptr && !rx->closed() && done < len && !rx_queue.empty()) {
             auto span = rx->reserve(len - done);
@@ -92,19 +128,66 @@ public:
         return done;
     }
 
-    m5::hal::v2::result_t<size_t> readableBytes(m5::hal::v2::bus::IAccessor* owner,
-                                                const m5::hal::v2::uart::AccessConfig& cfg) override
+    m5::hal::v2::result_t<size_t> readableBytesBackend(
+        m5::hal::v2::bus::OperationContext<m5::hal::v2::uart::AccessConfig>& context) override
     {
-        last_owner = owner;
-        last_cfg   = cfg;
+        last_owner = operationOwner(context);
+        last_cfg   = context.config;
+        ++readable_calls;
         return rx_queue.size();
     }
 
     std::vector<uint8_t> tx_recorded;
     std::vector<uint8_t> rx_queue;
     std::vector<char> call_order;
+    std::vector<char> lifecycle_order;
     m5::hal::v2::bus::IAccessor* last_owner = nullptr;
     m5::hal::v2::uart::AccessConfig last_cfg;
+    int active_tx         = 0;
+    int active_rx         = 0;
+    size_t readable_calls = 0;
+    bool fail_begin_tx    = false;
+    bool fail_begin_rx    = false;
+};
+
+class InspectableUartAccessor : public m5::hal::v2::bus::IAccessor {
+public:
+    InspectableUartAccessor(RecordingIBus& bus, const m5::hal::v2::uart::AccessConfig& config = {})
+        : m5::hal::v2::bus::IAccessor{bus}, _typed_bus{bus}, _context{makeOperationContext(config)}
+    {
+    }
+
+    const m5::hal::v2::uart::AccessConfig& getConfig() const override
+    {
+        return _context.config;
+    }
+
+    m5::hal::v2::bus::OperationContext<m5::hal::v2::uart::AccessConfig>& context()
+    {
+        return _context;
+    }
+
+    m5::hal::v2::result_t<void> begin(m5::hal::v2::bus::OperationMode mode)
+    {
+        _channel = mode == m5::hal::v2::bus::OperationMode::Tx ? m5::hal::v2::uart::Channel::Tx
+                                                               : m5::hal::v2::uart::Channel::Rx;
+        return _beginOperationAccess(
+            _context, 0, mode, [&](uint32_t) { return _typed_bus.lockFor(*this, _channel); },
+            [&] { return _typed_bus.unlockFor(*this, _channel); },
+            [&](auto& context) { return _typed_bus.beginOperation(context); });
+    }
+
+    m5::hal::v2::result_t<void> end()
+    {
+        return _endOperationAccess(
+            _context, 0, [&](auto& context) { return _typed_bus.endOperation(context); },
+            [&] { return _typed_bus.unlockFor(*this, _channel); });
+    }
+
+private:
+    RecordingIBus& _typed_bus;
+    m5::hal::v2::bus::OperationContext<m5::hal::v2::uart::AccessConfig> _context;
+    m5::hal::v2::uart::Channel _channel = m5::hal::v2::uart::Channel::Tx;
 };
 
 class ScriptedStreamingBus : public m5::hal::v2::uart::Bus_streaming {
@@ -143,14 +226,102 @@ protected:
 
 }  // namespace
 
+TEST(UARTCheckedFacade, RejectsInactiveEndedWrongBusAndWrongAccessorContexts)
+{
+    namespace bus   = m5::hal::v2::bus;
+    namespace error = m5::hal::v2::error;
+    namespace uart  = m5::hal::v2::uart;
+
+    RecordingIBus first_bus;
+    RecordingIBus second_bus;
+    InspectableUartAccessor tx{first_bus};
+    InspectableUartAccessor rx{first_bus};
+    InspectableUartAccessor other{first_bus};
+
+    auto inactive_write = first_bus.write(tx.context(), nullptr, 0);
+    ASSERT_FALSE(inactive_write.has_value());
+    EXPECT_EQ(inactive_write.error(), error::error_t::INVALID_STATE);
+    auto inactive_read = first_bus.read(rx.context(), nullptr, 0);
+    ASSERT_FALSE(inactive_read.has_value());
+    EXPECT_EQ(inactive_read.error(), error::error_t::INVALID_STATE);
+
+    tx.context().runtime.begin(0, 0, bus::OperationMode::Tx);
+    ASSERT_RESULT_OK(first_bus.lockFor(other, uart::Channel::Tx));
+    auto wrong_accessor = first_bus.beginOperation(tx.context());
+    ASSERT_FALSE(wrong_accessor.has_value());
+    EXPECT_EQ(wrong_accessor.error(), error::error_t::INVALID_STATE);
+    ASSERT_RESULT_OK(first_bus.unlockFor(other, uart::Channel::Tx));
+
+    ASSERT_RESULT_OK(tx.begin(bus::OperationMode::Tx));
+    ASSERT_RESULT_OK(rx.begin(bus::OperationMode::Rx));
+    auto wrong_bus_write = second_bus.write(tx.context(), nullptr, 0);
+    ASSERT_FALSE(wrong_bus_write.has_value());
+    EXPECT_EQ(wrong_bus_write.error(), error::error_t::INVALID_STATE);
+    auto wrong_bus_transfer = second_bus.transfer(tx.context(), rx.context(), nullptr, 0, nullptr, 0);
+    ASSERT_FALSE(wrong_bus_transfer.has_value());
+    EXPECT_EQ(wrong_bus_transfer.error(), error::error_t::INVALID_STATE);
+    ASSERT_RESULT_OK(rx.end());
+    ASSERT_RESULT_OK(tx.end());
+
+    auto ended_readable = first_bus.readableBytes(rx.context());
+    ASSERT_FALSE(ended_readable.has_value());
+    EXPECT_EQ(ended_readable.error(), error::error_t::INVALID_STATE);
+    EXPECT_TRUE(first_bus.call_order.empty());
+    EXPECT_EQ(first_bus.readable_calls, 0u);
+}
+
+TEST(UARTCheckedFacade, RejectsCorruptRuntimeAndRecoversBothSlotsAndLocks)
+{
+    namespace bus   = m5::hal::v2::bus;
+    namespace error = m5::hal::v2::error;
+
+    RecordingIBus uart_bus;
+    InspectableUartAccessor tx{uart_bus};
+    InspectableUartAccessor rx{uart_bus};
+
+    ASSERT_RESULT_OK(tx.begin(bus::OperationMode::Tx));
+    const auto registered_generation = tx.context().runtime.generation;
+    ++tx.context().runtime.generation;
+    auto stale = uart_bus.write(tx.context(), nullptr, 0);
+    ASSERT_FALSE(stale.has_value());
+    EXPECT_EQ(stale.error(), error::error_t::INVALID_STATE);
+    auto stale_end = tx.end();
+    ASSERT_FALSE(stale_end.has_value());
+    EXPECT_EQ(stale_end.error(), error::error_t::INVALID_STATE);
+    EXPECT_FALSE(tx.inAccess());
+
+    ASSERT_RESULT_OK(tx.begin(bus::OperationMode::Tx));
+    EXPECT_GT(tx.context().runtime.generation, registered_generation);
+    ASSERT_RESULT_OK(rx.begin(bus::OperationMode::Rx));
+    rx.context().runtime.mode = bus::OperationMode::Tx;
+    auto wrong_mode           = uart_bus.readableBytes(rx.context());
+    ASSERT_FALSE(wrong_mode.has_value());
+    EXPECT_EQ(wrong_mode.error(), error::error_t::INVALID_STATE);
+    auto wrong_mode_end = rx.end();
+    ASSERT_FALSE(wrong_mode_end.has_value());
+    EXPECT_EQ(wrong_mode_end.error(), error::error_t::INVALID_STATE);
+    EXPECT_FALSE(rx.inAccess());
+    ASSERT_RESULT_OK(tx.end());
+
+    ASSERT_RESULT_OK(tx.begin(bus::OperationMode::Tx));
+    ASSERT_RESULT_OK(rx.begin(bus::OperationMode::Rx));
+    auto recovered = uart_bus.transfer(tx.context(), rx.context(), nullptr, 0, nullptr, 0);
+    ASSERT_TRUE(recovered.has_value()) << "err=" << error::toString(recovered.error());
+    EXPECT_EQ(recovered->tx, 0u);
+    EXPECT_EQ(recovered->rx, 0u);
+    ASSERT_RESULT_OK(rx.end());
+    ASSERT_RESULT_OK(tx.end());
+}
+
 TEST(BusStreamingWrite, ErrorBeforeProgressPropagatesAndKeepsSource)
 {
     ScriptedStreamingBus bus;
+    m5::hal::v2::uart::TxAccessor accessor{bus, {}};
     bus.fail_first          = true;
     const uint8_t payload[] = {1, 2, 3, 4, 5, 6};
     m5::hal::v2::data::MemorySource src{payload, sizeof(payload)};
 
-    auto result = bus.write(nullptr, {}, &src, sizeof(payload));
+    auto result = accessor.write(src, sizeof(payload));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
     auto remaining = src.peek(sizeof(payload));
@@ -161,10 +332,11 @@ TEST(BusStreamingWrite, ErrorBeforeProgressPropagatesAndKeepsSource)
 TEST(BusStreamingWrite, ErrorAfterProgressReturnsAcceptedPrefix)
 {
     ScriptedStreamingBus bus;
+    m5::hal::v2::uart::TxAccessor accessor{bus, {}};
     const uint8_t payload[] = {1, 2, 3, 4, 5, 6};
     m5::hal::v2::data::MemorySource src{payload, sizeof(payload)};
 
-    auto result = bus.write(nullptr, {}, &src, sizeof(payload));
+    auto result = accessor.write(src, sizeof(payload));
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result.value(), 3u);
     EXPECT_EQ(bus.write_calls, 2u);
@@ -245,72 +417,23 @@ TEST(Accessor, WriteConsumesSource)
     EXPECT_EQ(bus.last_cfg.baud_rate, 921600u);
 }
 
-TEST(TxAccessor, TransactionTotalsAccumulateWrites)
+TEST(TxAccessor, ExplicitAccessIsNonNestedAndWritesBorrowIt)
 {
     RecordingIBus bus;
     m5::hal::v2::uart::TxAccessor tx{bus, {}};
 
-    ASSERT_RESULT_OK(tx.beginTransaction());
+    ASSERT_RESULT_OK(tx.beginAccess());
+    auto nested = tx.beginAccess();
+    ASSERT_FALSE(nested.has_value());
+    EXPECT_EQ(nested.error(), m5::hal::v2::error::error_t::INVALID_STATE);
     const uint8_t a[] = {0x01, 0x02};
     const uint8_t b[] = {0x03, 0x04, 0x05};
-    auto wa           = tx.write(a, sizeof(a));
-    ASSERT_TRUE(wa.has_value()) << "err=" << m5::hal::v2::error::toString(wa.error());
-    auto wb = tx.write(b, sizeof(b));
-    ASSERT_TRUE(wb.has_value()) << "err=" << m5::hal::v2::error::toString(wb.error());
-
-    auto ended = tx.endTransaction();
-    ASSERT_TRUE(ended.has_value()) << "err=" << m5::hal::v2::error::toString(ended.error());
-    EXPECT_EQ(ended->tx, sizeof(a) + sizeof(b));
-    EXPECT_EQ(ended->rx, 0u);
-}
-
-TEST(TxAccessor, NestedTransactionReturnsCurrentTotalsAndKeepsAccessUntilOuterEnd)
-{
-    RecordingIBus bus;
-    m5::hal::v2::uart::TxAccessor tx{bus, {}};
-    m5::hal::v2::uart::TxAccessor other{bus, {}};
-
-    ASSERT_RESULT_OK(tx.beginTransaction());
-    ASSERT_RESULT_OK(tx.beginTransaction());
-    const uint8_t payload[] = {0x10, 0x20, 0x30};
-    auto written            = tx.write(payload, sizeof(payload));
-    ASSERT_TRUE(written.has_value()) << "err=" << m5::hal::v2::error::toString(written.error());
-
-    auto inner = tx.endTransaction();
-    ASSERT_TRUE(inner.has_value()) << "err=" << m5::hal::v2::error::toString(inner.error());
-    EXPECT_EQ(inner->tx, sizeof(payload));
-    EXPECT_TRUE(tx.inTransaction());
-    EXPECT_TRUE(tx.inAccess());
-
-    auto blocked = other.beginTransaction(0);
-    ASSERT_FALSE(blocked.has_value());
-    EXPECT_EQ(blocked.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
-
-    auto outer = tx.endTransaction();
-    ASSERT_TRUE(outer.has_value()) << "err=" << m5::hal::v2::error::toString(outer.error());
-    EXPECT_EQ(outer->tx, sizeof(payload));
-    EXPECT_FALSE(tx.inTransaction());
-    EXPECT_FALSE(tx.inAccess());
-
-    ASSERT_RESULT_OK(other.beginTransaction(0));
-    auto other_end = other.endTransaction();
-    ASSERT_TRUE(other_end.has_value()) << "err=" << m5::hal::v2::error::toString(other_end.error());
-}
-
-TEST(TxAccessor, TransactionExcludesOtherAccessorOnSameChannel)
-{
-    RecordingIBus bus;
-    m5::hal::v2::uart::TxAccessor tx{bus, {}};
-    m5::hal::v2::uart::TxAccessor other{bus, {}};
-
-    ASSERT_RESULT_OK(tx.beginTransaction());
-    auto blocked = other.beginTransaction(0);
-    ASSERT_FALSE(blocked.has_value());
-    EXPECT_EQ(blocked.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
-    ASSERT_RESULT_OK(tx.endTransaction());
-
-    ASSERT_RESULT_OK(other.beginTransaction(0));
-    ASSERT_RESULT_OK(other.endTransaction());
+    ASSERT_RESULT_OK(tx.write(a, sizeof(a)));
+    ASSERT_RESULT_OK(tx.write(b, sizeof(b)));
+    EXPECT_EQ(bus.lifecycle_order, std::vector<char>({'T'}));
+    ASSERT_RESULT_OK(tx.endAccess());
+    EXPECT_EQ(bus.lifecycle_order, std::vector<char>({'T', 't'}));
+    EXPECT_EQ(bus.tx_recorded.size(), sizeof(a) + sizeof(b));
 }
 
 TEST(TxAccessor, StandaloneWriteSugarStillWorks)
@@ -322,19 +445,31 @@ TEST(TxAccessor, StandaloneWriteSugarStillWorks)
     auto result             = tx.write(payload, sizeof(payload));
     ASSERT_TRUE(result.has_value()) << "err=" << m5::hal::v2::error::toString(result.error());
     EXPECT_EQ(result.value(), sizeof(payload));
-    EXPECT_FALSE(tx.inTransaction());
     EXPECT_FALSE(tx.inAccess());
     ASSERT_EQ(bus.tx_recorded.size(), sizeof(payload));
+    EXPECT_EQ(bus.lifecycle_order, std::vector<char>({'T', 't'}));
+    auto status = tx.getLastTransferStatus();
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status->totals.tx, sizeof(payload));
+    EXPECT_EQ(status->completion, m5::hal::v2::bus::CompletionLevel::Complete);
 }
 
-TEST(TxAccessor, EndTransactionOutsideTransactionIsInvalidState)
+TEST(TxAccessor, BeginFailureDoesNotReplacePreviousTransferStatus)
 {
     RecordingIBus bus;
     m5::hal::v2::uart::TxAccessor tx{bus, {}};
+    const uint8_t payload[] = {0xAA};
+    ASSERT_TRUE(tx.write(payload, sizeof(payload)).has_value());
+    auto before = tx.getLastTransferStatus();
+    ASSERT_TRUE(before.has_value());
 
-    auto ended = tx.endTransaction();
-    ASSERT_FALSE(ended.has_value());
-    EXPECT_EQ(ended.error(), m5::hal::v2::error::error_t::INVALID_STATE);
+    bus.fail_begin_tx = true;
+    auto failed       = tx.write(payload, sizeof(payload));
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), m5::hal::v2::error::error_t::BUSY);
+    auto after = tx.getLastTransferStatus();
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(after->transfer_id, before->transfer_id);
 }
 
 TEST(RxAccessor, ReadUntilIncludesTheDelimiter)
@@ -353,13 +488,13 @@ TEST(RxAccessor, ReadUntilIncludesTheDelimiter)
     EXPECT_EQ(bus.rx_queue.size(), 1u);  // the next line's byte was not consumed
 }
 
-TEST(RxAccessor, TransactionTotalsAccumulateReads)
+TEST(RxAccessor, ExplicitAccessBorrowsAndLastStatusIsPerRead)
 {
     RecordingIBus bus;
     bus.rx_queue = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4};
     m5::hal::v2::uart::RxAccessor rx{bus, {}};
 
-    ASSERT_RESULT_OK(rx.beginTransaction());
+    ASSERT_RESULT_OK(rx.beginAccess());
     uint8_t first[2]  = {};
     uint8_t second[3] = {};
     auto ra           = rx.read(first, sizeof(first));
@@ -367,10 +502,10 @@ TEST(RxAccessor, TransactionTotalsAccumulateReads)
     auto rb = rx.read(second, sizeof(second));
     ASSERT_TRUE(rb.has_value()) << "err=" << m5::hal::v2::error::toString(rb.error());
 
-    auto ended = rx.endTransaction();
-    ASSERT_TRUE(ended.has_value()) << "err=" << m5::hal::v2::error::toString(ended.error());
-    EXPECT_EQ(ended->tx, 0u);
-    EXPECT_EQ(ended->rx, sizeof(first) + sizeof(second));
+    ASSERT_RESULT_OK(rx.endAccess());
+    auto status = rx.getLastTransferStatus();
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status->totals.rx, sizeof(second));
     EXPECT_EQ(first[0], 0xA0);
     EXPECT_EQ(second[2], 0xA4);
 }
@@ -387,18 +522,7 @@ TEST(RxAccessor, StandaloneReadSugarStillWorks)
     EXPECT_EQ(result.value(), sizeof(dst));
     EXPECT_EQ(dst[0], 0x55);
     EXPECT_EQ(dst[1], 0x66);
-    EXPECT_FALSE(rx.inTransaction());
     EXPECT_FALSE(rx.inAccess());
-}
-
-TEST(RxAccessor, EndTransactionOutsideTransactionIsInvalidState)
-{
-    RecordingIBus bus;
-    m5::hal::v2::uart::RxAccessor rx{bus, {}};
-
-    auto ended = rx.endTransaction();
-    ASSERT_FALSE(ended.has_value());
-    EXPECT_EQ(ended.error(), m5::hal::v2::error::error_t::INVALID_STATE);
 }
 
 TEST(RxAccessor, ReadUntilReturnsThePartialLineOnTimeout)
@@ -483,6 +607,11 @@ TEST(IBus, DefaultTransferComposesWriteThenRead)
     EXPECT_EQ(rx[0], 0xB0);
     EXPECT_EQ(rx[2], 0xB2);
     EXPECT_EQ(bus.last_cfg.baud_rate, 460800u);
+    auto status = dev.getLastTransferStatus();
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status->totals.tx, sizeof(tx));
+    EXPECT_EQ(status->totals.rx, sizeof(rx));
+    EXPECT_EQ(status->completion, m5::hal::v2::bus::CompletionLevel::Complete);
 }
 
 TEST(Accessor, ReadableBytesUsesBus)
@@ -557,6 +686,11 @@ TEST(Accessor, FacadeSessionLocksBothChannels)
 
     ASSERT_TRUE(dev.beginAccess(0).has_value());
     EXPECT_TRUE(dev.inAccess());
+    EXPECT_EQ(bus.lifecycle_order, std::vector<char>({'T', 'R'}));
+
+    auto nested = dev.beginAccess(0);
+    ASSERT_FALSE(nested.has_value());
+    EXPECT_EQ(nested.error(), m5::hal::v2::error::error_t::INVALID_STATE);
 
     auto tx_result = other_tx.beginAccess(0);
     ASSERT_FALSE(tx_result.has_value());
@@ -568,6 +702,78 @@ TEST(Accessor, FacadeSessionLocksBothChannels)
 
     ASSERT_TRUE(dev.endAccess().has_value());
     EXPECT_FALSE(dev.inAccess());
+    EXPECT_EQ(bus.lifecycle_order, std::vector<char>({'T', 'R', 'r', 't'}));
+}
+
+TEST(IBus, ConcurrentIndependentChannelEndDoesNotCrossReadSlots)
+{
+    for (size_t iteration = 0; iteration < 64; ++iteration) {
+        m5::hal::v2::uart::IBus bus;
+        m5::hal::v2::uart::TxAccessor tx{bus, {}};
+        m5::hal::v2::uart::RxAccessor rx{bus, {}};
+        ASSERT_RESULT_OK(tx.beginAccess(0));
+        ASSERT_RESULT_OK(rx.beginAccess(0));
+
+        std::atomic<unsigned> ready{0};
+        std::atomic<bool> go{false};
+        bool tx_ok = false;
+        bool rx_ok = false;
+        std::thread tx_end([&] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!go.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            tx_ok = tx.endAccess().has_value();
+        });
+        std::thread rx_end([&] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!go.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            rx_ok = rx.endAccess().has_value();
+        });
+        while (ready.load(std::memory_order_acquire) != 2) {
+            std::this_thread::yield();
+        }
+        go.store(true, std::memory_order_release);
+        tx_end.join();
+        rx_end.join();
+        EXPECT_TRUE(tx_ok);
+        EXPECT_TRUE(rx_ok);
+    }
+}
+
+TEST(Accessor, FacadeBeginRollsBackTxWhenRxBeginFails)
+{
+    RecordingIBus bus;
+    bus.fail_begin_rx = true;
+    m5::hal::v2::uart::Accessor dev{bus, {}};
+
+    auto begun = dev.beginAccess(0);
+    ASSERT_FALSE(begun.has_value());
+    EXPECT_EQ(begun.error(), m5::hal::v2::error::error_t::BUSY);
+    EXPECT_FALSE(dev.inAccess());
+    EXPECT_EQ(bus.active_tx, 0);
+    EXPECT_EQ(bus.active_rx, 0);
+    EXPECT_EQ(bus.lifecycle_order, std::vector<char>({'T', 'R', 't'}));
+}
+
+TEST(Accessor, ChildAccessIsVisibleAndBlocksFacadeMutation)
+{
+    RecordingIBus bus;
+    m5::hal::v2::uart::Accessor dev{bus, {}};
+    ASSERT_RESULT_OK(dev.tx().beginAccess(0));
+    EXPECT_TRUE(dev.inAccess());
+
+    auto begun = dev.beginAccess(0);
+    ASSERT_FALSE(begun.has_value());
+    EXPECT_EQ(begun.error(), m5::hal::v2::error::error_t::INVALID_STATE);
+    m5::hal::v2::uart::AccessConfig cfg;
+    cfg.baud_rate   = 57600;
+    auto configured = dev.setConfig(cfg);
+    ASSERT_FALSE(configured.has_value());
+    EXPECT_EQ(configured.error(), m5::hal::v2::error::error_t::INVALID_STATE);
+    ASSERT_RESULT_OK(dev.tx().endAccess());
 }
 
 int main(int argc, char** argv)

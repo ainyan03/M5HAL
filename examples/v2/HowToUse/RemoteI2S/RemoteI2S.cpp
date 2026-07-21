@@ -166,9 +166,9 @@ void initCore2V11Amplifier(m5hal::Hal& hal)
         ::printf("Core2 V1.1 amplifier power enabled (AXP2101 ALDO3)\n");
     }
 
-    auto rel = hal.I2C.release(bus.value());
+    auto rel = hal.I2C.close(bus.value());
     if (!rel.has_value()) {
-        warnResult("I2C release after amplifier init", rel.error());
+        warnResult("I2C close after amplifier init", rel.error());
     }
 }
 
@@ -352,7 +352,7 @@ int main(int argc, char** argv)
 
     initCore2V11Amplifier(remote);
 
-    m5hal::i2s::BusConfig_remote i2s_cfg;
+    m5hal::i2s::BusConfig i2s_cfg;
     i2s_cfg.pin_bclk       = static_cast<m5hal::types::gpio_number_t>(bclk);
     i2s_cfg.pin_ws         = static_cast<m5hal::types::gpio_number_t>(ws);
     i2s_cfg.pin_dout       = static_cast<m5hal::types::gpio_number_t>(dout);
@@ -368,9 +368,9 @@ int main(int argc, char** argv)
 
     int rc = streamTone(i2s_bus.value(), seconds, tone_hz, rate, channels, static_cast<size_t>(chunk_kib) * 1024);
 
-    auto rel = remote.I2S.release(i2s_bus.value());
+    auto rel = remote.I2S.close(i2s_bus.value());
     if (!rel.has_value()) {
-        warnResult("I2S release", rel.error());
+        warnResult("I2S close", rel.error());
     }
     return rc;
 }

@@ -7,11 +7,13 @@
 #include "../runtime/runtime.hpp"
 #include "../types.hpp"
 
+#include <cstdlib>
 #include <cstdint>
 
 namespace m5::hal::v2::remote {
 
 class RemoteSession;
+uint64_t nextRemoteSessionGeneration(void);
 
 /*!
   @brief Shared lifetime and serialization gate for one remote session.
@@ -23,7 +25,9 @@ class RemoteSession;
  */
 class RemoteSessionHandle {
 public:
-    RemoteSessionHandle()                                      = default;
+    RemoteSessionHandle() : _generation{nextRemoteSessionGeneration()}
+    {
+    }
     RemoteSessionHandle(const RemoteSessionHandle&)            = delete;
     RemoteSessionHandle& operator=(const RemoteSessionHandle&) = delete;
     RemoteSessionHandle(RemoteSessionHandle&&)                 = delete;
@@ -35,6 +39,16 @@ public:
         _session = &session;
     }
 
+    uint64_t generation(void) const
+    {
+        return _generation;
+    }
+
+    bool valid(void) const
+    {
+        return _generation != 0;
+    }
+
     /*!
       @brief Exclusive access to the bound session.
 
@@ -44,9 +58,11 @@ public:
      */
     class Lease {
     public:
-        explicit Lease(RemoteSessionHandle& handle, uint32_t timeout_ms = types::TIMEOUT_FOREVER)
-            : _handle{&handle}, _locked{handle._mutex.lock(timeout_ms)}
+        explicit Lease(RemoteSessionHandle& handle, uint32_t timeout_ms = types::TIMEOUT_FOREVER) : _handle{&handle}
         {
+            const auto locked = handle._mutex.lock(timeout_ms);
+            _locked           = locked.has_value();
+            _error            = locked.has_value() ? error::error_t::OK : locked.error();
             if (_locked) {
                 _session = handle._session;
             }
@@ -55,7 +71,9 @@ public:
         ~Lease()
         {
             if (_locked) {
-                _handle->_mutex.unlock();
+                if (!_handle->_mutex.unlock().has_value()) {
+                    std::abort();
+                }
             }
         }
 
@@ -71,7 +89,7 @@ public:
 
         error::error_t error() const
         {
-            return _locked ? error::error_t::CLOSED : error::error_t::TIMEOUT_ERROR;
+            return _locked ? error::error_t::CLOSED : _error;
         }
 
         RemoteSession& session() const
@@ -83,6 +101,7 @@ public:
         RemoteSessionHandle* _handle = nullptr;
         RemoteSession* _session      = nullptr;
         bool _locked                 = false;
+        error::error_t _error        = error::error_t::OK;
     };
 
     /*!
@@ -91,17 +110,20 @@ public:
       Idempotent. The connection must call this before destroying objects the
       session borrows (encoder, decoder, wire source, and wire sink).
      */
-    void close()
+    [[nodiscard]] result_t<void> close()
     {
-        if (_mutex.lock(types::TIMEOUT_FOREVER)) {
-            _session = nullptr;
-            _mutex.unlock();
+        auto locked = _mutex.lock(types::TIMEOUT_FOREVER);
+        if (!locked.has_value()) {
+            return m5::stl::make_unexpected(locked.error());
         }
+        _session = nullptr;
+        return _mutex.unlock();
     }
 
 private:
     runtime::Mutex _mutex;
     RemoteSession* _session = nullptr;
+    uint64_t _generation    = 0;
 };
 
 }  // namespace m5::hal::v2::remote

@@ -98,7 +98,7 @@ data::StreamSource src{dev.rx(), data::DataSpan{scratch, sizeof scratch}};
 frame::FrameReader reader{src};
 
 frame::View view;
-auto r = reader.next(view);   // expected<DecodeResult, error_t>
+auto r = reader.next(view);   // result_t<DecodeResult>
 ```
 
 `FrameReader::next(View&)`:

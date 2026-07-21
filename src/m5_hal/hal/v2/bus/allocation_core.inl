@@ -90,8 +90,8 @@ result_t<void> AllocationCore::commitBuses(uint32_t timeout_ms)
     const uint8_t capacity = _pool.capacity();
     int8_t target[BusRegistry::kCapacity];
     bool used[HwControllerPool::kMaxControllers] = {false};
-    // A bus whose demote (release) failed must not be re-touched by the
-    // promote loop -- otherwise a hardware retarget would retry release on a
+    // A bus whose demote (close) failed must not be re-touched by the
+    // promote loop -- otherwise a hardware retarget would retry close on a
     // backend whose swap already aborted, defeating the keep-old-on-failure
     // policy and risking a leaked / mis-accounted controller.
     bool demote_failed[BusRegistry::kCapacity] = {false};

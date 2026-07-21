@@ -1,7 +1,7 @@
 # Sony SPRESENSE canonical Arduino build fence.
 #
 # SPRESENSE has no maintained official PlatformIO platform. Use Sony's pinned
-# board-manager package and compile the same v2 API surface as the PIO matrix.
+# board-manager package and compile the canonical examples/v2/BuildTest fixture.
 name: build-check-spresense
 
 permissions:
@@ -77,7 +77,7 @@ jobs:
           ARDUINO_BOARD_MANAGER_ADDITIONAL_URLS: ${{ env.SPRESENSE_INDEX_URL }}
         run: |
           arduino-cli compile --clean --fqbn "$SPRESENSE_FQBN" \
-            --build-property "compiler.cpp.extra_flags=-std=gnu++17 -I$GITHUB_WORKSPACE/M5HAL/test/v2/build_check" \
+            --build-property "compiler.cpp.extra_flags=-std=gnu++17 -I$GITHUB_WORKSPACE/M5HAL" \
             --build-path "$GITHUB_WORKSPACE/.arduino-cli-spresense/build" \
             --library "$GITHUB_WORKSPACE/M5HAL" \
             --library "$GITHUB_WORKSPACE/M5Utility" \

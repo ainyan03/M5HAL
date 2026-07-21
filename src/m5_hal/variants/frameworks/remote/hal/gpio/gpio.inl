@@ -6,6 +6,7 @@
 
 #include "../../../../../hal/v2/bytecode/bytecode.hpp"
 #include "../../../../../hal/v2/remote/remote.hpp"
+#include "../../detail_helpers.hpp"
 
 namespace m5::hal::v2::gpio {
 
@@ -34,17 +35,10 @@ result_t<void> Port_remote::syncRead()
         return m5::stl::make_unexpected(req.error());
     }
     bytecode::BytecodeRunner runner{memory::defaultAllocator()};
-    runner.setReceiveOnly(true);
-    auto resp = session.lastResponse();
-    auto run  = runner.run(resp);
-    if (!run.has_value()) {
-        return m5::stl::make_unexpected(run.error());
-    }
-    if (!runner.statusReported()) {
-        return m5::stl::make_unexpected(error::error_t::PROTOCOL_ERROR);
-    }
-    if (error::isError(runner.reportedStatus())) {
-        return m5::stl::make_unexpected(runner.reportedStatus());
+    auto resp    = session.lastResponse();
+    auto decoded = remote::detail::decodeResponseStatus(resp, &runner);
+    if (!decoded.has_value()) {
+        return m5::stl::make_unexpected(decoded.error());
     }
     auto stored = runner.storedData(0);
     if (stored.size < 4) {

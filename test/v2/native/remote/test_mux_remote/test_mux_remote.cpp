@@ -42,6 +42,26 @@ size_t pumpValue(data::MuxFrameDecoder& dec, data::Source& src)
     return r.value();
 }
 
+result_t<bus::TransferTotals> transferI2cThroughAccessor(i2c::IBus& bus, const i2c::MasterAccessConfig& config,
+                                                         const i2c::TransferDesc& desc, data::Source* src,
+                                                         size_t tx_len, data::Sink* dst, size_t rx_len)
+{
+    i2c::MasterAccessor accessor{bus, config};
+    auto begun = accessor.beginAccess();
+    if (!begun.has_value()) {
+        return m5::stl::make_unexpected(begun.error());
+    }
+    auto transferred = accessor.transfer(desc, src, tx_len, dst, rx_len);
+    auto ended       = accessor.endAccess();
+    if (!transferred.has_value()) {
+        return transferred;
+    }
+    if (!ended.has_value()) {
+        return m5::stl::make_unexpected(ended.error());
+    }
+    return transferred;
+}
+
 struct SessionPair {
     mem::Allocator& alloc = mem::defaultAllocator();
     uint8_t wire_ab_buf[4096], wire_ba_buf[4096];
@@ -258,10 +278,21 @@ public:
     {
     }
 
-    result_t<size_t> write(bus::IAccessor* owner, const i2s::AccessConfig& cfg, data::Source* src, size_t len) override
+    bus::BusCapabilities capabilities(void) const override
     {
-        (void)owner;
-        last_cfg = cfg;
+        return bus::detail::BusCapabilitiesBuilder{}
+            .enable(bus::BusFeature::Transmit)
+            .enable(bus::BusFeature::Receive)
+            .enable(bus::BusFeature::FullDuplex)
+            .setLimit(bus::BusLimit::MaxAtomicTxBytes, 1024)
+            .setLimit(bus::BusLimit::MaxAtomicRxBytes, 1024)
+            .build();
+    }
+
+    result_t<size_t> writeBackend(bus::OperationContext<i2s::AccessConfig>& context, data::Source* src,
+                                  size_t len) override
+    {
+        last_cfg = context.config;
         ++write_calls;
         const size_t limit = len < max_write_per_call ? len : max_write_per_call;
         size_t done        = 0;
@@ -291,13 +322,25 @@ public:
 
 class EchoUARTBus : public uart::IBus {
 public:
-    result_t<size_t> write(bus::IAccessor* owner, const uart::AccessConfig& cfg, data::Source* src, size_t len) override
+    bus::BusCapabilities capabilities(void) const override
     {
-        (void)owner;
-        last_cfg    = cfg;
-        size_t done = 0;
-        while (done < len && src != nullptr && !src->eof()) {
-            auto p = src->peek(len - done);
+        return bus::detail::BusCapabilitiesBuilder{}
+            .enable(bus::BusFeature::Transmit)
+            .enable(bus::BusFeature::Receive)
+            .enable(bus::BusFeature::FullDuplex)
+            .build();
+    }
+
+    result_t<size_t> writeBackend(bus::OperationContext<uart::AccessConfig>& context, data::Source* src,
+                                  size_t len) override
+    {
+        const auto& cfg = context.config;
+        last_cfg        = cfg;
+        ++write_calls;
+        const size_t limit = len < max_write_per_call ? len : max_write_per_call;
+        size_t done        = 0;
+        while (done < limit && src != nullptr && !src->eof()) {
+            auto p = src->peek(limit - done);
             if (!p.has_value()) {
                 return m5::stl::make_unexpected(p.error());
             }
@@ -314,13 +357,17 @@ public:
         return done;
     }
 
-    result_t<size_t> read(bus::IAccessor* owner, const uart::AccessConfig& cfg, data::Sink* dst, size_t len) override
+    result_t<size_t> readBackend(bus::OperationContext<uart::AccessConfig>& context, data::Sink* dst,
+                                 size_t len) override
     {
-        (void)owner;
-        last_cfg    = cfg;
-        size_t done = 0;
-        while (done < len && dst != nullptr && !dst->closed() && !rx_queue.empty()) {
-            auto rsv = dst->reserve(len - done);
+        const auto& cfg = context.config;
+        last_cfg        = cfg;
+        ++read_calls;
+        read_first_timeouts.push_back(cfg.first_byte_timeout_ms);
+        const size_t limit = len < max_read_per_call ? len : max_read_per_call;
+        size_t done        = 0;
+        while (done < limit && dst != nullptr && !dst->closed() && !rx_queue.empty()) {
+            auto rsv = dst->reserve(limit - done);
             if (!rsv.has_value()) {
                 return m5::stl::make_unexpected(rsv.error());
             }
@@ -339,15 +386,19 @@ public:
         return done;
     }
 
-    result_t<size_t> readableBytes(bus::IAccessor* owner, const uart::AccessConfig& cfg) override
+    result_t<size_t> readableBytesBackend(bus::OperationContext<uart::AccessConfig>& context) override
     {
-        (void)owner;
-        last_cfg = cfg;
+        last_cfg = context.config;
         return rx_queue.size();
     }
 
     uart::AccessConfig last_cfg{};
     std::vector<uint8_t> rx_queue;
+    size_t max_write_per_call = static_cast<size_t>(-1);
+    size_t max_read_per_call  = static_cast<size_t>(-1);
+    size_t write_calls        = 0;
+    size_t read_calls         = 0;
+    std::vector<uint32_t> read_first_timeouts;
 };
 
 class SplitRxSPIBus : public spi::IBus {
@@ -356,11 +407,12 @@ public:
     {
     }
 
-    result_t<void> transfer(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg, const spi::TransferDesc& desc,
-                            data::Source* src, size_t tx_len, data::Sink* dst, size_t rx_len) override
+protected:
+    result_t<void> transferBackend(bus::OperationContext<spi::MasterAccessConfig>& context,
+                                   const spi::TransferDesc& desc, data::Source* src, size_t tx_len, data::Sink* dst,
+                                   size_t rx_len) override
     {
-        (void)owner;
-        (void)cfg;
+        (void)context;
         (void)desc;
         ++transfer_calls;
         bus::TransferTotals totals{};
@@ -403,15 +455,15 @@ public:
         return {};
     }
 
-    result_t<bus::TransferTotals> waitTransfer(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg) override
+    result_t<bus::TransferTotals> waitTransferBackend(bus::OperationContext<spi::MasterAccessConfig>& context) override
     {
-        (void)owner;
-        (void)cfg;
+        (void)context;
         auto out    = last_totals;
         last_totals = bus::TransferTotals{};
         return out;
     }
 
+public:
     size_t max_rx_per_call = 0;
     size_t transfer_calls  = 0;
     size_t rx_cursor       = 0;
@@ -421,14 +473,27 @@ public:
 
 class PatternI2CBus : public i2c::IBus {
 public:
-    PatternI2CBus(uint16_t ack_address, size_t max_rx) : ack_addr{ack_address}, max_rx_per_call{max_rx}
+    PatternI2CBus(uint16_t ack_address, size_t max_rx, uint32_t advertised_frequency = 400000)
+        : advertised_frequency_hz{advertised_frequency}, ack_addr{ack_address}, max_rx_per_call{max_rx}
     {
     }
 
-    result_t<void> transfer(bus::IAccessor* owner, const i2c::MasterAccessConfig& cfg, const i2c::TransferDesc& desc,
-                            data::Source* src, size_t tx_len, data::Sink* dst, size_t rx_len) override
+    bus::BusCapabilities capabilities(void) const override
     {
-        (void)owner;
+        return bus::detail::BusCapabilitiesBuilder{}
+            .enable(bus::BusFeature::MasterTransfer)
+            .enable(bus::BusFeature::Transmit)
+            .enable(bus::BusFeature::Receive)
+            .setLimit(bus::BusLimit::MaxFrequencyHz, advertised_frequency_hz)
+            .build();
+    }
+
+protected:
+    result_t<void> transferBackend(bus::OperationContext<i2c::MasterAccessConfig>& context,
+                                   const i2c::TransferDesc& desc, data::Source* src, size_t tx_len, data::Sink* dst,
+                                   size_t rx_len) override
+    {
+        const auto& cfg = context.config;
         ++transfer_calls;
         ready_totals.clear();
         last_addr = cfg.i2c_addr;
@@ -486,23 +551,78 @@ public:
         return {};
     }
 
-    result_t<bus::TransferTotals> waitTransfer(bus::IAccessor* owner, const i2c::MasterAccessConfig& cfg) override
+    result_t<bus::TransferTotals> waitTransferBackend(bus::OperationContext<i2c::MasterAccessConfig>&) override
     {
-        (void)owner;
-        (void)cfg;
         auto out = ready_totals;
         ready_totals.clear();
         return out;
     }
 
-    uint16_t ack_addr      = 0x42;
-    size_t max_rx_per_call = 0;
-    size_t transfer_calls  = 0;
-    size_t probe_calls     = 0;
-    size_t rx_cursor       = 0;
-    uint16_t last_addr     = 0;
+public:
+    uint32_t advertised_frequency_hz = 400000;
+    uint16_t ack_addr                = 0x42;
+    size_t max_rx_per_call           = 0;
+    size_t transfer_calls            = 0;
+    size_t probe_calls               = 0;
+    size_t rx_cursor                 = 0;
+    uint16_t last_addr               = 0;
     std::vector<uint8_t> tx_bytes;
     bus::TransferTotals ready_totals;
+};
+
+class FragmentedMemorySource : public data::Source {
+public:
+    FragmentedMemorySource(data::ConstDataSpan bytes, size_t fragment) : _bytes{bytes}, _fragment{fragment}
+    {
+    }
+
+    result_t<data::ConstDataSpan> peek(size_t max_len) override
+    {
+        const size_t remaining = _cursor < _bytes.size ? _bytes.size - _cursor : 0;
+        const size_t n         = std::min(std::min(max_len, _fragment), remaining);
+        return data::ConstDataSpan{_cursor == 0 ? _bytes.data : _bytes.data + _cursor, n};
+    }
+    result_t<void> advance(size_t n) override
+    {
+        _cursor += std::min(n, _bytes.size - _cursor);
+        return {};
+    }
+    bool eof() const override
+    {
+        return _cursor >= _bytes.size;
+    }
+
+private:
+    data::ConstDataSpan _bytes;
+    size_t _fragment = 1;
+    size_t _cursor   = 0;
+};
+
+class EmptyStateSource : public data::Source {
+public:
+    explicit EmptyStateSource(bool closed) : _closed{closed}
+    {
+    }
+
+    result_t<data::ConstDataSpan> peek(size_t) override
+    {
+        return data::ConstDataSpan{};
+    }
+    result_t<void> advance(size_t) override
+    {
+        return {};
+    }
+    bool eof() const override
+    {
+        return _closed;
+    }
+    bool closed() const override
+    {
+        return _closed;
+    }
+
+private:
+    bool _closed;
 };
 
 struct CapturedMuxFrame {
@@ -595,6 +715,80 @@ private:
 
     data::MuxFrameEncoder* _enc;
     bytecode::BytecodeRunner _runner{mem::defaultAllocator()};
+};
+
+class CapabilityBusCreatePeer {
+public:
+    CapabilityBusCreatePeer(data::MuxFrameEncoder& enc, data::MuxFrameDecoder& dec,
+                            uint32_t advertised_frequency = 400000, uint32_t rx_ceiling = remote::kMaxTransferRx)
+        : _enc{&enc},
+          _bus{0x42, remote::kMaxTransferRx, advertised_frequency},
+          _accessor{_bus, i2c::MasterAccessConfig{}}
+    {
+        _runner.setCapabilityRxCeiling(rx_ceiling);
+        _runner.setBusCreateHandler(&CapabilityBusCreatePeer::onBusCreate, this);
+        dec.setFrameHandler(
+            [](void* ctx, const frame::View& view) {
+                auto* peer = static_cast<CapabilityBusCreatePeer*>(ctx);
+                if (view.kind == frame::Kind::Request) {
+                    peer->handleRequest(view.b3, view.payload);
+                }
+            },
+            this);
+    }
+
+    result_t<size_t> runLegacyDiscardCreate(uint8_t bus_id)
+    {
+        uint8_t script_bytes[remote::kMaxScriptSize];
+        data::MemorySink script{script_bytes, sizeof(script_bytes)};
+        bytecode::BytecodeEncoder encoder{script};
+        const uint8_t pins[] = {22, 0, 21, 0};
+        auto encoded =
+            encoder.busCreate(types::bus_kind_t::I2C, bus_id, bytecode::kDiscardStoreId, {pins, sizeof(pins)});
+        if (encoded.has_value()) {
+            encoded = encoder.end();
+        }
+        if (!encoded.has_value()) {
+            return m5::stl::make_unexpected(encoded.error());
+        }
+        auto ran = _runner.run({script_bytes, script.written()});
+        if (!ran.has_value()) {
+            return m5::stl::make_unexpected(ran.error());
+        }
+        return _runner.storedCount();
+    }
+
+private:
+    static result_t<void> onBusCreate(void* ctx, bool create, types::bus_kind_t kind, uint8_t bus_id,
+                                      data::ConstDataSpan)
+    {
+        auto* peer = static_cast<CapabilityBusCreatePeer*>(ctx);
+        if (kind != types::bus_kind_t::I2C) {
+            return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+        }
+        if (create) {
+            return peer->_runner.registerI2C(bus_id, peer->_accessor);
+        }
+        peer->_runner.unregisterI2C(bus_id);
+        return {};
+    }
+
+    void handleRequest(uint8_t seq, data::ConstDataSpan payload)
+    {
+        auto run    = _runner.run(payload);
+        auto status = run.has_value() ? error::error_t::OK : run.error();
+        uint8_t response[frame::kMaxPayload];
+        data::MemorySink sink{response, sizeof(response)};
+        auto written = _runner.writeResponse(sink, status);
+        if (written.has_value()) {
+            _enc->writeFrame(frame::Kind::Response, seq, {response, sink.written()});
+        }
+    }
+
+    data::MuxFrameEncoder* _enc;
+    bytecode::BytecodeRunner _runner{mem::defaultAllocator()};
+    PatternI2CBus _bus;
+    i2c::MasterAccessor _accessor;
 };
 
 struct RemoteConfigCompatHarness {
@@ -796,23 +990,43 @@ static std::vector<uint8_t> writtenBytes(const uint8_t* buf, size_t len)
     return std::vector<uint8_t>{buf, buf + len};
 }
 
-static std::vector<uint8_t> expectedI2cStreamScript(uint8_t bus_id, uint8_t stream_id,
-                                                    const i2c::MasterAccessConfig& cfg, const i2c::TransferDesc& desc,
-                                                    size_t tx_len, size_t rx_len)
+template <typename Config>
+static std::vector<uint8_t> expectedConfigScript(uint8_t bus_id, const Config& cfg)
 {
     uint8_t buf[remote::kMaxScriptSize];
     data::MemorySink sink{buf, sizeof(buf)};
     bytecode::BytecodeEncoder enc{sink};
     auto r = enc.configure(bus_id, cfg);
     if (r.has_value()) {
-        uint8_t meta_buf[1 + i2c::TransferDesc::PREFIX_CAPACITY];
-        meta_buf[0] = desc.prefix_len;
-        if (desc.prefix_len != 0) {
-            ::memcpy(meta_buf + 1, desc.prefix, desc.prefix_len);
-        }
-        const size_t meta_len = 1u + static_cast<size_t>(desc.prefix_len);
-        r = enc.streamTransfer(types::bus_kind_t::I2C, bus_id, stream_id, static_cast<uint32_t>(tx_len),
-                               static_cast<uint32_t>(rx_len), {meta_buf, meta_len});
+        r = enc.end();
+    }
+    EXPECT_TRUE(r.has_value()) << "err=" << error::toString(r.error());
+    return writtenBytes(buf, sink.written());
+}
+
+template <typename Desc>
+static std::vector<uint8_t> expectedAtomicTransferScript(uint8_t bus_id, const Desc& desc, data::ConstDataSpan tx,
+                                                         size_t rx_len)
+{
+    uint8_t buf[remote::kMaxScriptSize];
+    data::MemorySink sink{buf, sizeof(buf)};
+    bytecode::BytecodeEncoder enc{sink};
+    auto r = enc.transfer(bus_id, desc, tx, rx_len, remote::kDefaultStoreId);
+    if (r.has_value()) {
+        r = enc.end();
+    }
+    EXPECT_TRUE(r.has_value()) << "err=" << error::toString(r.error());
+    return writtenBytes(buf, sink.written());
+}
+
+static std::vector<uint8_t> expectedSpiBeginScript(uint8_t bus_id, const spi::MasterAccessConfig& cfg)
+{
+    uint8_t buf[remote::kMaxScriptSize];
+    data::MemorySink sink{buf, sizeof(buf)};
+    bytecode::BytecodeEncoder enc{sink};
+    auto r = enc.configure(bus_id, cfg);
+    if (r.has_value()) {
+        r = enc.busBeginTransaction(types::bus_kind_t::SPI, bus_id);
     }
     if (r.has_value()) {
         r = enc.end();
@@ -821,36 +1035,12 @@ static std::vector<uint8_t> expectedI2cStreamScript(uint8_t bus_id, uint8_t stre
     return writtenBytes(buf, sink.written());
 }
 
-static std::vector<uint8_t> expectedSpiStreamScript(uint8_t bus_id, uint8_t stream_id,
-                                                    const spi::MasterAccessConfig& cfg, const spi::TransferDesc& desc,
-                                                    size_t tx_len, size_t rx_len)
+static std::vector<uint8_t> expectedSpiEndScript(uint8_t bus_id)
 {
     uint8_t buf[remote::kMaxScriptSize];
     data::MemorySink sink{buf, sizeof(buf)};
     bytecode::BytecodeEncoder enc{sink};
-    uint8_t meta_buf[15];
-    meta_buf[0]  = static_cast<uint8_t>((desc.dc_level_valid ? 0x01 : 0x00) | (desc.dc_level ? 0x02 : 0x00));
-    meta_buf[1]  = static_cast<uint8_t>(desc.command_dc_level);
-    meta_buf[2]  = static_cast<uint8_t>(desc.address_dc_level);
-    meta_buf[3]  = static_cast<uint8_t>(desc.data_dc_level);
-    meta_buf[4]  = static_cast<uint8_t>(desc.command & 0xFFu);
-    meta_buf[5]  = static_cast<uint8_t>((desc.command >> 8) & 0xFFu);
-    meta_buf[6]  = static_cast<uint8_t>((desc.command >> 16) & 0xFFu);
-    meta_buf[7]  = static_cast<uint8_t>((desc.command >> 24) & 0xFFu);
-    meta_buf[8]  = static_cast<uint8_t>(desc.address & 0xFFu);
-    meta_buf[9]  = static_cast<uint8_t>((desc.address >> 8) & 0xFFu);
-    meta_buf[10] = static_cast<uint8_t>((desc.address >> 16) & 0xFFu);
-    meta_buf[11] = static_cast<uint8_t>((desc.address >> 24) & 0xFFu);
-    meta_buf[12] = desc.command_bytes;
-    meta_buf[13] = desc.address_bytes;
-    meta_buf[14] = desc.dummy_cycles;
-    // First SPI transfer now carries configure just like the other bus kinds;
-    // later matching transfers omit it through the host-side config cache.
-    auto r = enc.configure(bus_id, cfg);
-    if (r.has_value()) {
-        r = enc.streamTransfer(types::bus_kind_t::SPI, bus_id, stream_id, static_cast<uint32_t>(tx_len),
-                               static_cast<uint32_t>(rx_len), {meta_buf, sizeof(meta_buf)});
-    }
+    auto r = enc.busEndTransaction(types::bus_kind_t::SPI, bus_id);
     if (r.has_value()) {
         r = enc.end();
     }
@@ -1103,10 +1293,11 @@ TEST(RemoteTransferWire, BusRemoteScriptsMatchLegacyOpcodeBytes)
         data::MemorySource src{tx, sizeof(tx)};
         data::MemorySink dst{rx, sizeof(rx)};
 
-        auto r = bus.transfer(nullptr, cfg, desc, &src, sizeof(tx), &dst, sizeof(rx));
+        auto r = transferI2cThroughAccessor(bus, cfg, desc, &src, sizeof(tx), &dst, sizeof(rx));
         ASSERT_TRUE(r.has_value()) << "err=" << error::toString(r.error());
-        ASSERT_EQ(peer.requests.size(), 1u);
-        EXPECT_EQ(peer.requests[0], expectedI2cStreamScript(0, 0, cfg, desc, sizeof(tx), sizeof(rx)));
+        ASSERT_EQ(peer.requests.size(), 2u);
+        EXPECT_EQ(peer.requests[0], expectedConfigScript(0, cfg));
+        EXPECT_EQ(peer.requests[1], expectedAtomicTransferScript(0, desc, {tx, sizeof(tx)}, sizeof(rx)));
     }
 
     {
@@ -1127,13 +1318,17 @@ TEST(RemoteTransferWire, BusRemoteScriptsMatchLegacyOpcodeBytes)
         desc.dummy_cycles   = 5;
         uint8_t tx[]        = {0x01, 0x02};
         uint8_t rx[2]       = {};
-        data::MemorySource src{tx, sizeof(tx)};
-        data::MemorySink dst{rx, sizeof(rx)};
-
-        auto r = bus.transfer(nullptr, cfg, desc, &src, sizeof(tx), &dst, sizeof(rx));
+        spi::MasterAccessor accessor{bus, cfg};
+        auto begun = accessor.beginAccess(0);
+        ASSERT_TRUE(begun.has_value()) << "err=" << error::toString(begun.error());
+        auto r = accessor.transfer(desc, data::ConstDataSpan{tx, sizeof(tx)}, data::DataSpan{rx, sizeof(rx)});
         ASSERT_TRUE(r.has_value()) << "err=" << error::toString(r.error());
-        ASSERT_EQ(peer.requests.size(), 1u);
-        EXPECT_EQ(peer.requests[0], expectedSpiStreamScript(1, 0, cfg, desc, sizeof(tx), sizeof(rx)));
+        auto ended = accessor.endAccess(0);
+        ASSERT_TRUE(ended.has_value()) << "err=" << error::toString(ended.error());
+        ASSERT_EQ(peer.requests.size(), 3u);
+        EXPECT_EQ(peer.requests[0], expectedSpiBeginScript(1, cfg));
+        EXPECT_EQ(peer.requests[1], expectedAtomicTransferScript(1, desc, {tx, sizeof(tx)}, sizeof(rx)));
+        EXPECT_EQ(peer.requests[2], expectedSpiEndScript(1));
     }
 
     {
@@ -1154,12 +1349,14 @@ TEST(RemoteTransferWire, BusRemoteScriptsMatchLegacyOpcodeBytes)
         data::MemorySource src{tx, sizeof(tx)};
         data::MemorySink dst{rx, sizeof(rx)};
 
-        auto r = bus.transfer(nullptr, cfg, &src, sizeof(tx), &dst, sizeof(rx));
+        i2s::Accessor accessor{bus, cfg};
+        auto r = accessor.transfer(src, sizeof(tx), dst, sizeof(rx));
         ASSERT_TRUE(r.has_value()) << "err=" << error::toString(r.error());
         EXPECT_EQ(r->tx, sizeof(tx));
         EXPECT_EQ(r->rx, sizeof(rx));
-        ASSERT_EQ(peer.requests.size(), 1u);
-        EXPECT_EQ(peer.requests[0], expectedI2sStreamScript(2, 0, cfg, sizeof(tx), sizeof(rx)));
+        ASSERT_EQ(peer.requests.size(), 2u);
+        EXPECT_TRUE(scriptContainsOpcode(peer.requests[0], bytecode::OpCode::BusConfigure));
+        EXPECT_TRUE(scriptContainsOpcode(peer.requests[1], bytecode::OpCode::BusStreamTransfer));
     }
 
     {
@@ -1183,13 +1380,40 @@ TEST(RemoteTransferWire, BusRemoteScriptsMatchLegacyOpcodeBytes)
         data::MemorySource src{tx, sizeof(tx)};
         data::MemorySink dst{rx, sizeof(rx)};
 
-        auto r = bus.transfer(nullptr, cfg, &src, sizeof(tx), &dst, sizeof(rx));
+        uart::Accessor accessor{bus, cfg};
+        auto r = accessor.transfer(src, sizeof(tx), dst, sizeof(rx));
         ASSERT_TRUE(r.has_value()) << "err=" << error::toString(r.error());
         EXPECT_EQ(r->tx, sizeof(tx));
         EXPECT_EQ(r->rx, sizeof(rx));
-        ASSERT_EQ(peer.requests.size(), 1u);
-        EXPECT_EQ(peer.requests[0], expectedUartStreamScript(3, 0, cfg, sizeof(tx), sizeof(rx)));
+        ASSERT_EQ(peer.requests.size(), 2u);
+        EXPECT_TRUE(scriptContainsOpcode(peer.requests[0], bytecode::OpCode::BusConfigure));
+        EXPECT_TRUE(scriptContainsOpcode(peer.requests[1], bytecode::OpCode::BusStreamTransfer));
     }
+}
+
+TEST(RemoteTransferWire, SPIAccessKeepsLegacyB4TransferB5Sequence)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    ScriptCapturePeer peer{pair.enc_b};
+    attachScriptCapturePeer(pair, peer, session);
+
+    spi::Bus_remote bus{session, 1};
+    spi::MasterAccessConfig cfg;
+    cfg.pin_cs = 5;
+    spi::MasterAccessor accessor{bus, cfg};
+    spi::TransferDesc desc;
+    const uint8_t tx[] = {0x11, 0x22};
+
+    ASSERT_TRUE(accessor.beginAccess(0).has_value());
+    auto transferred = accessor.transfer(desc, data::ConstDataSpan{tx, sizeof(tx)}, data::DataSpan{});
+    ASSERT_TRUE(transferred.has_value()) << "err=" << error::toString(transferred.error());
+    ASSERT_TRUE(accessor.endAccess().has_value());
+
+    ASSERT_EQ(peer.requests.size(), 3u);
+    EXPECT_EQ(peer.requests[0], expectedSpiBeginScript(1, cfg));
+    EXPECT_EQ(peer.requests[1], expectedAtomicTransferScript(1, desc, {tx, sizeof(tx)}, 0));
+    EXPECT_EQ(peer.requests[2], expectedSpiEndScript(1));
 }
 
 TEST(RemoteTransferWire, UartI2sProxiesRejectUnboundSessionAndNullArguments)
@@ -1204,16 +1428,20 @@ TEST(RemoteTransferWire, UartI2sProxiesRejectUnboundSessionAndNullArguments)
         // A proxy without a session must fail loudly, not report success.
         uart::Bus_remote uart_bus;
         i2s::Bus_remote i2s_bus;
-        auto uw = uart_bus.write(nullptr, ucfg, &src, sizeof(buf));
+        uart::TxAccessor uart_tx{uart_bus, ucfg};
+        uart::RxAccessor uart_rx{uart_bus, ucfg};
+        i2s::TxAccessor i2s_tx{i2s_bus, icfg};
+        i2s::RxAccessor i2s_rx{i2s_bus, icfg};
+        auto uw = uart_tx.write(src, sizeof(buf));
         ASSERT_FALSE(uw.has_value());
         EXPECT_EQ(uw.error(), error::error_t::INVALID_STATE);
-        auto ur = uart_bus.read(nullptr, ucfg, &dst, sizeof(buf));
+        auto ur = uart_rx.read(dst, sizeof(buf));
         ASSERT_FALSE(ur.has_value());
         EXPECT_EQ(ur.error(), error::error_t::INVALID_STATE);
-        auto iw = i2s_bus.write(nullptr, icfg, &src, sizeof(buf));
+        auto iw = i2s_tx.write(src, sizeof(buf));
         ASSERT_FALSE(iw.has_value());
         EXPECT_EQ(iw.error(), error::error_t::INVALID_STATE);
-        auto ir = i2s_bus.read(nullptr, icfg, &dst, sizeof(buf));
+        auto ir = i2s_rx.read(dst, sizeof(buf));
         ASSERT_FALSE(ir.has_value());
         EXPECT_EQ(ir.error(), error::error_t::INVALID_STATE);
     }
@@ -1226,30 +1454,34 @@ TEST(RemoteTransferWire, UartI2sProxiesRejectUnboundSessionAndNullArguments)
 
         uart::Bus_remote uart_bus{session, 0, uart::IBusConfig{}};
         i2s::Bus_remote i2s_bus{session, 1};
+        uart::TxAccessor uart_tx{uart_bus, ucfg};
+        uart::RxAccessor uart_rx{uart_bus, ucfg};
+        i2s::TxAccessor i2s_tx{i2s_bus, icfg};
+        i2s::RxAccessor i2s_rx{i2s_bus, icfg};
 
         // A nonzero length with a null Source/Sink is an API contract
         // violation, not an empty transfer.
-        auto uw = uart_bus.write(nullptr, ucfg, nullptr, sizeof(buf));
+        auto uw = uart_tx.write(static_cast<const uint8_t*>(nullptr), sizeof(buf));
         ASSERT_FALSE(uw.has_value());
         EXPECT_EQ(uw.error(), error::error_t::INVALID_ARGUMENT);
-        auto ur = uart_bus.read(nullptr, ucfg, nullptr, sizeof(buf));
+        auto ur = uart_rx.read(static_cast<uint8_t*>(nullptr), sizeof(buf));
         ASSERT_FALSE(ur.has_value());
         EXPECT_EQ(ur.error(), error::error_t::INVALID_ARGUMENT);
-        auto iw = i2s_bus.write(nullptr, icfg, nullptr, sizeof(buf));
+        auto iw = i2s_tx.write(static_cast<const uint8_t*>(nullptr), sizeof(buf));
         ASSERT_FALSE(iw.has_value());
         EXPECT_EQ(iw.error(), error::error_t::INVALID_ARGUMENT);
-        auto ir = i2s_bus.read(nullptr, icfg, nullptr, sizeof(buf));
+        auto ir = i2s_rx.read(static_cast<uint8_t*>(nullptr), sizeof(buf));
         ASSERT_FALSE(ir.has_value());
         EXPECT_EQ(ir.error(), error::error_t::INVALID_ARGUMENT);
 
         // Zero length stays a no-op success and puts nothing on the wire.
-        auto uz = uart_bus.write(nullptr, ucfg, &src, 0);
+        auto uz = uart_tx.write(src, 0);
         ASSERT_TRUE(uz.has_value());
         EXPECT_EQ(uz.value(), 0u);
-        auto iz = i2s_bus.read(nullptr, icfg, &dst, 0);
+        auto iz = i2s_rx.read(dst, 0);
         ASSERT_TRUE(iz.has_value());
         EXPECT_EQ(iz.value(), 0u);
-        EXPECT_TRUE(peer.requests.empty());
+        EXPECT_EQ(peer.requests.size(), 2u);
     }
 }
 
@@ -1265,9 +1497,20 @@ TEST(RemoteTransferWire, ClosedSessionHandleMakesExistingProxyReturnClosed)
     uart::AccessConfig cfg;
     uint8_t byte = 0x5A;
     data::MemorySource src{&byte, 1};
-    auto written = bus.write(nullptr, cfg, &src, 1);
+    uart::TxAccessor accessor{bus, cfg};
+    auto written = accessor.write(src, 1);
     ASSERT_FALSE(written.has_value());
     EXPECT_EQ(written.error(), error::error_t::CLOSED);
+    EXPECT_FALSE(src.eof());
+
+    i2c::Bus_remote i2c_bus{handle, 1, i2c::IBusConfig{}};
+    i2c::MasterAccessConfig i2c_cfg;
+    i2c::TransferDesc desc;
+    data::MemorySource i2c_src{&byte, 1};
+    auto transferred = transferI2cThroughAccessor(i2c_bus, i2c_cfg, desc, &i2c_src, 1, nullptr, 0);
+    ASSERT_FALSE(transferred.has_value());
+    EXPECT_EQ(transferred.error(), error::error_t::CLOSED);
+    EXPECT_FALSE(i2c_src.eof());
 }
 
 TEST(RemoteTransferWire, HeterogeneousProxiesSerializeOneInflightSession)
@@ -1289,18 +1532,20 @@ TEST(RemoteTransferWire, HeterogeneousProxiesSerializeOneInflightSession)
     std::thread uart_thread{[&] {
         uint8_t payload[] = {0x11, 0x12};
         data::MemorySource src{payload, sizeof(payload)};
+        uart::TxAccessor accessor{uart_bus, uart_cfg};
         while (!start.load(std::memory_order_acquire)) {
             std::this_thread::yield();
         }
-        uart_ok.store(uart_bus.write(nullptr, uart_cfg, &src, sizeof(payload)).has_value(), std::memory_order_release);
+        uart_ok.store(accessor.write(src, sizeof(payload)).has_value(), std::memory_order_release);
     }};
     std::thread i2s_thread{[&] {
         uint8_t payload[] = {0x21, 0x22};
         data::MemorySource src{payload, sizeof(payload)};
+        i2s::TxAccessor accessor{i2s_bus, i2s_cfg};
         while (!start.load(std::memory_order_acquire)) {
             std::this_thread::yield();
         }
-        i2s_ok.store(i2s_bus.write(nullptr, i2s_cfg, &src, sizeof(payload)).has_value(), std::memory_order_release);
+        i2s_ok.store(accessor.write(src, sizeof(payload)).has_value(), std::memory_order_release);
     }};
 
     start.store(true, std::memory_order_release);
@@ -1308,9 +1553,12 @@ TEST(RemoteTransferWire, HeterogeneousProxiesSerializeOneInflightSession)
     i2s_thread.join();
     EXPECT_TRUE(uart_ok.load(std::memory_order_acquire));
     EXPECT_TRUE(i2s_ok.load(std::memory_order_acquire));
-    ASSERT_EQ(peer.requests.size(), 2u);
-    EXPECT_TRUE(scriptContainsOpcode(peer.requests[0], bytecode::OpCode::BusStreamTransfer));
-    EXPECT_TRUE(scriptContainsOpcode(peer.requests[1], bytecode::OpCode::BusStreamTransfer));
+    ASSERT_EQ(peer.requests.size(), 4u);
+    size_t stream_requests = 0;
+    for (const auto& request : peer.requests) {
+        stream_requests += scriptContainsOpcode(request, bytecode::OpCode::BusStreamTransfer) ? 1u : 0u;
+    }
+    EXPECT_EQ(stream_requests, 2u);
 }
 
 TEST(RemoteI2cLock, UsesCommonTimedMutexContract)
@@ -1366,9 +1614,157 @@ TEST(RemoteBackend, ProxyLastOwnerBestEffortReleasesPeerBus)
     ASSERT_TRUE(acquired.has_value()) << "err=" << error::toString(acquired.error());
     ASSERT_EQ(h.peer.create_count, 1u);
     ASSERT_EQ(h.peer.release_count, 0u);
+    const auto legacy_caps = acquired.value()->capabilities();
+    EXPECT_FALSE(legacy_caps.supports(bus::BusFeature::MasterTransfer));
+    EXPECT_GT(legacy_caps.generation(), 0u);
 
     acquired.value().reset();
     EXPECT_EQ(h.peer.release_count, 1u);
+}
+
+TEST(RemoteBackend, LegacyDiscardBusCreateGetsNoCapabilityStoreFromNewRunner)
+{
+    SessionPair pair;
+    CapabilityBusCreatePeer peer{pair.enc_b, pair.dec_b};
+    auto stored = peer.runLegacyDiscardCreate(0);
+    ASSERT_TRUE(stored.has_value()) << "err=" << error::toString(stored.error());
+    EXPECT_EQ(stored.value(), 0u);
+}
+
+TEST(RemoteBackend, NewHostAcceptsFrozenOldServerBusCreateResponseWithoutCapabilityStore)
+{
+    // DynamicBusCreatePeer deliberately registers no runner binding. Its
+    // status-only response is byte-for-byte the old server behavior even
+    // though the new host requests a capability store.
+    RemoteConfigCompatHarness h;
+    auto acquired = h.hal.I2C.acquire(i2c::LogicalBusConfig{i2c::Scl{22}, i2c::Sda{21}});
+    ASSERT_TRUE(acquired.has_value()) << "err=" << error::toString(acquired.error());
+    const auto caps = acquired.value()->capabilities();
+    EXPECT_FALSE(caps.supports(bus::BusFeature::MasterTransfer));
+    EXPECT_FALSE(caps.limit(bus::BusLimit::MaxFrequencyHz).has_value());
+    // An old server may enforce a smaller private max_transfer_rx. Without a
+    // record the new host must leave that limit unknown rather than assuming
+    // the framing maximum is executable by the peer.
+    EXPECT_FALSE(caps.limit(bus::BusLimit::MaxAtomicRxBytes).has_value());
+    EXPECT_GT(caps.generation(), 0u);
+}
+
+TEST(RemoteBackend, DynamicBusCreateBindsInstanceCapabilityToSessionAndTransportLimits)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    CapabilityBusCreatePeer peer{pair.enc_b, pair.dec_b, 400000, 64};
+    session.setPeerPoll([](void* ctx) { static_cast<SessionPair*>(ctx)->pump(); }, &pair);
+    remote::RemoteBackend backend{session};
+    RemoteTestHal hal{&backend};
+
+    auto acquired = hal.I2C.acquire(i2c::LogicalBusConfig{i2c::Scl{22}, i2c::Sda{21}});
+    ASSERT_TRUE(acquired.has_value()) << "err=" << error::toString(acquired.error());
+    const auto snapshot            = acquired.value()->capabilities();
+    const auto snapshot_generation = snapshot.generation();
+    EXPECT_TRUE(snapshot.supports(bus::BusFeature::MasterTransfer));
+    EXPECT_TRUE(snapshot.supports(bus::BusFeature::Transmit));
+    EXPECT_TRUE(snapshot.supports(bus::BusFeature::Receive));
+    EXPECT_GT(snapshot.generation(), 0u);
+    auto frequency = snapshot.limit(bus::BusLimit::MaxFrequencyHz);
+    ASSERT_TRUE(frequency.has_value());
+    EXPECT_EQ(frequency.value(), 400000u);
+    auto tx = snapshot.limit(bus::BusLimit::MaxAtomicTxBytes);
+    auto rx = snapshot.limit(bus::BusLimit::MaxAtomicRxBytes);
+    ASSERT_TRUE(tx.has_value());
+    ASSERT_TRUE(rx.has_value());
+    EXPECT_EQ(tx.value(), remote::kMaxAtomicI2CTxBase);
+    EXPECT_EQ(rx.value(), 64u);
+
+    acquired.value().reset();
+    // Snapshot is an owned value and remains usable after remote release.
+    EXPECT_TRUE(snapshot.supports(bus::BusFeature::MasterTransfer));
+    EXPECT_EQ(snapshot.generation(), snapshot_generation);
+}
+
+TEST(RemoteServer, CapabilityRegistrationFailureCompensatesApplicationCreate)
+{
+    uint8_t scratch[remote::kMaxScriptSize];
+    remote::Server server{data::DataSpan{scratch, sizeof(scratch)}};
+    struct Handler {
+        size_t creates  = 0;
+        size_t releases = 0;
+
+        static result_t<void> call(void* ctx, bool create, types::bus_kind_t, uint8_t, data::ConstDataSpan)
+        {
+            auto& self = *static_cast<Handler*>(ctx);
+            create ? ++self.creates : ++self.releases;
+            // Deliberately do not register a runner binding. The Server's
+            // capability-record step must fail and compensate this success.
+            return {};
+        }
+    } handler;
+    server.setBusCreateHandler(&Handler::call, &handler);
+
+    uint8_t script_buf[64];
+    data::MemorySink script{script_buf, sizeof(script_buf)};
+    bytecode::BytecodeEncoder encoder{script};
+    ASSERT_TRUE(encoder.busCreate(types::bus_kind_t::I2C, 0, bytecode::kDiscardStoreId, {}).has_value());
+    ASSERT_TRUE(encoder.end().has_value());
+    uint8_t response_buf[64];
+    data::MemorySink response{response_buf, sizeof(response_buf)};
+
+    auto processed = server.processScript({script_buf, script.written()}, response);
+    ASSERT_TRUE(processed.has_value()) << "err=" << error::toString(processed.error());
+    EXPECT_EQ(processed.value(), error::error_t::INVALID_STATE);
+    EXPECT_EQ(handler.creates, 1u);
+    EXPECT_EQ(handler.releases, 1u);
+    EXPECT_EQ(server.capabilityCount(), 0u);
+}
+
+TEST(RemoteBackend, ReconnectPublishesNewGenerationAndKeepsOldSnapshotImmutable)
+{
+    std::shared_ptr<i2c::IBus> old_bus;
+    bus::BusCapabilities old_snapshot;
+
+    {
+        SessionPair pair;
+        remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+        CapabilityBusCreatePeer peer{pair.enc_b, pair.dec_b, 400000};
+        session.setPeerPoll([](void* ctx) { static_cast<SessionPair*>(ctx)->pump(); }, &pair);
+        remote::RemoteBackend backend{session};
+        RemoteTestHal hal{&backend};
+
+        auto acquired = hal.I2C.acquire(i2c::LogicalBusConfig{i2c::Scl{22}, i2c::Sda{21}});
+        ASSERT_TRUE(acquired.has_value()) << "err=" << error::toString(acquired.error());
+        old_bus      = acquired.value();
+        old_snapshot = old_bus->capabilities();
+        session.sharedHandle()->close();
+    }
+
+    auto old_frequency = old_snapshot.limit(bus::BusLimit::MaxFrequencyHz);
+    ASSERT_TRUE(old_frequency.has_value());
+    EXPECT_EQ(old_frequency.value(), 400000u);
+
+    i2c::MasterAccessConfig cfg;
+    i2c::TransferDesc desc;
+    auto stale = transferI2cThroughAccessor(*old_bus, cfg, desc, nullptr, 0, nullptr, 0);
+    ASSERT_FALSE(stale.has_value());
+    EXPECT_EQ(stale.error(), error::error_t::CLOSED);
+
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    CapabilityBusCreatePeer peer{pair.enc_b, pair.dec_b, 100000};
+    session.setPeerPoll([](void* ctx) { static_cast<SessionPair*>(ctx)->pump(); }, &pair);
+    remote::RemoteBackend backend{session};
+    RemoteTestHal hal{&backend};
+
+    auto acquired = hal.I2C.acquire(i2c::LogicalBusConfig{i2c::Scl{22}, i2c::Sda{21}});
+    ASSERT_TRUE(acquired.has_value()) << "err=" << error::toString(acquired.error());
+    const auto new_snapshot = acquired.value()->capabilities();
+    auto new_frequency      = new_snapshot.limit(bus::BusLimit::MaxFrequencyHz);
+    ASSERT_TRUE(new_frequency.has_value());
+    EXPECT_EQ(new_frequency.value(), 100000u);
+    EXPECT_NE(new_snapshot.generation(), old_snapshot.generation());
+
+    // A reconnect publishes a new value; it never mutates snapshots already handed out.
+    EXPECT_EQ(old_snapshot.limit(bus::BusLimit::MaxFrequencyHz).value(), 400000u);
+    EXPECT_NE(old_snapshot.generation(), new_snapshot.generation());
 }
 
 TEST(RemoteBackend, SpiFeatureIntentIsRejectedBeforeBusCreate)
@@ -1378,7 +1774,7 @@ TEST(RemoteBackend, SpiFeatureIntentIsRejectedBeforeBusCreate)
 
     auto acquired = h.hal.SPI.acquire(cfg);
     ASSERT_FALSE(acquired.has_value());
-    EXPECT_EQ(acquired.error(), error::error_t::NOT_IMPLEMENTED);
+    EXPECT_EQ(acquired.error(), error::error_t::UNSUPPORTED);
     EXPECT_EQ(h.peer.create_count, 0u);
 }
 
@@ -1404,7 +1800,7 @@ TEST(RemoteBackend, FailedDestructorReleaseQuarantinesBusId)
     EXPECT_EQ(h.peer.last_bus_id, 1u);
 }
 
-TEST(RemoteBackend, ExplicitReleaseClosesProxyRevivedFromWeakPointer)
+TEST(RemoteBackend, ExplicitCloseClosesProxyRevivedFromWeakPointer)
 {
     RemoteConfigCompatHarness h;
     auto acquired = h.hal.I2C.acquire(i2c::LogicalBusConfig{i2c::Scl{22}, i2c::Sda{21}});
@@ -1413,32 +1809,32 @@ TEST(RemoteBackend, ExplicitReleaseClosesProxyRevivedFromWeakPointer)
     std::weak_ptr<bus::IBus> weak = acquired.value();
     std::shared_ptr<bus::IBus> revived;
     h.peer.release_hook = [&]() { revived = weak.lock(); };
-    auto released       = h.hal.I2C.release(acquired.value());
-    ASSERT_TRUE(released.has_value()) << "err=" << error::toString(released.error());
+    auto closed         = h.hal.I2C.close(acquired.value());
+    ASSERT_TRUE(closed.has_value()) << "err=" << error::toString(closed.error());
     ASSERT_TRUE(revived);
 
     auto stale = std::static_pointer_cast<i2c::IBus>(revived);
     i2c::MasterAccessConfig cfg;
     i2c::TransferDesc desc;
-    auto operation = stale->transfer(nullptr, cfg, desc, nullptr, 0, nullptr, 0);
+    auto operation = transferI2cThroughAccessor(*stale, cfg, desc, nullptr, 0, nullptr, 0);
     ASSERT_FALSE(operation.has_value());
     EXPECT_EQ(operation.error(), error::error_t::CLOSED);
 }
 
-TEST(RemoteBackend, ExplicitReleaseFailureRollsBackAndCanRetry)
+TEST(RemoteBackend, ExplicitCloseFailureRollsBackAndCanRetry)
 {
     RemoteConfigCompatHarness h;
     auto acquired = h.hal.I2C.acquire(i2c::LogicalBusConfig{i2c::Scl{22}, i2c::Sda{21}});
     ASSERT_TRUE(acquired.has_value()) << "err=" << error::toString(acquired.error());
 
     h.peer.fail_release = true;
-    auto failed         = h.hal.I2C.release(acquired.value());
+    auto failed         = h.hal.I2C.close(acquired.value());
     ASSERT_FALSE(failed.has_value());
     EXPECT_EQ(failed.error(), error::error_t::IO_ERROR);
     ASSERT_TRUE(acquired.value());
 
     h.peer.fail_release = false;
-    auto retried        = h.hal.I2C.release(acquired.value());
+    auto retried        = h.hal.I2C.close(acquired.value());
     ASSERT_TRUE(retried.has_value()) << "err=" << error::toString(retried.error());
     EXPECT_FALSE(acquired.value());
     EXPECT_EQ(h.peer.release_count, 1u);
@@ -1517,16 +1913,18 @@ TEST(RemoteTransferWire, RepeatedUartWriteOmitsUnchangedConfigure)
     uint8_t second_payload[] = {0x21, 0x22};
     data::MemorySource first_src{first_payload, sizeof(first_payload)};
     data::MemorySource second_src{second_payload, sizeof(second_payload)};
+    uart::TxAccessor accessor{bus, cfg};
 
-    auto first = bus.write(nullptr, cfg, &first_src, sizeof(first_payload));
+    auto first = accessor.write(first_src, sizeof(first_payload));
     ASSERT_TRUE(first.has_value()) << "err=" << error::toString(first.error());
-    auto second = bus.write(nullptr, cfg, &second_src, sizeof(second_payload));
+    auto second = accessor.write(second_src, sizeof(second_payload));
     ASSERT_TRUE(second.has_value()) << "err=" << error::toString(second.error());
 
-    ASSERT_EQ(peer.requests.size(), 2u);
+    ASSERT_EQ(peer.requests.size(), 3u);
     EXPECT_TRUE(scriptContainsOpcode(peer.requests[0], bytecode::OpCode::BusConfigure));
     EXPECT_FALSE(scriptContainsOpcode(peer.requests[1], bytecode::OpCode::BusConfigure));
     EXPECT_TRUE(scriptContainsOpcode(peer.requests[1], bytecode::OpCode::BusStreamTransfer));
+    EXPECT_TRUE(scriptContainsOpcode(peer.requests[2], bytecode::OpCode::BusStreamTransfer));
 }
 
 TEST(RemoteTransferWire, ConfigChangeResendsConfigure)
@@ -1543,16 +1941,18 @@ TEST(RemoteTransferWire, ConfigChangeResendsConfigure)
         uint8_t payload[] = {0x31};
         data::MemorySource first_src{payload, sizeof(payload)};
         data::MemorySource second_src{payload, sizeof(payload)};
+        uart::TxAccessor accessor{bus, cfg};
 
-        auto first = bus.write(nullptr, cfg, &first_src, sizeof(payload));
+        auto first = accessor.write(first_src, sizeof(payload));
         ASSERT_TRUE(first.has_value()) << "err=" << error::toString(first.error());
         cfg.baud_rate = 230400;
-        auto second   = bus.write(nullptr, cfg, &second_src, sizeof(payload));
+        ASSERT_TRUE(accessor.setConfig(cfg).has_value());
+        auto second = accessor.write(second_src, sizeof(payload));
         ASSERT_TRUE(second.has_value()) << "err=" << error::toString(second.error());
 
-        ASSERT_EQ(peer.requests.size(), 2u);
+        ASSERT_EQ(peer.requests.size(), 4u);
         EXPECT_TRUE(scriptContainsOpcode(peer.requests[0], bytecode::OpCode::BusConfigure));
-        EXPECT_TRUE(scriptContainsOpcode(peer.requests[1], bytecode::OpCode::BusConfigure));
+        EXPECT_TRUE(scriptContainsOpcode(peer.requests[2], bytecode::OpCode::BusConfigure));
     }
 
     {
@@ -1566,18 +1966,20 @@ TEST(RemoteTransferWire, ConfigChangeResendsConfigure)
         cfg.i2c_addr = 0x52;
         i2c::TransferDesc desc;
 
-        auto first = bus.transfer(nullptr, cfg, desc, nullptr, 0, nullptr, 0);
+        auto first = transferI2cThroughAccessor(bus, cfg, desc, nullptr, 0, nullptr, 0);
         ASSERT_TRUE(first.has_value()) << "err=" << error::toString(first.error());
-        auto same = bus.transfer(nullptr, cfg, desc, nullptr, 0, nullptr, 0);
+        auto same = transferI2cThroughAccessor(bus, cfg, desc, nullptr, 0, nullptr, 0);
         ASSERT_TRUE(same.has_value()) << "err=" << error::toString(same.error());
         cfg.i2c_addr = 0x53;
-        auto changed = bus.transfer(nullptr, cfg, desc, nullptr, 0, nullptr, 0);
+        auto changed = transferI2cThroughAccessor(bus, cfg, desc, nullptr, 0, nullptr, 0);
         ASSERT_TRUE(changed.has_value()) << "err=" << error::toString(changed.error());
 
-        ASSERT_EQ(peer.requests.size(), 3u);
+        ASSERT_EQ(peer.requests.size(), 5u);
         EXPECT_TRUE(scriptContainsOpcode(peer.requests[0], bytecode::OpCode::BusConfigure));
-        EXPECT_FALSE(scriptContainsOpcode(peer.requests[1], bytecode::OpCode::BusConfigure));
-        EXPECT_TRUE(scriptContainsOpcode(peer.requests[2], bytecode::OpCode::BusConfigure));
+        EXPECT_TRUE(scriptContainsOpcode(peer.requests[1], bytecode::OpCode::BusTransfer));
+        EXPECT_TRUE(scriptContainsOpcode(peer.requests[2], bytecode::OpCode::BusTransfer));
+        EXPECT_TRUE(scriptContainsOpcode(peer.requests[3], bytecode::OpCode::BusConfigure));
+        EXPECT_TRUE(scriptContainsOpcode(peer.requests[4], bytecode::OpCode::BusTransfer));
     }
 }
 
@@ -1595,20 +1997,22 @@ TEST(RemoteTransferWire, HelloInvalidatesConfigCache)
     data::MemorySource first_src{payload, sizeof(payload)};
     data::MemorySource second_src{payload, sizeof(payload)};
     data::MemorySource third_src{payload, sizeof(payload)};
+    uart::TxAccessor accessor{bus, cfg};
 
-    auto first = bus.write(nullptr, cfg, &first_src, sizeof(payload));
+    auto first = accessor.write(first_src, sizeof(payload));
     ASSERT_TRUE(first.has_value()) << "err=" << error::toString(first.error());
-    auto second = bus.write(nullptr, cfg, &second_src, sizeof(payload));
+    auto second = accessor.write(second_src, sizeof(payload));
     ASSERT_TRUE(second.has_value()) << "err=" << error::toString(second.error());
     auto hello = session.hello();
     ASSERT_TRUE(hello.has_value()) << "err=" << error::toString(hello.error());
-    auto third = bus.write(nullptr, cfg, &third_src, sizeof(payload));
+    auto third = accessor.write(third_src, sizeof(payload));
     ASSERT_TRUE(third.has_value()) << "err=" << error::toString(third.error());
 
-    ASSERT_EQ(peer.requests.size(), 3u);
+    ASSERT_EQ(peer.requests.size(), 4u);
     EXPECT_TRUE(scriptContainsOpcode(peer.requests[0], bytecode::OpCode::BusConfigure));
     EXPECT_FALSE(scriptContainsOpcode(peer.requests[1], bytecode::OpCode::BusConfigure));
-    EXPECT_TRUE(scriptContainsOpcode(peer.requests[2], bytecode::OpCode::BusConfigure));
+    EXPECT_FALSE(scriptContainsOpcode(peer.requests[2], bytecode::OpCode::BusConfigure));
+    EXPECT_TRUE(scriptContainsOpcode(peer.requests[3], bytecode::OpCode::BusConfigure));
 }
 
 TEST(RemoteTransferWire, ErrorResponseDoesNotUpdateConfigCache)
@@ -1625,109 +2029,110 @@ TEST(RemoteTransferWire, ErrorResponseDoesNotUpdateConfigCache)
     uint8_t second_payload[] = {0x52};
     data::MemorySource first_src{first_payload, sizeof(first_payload)};
     data::MemorySource second_src{second_payload, sizeof(second_payload)};
+    uart::TxAccessor accessor{bus, cfg};
 
     peer.fail_next_request = true;
-    auto first             = bus.write(nullptr, cfg, &first_src, sizeof(first_payload));
+    auto first             = accessor.write(first_src, sizeof(first_payload));
     ASSERT_FALSE(first.has_value());
     EXPECT_EQ(first.error(), error::error_t::IO_ERROR);
-    auto second = bus.write(nullptr, cfg, &second_src, sizeof(second_payload));
+    auto second = accessor.write(second_src, sizeof(second_payload));
     ASSERT_TRUE(second.has_value()) << "err=" << error::toString(second.error());
 
-    ASSERT_EQ(peer.requests.size(), 2u);
+    ASSERT_EQ(peer.requests.size(), 3u);
     EXPECT_TRUE(scriptContainsOpcode(peer.requests[0], bytecode::OpCode::BusConfigure));
     EXPECT_TRUE(scriptContainsOpcode(peer.requests[1], bytecode::OpCode::BusConfigure));
 }
 
-TEST(RemoteConfigCompat, LogicalSpiThenTypedIgnoresWireOmittedDc)
+TEST(RemoteConfigCompat, LogicalSpiThenPortableIgnoresWireOmittedDc)
 {
     RemoteConfigCompatHarness h;
 
     auto logical = h.hal.SPI.acquire(spi::LogicalBusConfig{spi::Clk{18}, spi::Mosi{23}, spi::Miso{19}});
     ASSERT_TRUE(logical.has_value()) << "err=" << error::toString(logical.error());
 
-    spi::BusConfig_remote typed;
-    typed.pin_clk  = 18;
-    typed.pin_mosi = 23;
-    typed.pin_miso = 19;
-    typed.pin_dc   = 5;
+    spi::IBusConfig portable;
+    portable.pin_clk  = 18;
+    portable.pin_mosi = 23;
+    portable.pin_miso = 19;
+    portable.pin_dc   = 5;
 
-    auto reacquired = h.hal.SPI.acquire(typed);
+    auto reacquired = h.hal.SPI.acquire(portable);
     ASSERT_TRUE(reacquired.has_value()) << "err=" << error::toString(reacquired.error());
     EXPECT_EQ(logical.value().get(), reacquired.value().get());
     EXPECT_EQ(h.peer.create_count, 1u);
 }
 
-TEST(RemoteConfigCompat, LogicalUartThenTypedIgnoresWireOmittedFlowControl)
+TEST(RemoteConfigCompat, LogicalUartThenPortableIgnoresWireOmittedFlowControl)
 {
     RemoteConfigCompatHarness h;
 
     auto logical = h.hal.UART.acquire(uart::LogicalBusConfig{uart::Tx{17}, uart::Rx{16}});
     ASSERT_TRUE(logical.has_value()) << "err=" << error::toString(logical.error());
 
-    uart::BusConfig_remote typed;
-    typed.pin_tx  = 17;
-    typed.pin_rx  = 16;
-    typed.pin_rts = 4;
+    uart::IBusConfig portable;
+    portable.pin_tx  = 17;
+    portable.pin_rx  = 16;
+    portable.pin_rts = 4;
 
-    auto reacquired = h.hal.UART.acquire(typed);
+    auto reacquired = h.hal.UART.acquire(portable);
     ASSERT_TRUE(reacquired.has_value()) << "err=" << error::toString(reacquired.error());
     EXPECT_EQ(logical.value().get(), reacquired.value().get());
     EXPECT_EQ(h.peer.create_count, 1u);
 }
 
-TEST(RemoteConfigCompat, LogicalI2sThenTypedIgnoresMclkAndNormalizesBuffers)
+TEST(RemoteConfigCompat, LogicalI2sThenPortableIgnoresMclkAndNormalizesBuffers)
 {
     RemoteConfigCompatHarness h;
 
     auto logical = h.hal.I2S.acquire(i2s::LogicalBusConfig{i2s::Bclk{12}, i2s::Ws{0}, i2s::Dout{2}, i2s::Din{34}});
     ASSERT_TRUE(logical.has_value()) << "err=" << error::toString(logical.error());
 
-    i2s::BusConfig_remote typed;
-    typed.pin_bclk       = 12;
-    typed.pin_ws         = 0;
-    typed.pin_dout       = 2;
-    typed.pin_din        = 34;
-    typed.pin_mclk       = 3;
-    typed.tx_buffer_size = 8000;
-    typed.rx_buffer_size = 8191;
+    i2s::IBusConfig portable;
+    portable.pin_bclk       = 12;
+    portable.pin_ws         = 0;
+    portable.pin_dout       = 2;
+    portable.pin_din        = 34;
+    portable.pin_mclk       = 3;
+    portable.tx_buffer_size = 8000;
+    portable.rx_buffer_size = 8191;
 
-    auto reacquired = h.hal.I2S.acquire(typed);
+    auto reacquired = h.hal.I2S.acquire(portable);
     ASSERT_TRUE(reacquired.has_value()) << "err=" << error::toString(reacquired.error());
     EXPECT_EQ(logical.value().get(), reacquired.value().get());
     EXPECT_EQ(h.peer.create_count, 1u);
 }
 
-TEST(RemoteConfigCompat, TypedI2sRejectsIncompleteStandardWiringBeforeBusCreate)
+TEST(RemoteConfigCompat, PortableI2sRejectsIncompleteStandardWiringBeforeBusCreate)
 {
     RemoteConfigCompatHarness h;
-    const auto expect_invalid = [&h](i2s::BusConfig_remote cfg) {
+    const auto expect_invalid = [&h](i2s::IBusConfig cfg) {
         auto acquired = h.hal.I2S.acquire(cfg);
         ASSERT_FALSE(acquired.has_value());
         EXPECT_EQ(acquired.error(), error::error_t::INVALID_ARGUMENT) << "err=" << error::toString(acquired.error());
         EXPECT_EQ(h.peer.create_count, 0u);
     };
 
-    i2s::BusConfig_remote missing_bclk;
+    i2s::IBusConfig missing_bclk;
     missing_bclk.pin_ws   = 0;
     missing_bclk.pin_dout = 2;
     expect_invalid(missing_bclk);
 
-    i2s::BusConfig_remote missing_ws;
+    i2s::IBusConfig missing_ws;
     missing_ws.pin_bclk = 12;
     missing_ws.pin_din  = 34;
     expect_invalid(missing_ws);
 
-    i2s::BusConfig_remote missing_data;
+    i2s::IBusConfig missing_data;
     missing_data.pin_bclk = 12;
     missing_data.pin_ws   = 0;
     expect_invalid(missing_data);
 }
 
-TEST(RemoteConfigCompat, TypedUartRejectsDifferentWireBufferUnit)
+TEST(RemoteConfigCompat, PortableUartRejectsDifferentWireBufferUnit)
 {
     RemoteConfigCompatHarness h;
 
-    uart::BusConfig_remote cfg_a;
+    uart::IBusConfig cfg_a;
     cfg_a.pin_tx         = 25;
     cfg_a.pin_rx         = 26;
     cfg_a.rx_buffer_size = 512;
@@ -1735,8 +2140,8 @@ TEST(RemoteConfigCompat, TypedUartRejectsDifferentWireBufferUnit)
     auto first = h.hal.UART.acquire(cfg_a);
     ASSERT_TRUE(first.has_value()) << "err=" << error::toString(first.error());
 
-    uart::BusConfig_remote cfg_b = cfg_a;
-    cfg_b.rx_buffer_size         = 1024;
+    uart::IBusConfig cfg_b = cfg_a;
+    cfg_b.rx_buffer_size   = 1024;
 
     auto second = h.hal.UART.acquire(cfg_b);
     ASSERT_FALSE(second.has_value());
@@ -2288,8 +2693,9 @@ TEST(RemoteTransferWire, OverlongSourceIsCappedAtRequestedTxLen)
     }
     data::MemorySource src{payload.data(), payload.size()};
     i2s::Bus_remote host_bus{session, 0};
+    i2s::TxAccessor host_tx{host_bus, cfg};
 
-    auto written = host_bus.write(nullptr, cfg, &src, 8);
+    auto written = host_tx.write(src, 8);
     ASSERT_TRUE(written.has_value()) << "err=" << error::toString(written.error());
     EXPECT_EQ(written.value(), 8u);
 
@@ -2336,8 +2742,9 @@ TEST(RemoteTransferWire, UARTHostTransferRoundtripThroughServer)
     data::MemorySource src{tx, sizeof(tx)};
     data::MemorySink dst{rx, sizeof(rx)};
     uart::Bus_remote host_bus{session, 0, uart::IBusConfig{}};
+    uart::Accessor host_accessor{host_bus, cfg};
 
-    auto result = host_bus.transfer(nullptr, cfg, &src, sizeof(tx), &dst, sizeof(rx));
+    auto result = host_accessor.transfer(src, sizeof(tx), dst, sizeof(rx));
     ASSERT_TRUE(result.has_value()) << "err=" << error::toString(result.error());
     EXPECT_EQ(result->tx, sizeof(tx));
     EXPECT_EQ(result->rx, sizeof(rx));
@@ -2346,7 +2753,80 @@ TEST(RemoteTransferWire, UARTHostTransferRoundtripThroughServer)
     EXPECT_EQ(device_bus.last_cfg.baud_rate, 921600u);
 }
 
-TEST(RemoteServerStreamTransfer, ReadOnlyLargeI2CTransferCompletesThroughPendingPoll)
+TEST(RemoteTransferWire, UARTReadTimeoutReturnsActualShortLengthThroughServer)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    remote::RemoteServerAdapter adapter{pair.enc_b, pair.dec_b, pair.wire_ab.source(), pair.wire_ba.sink()};
+    remote::RemoteServerHandler handler;
+    uint8_t scratch[remote::kMaxScriptSize];
+    remote::Server server{data::DataSpan{scratch, sizeof(scratch)}};
+
+    uart::AccessConfig cfg;
+    cfg.first_byte_timeout_ms = 30;
+    cfg.inter_byte_timeout_ms = 5;
+    EchoUARTBus device_bus;
+    device_bus.rx_queue = {0x31, 0x32, 0x33};
+    uart::Accessor device_acc{device_bus, cfg};
+    ASSERT_TRUE(server.registerUART(0, device_acc).has_value());
+    attachRealServer(session, adapter, handler, server);
+
+    uart::Bus_remote host_bus{session, 0, uart::IBusConfig{}};
+    uart::RxAccessor host_rx{host_bus, cfg};
+    uint8_t rx[8] = {};
+    data::MemorySink dst{rx, sizeof(rx)};
+    auto read = host_rx.read(dst, sizeof(rx));
+
+    ASSERT_TRUE(read.has_value()) << "err=" << error::toString(read.error());
+    EXPECT_EQ(read.value(), 3u);
+    EXPECT_EQ(dst.written(), 3u);
+    EXPECT_EQ(device_bus.read_calls, 1u);
+    EXPECT_EQ(rx[0], 0x31);
+    EXPECT_EQ(rx[1], 0x32);
+    EXPECT_EQ(rx[2], 0x33);
+}
+
+TEST(RemoteTransferWire, UARTLargeReadUsesInterByteTimeoutForContinuationChunk)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    remote::RemoteServerAdapter adapter{pair.enc_b, pair.dec_b, pair.wire_ab.source(), pair.wire_ba.sink()};
+    remote::RemoteServerHandler handler;
+    uint8_t scratch[remote::kMaxScriptSize];
+    remote::Server server{data::DataSpan{scratch, sizeof(scratch)}};
+
+    uart::AccessConfig cfg;
+    cfg.first_byte_timeout_ms = 100;
+    cfg.inter_byte_timeout_ms = 20;
+    EchoUARTBus device_bus;
+    device_bus.rx_queue.resize(frame::kMaxDataPayload + 8, 0x5A);
+    uart::Accessor device_acc{device_bus, cfg};
+    ASSERT_TRUE(server.registerUART(0, device_acc).has_value());
+    attachRealServer(session, adapter, handler, server);
+
+    uart::Bus_remote host_bus{session, 0, uart::IBusConfig{}};
+    uart::RxAccessor host_rx{host_bus, cfg};
+    std::array<uint8_t, frame::kMaxDataPayload + 32> rx{};
+    data::MemorySink dst{rx.data(), rx.size()};
+    auto read = host_rx.read(dst, rx.size());
+
+    ASSERT_TRUE(read.has_value()) << "err=" << error::toString(read.error());
+    EXPECT_EQ(read.value(), frame::kMaxDataPayload + 8);
+    ASSERT_EQ(device_bus.read_first_timeouts.size(), 2u);
+    EXPECT_EQ(device_bus.read_first_timeouts[0], cfg.first_byte_timeout_ms);
+    EXPECT_EQ(device_bus.read_first_timeouts[1], cfg.inter_byte_timeout_ms);
+    EXPECT_EQ(device_acc.rx().getConfig().first_byte_timeout_ms, cfg.first_byte_timeout_ms);
+}
+
+TEST(RemoteUARTTimeout, ResponseDeadlineIncludesConfiguredNominalTimeouts)
+{
+    EXPECT_EQ(remote::detail::remoteUartWriteResponseTimeoutMs(100, 5), 750u);
+    EXPECT_EQ(remote::detail::remoteUartReadResponseTimeoutMs(100, 20, 5), 430u);
+    EXPECT_EQ(remote::detail::remoteUartTransferResponseTimeoutMs(100, 100, 20, 5, 5), 930u);
+    EXPECT_EQ(remote::detail::remoteUartTransferResponseTimeoutMs(100, 100, 20, 0, 5), 430u);
+}
+
+TEST(RemoteAtomicTransfer, OversizeI2CReadIsRejectedBeforeWireActivity)
 {
     SessionPair pair;
     remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
@@ -2369,22 +2849,105 @@ TEST(RemoteServerStreamTransfer, ReadOnlyLargeI2CTransferCompletesThroughPending
     cfg.wire_timeout_ms = 100;
     i2c::MasterAccessor host_acc{host_bus, cfg};
 
-    static constexpr size_t kLargeRxLen = 8192;
-    std::array<uint8_t, kLargeRxLen> rx{};
+    std::array<uint8_t, remote::kMaxTransferRx + 1> rx{};
     data::MemorySink dst{rx.data(), rx.size()};
 
     auto read = host_acc.read(dst, rx.size());
-    ASSERT_TRUE(read.has_value()) << "err=" << error::toString(read.error());
-    EXPECT_EQ(read.value(), rx.size());
-    ASSERT_EQ(dst.written(), rx.size());
-    EXPECT_GT(device_bus.transfer_calls, data::BlockSource::kMaxBlocks);
-    EXPECT_EQ(device_bus.rx_cursor, rx.size());
-    for (size_t i = 0; i < rx.size(); ++i) {
-        EXPECT_EQ(rx[i], static_cast<uint8_t>(i & 0xFFu)) << "i=" << i;
-    }
+    ASSERT_FALSE(read.has_value());
+    EXPECT_EQ(read.error(), error::error_t::UNSUPPORTED);
+    EXPECT_EQ(dst.written(), 0u);
+    EXPECT_EQ(device_bus.transfer_calls, 0u);
 }
 
-TEST(RemoteServerStreamTransfer, ReadOnlyI2CBackpressureDoesNotDropPolledData)
+TEST(RemoteAtomicTransfer, FragmentedHostSourceStillProducesOneI2CTransaction)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    remote::RemoteServerAdapter adapter{pair.enc_b, pair.dec_b, pair.wire_ab.source(), pair.wire_ba.sink()};
+    remote::RemoteServerHandler handler;
+    uint8_t scratch[remote::kMaxScriptSize];
+    remote::Server server{data::DataSpan{scratch, sizeof(scratch)}};
+
+    PatternI2CBus device_bus{0x42, remote::kMaxTransferRx};
+    i2c::MasterAccessor device_acc{device_bus, i2c::MasterAccessConfig{}};
+    ASSERT_TRUE(server.registerI2C(0, device_acc).has_value());
+    attachRealServer(session, adapter, handler, server);
+
+    i2c::Bus_remote host_bus{session, 0, i2c::IBusConfig{}};
+    i2c::MasterAccessConfig cfg;
+    cfg.i2c_addr = 0x42;
+    i2c::TransferDesc desc;
+    desc.prefix_len = 2;
+    desc.prefix[0]  = 0x12;
+    desc.prefix[1]  = 0x34;
+    std::array<uint8_t, 200> tx{};
+    for (size_t i = 0; i < tx.size(); ++i) {
+        tx[i] = static_cast<uint8_t>(i);
+    }
+    FragmentedMemorySource src{{tx.data(), tx.size()}, 17};
+
+    auto transferred = transferI2cThroughAccessor(host_bus, cfg, desc, &src, tx.size(), nullptr, 0);
+    ASSERT_TRUE(transferred.has_value()) << "err=" << error::toString(transferred.error());
+    EXPECT_TRUE(src.eof());
+    EXPECT_EQ(device_bus.transfer_calls, 1u);
+    EXPECT_EQ(device_bus.tx_bytes, std::vector<uint8_t>(tx.begin(), tx.end()));
+}
+
+TEST(RemoteAtomicTransfer, EmptySourceDistinguishesWouldBlockFromFinalUnderflow)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    ScriptCapturePeer peer{pair.enc_b};
+    attachScriptCapturePeer(pair, peer, session);
+    spi::Bus_remote bus{session, 0};
+    spi::MasterAccessConfig cfg;
+    spi::TransferDesc desc;
+    spi::MasterAccessor accessor{bus, cfg};
+    auto begun = accessor.beginAccess(0);
+    ASSERT_TRUE(begun.has_value()) << "err=" << error::toString(begun.error());
+    peer.requests.clear();
+
+    EmptyStateSource open{false};
+    auto waiting = accessor.transfer(desc, &open, 1, nullptr, 0);
+    ASSERT_FALSE(waiting.has_value());
+    EXPECT_EQ(waiting.error(), error::error_t::WOULD_BLOCK);
+    EXPECT_TRUE(peer.requests.empty());
+
+    EmptyStateSource closed{true};
+    auto drained = accessor.transfer(desc, &closed, 1, nullptr, 0);
+    ASSERT_FALSE(drained.has_value());
+    EXPECT_EQ(drained.error(), error::error_t::BUFFER_UNDERFLOW);
+    EXPECT_TRUE(peer.requests.empty());
+    auto ended = accessor.endAccess(0);
+    ASSERT_TRUE(ended.has_value()) << "err=" << error::toString(ended.error());
+}
+
+TEST(RemoteAtomicTransfer, OversizeSPIWriteIsRejectedBeforeRequest)
+{
+    SessionPair pair;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), pair.wire_ab.sink()};
+    ScriptCapturePeer peer{pair.enc_b};
+    attachScriptCapturePeer(pair, peer, session);
+    spi::Bus_remote bus{session, 0};
+    spi::MasterAccessConfig cfg;
+    spi::TransferDesc desc;
+    std::array<uint8_t, remote::kMaxAtomicSPITx + 1> tx{};
+    data::MemorySource src{tx.data(), tx.size()};
+    spi::MasterAccessor accessor{bus, cfg};
+    auto begun = accessor.beginAccess(0);
+    ASSERT_TRUE(begun.has_value()) << "err=" << error::toString(begun.error());
+    peer.requests.clear();
+
+    auto transferred = accessor.transfer(desc, &src, tx.size(), nullptr, 0);
+    ASSERT_FALSE(transferred.has_value());
+    EXPECT_EQ(transferred.error(), error::error_t::UNSUPPORTED);
+    EXPECT_FALSE(src.eof());
+    EXPECT_TRUE(peer.requests.empty());
+    auto ended = accessor.endAccess(0);
+    ASSERT_TRUE(ended.has_value()) << "err=" << error::toString(ended.error());
+}
+
+TEST(RemoteServerStreamTransfer, RawI2CStreamTransferIsRejectedWithoutBusActivity)
 {
     SessionPair pair;
     MuxFrameCapture capture;
@@ -2401,23 +2964,11 @@ TEST(RemoteServerStreamTransfer, ReadOnlyI2CBackpressureDoesNotDropPolledData)
     handler.server = &server;
 
     static constexpr uint8_t kStreamId = 1;
-    static constexpr size_t kRxLen     = frame::kMaxDataPayload * (data::BlockSource::kMaxBlocks + 2);
-    std::array<uint8_t, kRxLen> rx{};
-    data::MemorySink dst{rx.data(), rx.size()};
-    ASSERT_TRUE(pair.dec_a.setSink(kStreamId, dst));
-
-    i2c::MasterAccessConfig cfg;
-    cfg.i2c_addr        = 0x42;
-    cfg.wire_timeout_ms = 100;
-    uint8_t meta[]      = {0};
+    uint8_t meta[]                     = {0};
     uint8_t script_buf[remote::kMaxScriptSize];
     data::MemorySink script{script_buf, sizeof(script_buf)};
     bytecode::BytecodeEncoder enc{script};
-    auto e = enc.configure(0, cfg);
-    if (e.has_value()) {
-        e = enc.streamTransfer(types::bus_kind_t::I2C, 0, kStreamId, 0, static_cast<uint32_t>(kRxLen),
-                               {meta, sizeof(meta)});
-    }
+    auto e = enc.streamTransfer(types::bus_kind_t::I2C, 0, kStreamId, 0, 1, {meta, sizeof(meta)});
     if (e.has_value()) {
         e = enc.end();
     }
@@ -2426,42 +2977,15 @@ TEST(RemoteServerStreamTransfer, ReadOnlyI2CBackpressureDoesNotDropPolledData)
     auto handled = remote::RemoteServerHandler::handler(&handler, frame::Kind::Request, 11,
                                                         {script_buf, script.written()}, pair.enc_b, pair.dec_b);
     ASSERT_TRUE(handled.has_value()) << "err=" << error::toString(handled.error());
-    ASSERT_TRUE(server.responseDeferred());
-
-    auto first_poll = server.poll(pair.enc_b, 100);
-    ASSERT_TRUE(first_poll.has_value()) << "err=" << error::toString(first_poll.error());
-    constexpr size_t kDataQueueLimit = data::BlockSource::kMaxBlocks - 1;
-    EXPECT_EQ(pair.enc_b.output().blockCount(), kDataQueueLimit);
-    EXPECT_EQ(device_bus.transfer_calls, kDataQueueLimit);
-    EXPECT_EQ(device_bus.rx_cursor, frame::kMaxDataPayload * kDataQueueLimit);
-
-    const size_t calls_at_full  = device_bus.transfer_calls;
-    const size_t cursor_at_full = device_bus.rx_cursor;
-    auto blocked_poll           = server.poll(pair.enc_b, 101);
-    ASSERT_TRUE(blocked_poll.has_value()) << "err=" << error::toString(blocked_poll.error());
-    EXPECT_EQ(pair.enc_b.output().blockCount(), kDataQueueLimit);
-    EXPECT_EQ(device_bus.transfer_calls, calls_at_full);
-    EXPECT_EQ(device_bus.rx_cursor, cursor_at_full);
-
     pumpEncoderToDecoder(pair.enc_b, pair.wire_ba, pair.dec_a);
-    EXPECT_EQ(dst.written(), cursor_at_full);
-
-    auto resumed_poll = server.poll(pair.enc_b, 102);
-    ASSERT_TRUE(resumed_poll.has_value()) << "err=" << error::toString(resumed_poll.error());
-    pumpEncoderToDecoder(pair.enc_b, pair.wire_ba, pair.dec_a);
-
-    ASSERT_EQ(dst.written(), rx.size());
-    EXPECT_EQ(device_bus.rx_cursor, rx.size());
-    size_t response_count = 0;
-    for (const auto& f : capture.frames) {
-        if (f.kind == frame::Kind::Response) {
-            ++response_count;
-        }
-    }
-    EXPECT_EQ(response_count, 1u);
-    for (size_t i = 0; i < rx.size(); ++i) {
-        EXPECT_EQ(rx[i], static_cast<uint8_t>(i & 0xFFu)) << "i=" << i;
-    }
+    ASSERT_FALSE(server.responseDeferred());
+    ASSERT_EQ(capture.frames.size(), 1u);
+    bytecode::BytecodeRunner response{mem::defaultAllocator()};
+    response.setReceiveOnly(true);
+    auto decoded = response.run({capture.frames[0].payload.data(), capture.frames[0].payload.size()});
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(response.reportedStatus(), error::error_t::UNSUPPORTED);
+    EXPECT_EQ(device_bus.transfer_calls, 0u);
 }
 
 TEST(RemoteTransferWire, ZeroLengthI2CProbeReachesRemoteBus)
@@ -2616,7 +3140,7 @@ TEST(RemoteServerStreamTransfer, PendingStreamStallTimesOut)
     server.abortPendingStream();
 }
 
-TEST(RemoteServerStreamTransfer, TxRxPendingCompletesOnlyAfterBothDirectionsFinish)
+TEST(RemoteServerStreamTransfer, RawSPIStreamTransferIsRejectedWithoutBusActivity)
 {
     SessionPair pair;
     MuxFrameCapture capture;
@@ -2646,42 +3170,16 @@ TEST(RemoteServerStreamTransfer, TxRxPendingCompletesOnlyAfterBothDirectionsFini
     auto handled = remote::RemoteServerHandler::handler(&handler, frame::Kind::Request, 10,
                                                         {script_buf, script.written()}, pair.enc_b, pair.dec_b);
     ASSERT_TRUE(handled.has_value()) << "err=" << error::toString(handled.error());
-    ASSERT_TRUE(server.responseDeferred());
-
-    uint8_t tx_bytes[] = {0x11, 0x22, 0x33};
-    data::MemorySource tx_src{tx_bytes, sizeof(tx_bytes)};
-    ASSERT_TRUE(pair.enc_a.attach(2, tx_src));
-    pumpValue(pair.enc_a);
-    SessionPair::transfer(pair.enc_a.output(), pair.wire_ab.sink());
-    pumpValue(pair.dec_b, pair.wire_ab.source());
-
-    auto first_poll = server.poll(pair.enc_b, 100);
-    ASSERT_TRUE(first_poll.has_value()) << "err=" << error::toString(first_poll.error());
     pumpEncoderToDecoder(pair.enc_b, pair.wire_ba, pair.dec_a);
-    EXPECT_TRUE(server.responseDeferred());
-    EXPECT_EQ(bus.tx_bytes.size(), sizeof(tx_bytes));
-    size_t response_count = 0;
-    for (const auto& f : capture.frames) {
-        if (f.kind == frame::Kind::Response) {
-            ++response_count;
-        }
-    }
-    EXPECT_EQ(response_count, 0u);
-    EXPECT_EQ(bus.rx_cursor, 2u);
-
-    auto second_poll = server.poll(pair.enc_b, 101);
-    ASSERT_TRUE(second_poll.has_value()) << "err=" << error::toString(second_poll.error());
-    pumpEncoderToDecoder(pair.enc_b, pair.wire_ba, pair.dec_a);
-    response_count = 0;
-    for (const auto& f : capture.frames) {
-        if (f.kind == frame::Kind::Response) {
-            ++response_count;
-        }
-    }
-    EXPECT_EQ(response_count, 1u);
-    EXPECT_EQ(bus.rx_cursor, 5u);
-
-    pair.enc_a.detach(2);
+    ASSERT_FALSE(server.responseDeferred());
+    ASSERT_EQ(capture.frames.size(), 1u);
+    bytecode::BytecodeRunner response{mem::defaultAllocator()};
+    response.setReceiveOnly(true);
+    auto decoded = response.run({capture.frames[0].payload.data(), capture.frames[0].payload.size()});
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(response.reportedStatus(), error::error_t::UNSUPPORTED);
+    EXPECT_TRUE(bus.tx_bytes.empty());
+    EXPECT_EQ(bus.rx_cursor, 0u);
 }
 
 TEST(RemoteServerStreamTransfer, StreamTransferMustBeTerminal)
@@ -2947,7 +3445,7 @@ struct NorespAwareEchoPeer {
 // A Source whose peek()/advance() always fail. Used to force a pumpWire()
 // error strictly after a Request has already been enqueued/flushed to a
 // separate, real TX sink — reproducing the "post-enqueue, non-timeout
-// pump error" case (F4/F5) without needing a peer at all.
+// pump error" case without needing a peer at all.
 class AlwaysFailingSource : public data::Source {
 public:
     result_t<data::ConstDataSpan> peek(size_t) override
@@ -2964,6 +3462,22 @@ public:
     }
 };
 
+class AlwaysFailingSink : public data::Sink {
+public:
+    result_t<data::DataSpan> reserve(size_t) override
+    {
+        return m5::stl::make_unexpected(error::error_t::IO_ERROR);
+    }
+    result_t<void> commit(size_t) override
+    {
+        return m5::stl::make_unexpected(error::error_t::IO_ERROR);
+    }
+    bool closed() const override
+    {
+        return false;
+    }
+};
+
 static void setPairPeerPoll(SessionPair& pair, remote::RemoteSession& session)
 {
     session.setPeerPoll(
@@ -2972,6 +3486,22 @@ static void setPairPeerPoll(SessionPair& pair, remote::RemoteSession& session)
             p->pump();
         },
         &pair);
+}
+
+TEST(MuxRemoteSession, TxDrainHardErrorIsReturnedBeforeResponseTimeout)
+{
+    SessionPair pair;
+    AlwaysFailingSink failing_tx;
+    remote::RemoteSession session{pair.enc_a, pair.dec_a, pair.wire_ba.source(), failing_tx};
+    auto cfg                = session.getConfig();
+    cfg.response_timeout_ms = 1000;
+    session.setConfig(cfg);
+
+    const uint8_t script[] = {0x00};
+    auto result            = session.request({script, sizeof(script)});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), error::error_t::IO_ERROR);
+    EXPECT_TRUE(session.lastRequestEnqueued());
 }
 
 TEST(MuxRemoteSession, TimedOutStreamIsNotImmediatelyReused)
@@ -3269,7 +3799,7 @@ TEST(MuxRemoteSession, ResetDoesNotClearQuarantine)
 
     // reset() is fire-and-forget: the host never waits for the device's
     // reset Response, so a successful send proves nothing about whether
-    // the device has stopped the old transfer (F2 / spec/design/remote.md
+    // the device has stopped the old transfer (spec/design/remote.md
     // §timeout / resync, item 3). Only a terminal-frame match, the
     // insurance timer, or hello() may release the entry.
     cfg.response_timeout_ms = 2000;
@@ -3312,7 +3842,7 @@ TEST(MuxRemoteSession, StaleDataRefreshesQuarantineInactivityTimer)
     // Keep delivering stray Data for the quarantined id across more wall
     // time than one insurance-timer window (8 * 50ms > 250ms). Each arrival
     // must reset the "last activity seen" clock via the stale-Data observer
-    // (F1) — mirroring the server's own inactivity semantics
+    // — mirroring the server's own inactivity semantics
     // (Config::stream_quarantine_ms) instead of expiring on a fixed
     // deadline.
     const uint8_t stray[] = {0xEE};
@@ -3389,7 +3919,7 @@ TEST(MuxRemoteSession, StaleDataRefreshesQuarantineForRxBearingStream)
 // of manually invoking quarantineStream() the way the RemoteSession-level
 // quarantine tests do. Reverting remote_transfer.inl's quarantine-vs-detach
 // decision to an unconditional detach would leave those tests green, but
-// must fail this one (F8).
+// must fail this one.
 TEST(RemoteTransferWire, TimedOutRequestAutoQuarantinesStreamIdThroughProductionPath)
 {
     SessionPair pair;
@@ -3459,7 +3989,7 @@ TEST(MuxRemoteSession, SeqWrapDuringQuarantineDoesNotMisreleaseIt)
 
     // Cycle the seq counter across the full 7 bit space (128 values) via
     // NORESP requests. Without nextSeq() skipping the quarantined seq
-    // (F3), the 128th call here would land back on seq 0 — id0's own
+    // the 128th call here would land back on seq 0 — id0's own
     // quarantined seq — and a later unrelated Response for that reused seq
     // would incorrectly release id0's quarantine.
     const uint8_t norresp_script[] = {0x01};
@@ -3491,7 +4021,7 @@ TEST(MuxRemoteSession, NonTimeoutPumpErrorAfterEnqueueAlsoQuarantines)
     // + flushTx() genuinely enqueue and drain the Request before the
     // always-failing RX source is ever touched — reproducing "the Request
     // left the host, but the failure that follows has nothing to do with a
-    // response timeout" (F4/F5), the simplest peer-free form of this case.
+    // response timeout", the simplest peer-free form of this case.
     remote::RemoteSession session{pair.enc_a, pair.dec_a, failing_rx, pair.wire_ab.sink()};
 
     const uint8_t id0 = session.attachStream(nullptr, nullptr);
@@ -3737,9 +4267,9 @@ static E2EServer* g_active_e2e_server = nullptr;
 struct E2EServer {
     data::MuxFrameEncoder* enc = nullptr;
     data::MuxFrameDecoder* dec = nullptr;
-    i2c::IBus i2c_bus;
+    PatternI2CBus i2c_bus{0, remote::kMaxTransferRx};
     i2c::MasterAccessor i2c_acc{i2c_bus, i2c::MasterAccessConfig{}};
-    spi::IBus spi_bus;
+    SplitRxSPIBus spi_bus{remote::kMaxTransferRx};
     spi::MasterAccessor spi_acc{spi_bus, spi::MasterAccessConfig{}};
     bytecode::BytecodeRunner runner{mem::defaultAllocator()};
 
@@ -3955,7 +4485,7 @@ TEST(E2EStreamTransfer, I2CWriteOnly)
     i2c::MasterAccessConfig cfg;
     i2c::TransferDesc desc;
 
-    auto r = bus.transfer(nullptr, cfg, desc, &tx_src, sizeof(tx_data), nullptr, 0);
+    auto r = transferI2cThroughAccessor(bus, cfg, desc, &tx_src, sizeof(tx_data), nullptr, 0);
     w.server_running.store(false, std::memory_order_release);
     srv.join();
 
@@ -3963,7 +4493,7 @@ TEST(E2EStreamTransfer, I2CWriteOnly)
     EXPECT_TRUE(tx_src.eof());
 }
 
-TEST(E2EStreamTransfer, LargeTransferExceedsOldLimit)
+TEST(E2EStreamTransfer, OversizeAtomicTransferIsRejectedWithoutConsumingSource)
 {
     TwoThreadWire w;
     E2EServer server{w.enc_b, w.dec_b};
@@ -3983,12 +4513,14 @@ TEST(E2EStreamTransfer, LargeTransferExceedsOldLimit)
     i2c::MasterAccessConfig cfg;
     i2c::TransferDesc desc;
 
-    auto r = bus.transfer(nullptr, cfg, desc, &tx_src, tx_data.size(), nullptr, 0);
+    auto r = transferI2cThroughAccessor(bus, cfg, desc, &tx_src, tx_data.size(), nullptr, 0);
     w.server_running.store(false, std::memory_order_release);
     srv.join();
 
-    ASSERT_TRUE(r.has_value()) << "transfer failed: " << error::toString(r.error());
-    EXPECT_TRUE(tx_src.eof());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), error::error_t::UNSUPPORTED);
+    EXPECT_FALSE(tx_src.eof());
+    EXPECT_EQ(server.i2c_bus.transfer_calls, 0u);
 }
 
 // Regression: repeated small stream transfers on one session must not exhaust
@@ -4003,7 +4535,7 @@ TEST(E2EStreamTransfer, RepeatedTransfersSoakDoesNotWedge)
     remote::RemoteSession session{w.enc_a, w.dec_a, w.wire_ba.source(), w.wire_ab.sink()};
     session.setPeerPoll([](void* ctx) { static_cast<TwoThreadWire*>(ctx)->clientPump(); }, &w);
 
-    std::array<uint8_t, 2048> tx_data;
+    std::array<uint8_t, 64> tx_data;
     for (size_t i = 0; i < tx_data.size(); ++i) {
         tx_data[i] = static_cast<uint8_t>(i & 0xFF);
     }
@@ -4012,9 +4544,9 @@ TEST(E2EStreamTransfer, RepeatedTransfersSoakDoesNotWedge)
     i2c::MasterAccessConfig cfg;
     i2c::TransferDesc desc;
 
-    for (int cycle = 0; cycle < 300; ++cycle) {
+    for (int cycle = 0; cycle < 100; ++cycle) {
         data::MemorySource tx_src{tx_data.data(), tx_data.size()};
-        auto r = bus.transfer(nullptr, cfg, desc, &tx_src, tx_data.size(), nullptr, 0);
+        auto r = transferI2cThroughAccessor(bus, cfg, desc, &tx_src, tx_data.size(), nullptr, 0);
         if (!r.has_value()) {
             w.server_running.store(false, std::memory_order_release);
             srv.join();
@@ -4026,6 +4558,7 @@ TEST(E2EStreamTransfer, RepeatedTransfersSoakDoesNotWedge)
     }
     w.server_running.store(false, std::memory_order_release);
     srv.join();
+    EXPECT_EQ(server.i2c_bus.transfer_calls, 100u);
 }
 
 TEST(E2EStreamTransfer, I2CWriteReadEchoMatches)
@@ -4047,7 +4580,7 @@ TEST(E2EStreamTransfer, I2CWriteReadEchoMatches)
     i2c::MasterAccessConfig cfg;
     i2c::TransferDesc desc;
 
-    auto r = bus.transfer(nullptr, cfg, desc, &tx_src, sizeof(tx_data), &rx_sink, sizeof(rx_buf));
+    auto r = transferI2cThroughAccessor(bus, cfg, desc, &tx_src, sizeof(tx_data), &rx_sink, sizeof(rx_buf));
     w.server_running.store(false, std::memory_order_release);
     srv.join();
 
@@ -4055,7 +4588,7 @@ TEST(E2EStreamTransfer, I2CWriteReadEchoMatches)
     EXPECT_TRUE(tx_src.eof());
     ASSERT_EQ(rx_sink.written(), sizeof(rx_buf));
     for (size_t i = 0; i < sizeof(tx_data); ++i) {
-        EXPECT_EQ(rx_buf[i], static_cast<uint8_t>(tx_data[i] ^ 0xFF)) << "i=" << i;
+        EXPECT_EQ(rx_buf[i], static_cast<uint8_t>(i)) << "i=" << i;
     }
 }
 
@@ -4068,7 +4601,7 @@ TEST(E2EStreamTransfer, I2CReadOnlyFillPattern)
     remote::RemoteSession session{w.enc_a, w.dec_a, w.wire_ba.source(), w.wire_ab.sink()};
     session.setPeerPoll([](void* ctx) { static_cast<TwoThreadWire*>(ctx)->clientPump(); }, &w);
 
-    uint8_t rx_buf[600]{};
+    uint8_t rx_buf[200]{};
     data::MemorySink rx_sink{rx_buf, sizeof(rx_buf)};
     i2c::IBusConfig bus_cfg;
     i2c::Bus_remote bus{session, 0, bus_cfg};
@@ -4076,19 +4609,19 @@ TEST(E2EStreamTransfer, I2CReadOnlyFillPattern)
     i2c::MasterAccessConfig cfg;
     i2c::TransferDesc desc;
 
-    auto r = bus.transfer(nullptr, cfg, desc, nullptr, 0, &rx_sink, sizeof(rx_buf));
+    auto r = transferI2cThroughAccessor(bus, cfg, desc, nullptr, 0, &rx_sink, sizeof(rx_buf));
     w.server_running.store(false, std::memory_order_release);
     srv.join();
 
     ASSERT_TRUE(r.has_value()) << "transfer failed: " << error::toString(r.error());
     ASSERT_EQ(rx_sink.written(), sizeof(rx_buf));
     for (size_t i = 0; i < sizeof(rx_buf); ++i) {
-        const uint8_t expected = static_cast<uint8_t>(0x42 + (i / 252));
+        const uint8_t expected = static_cast<uint8_t>(i);
         EXPECT_EQ(rx_buf[i], expected) << "i=" << i;
     }
 }
 
-TEST(E2EStreamTransfer, LargeBidirectionalEchoMatches)
+TEST(E2EStreamTransfer, MaximumPracticalBidirectionalAtomicTransferStaysSingle)
 {
     TwoThreadWire w;
     E2EServer server{w.enc_b, w.dec_b};
@@ -4097,8 +4630,8 @@ TEST(E2EStreamTransfer, LargeBidirectionalEchoMatches)
     remote::RemoteSession session{w.enc_a, w.dec_a, w.wire_ba.source(), w.wire_ab.sink()};
     session.setPeerPoll([](void* ctx) { static_cast<TwoThreadWire*>(ctx)->clientPump(); }, &w);
 
-    std::array<uint8_t, 1000> tx_data;
-    std::array<uint8_t, 1000> rx_buf{};
+    std::array<uint8_t, remote::kMaxAtomicI2CTxBase> tx_data;
+    std::array<uint8_t, remote::kMaxTransferRx> rx_buf{};
     for (size_t i = 0; i < tx_data.size(); ++i) {
         tx_data[i] = static_cast<uint8_t>(i & 0xFF);
     }
@@ -4110,7 +4643,7 @@ TEST(E2EStreamTransfer, LargeBidirectionalEchoMatches)
     i2c::MasterAccessConfig cfg;
     i2c::TransferDesc desc;
 
-    auto r = bus.transfer(nullptr, cfg, desc, &tx_src, tx_data.size(), &rx_sink, rx_buf.size());
+    auto r = transferI2cThroughAccessor(bus, cfg, desc, &tx_src, tx_data.size(), &rx_sink, rx_buf.size());
     w.server_running.store(false, std::memory_order_release);
     srv.join();
 
@@ -4118,8 +4651,9 @@ TEST(E2EStreamTransfer, LargeBidirectionalEchoMatches)
     EXPECT_TRUE(tx_src.eof());
     ASSERT_EQ(rx_sink.written(), rx_buf.size());
     for (size_t i = 0; i < rx_buf.size(); ++i) {
-        EXPECT_EQ(rx_buf[i], static_cast<uint8_t>((i & 0xFF) ^ 0xFF)) << "i=" << i;
+        EXPECT_EQ(rx_buf[i], static_cast<uint8_t>(i & 0xFF)) << "i=" << i;
     }
+    EXPECT_EQ(server.i2c_bus.transfer_calls, 1u);
 }
 
 TEST(E2EStreamTransfer, SPIFullDuplexEchoMatches)
@@ -4140,17 +4674,22 @@ TEST(E2EStreamTransfer, SPIFullDuplexEchoMatches)
 
     spi::MasterAccessConfig cfg;
     spi::TransferDesc desc;
-
-    auto r = bus.transfer(nullptr, cfg, desc, &tx_src, sizeof(tx_data), &rx_sink, sizeof(rx_buf));
+    spi::MasterAccessor accessor{bus, cfg};
+    auto begun = accessor.beginAccess(0);
+    ASSERT_TRUE(begun.has_value()) << "err=" << error::toString(begun.error());
+    auto r     = accessor.transfer(desc, &tx_src, sizeof(tx_data), &rx_sink, sizeof(rx_buf));
+    auto ended = accessor.endAccess(0);
     w.server_running.store(false, std::memory_order_release);
     srv.join();
 
     ASSERT_TRUE(r.has_value()) << "transfer failed: " << error::toString(r.error());
+    ASSERT_TRUE(ended.has_value()) << "end failed: " << error::toString(ended.error());
     EXPECT_TRUE(tx_src.eof());
     ASSERT_EQ(rx_sink.written(), sizeof(rx_buf));
     for (size_t i = 0; i < sizeof(tx_data); ++i) {
-        EXPECT_EQ(rx_buf[i], static_cast<uint8_t>(tx_data[i] ^ 0xFF)) << "i=" << i;
+        EXPECT_EQ(rx_buf[i], static_cast<uint8_t>(0xA0u + (i & 0x0Fu))) << "i=" << i;
     }
+    EXPECT_EQ(server.spi_bus.transfer_calls, 1u);
 }
 
 // A peer that answers every Request with a Response carrying no terminal
@@ -4232,7 +4771,7 @@ TEST(RemoteI2cProxy, TransferRejectsOverlongPrefix)
     i2c::TransferDesc desc;
     desc.prefix_len = static_cast<uint8_t>(i2c::TransferDesc::PREFIX_CAPACITY + 1);
 
-    auto r = host_bus.transfer(nullptr, cfg, desc, nullptr, 0, nullptr, 0);
+    auto r = transferI2cThroughAccessor(host_bus, cfg, desc, nullptr, 0, nullptr, 0);
     ASSERT_FALSE(r.has_value()) << "expected INVALID_ARGUMENT for an over-length I2C prefix";
     EXPECT_EQ(r.error(), error::error_t::INVALID_ARGUMENT);
 }
@@ -4240,14 +4779,77 @@ TEST(RemoteI2cProxy, TransferRejectsOverlongPrefix)
 // HelloResp must serialize the server's statically registered bus capabilities
 // as [proto_ver][flags][n]([bus_kind][bus_id])*n, and the host decoder must see
 // them (spec/design/remote.md §hello).
-TEST(RemoteServerHandler, HelloRespReportsRegisteredCapabilities)
+static result_t<remote::Capabilities> decodeFrozenV1Hello(data::ConstDataSpan body)
+{
+    remote::Capabilities caps;
+    if (body.size == 0) {
+        caps.proto_ver           = remote::kProtocolVersion;
+        caps.supports_bus_create = true;
+        return caps;
+    }
+    if (body.size < 3) {
+        return m5::stl::make_unexpected(error::error_t::PROTOCOL_ERROR);
+    }
+    caps.proto_ver = body.data[0];
+    if (caps.proto_ver != remote::kProtocolVersion) {
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
+    caps.has_gpio            = (body.data[1] & 0x01u) != 0;
+    caps.supports_bus_create = (body.data[1] & 0x02u) != 0;
+    const size_t count       = body.data[2];
+    const size_t prefix_size = 3 + count * 2;
+    if (count > remote::Capabilities::kMaxEntries || body.size < prefix_size) {
+        return m5::stl::make_unexpected(error::error_t::PROTOCOL_ERROR);
+    }
+    caps.bus_count = count;
+    for (size_t i = 0; i < count; ++i) {
+        caps.buses[i].kind   = static_cast<types::bus_kind_t>(body.data[3 + i * 2]);
+        caps.buses[i].bus_id = body.data[4 + i * 2];
+    }
+    if (caps.has_gpio && body.size >= prefix_size + 3) {
+        caps.gpio_port_count = body.data[prefix_size];
+        caps.gpio_pin_count  = static_cast<uint16_t>(static_cast<uint16_t>(body.data[prefix_size + 1]) |
+                                                     (static_cast<uint16_t>(body.data[prefix_size + 2]) << 8));
+    }
+    // The frozen decoder intentionally ignores every byte after its v1 prefix.
+    return caps;
+}
+
+TEST(RemoteHelloCompatibility, FrozenV1DecoderPreservesEmptyAndVersionMismatchBehavior)
+{
+    auto empty = decodeFrozenV1Hello({});
+    ASSERT_TRUE(empty.has_value()) << "err=" << error::toString(empty.error());
+    EXPECT_EQ(empty->proto_ver, remote::kProtocolVersion);
+    EXPECT_TRUE(empty->supports_bus_create);
+    EXPECT_EQ(empty->bus_count, 0u);
+
+    const uint8_t future_body[] = {static_cast<uint8_t>(remote::kProtocolVersion + 1), 0, 0};
+    auto future                 = decodeFrozenV1Hello({future_body, sizeof(future_body)});
+    ASSERT_FALSE(future.has_value());
+    EXPECT_EQ(future.error(), error::error_t::UNSUPPORTED);
+}
+
+TEST(RemoteHelloCompatibility, FrozenV1DecoderSilentlyDefaultsATruncatedOptionalGpioTail)
+{
+    const uint8_t frozen_body[] = {remote::kProtocolVersion, 0x03, 0};
+    auto decoded                = decodeFrozenV1Hello({frozen_body, sizeof(frozen_body)});
+    ASSERT_TRUE(decoded.has_value()) << "err=" << error::toString(decoded.error());
+    EXPECT_TRUE(decoded->has_gpio);
+    EXPECT_TRUE(decoded->supports_bus_create);
+    EXPECT_EQ(decoded->gpio_port_count, 0u);
+    EXPECT_EQ(decoded->gpio_pin_count, 0u);
+}
+
+TEST(RemoteServerHandler, HelloRespReportsCapabilitiesAndRemainsReadableByFrozenV1Host)
 {
     SessionPair pair;
     MuxFrameCapture capture;
     pair.dec_a.setFrameHandler(&MuxFrameCapture::onFrame, &capture);
     remote::RemoteServerHandler handler;
     uint8_t scratch[remote::kMaxScriptSize];
-    remote::Server server{data::DataSpan{scratch, sizeof(scratch)}};
+    remote::Server::Config server_config;
+    server_config.max_transfer_rx = 64;
+    remote::Server server{data::DataSpan{scratch, sizeof(scratch)}, server_config};
 
     PatternI2CBus i2c_bus{0x42, 16};
     i2c::MasterAccessConfig i2c_cfg;
@@ -4268,7 +4870,25 @@ TEST(RemoteServerHandler, HelloRespReportsRegisteredCapabilities)
     ASSERT_EQ(capture.frames[0].kind, frame::Kind::HelloResp);
 
     const auto& body = capture.frames[0].payload;
-    auto caps        = remote::detail::decodeHelloCaps(data::ConstDataSpan{body.data(), body.size()});
+    // Frozen v1 hosts consume only this prefix and ignore the tail.
+    ASSERT_GE(body.size(), 3u + 2u * 2u);
+    EXPECT_EQ(body[0], remote::kProtocolVersion);
+    EXPECT_EQ(body[2], 2u);
+    EXPECT_EQ(body[3], static_cast<uint8_t>(types::bus_kind_t::I2C));
+    EXPECT_EQ(body[4], 0u);
+    EXPECT_EQ(body[5], static_cast<uint8_t>(types::bus_kind_t::UART));
+    EXPECT_EQ(body[6], 2u);
+    EXPECT_GT(body.size(), 7u);
+    auto frozen = decodeFrozenV1Hello(data::ConstDataSpan{body.data(), body.size()});
+    ASSERT_TRUE(frozen.has_value()) << "err=" << error::toString(frozen.error());
+    ASSERT_EQ(frozen->bus_count, 2u);
+    EXPECT_EQ(frozen->buses[0].kind, types::bus_kind_t::I2C);
+    EXPECT_EQ(frozen->buses[0].bus_id, 0u);
+    EXPECT_EQ(frozen->buses[1].kind, types::bus_kind_t::UART);
+    EXPECT_EQ(frozen->buses[1].bus_id, 2u);
+    EXPECT_FALSE(frozen->has_bus_capabilities);
+
+    auto caps = remote::detail::decodeHelloCaps(data::ConstDataSpan{body.data(), body.size()});
     ASSERT_TRUE(caps.has_value()) << "err=" << error::toString(caps.error());
     EXPECT_EQ(caps->proto_ver, remote::kProtocolVersion);
     ASSERT_EQ(caps->bus_count, 2u);
@@ -4277,14 +4897,80 @@ TEST(RemoteServerHandler, HelloRespReportsRegisteredCapabilities)
     for (size_t i = 0; i < caps->bus_count; ++i) {
         if (caps->buses[i].kind == types::bus_kind_t::I2C && caps->buses[i].bus_id == 0) {
             saw_i2c = true;
+            EXPECT_TRUE(caps->buses[i].capabilities.supports(bus::BusFeature::MasterTransfer));
+            EXPECT_TRUE(caps->buses[i].capabilities.supports(bus::BusFeature::Transmit));
+            auto frequency = caps->buses[i].capabilities.limit(bus::BusLimit::MaxFrequencyHz);
+            ASSERT_TRUE(frequency.has_value());
+            EXPECT_EQ(frequency.value(), 400000u);
+            auto rx = caps->buses[i].capabilities.limit(bus::BusLimit::MaxAtomicRxBytes);
+            ASSERT_TRUE(rx.has_value());
+            EXPECT_EQ(rx.value(), 64u);
         }
         if (caps->buses[i].kind == types::bus_kind_t::UART && caps->buses[i].bus_id == 2) {
             saw_uart = true;
+            EXPECT_TRUE(caps->buses[i].capabilities.supports(bus::BusFeature::FullDuplex));
         }
     }
     EXPECT_TRUE(saw_i2c) << "I2C(0) capability missing from HelloResp";
     EXPECT_TRUE(saw_uart) << "UART(2) capability missing from HelloResp";
     EXPECT_FALSE(caps->has_gpio);
+    EXPECT_TRUE(caps->has_bus_capabilities);
+}
+
+TEST(RemoteServerCapabilities, DirectionalI2SRegistrationMasksPhysicalBusSurface)
+{
+    uint8_t scratch[remote::kMaxScriptSize];
+    remote::Server server{data::DataSpan{scratch, sizeof(scratch)}};
+    RecordingI2SBus physical_bus{64};
+    i2s::AccessConfig cfg;
+    i2s::TxAccessor tx{physical_bus, cfg};
+    i2s::RxAccessor rx{physical_bus, cfg};
+
+    ASSERT_TRUE(server.registerI2S(0, tx).has_value());
+    ASSERT_TRUE(server.registerI2S(1, rx).has_value());
+    ASSERT_EQ(server.capabilityCount(), 2u);
+
+    const auto tx_caps = server.capabilityAt(0).capabilities;
+    EXPECT_TRUE(tx_caps.supports(bus::BusFeature::Transmit));
+    EXPECT_FALSE(tx_caps.supports(bus::BusFeature::Receive));
+    EXPECT_FALSE(tx_caps.supports(bus::BusFeature::FullDuplex));
+    EXPECT_TRUE(tx_caps.limit(bus::BusLimit::MaxAtomicTxBytes).has_value());
+    EXPECT_FALSE(tx_caps.limit(bus::BusLimit::MaxAtomicRxBytes).has_value());
+
+    const auto rx_caps = server.capabilityAt(1).capabilities;
+    EXPECT_FALSE(rx_caps.supports(bus::BusFeature::Transmit));
+    EXPECT_TRUE(rx_caps.supports(bus::BusFeature::Receive));
+    EXPECT_FALSE(rx_caps.supports(bus::BusFeature::FullDuplex));
+    EXPECT_FALSE(rx_caps.limit(bus::BusLimit::MaxAtomicTxBytes).has_value());
+    ASSERT_TRUE(rx_caps.limit(bus::BusLimit::MaxAtomicRxBytes).has_value());
+    EXPECT_EQ(rx_caps.limit(bus::BusLimit::MaxAtomicRxBytes).value(), remote::kMaxTransferRx);
+}
+
+TEST(RemoteHelloCompatibility, NewDecoderAcceptsFrozenV1BodyWithoutCapabilityExtension)
+{
+    const uint8_t old_body[] = {
+        remote::kProtocolVersion, 0x02, 1, static_cast<uint8_t>(types::bus_kind_t::I2C), 0,
+    };
+    auto caps = remote::detail::decodeHelloCaps({old_body, sizeof(old_body)});
+    ASSERT_TRUE(caps.has_value()) << "err=" << error::toString(caps.error());
+    ASSERT_EQ(caps->bus_count, 1u);
+    EXPECT_TRUE(caps->supports_bus_create);
+    EXPECT_FALSE(caps->has_bus_capabilities);
+    EXPECT_FALSE(caps->buses[0].capabilities.supports(bus::BusFeature::MasterTransfer));
+    EXPECT_FALSE(caps->buses[0].capabilities.limit(bus::BusLimit::MaxFrequencyHz).has_value());
+}
+
+TEST(RemoteHelloCompatibility, UnknownExtensionTagIsSkippedAndAdvertisedTruncationIsRejected)
+{
+    const uint8_t unknown[] = {remote::kProtocolVersion, 0x04, 0, 3, 0x7F, 1, 0xA5};
+    auto skipped            = remote::detail::decodeHelloCaps({unknown, sizeof(unknown)});
+    ASSERT_TRUE(skipped.has_value()) << "err=" << error::toString(skipped.error());
+    EXPECT_TRUE(skipped->has_bus_capabilities);
+
+    const uint8_t truncated[] = {remote::kProtocolVersion, 0x04, 0, 4, 0x7F, 1, 0xA5};
+    auto rejected             = remote::detail::decodeHelloCaps({truncated, sizeof(truncated)});
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error(), error::error_t::PROTOCOL_ERROR);
 }
 
 }  // namespace

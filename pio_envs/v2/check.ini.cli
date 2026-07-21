@@ -25,6 +25,16 @@
 extends = common_native
 build_src_filter = +<*> +<../test/v2/stub/build_check_native.cpp>
 
+; Hosted runtime without exception support. std::thread cannot report create
+; failure without throwing, so Task::start must compile and safely return
+; UNSUPPORTED without entering the throwing constructor path.
+[env:v2_check_native_noexceptions]
+extends = common_native
+build_flags =
+    ${common_native.build_flags}
+    -fno-exceptions
+build_src_filter = +<*> +<../test/v2/stub/build_check_native.cpp>
+
 [env:v2_check_esp32_arduino]
 extends = common_esp32dev, common_arduino
 build_src_filter = +<*> +<../test/v2/stub/build_check_arduino.cpp>

@@ -5,7 +5,11 @@
 #include "i2c.hpp"
 #include "begin_result.hpp"
 #include "../../../../../hal/v2/bus/bus.hpp"
+#include "../../../../../hal/v2/resource_domain.hpp"
 #include <M5Utility.hpp>
+
+#include <cstdint>
+#include <new>
 
 #if __has_include(<Arduino.h>)
 #include <Arduino.h>
@@ -38,8 +42,40 @@ error::error_t mapWireEndTransmission(uint8_t code)
     }
 }
 
+constexpr uint16_t kNativeProvider = 0x0101;
+
+struct PendingNativeToken {
+    bus::FixedNativeInterner<bus::NativeIdentity, bus::BusRegistry::kCapacity>* interner = nullptr;
+    bus::NativeToken token{};
+
+    ~PendingNativeToken()
+    {
+        if (interner != nullptr && token.valid()) {
+            (void)interner->release(token);
+        }
+    }
+
+    void dismiss()
+    {
+        interner = nullptr;
+        token    = {};
+    }
+};
+
+bus::BindingDescriptor makeNativeBinding(const IBusConfig& cfg, bus::NativeToken token)
+{
+    bus::BindingDescriptor binding;
+    binding.provider    = kNativeProvider;
+    binding.ownership   = bus::Ownership::Borrowed;
+    binding.native_kind = bus::NativeBindingKind::Native;
+    binding.native      = token;
+    binding.config_primary =
+        static_cast<uint16_t>(cfg.pin_scl) | (static_cast<uint32_t>(static_cast<uint16_t>(cfg.pin_sda)) << 16u);
+    return binding;
+}
+
 // The ESP8266 core's TwoWire has no end() — the peripheral cannot be
-// deinitialized there and release() leaves it configured (begin() re-inits).
+// deinitialized there and teardown leaves it configured (begin() re-inits).
 void wireEnd(::TwoWire& wire)
 {
 #if !defined(ARDUINO_ARCH_ESP8266)
@@ -52,26 +88,42 @@ void wireEnd(::TwoWire& wire)
 }  // namespace impl_arduino
 }  // namespace
 
-error::error_t Bus_arduino::attach(::TwoWire& wire)
+result_t<void> Bus_arduino::adoptBorrowedNative(
+    ::TwoWire& wire, const IBusConfig& config,
+    bus::FixedNativeInterner<bus::NativeIdentity, bus::BusRegistry::kCapacity>& interner, bus::NativeToken token)
 {
-    if (_wire) {
-        (void)release();
-    }
-    _wire            = &wire;
-    _owns_wire       = false;
-    _last_freq       = 0;
-    _last_timeout_ms = 0xFFFFFFFFu;
-    return error::error_t::OK;
-}
-
-result_t<void> Bus_arduino::init(const BusConfig_arduino& config)
-{
-    auto* wire = config.wire;
-    if (wire == nullptr) {
+    if (!token.valid()) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
-    if (_wire) {
-        (void)release();
+    if (!initializationAllowed(false)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    auto reset = teardown();
+    if (!reset.has_value()) {
+        return reset;
+    }
+    _config          = config;
+    _wire            = &wire;
+    _owns_wire       = false;
+    auto initialized = markInitializationSucceeded(false);
+    if (!initialized.has_value()) {
+        _wire = nullptr;
+        return initialized;
+    }
+    _native_interner = &interner;
+    _native_token    = token;
+    return {};
+}
+
+result_t<void> Bus_arduino::init(const IBusConfig& config)
+{
+    auto* wire = &Wire;
+    if (!initializationAllowed(false)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    auto reset = teardown();
+    if (!reset.has_value()) {
+        return reset;
     }
     bool began = false;
 
@@ -98,18 +150,46 @@ result_t<void> Bus_arduino::init(const BusConfig_arduino& config)
         return m5::stl::make_unexpected(error::error_t::IO_ERROR);
     }
 
-    _config  = config;
-    auto err = attach(*wire);
-    if (error::isError(err)) {
-        impl_arduino::wireEnd(*wire);
-        return m5::stl::make_unexpected(err);
+    _config          = config;
+    _wire            = wire;
+    _owns_wire       = true;
+    _last_freq       = 0;
+    _last_timeout_ms = 0xFFFFFFFFu;
+    auto initialized = markInitializationSucceeded(false);
+    if (!initialized.has_value()) {
+        (void)teardown();
+        return initialized;
     }
-    _owns_wire = true;
     return {};
 }
 
-result_t<void> Bus_arduino::release(void)
+result_t<void> Bus_arduino::init(const IBusConfig& config, native::Borrowed<::TwoWire> policy)
 {
+    if (!initializationAllowed(false)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    auto reset = teardown();
+    if (!reset.has_value()) {
+        return reset;
+    }
+    _config          = config;
+    _wire            = &policy.resource();
+    _owns_wire       = false;
+    _last_freq       = 0;
+    _last_timeout_ms = 0xFFFFFFFFu;
+    return markInitializationSucceeded(false);
+}
+
+result_t<void> Bus_arduino::teardown(void)
+{
+    if (_native_interner != nullptr && _native_token.valid()) {
+        auto released = _native_interner->release(_native_token);
+        if (!released.has_value()) {
+            return released;
+        }
+    }
+    _native_interner = nullptr;
+    _native_token    = {};
     if (_wire && _owns_wire) {
         impl_arduino::wireEnd(*_wire);
     }
@@ -120,13 +200,85 @@ result_t<void> Bus_arduino::release(void)
     return {};
 }
 
-result_t<void> Bus_arduino::transfer(bus::IAccessor* owner, const i2c::MasterAccessConfig& cfg,
-                                     const i2c::TransferDesc& desc, data::Source* src, size_t tx_len, data::Sink* dst,
-                                     size_t rx_len)
+bus::CloseOutcome Bus_arduino::closeBackend(void)
 {
-    // `owner` is reserved for future lock / unlock semantics
-    // (the M5UU lock migration is currently on hold); ignored here.
-    (void)owner;
+    auto closed = teardown();
+    if (!closed.has_value()) {
+        return bus::CloseOutcome::noMutation(closed.error());
+    }
+    return bus::CloseOutcome::success();
+}
+
+result_t<std::shared_ptr<IBus>> NativeProvider_arduino<native::Borrowed<::TwoWire>>::acquire(
+    bus::IHalBackend& backend, const IBusConfig& cfg, native::Borrowed<::TwoWire> policy)
+{
+    const auto* domain = backend.localResourceDomain();
+    if (domain == nullptr) {
+        // A remote backend has no local domain. Reject before touching the
+        // caller's native object or issuing any transport request.
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
+
+    const uint64_t address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&policy.resource()));
+    auto identity          = bus::NativeIdentity::make(bus::NativeIdentityKind::ObjectAddress, {address});
+    if (!identity.has_value()) {
+        return m5::stl::make_unexpected(identity.error());
+    }
+    auto& interner = domain->nativeInterner();
+    auto token     = interner.intern(identity.value());
+    if (!token.has_value()) {
+        return m5::stl::make_unexpected(token.error());
+    }
+    impl_arduino::PendingNativeToken pending{&interner, token.value()};
+    auto key = bus::ResourceKey::makeToken(types::bus_kind_t::I2C, bus::ResourceTag::Native, token.value(),
+                                           static_cast<uint32_t>(bus::NativeIdentityKind::ObjectAddress));
+    if (!key.has_value()) {
+        return m5::stl::make_unexpected(key.error());
+    }
+    const auto binding = impl_arduino::makeNativeBinding(cfg, token.value());
+    auto acquired      = backend.busRegistry().acquireOrFind(
+        key.value(), binding,
+        [&cfg](const std::shared_ptr<bus::IBus>& existing) -> result_t<void> {
+            if (!BusTraits::configCompatible(static_cast<const IBusConfig&>(existing->getConfig()), cfg)) {
+                return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+            }
+            return {};
+        },
+        [&]() -> result_t<std::shared_ptr<bus::IBus>> {
+            std::unique_ptr<Bus_arduino> concrete{new (std::nothrow) Bus_arduino()};
+            if (!concrete) {
+                return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+            }
+            concrete->bindLocalResources(backend.localResources());
+            auto adopted = concrete->adoptBorrowedNative(policy.resource(), cfg, interner, token.value());
+            if (!adopted.has_value()) {
+                return m5::stl::make_unexpected(adopted.error());
+            }
+            pending.dismiss();
+
+            std::shared_ptr<Bus> facade{new (std::nothrow) Bus()};
+            if (!facade) {
+                return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+            }
+            facade->bindLocalResources(backend.localResources());
+            std::unique_ptr<IBus> selected{concrete.release()};
+            auto installed = facade->adoptPortableBackend(std::move(selected), cfg);
+            if (!installed.has_value()) {
+                return m5::stl::make_unexpected(installed.error());
+            }
+            return std::shared_ptr<bus::IBus>{std::move(facade)};
+        });
+    if (!acquired.has_value()) {
+        return m5::stl::make_unexpected(acquired.error());
+    }
+    return std::static_pointer_cast<IBus>(acquired.value());
+}
+
+result_t<void> Bus_arduino::transferBackend(bus::OperationContext<i2c::MasterAccessConfig>& context,
+                                            const i2c::TransferDesc& desc, data::Source* src, size_t tx_len,
+                                            data::Sink* dst, size_t rx_len)
+{
+    const auto& cfg = context.config;
     _transfer_totals.clear();
     if (_wire == nullptr) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
@@ -172,10 +324,10 @@ result_t<void> Bus_arduino::transfer(bus::IAccessor* owner, const i2c::MasterAcc
     // function body.
     data::ConstDataSpan header{desc.prefix, desc.prefix_len};
 
-    size_t total     = 0;
-    size_t received  = 0;
-    bool write_phase = (header.size > 0) || (src != nullptr && tx_len > 0 && !src->eof());
-    bool read_phase  = (dst != nullptr && rx_len > 0);
+    size_t transmitted = 0;
+    size_t received    = 0;
+    bool write_phase   = (header.size > 0) || (src != nullptr && tx_len > 0 && !src->eof());
+    bool read_phase    = (dst != nullptr && rx_len > 0);
 
     // Probe contract (see i2c.hpp): an all-empty descriptor sends
     // only address+W and inspects the ACK. We implement this with
@@ -198,7 +350,7 @@ result_t<void> Bus_arduino::transfer(bus::IAccessor* owner, const i2c::MasterAcc
             if (w != header.size) {
                 // Wire only buffers here; a short write means the local TX
                 // buffer is full, not a wire fault. Wire has no abort, so the
-                // release below transmits the partial buffer (best effort).
+                // endTransmission below sends the partial buffer (best effort).
                 (void)_wire->endTransmission(true);
                 return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
             }
@@ -232,7 +384,7 @@ result_t<void> Bus_arduino::transfer(bus::IAccessor* owner, const i2c::MasterAcc
                     return m5::stl::make_unexpected(adv.error());
                 }
                 tx_remaining -= w;
-                total += w;
+                transmitted += w;
             }
         }
         bool send_stop = (dst == nullptr) || !cfg.use_restart;
@@ -252,18 +404,9 @@ result_t<void> Bus_arduino::transfer(bus::IAccessor* owner, const i2c::MasterAcc
         }
         auto rx_span = rsv.value().first(rx_len);
         if (rx_span.size > 0) {
-// TwoWire::requestFrom silently truncates requests that exceed its internal
-// RX buffer. Detect and reject oversized requests before touching the wire
-// so callers get INVALID_ARGUMENT rather than a short / wrong read.
-#if defined(I2C_BUFFER_LENGTH)
-            constexpr size_t kWireRxBufLen = I2C_BUFFER_LENGTH;
-#else
-            // Fall back to the Arduino default (Wire.h hard-codes 32 on most
-            // cores; 128 is the safe conservative ceiling used when no macro
-            // is available).
-            constexpr size_t kWireRxBufLen = 128u;
-#endif
-            if (rx_span.size > kWireRxBufLen) {
+            // Reject before requestFrom(): some cores truncate, while others
+            // trust the length and can overwrite their internal RX array.
+            if (rx_span.size > arduino_i2c_capability_detail::wireRxBufferLength()) {
                 return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
             }
             size_t got = _wire->requestFrom(static_cast<uint8_t>(cfg.i2c_addr), static_cast<size_t>(rx_span.size),
@@ -285,19 +428,18 @@ result_t<void> Bus_arduino::transfer(bus::IAccessor* owner, const i2c::MasterAcc
             if (!com.has_value()) {
                 return m5::stl::make_unexpected(com.error());
             }
-            total += rx_span.size;
             received += rx_span.size;
         }
     }
 
-    _transfer_totals.tx += total - received;
+    _transfer_totals.tx += transmitted;
     _transfer_totals.rx += received;
     return {};
 }
 
-result_t<bus::TransferTotals> Bus_arduino::waitTransfer(bus::IAccessor* owner, const i2c::MasterAccessConfig& cfg)
+result_t<bus::TransferTotals> Bus_arduino::waitTransferBackend(bus::OperationContext<i2c::MasterAccessConfig>& context)
 {
-    (void)owner;
+    const auto& cfg = context.config;
     (void)cfg;
     auto totals = _transfer_totals;
     _transfer_totals.clear();

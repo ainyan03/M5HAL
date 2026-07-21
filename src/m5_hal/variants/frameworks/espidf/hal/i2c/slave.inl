@@ -3,16 +3,25 @@
 #define M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_I2C_SLAVE_INL
 
 #include "slave.hpp"
+#include "../../../../../hal/v2/i2c/slave_accessor.hpp"
 
 // M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS: mirrors the same gate in slave.hpp so this .inl
 // compiles unmodified under the native host regression harness.
 #if (defined(ESP_PLATFORM) || defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)) && \
     (M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_SLAVE_LL_BE || M5HAL_ESPIDF_I2C_HAS_SLAVE_V2)
 
+#include "../../detail/esp_err_map.hpp"
+
 #include <algorithm>
 #include <esp_err.h>
 #include <soc/soc_caps.h>
 #include <string.h>
+#if defined(ESP_PLATFORM) && __has_include(<esp_memory_utils.h>)
+#include <esp_memory_utils.h>
+#define M5HAL_DETAIL_I2C_SLAVE_HAS_INTERNAL_PTR_CHECK_ 1
+#else
+#define M5HAL_DETAIL_I2C_SLAVE_HAS_INTERNAL_PTR_CHECK_ 0
+#endif
 
 #include "../../../freertos/hal/runtime/time.hpp"
 #include <freertos/task.h>
@@ -86,21 +95,12 @@ namespace impl_espidf_slave {
 error::error_t mapEspErr(::esp_err_t err)
 {
     switch (err) {
-        case ESP_OK:
-            return error::error_t::OK;
-        case ESP_ERR_INVALID_ARG:
-        case ESP_ERR_INVALID_STATE:
-            return error::error_t::INVALID_ARGUMENT;
-        case ESP_ERR_TIMEOUT:
-            return error::error_t::TIMEOUT_ERROR;
-        case ESP_ERR_NO_MEM:
-            return error::error_t::OUT_OF_RESOURCE;
         case ESP_ERR_NOT_FOUND:
             return error::error_t::I2C_NO_ACK;
         case ESP_ERR_NOT_SUPPORTED:
             return error::error_t::UNSUPPORTED;
         default:
-            return error::error_t::I2C_BUS_ERROR;
+            return ::m5::variants::frameworks::espidf::detail::mapEspErrCommon(err, error::error_t::I2C_BUS_ERROR);
     }
 }
 #endif
@@ -192,6 +192,106 @@ constexpr uint32_t kBeTxWmIntr = I2C_TXFIFO_EMPTY_INT_ENA_M;
 }  // namespace impl_espidf_slave
 }  // namespace
 
+#if M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_SLAVE_LL_BE
+result_t<void> SlaveBus_espidf::stopQueuedProducerAndQuiesce(uint32_t generation)
+{
+    // The wire and interrupt producers must already be fenced and the bridge
+    // must already be Closing.  Stop the only remaining producer before any
+    // caller-owned Accessor/Context pointer can be detached.
+    portENTER_CRITICAL_SAFE(&_mux);
+    _task_stop = true;
+    portEXIT_CRITICAL_SAFE(&_mux);
+    notifyTaskFromTask();
+
+    const bool stopped = impl_espidf_slave::waitTaskStopped(&_mux, _task_running);
+    if (!stopped) {
+        auto* task = _task;
+        if (task != nullptr) ::vTaskDelete(task);
+        portENTER_CRITICAL_SAFE(&_mux);
+        _task         = nullptr;
+        _task_running = false;
+        portEXIT_CRITICAL_SAFE(&_mux);
+    } else {
+        portENTER_CRITICAL_SAFE(&_mux);
+        _task = nullptr;
+        portEXIT_CRITICAL_SAFE(&_mux);
+    }
+
+    // A stopped producer task is not recreated until teardown/init. Keep
+    // this backend fenced even if the bridge itself is reset after detachment.
+    __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+
+    bool quiesced = stopped ? _queued_bridge.workerForceQuiesce(generation)
+                            : _queued_bridge.workerAbandonAfterProducerStopped(generation);
+    if (!quiesced && stopped) {
+        // The producer is known stopped, so abandonment is also a safe final
+        // cleanup if the ordinary force-close invariant was unexpectedly lost.
+        quiesced = _queued_bridge.workerAbandonAfterProducerStopped(generation);
+    }
+    if (!quiesced) {
+        // Interrupts/wire were fenced by the caller and the producer task is
+        // now gone. Recover independently of a corrupted state/generation so
+        // teardown/re-init can never inherit a permanently Closing bridge.
+        _queued_bridge.workerRecoverAfterAllProducersStopped();
+    }
+    return {};
+}
+
+#if defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)
+void SlaveBus_espidf::testHoldQueuedWorkerSession()
+{
+    if (_test_held_queued_worker != nullptr) return;
+    auto worker = _queued_bridge.workerBeginSession(_queued_generation);
+    if (worker.status() == detail::SlaveQueueBridgeResult::Accepted) {
+        _test_held_queued_worker = new QueuedBridge::WorkerSession(static_cast<QueuedBridge::WorkerSession&&>(worker));
+    }
+}
+
+void SlaveBus_espidf::testFailNextQueuedBeginWithHeldWorker()
+{
+    _test_fail_next_queued_begin = true;
+}
+
+void SlaveBus_espidf::testRunWorkerDuringQueuedEnd()
+{
+#if M5HAL_ESPIDF_I2C_SLAVE_LL_BE
+    portENTER_CRITICAL_SAFE(&_mux);
+    _queued_be_reload_pending          = true;
+    _test_run_worker_during_queued_end = true;
+    portEXIT_CRITICAL_SAFE(&_mux);
+#endif
+}
+
+void SlaveBus_espidf::testReleaseHeldQueuedWorkerSession()
+{
+    delete _test_held_queued_worker;
+    _test_held_queued_worker = nullptr;
+}
+
+bool SlaveBus_espidf::testQueuedEndpointsDetached() const
+{
+    return _queued_accessor == nullptr && _queued_context == nullptr;
+}
+
+bool SlaveBus_espidf::testQueuedProducerTaskPresent() const
+{
+    return _task != nullptr;
+}
+#endif
+#endif
+
+result_t<void> SlaveBus_espidf::resetForInitialization(void)
+{
+    auto outcome = teardownBackend();
+    if (outcome.disposition == bus::CloseDisposition::Success) {
+        return {};
+    }
+    if (outcome.disposition == bus::CloseDisposition::PartialOrUnknown) {
+        quarantineLifecycleAfterPartialTeardown();
+    }
+    return m5::stl::make_unexpected(outcome.error_code);
+}
+
 // ===========================================================================
 // HW-facing layer
 // ===========================================================================
@@ -208,6 +308,9 @@ constexpr uint32_t kBeTxWmIntr = I2C_TXFIFO_EMPTY_INT_ENA_M;
 
 result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
 {
+    if (!initializationAllowed(false)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
     if (cfg.pin_scl < 0 || cfg.pin_sda < 0 || cfg.address_is_10bit || cfg.address > 0x7Fu) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
@@ -220,9 +323,9 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
     }
 
     if (_hw != nullptr || _task != nullptr || _intr != nullptr) {
-        auto released = release();
-        if (!released.has_value()) {
-            return m5::stl::make_unexpected(released.error());
+        auto reset = resetForInitialization();
+        if (!reset.has_value()) {
+            return reset;
         }
     }
     _config  = cfg;
@@ -232,13 +335,20 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
     {
         portENTER_CRITICAL_SAFE(&_mux);
         resetStateLocked();
-        _hold_kind      = HoldKind::none;
-        _masked_intrs   = 0;
-        _baseline_intrs = 0;
-        _resp_len       = 0;
-        _resp_pos       = 0;
-        _task_stop      = false;
-        _task_running   = true;
+        _hold_kind             = HoldKind::none;
+        _masked_intrs          = 0;
+        _baseline_intrs        = 0;
+        _resp_len              = 0;
+        _resp_pos              = 0;
+        _task_stop             = false;
+        _task_running          = true;
+        _queued_active         = false;
+        _queued_lifecycle_used = false;
+        _queued_accessor       = nullptr;
+        _queued_context        = nullptr;
+        _queued_generation     = 0;
+        __atomic_store_n(&_queued_broken, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&_queued_dropped_rx, 0, __ATOMIC_RELAXED);
         portEXIT_CRITICAL_SAFE(&_mux);
     }
     if (::xTaskCreate(&SlaveBus_espidf::taskThunk, "m5hal_i2c_slave", 3072, this, configMAX_PRIORITIES - 1, &_task) !=
@@ -252,6 +362,7 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
     const ::i2c_port_t port = static_cast<::i2c_port_t>(port_r.value());
     ::i2c_dev_t* const hw   = I2C_LL_GET_HW(port);
     _hw                     = hw;
+    _port                   = port_r.value();
 
     // periph_module_enable() is deprecated as "not functional" on newer SoCs
     // (C61/C5/P4 and others) after the RCC refactor. Use the same RCC API as
@@ -339,9 +450,17 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
     hw->ctr.sda_force_out = 1;
     hw->ctr.scl_force_out = 1;
     ::i2c_ll_master_rx_full_ack_level(hw, 0);
+#if M5HAL_DETAIL_ESPIDF_I2C_SLAVE_LL_V54_API_
     ::i2c_ll_slave_enable_auto_start(hw, true);
+#else
+    ::i2c_ll_slave_tx_auto_start_en(hw, true);
+#endif
 
-    ::i2c_ll_set_slave_addr(hw, cfg.address, false);
+    if (cfg.legacy_wire_frame_window) {
+        ::i2c_ll_set_slave_addr(hw, cfg.address, false);
+    } else {
+        ::i2c_ll_set_slave_addr(hw, 0x3FFu, true);
+    }
     // Make the bus timeout effectively never fire so it cannot abort a long clock
     // stretch (the timeout register name is SoC-specific; the helper is portable).
     ::i2c_ll_set_tout(hw, I2C_LL_MAX_TIMEOUT);
@@ -357,7 +476,11 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
     ::i2c_ll_set_txfifo_empty_thr(hw, SOC_I2C_FIFO_LEN / 2);
 
     hw->fifo_conf.fifo_prt_en = 1;
+#if M5HAL_DETAIL_ESPIDF_I2C_SLAVE_LL_V54_API_
     ::i2c_ll_enable_fifo_mode(hw, true);
+#else
+    ::i2c_ll_slave_set_fifo_mode(hw, true);
+#endif
     // REQUIRED: do NOT store the matched address byte in the RX FIFO. With its
     // power-on default the slave address lands in RX and is mistaken for data.
     hw->fifo_conf.fifo_addr_cfg_en = 0;
@@ -370,14 +493,16 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
 
     if (::esp_intr_alloc(i2c_periph_signal[port].irq, M5HAL_DETAIL_I2C_SLAVE_ISR_INTR_FLAGS_,
                          &SlaveBus_espidf::isrThunk, this, &_intr) != ESP_OK) {
-        auto released = release();
-        if (!released.has_value()) {
-            return m5::stl::make_unexpected(released.error());
+        auto reset = resetForInitialization();
+        if (!reset.has_value()) {
+            return reset;
         }
         return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
     }
     _baseline_intrs = I2C_RXFIFO_WM_INT_ENA_M | I2C_TRANS_COMPLETE_INT_ENA_M | I2C_SLAVE_STRETCH_INT_ENA_M;
-    ::i2c_ll_enable_intr_mask(hw, _baseline_intrs);
+    if (cfg.legacy_wire_frame_window) {
+        ::i2c_ll_enable_intr_mask(hw, _baseline_intrs);
+    }
     ::i2c_ll_update(hw);
 #if M5HAL_DEBUG_ESPIDF_I2C_SLAVE_GPIO_MARKERS
     {
@@ -390,6 +515,11 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
         }
     }
 #endif
+    auto initialized = markInitializationSucceeded(false);
+    if (!initialized.has_value()) {
+        (void)resetForInitialization();
+        return initialized;
+    }
     return {};
 }
 
@@ -405,14 +535,19 @@ void SlaveBus_espidf::restorePins()
     _pin_sda = -1;
 }
 
-result_t<void> SlaveBus_espidf::release(void)
+bus::CloseOutcome SlaveBus_espidf::teardownBackend(void)
 {
+    if (_queued_active && _queued_accessor != nullptr && _queued_context != nullptr) {
+        (void)endOperationBackend(*_queued_context);
+    }
     if (_intr != nullptr) {
         if (_hw != nullptr) {
             ::i2c_ll_disable_intr_mask(_hw, I2C_LL_INTR_MASK);
             ::i2c_ll_clear_intr_mask(_hw, I2C_LL_INTR_MASK);
         }
-        (void)::esp_intr_free(_intr);
+        if (::esp_intr_free(_intr) != ESP_OK) {
+            return bus::CloseOutcome::partialOrUnknown(error::error_t::I2C_BUS_ERROR);
+        }
         _intr = nullptr;
     }
 
@@ -422,23 +557,474 @@ result_t<void> SlaveBus_espidf::release(void)
         portEXIT_CRITICAL_SAFE(&_mux);
         notifyTaskFromTask();
         if (!impl_espidf_slave::waitTaskStopped(&_mux, _task_running)) {
-            return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+            ::vTaskDelete(_task);
+            portENTER_CRITICAL_SAFE(&_mux);
+            _task_running = false;
+            portEXIT_CRITICAL_SAFE(&_mux);
         }
         _task = nullptr;
     }
 
-    _hw = nullptr;
+    _queued_bridge.workerRecoverAfterAllProducersStopped();
+    if (!_queued_bridge.workerReset()) {
+        return bus::CloseOutcome::partialOrUnknown(error::error_t::INVALID_STATE);
+    }
+
     restorePins();
+    if (_hw != nullptr && _port >= 0) {
+#if M5HAL_DEBUG_ESPIDF_I2C_SLAVE_NO_CONTROLLER_CLOCK
+        // The matching controller-clock enable was intentionally skipped.
+#elif defined(SOC_PERIPH_CLK_CTRL_SHARED) && SOC_PERIPH_CLK_CTRL_SHARED
+        PERIPH_RCC_ATOMIC()
+        {
+            i2c_ll_enable_controller_clock(_hw, false);
+        }
+#else
+        i2c_ll_enable_controller_clock(_hw, false);
+#endif
+
+        const ::i2c_port_t port = static_cast<::i2c_port_t>(_port);
+#if defined(SOC_RCC_IS_INDEPENDENT) && SOC_RCC_IS_INDEPENDENT
+        i2c_ll_enable_bus_clock(port, false);
+#else
+        PERIPH_RCC_ATOMIC()
+        {
+            i2c_ll_enable_bus_clock(port, false);
+        }
+#endif
+    }
+    _port = -1;
+    _hw   = nullptr;
 
     portENTER_CRITICAL_SAFE(&_mux);
     resetStateLocked();
-    _hold_kind      = HoldKind::none;
-    _masked_intrs   = 0;
-    _baseline_intrs = 0;
-    _task_stop      = false;
-    _task_running   = false;
+    _hold_kind             = HoldKind::none;
+    _masked_intrs          = 0;
+    _baseline_intrs        = 0;
+    _task_stop             = false;
+    _task_running          = false;
+    _queued_active         = false;
+    _queued_lifecycle_used = false;
+    _queued_accessor       = nullptr;
+    _queued_context        = nullptr;
+    _queued_generation     = 0;
+    __atomic_store_n(&_queued_broken, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&_queued_dropped_rx, 0, __ATOMIC_RELAXED);
+    portEXIT_CRITICAL_SAFE(&_mux);
+    return bus::CloseOutcome::success();
+}
+
+result_t<void> SlaveBus_espidf::beginOperationBackend(bus::OperationContext<i2c::SlaveAccessConfig>& context)
+{
+    auto& accessor = operationOwner(context);
+    if (context.config.tx_mode != slave::QueueMode::Byte || context.config.rx_mode != slave::QueueMode::Byte ||
+        _config.tx_underrun != i2c::TxUnderrun::Fill || _config.legacy_wire_frame_window) {
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
+#if M5HAL_DETAIL_I2C_SLAVE_HAS_INTERNAL_PTR_CHECK_
+    if (!::esp_ptr_internal(&_queued_bridge)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+#endif
+    portENTER_CRITICAL_SAFE(&_mux);
+    bool legacy_in_use = false;
+    for (const auto& transaction : _transactions) {
+        legacy_in_use = legacy_in_use || transaction.in_use;
+    }
+    if (_hw == nullptr || _queued_active || legacy_in_use || _open != nullptr || _current != nullptr ||
+        __atomic_load_n(&_queued_broken, __ATOMIC_ACQUIRE) != 0) {
+        portEXIT_CRITICAL_SAFE(&_mux);
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    if (!_queued_bridge.workerBegin(context.runtime.generation, _config.tx_fill_byte)) {
+        portEXIT_CRITICAL_SAFE(&_mux);
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    _queued_accessor         = static_cast<SlaveAccessor*>(&accessor);
+    _queued_context          = &context;
+    _queued_generation       = context.runtime.generation;
+    _queued_copied_unique    = 0;
+    _queued_popped_confirmed = 0;
+    _queued_worker_runs      = 0;
+    __atomic_store_n(&_queued_dropped_rx, 0, __ATOMIC_RELAXED);
+    _queued_active         = true;
+    _queued_lifecycle_used = true;
+    _queued_tx_ledger.reset();
+    ::i2c_ll_txfifo_rst(_hw);
+    ::i2c_ll_rxfifo_rst(_hw);
+    ::i2c_ll_slave_clear_stretch(_hw);
+    ::i2c_ll_clear_intr_mask(_hw, I2C_LL_INTR_MASK);
+    portEXIT_CRITICAL_SAFE(&_mux);
+
+    // Prime caller-prequeued TX bytes synchronously while every peripheral
+    // interrupt is still masked. Enabling address-match first would let an
+    // external master observe fill bytes merely because the worker task had
+    // not run yet.
+    processQueuedWorker();
+
+    portENTER_CRITICAL_SAFE(&_mux);
+    if (!_queued_active || _queued_accessor != &accessor || _queued_context != &context ||
+        __atomic_load_n(&_queued_broken, __ATOMIC_ACQUIRE) != 0) {
+        portEXIT_CRITICAL_SAFE(&_mux);
+        (void)_queued_bridge.workerRequestClose(context.runtime.generation);
+        const auto aborted = stopQueuedProducerAndQuiesce(context.runtime.generation);
+        portENTER_CRITICAL_SAFE(&_mux);
+        _queued_active     = false;
+        _queued_accessor   = nullptr;
+        _queued_context    = nullptr;
+        _queued_generation = 0;
+        portEXIT_CRITICAL_SAFE(&_mux);
+        const bool reset = _queued_bridge.workerReset();
+        if (!reset) return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+        if (!aborted.has_value()) return m5::stl::make_unexpected(aborted.error());
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    ::i2c_ll_set_slave_addr(_hw, _config.address, false);
+    ::i2c_ll_enable_intr_mask(_hw, _baseline_intrs);
+    ::i2c_ll_update(_hw);
     portEXIT_CRITICAL_SAFE(&_mux);
     return {};
+}
+
+result_t<void> SlaveBus_espidf::endOperationBackend(bus::OperationContext<i2c::SlaveAccessConfig>& context)
+{
+    auto& accessor            = operationOwner(context);
+    const uint32_t generation = context.runtime.generation;
+    uint32_t dropped_rx       = 0;
+    bool hard_stopped         = false;
+    portENTER_CRITICAL_SAFE(&_mux);
+    if (!_queued_active || _queued_accessor != &accessor || _queued_context != &context || _hw == nullptr) {
+        portEXIT_CRITICAL_SAFE(&_mux);
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    // Fence new address matches before waiting for an already accepted wire
+    // transaction to reach STOP. A 10-bit address cannot match this bus's
+    // configured 7-bit address, while the transaction already in progress no
+    // longer consults the address comparator.
+    ::i2c_ll_set_slave_addr(_hw, 0x3FFu, true);
+    ::i2c_ll_update(_hw);
+    portEXIT_CRITICAL_SAFE(&_mux);
+
+    while (::i2c_ll_is_bus_busy(_hw)) {
+        if (bus::remainingTimeout(context.runtime, runtime::millis()) == 0) {
+            hard_stopped = true;
+            break;
+        }
+        ::vTaskDelay(1);
+    }
+
+    portENTER_CRITICAL_SAFE(&_mux);
+    ::i2c_ll_disable_intr_mask(_hw, I2C_LL_INTR_MASK);
+    if (hard_stopped) {
+#if defined(SOC_PERIPH_CLK_CTRL_SHARED) && SOC_PERIPH_CLK_CTRL_SHARED
+        PERIPH_RCC_ATOMIC()
+        {
+            i2c_ll_enable_controller_clock(_hw, false);
+        }
+#else
+        i2c_ll_enable_controller_clock(_hw, false);
+#endif
+        __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+    }
+    uint32_t free = 0;
+    if (!hard_stopped) ::i2c_ll_get_txfifo_len(_hw, &free);
+    const uint32_t occupancy = free >= SOC_I2C_FIFO_LEN ? 0 : SOC_I2C_FIFO_LEN - free;
+    if (!hard_stopped) {
+        auto session = _queued_bridge.isrBegin(generation);
+        if (session.status() == detail::SlaveQueueBridgeResult::Accepted) {
+            uint32_t rx = 0;
+            ::i2c_ll_get_rxfifo_cnt(_hw, &rx);
+            if (rx != 0) {
+                auto prepared = _queued_bridge.prepareRx(session, rx);
+                if (prepared.status == detail::SlaveQueueBridgeResult::Accepted) {
+                    if (prepared.first.size != 0) {
+                        ::i2c_ll_read_rxfifo(_hw, prepared.first.data, static_cast<uint32_t>(prepared.first.size));
+                    }
+                    if (prepared.second.size != 0) {
+                        ::i2c_ll_read_rxfifo(_hw, prepared.second.data, static_cast<uint32_t>(prepared.second.size));
+                    }
+                    if (_queued_bridge.commitRx(session) != detail::SlaveQueueBridgeResult::Accepted) {
+                        __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+                    }
+                } else {
+                    uint8_t scratch[SOC_I2C_FIFO_LEN];
+                    while (rx != 0) {
+                        const uint32_t count = std::min<uint32_t>(rx, sizeof(scratch));
+                        ::i2c_ll_read_rxfifo(_hw, scratch, count);
+                        dropped_rx += count;
+                        rx -= count;
+                    }
+                }
+            }
+            if (_queued_bridge.boundaryRequired()) {
+                (void)_queued_bridge.abortBoundary(session, occupancy);
+            }
+        } else {
+            __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+        }
+    }
+    if (!hard_stopped) {
+        ::i2c_ll_txfifo_rst(_hw);
+        ::i2c_ll_rxfifo_rst(_hw);
+        ::i2c_ll_slave_clear_stretch(_hw);
+    }
+    (void)_queued_bridge.workerRequestClose(generation);
+    portEXIT_CRITICAL_SAFE(&_mux);
+    if (dropped_rx != 0) {
+        auto& queued_accessor = static_cast<SlaveAccessor&>(accessor);
+        queued_accessor.backendRecordDroppedBytes(dropped_rx);
+        queued_accessor.backendEvents().publish(slave::SlaveEvent::Overflow, queued_accessor.readable(),
+                                                queued_accessor.writable(), generation);
+    }
+    if (hard_stopped) restorePins();
+    notifyTaskFromTask();
+#if defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)
+    processQueuedWorker();
+#endif
+
+    bool forced      = false;
+    bool abort_error = false;
+    for (;;) {
+        if (_queued_bridge.workerTryQuiesce(generation)) break;
+        const uint32_t remaining = bus::remainingTimeout(context.runtime, runtime::millis());
+        if (remaining == 0) {
+            forced      = true;
+            abort_error = !stopQueuedProducerAndQuiesce(generation).has_value();
+            break;
+        }
+        notifyTaskFromTask();
+        ::vTaskDelay(1);
+    }
+
+    portENTER_CRITICAL_SAFE(&_mux);
+    _queued_active     = false;
+    _queued_accessor   = nullptr;
+    _queued_context    = nullptr;
+    _queued_generation = 0;
+    __atomic_store_n(&_queued_broken,
+                     (__atomic_load_n(&_queued_broken, __ATOMIC_ACQUIRE) != 0 || _queued_bridge.broken()) ? 1u : 0u,
+                     __ATOMIC_RELEASE);
+    portEXIT_CRITICAL_SAFE(&_mux);
+    const bool reset = _queued_bridge.workerReset();
+    if (!reset) return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    const bool broken = __atomic_load_n(&_queued_broken, __ATOMIC_ACQUIRE) != 0;
+    if (abort_error) return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    if (hard_stopped || forced) return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+    if (broken) return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    return {};
+}
+
+void SlaveBus_espidf::notifyOperationActivity(bus::IAccessor* owner)
+{
+    portENTER_CRITICAL_SAFE(&_mux);
+    const bool notify = _queued_active && _queued_accessor == owner;
+    portEXIT_CRITICAL_SAFE(&_mux);
+    if (notify) notifyTaskFromTask();
+#if defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)
+    if (notify) processQueuedWorker();
+#endif
+}
+
+void SlaveBus_espidf::processQueuedWorker()
+{
+    SlaveAccessor* accessor                                = nullptr;
+    bus::OperationContext<i2c::SlaveAccessConfig>* context = nullptr;
+    uint32_t generation                                    = 0;
+    portENTER_CRITICAL_SAFE(&_mux);
+    if (_queued_active) {
+        accessor   = _queued_accessor;
+        context    = _queued_context;
+        generation = _queued_generation;
+    }
+    portEXIT_CRITICAL_SAFE(&_mux);
+    if (accessor == nullptr || context == nullptr) return;
+
+    auto worker = _queued_bridge.workerBeginSession(generation);
+    if (worker.status() != detail::SlaveQueueBridgeResult::Accepted) return;
+#if defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)
+    if (_test_fail_next_queued_begin) {
+        _test_fail_next_queued_begin = false;
+        _test_held_queued_worker = new QueuedBridge::WorkerSession(static_cast<QueuedBridge::WorkerSession&&>(worker));
+        __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+        return;
+    }
+#endif
+
+    auto publish = [&](slave::SlaveEvent events) {
+        accessor->backendEvents().publish(events, accessor->readable(), accessor->writable(), generation);
+    };
+    const uint32_t dropped_rx = __atomic_exchange_n(&_queued_dropped_rx, 0, __ATOMIC_ACQ_REL);
+    if (dropped_rx != 0) {
+        accessor->backendRecordDroppedBytes(dropped_rx);
+        publish(slave::SlaveEvent::Overflow);
+    }
+    if (__atomic_load_n(&_queued_broken, __ATOMIC_ACQUIRE) != 0 || _queued_bridge.broken()) {
+        __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+        publish(slave::SlaveEvent::BusBroken);
+    }
+    auto confirm = [&](const detail::SlaveTxTotals& totals, bool confirm_bridge_real) -> bool {
+        if (totals.real != 0) {
+            if (confirm_bridge_real && _queued_bridge.workerConfirmTxReal(worker, static_cast<uint32_t>(totals.real)) !=
+                                           detail::SlaveQueueBridgeResult::Accepted) {
+                return false;
+            }
+            auto popped = accessor->backendTxQueue().popBytes(totals.real);
+            if (!popped.has_value()) {
+                return false;
+            }
+            _queued_popped_confirmed += totals.real;
+            publish(slave::SlaveEvent::TxSpace);
+        }
+        if (totals.fill != 0) {
+            accessor->backendTxQueue().recordUnderrun(static_cast<uint32_t>(totals.fill));
+            publish(slave::SlaveEvent::Underrun);
+        }
+        return true;
+    };
+
+    for (size_t iteration = 0; iteration < kQueuedEventCapacity; ++iteration) {
+        detail::SlaveQueueRawEvent event;
+        uint8_t rx_bytes[kQueuedRxCapacity];
+        const auto peeked = _queued_bridge.workerPeekStep(worker, event, rx_bytes, sizeof(rx_bytes));
+        if (peeked == detail::SlaveQueueWorkerStep::Empty) break;
+        if (peeked != detail::SlaveQueueWorkerStep::Ready) {
+            __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+            publish(slave::SlaveEvent::BusBroken);
+            break;
+        }
+
+        bool commit   = true;
+        bool boundary = false;
+        detail::SlaveTxBoundaryResult boundary_result{};
+        switch (event.kind) {
+            case detail::SlaveQueueRawEventKind::RxPayload: {
+                if (accessor->backendRxWritable() < event.count) return;
+                auto written = accessor->backendWriteRx({rx_bytes, event.count});
+                if (!written.has_value() || *written != event.count) return;
+                publish(slave::SlaveEvent::RxAvailable);
+                break;
+            }
+            case detail::SlaveQueueRawEventKind::TxLoadedReal:
+                commit = _queued_tx_ledger.load(detail::SlaveTxProvenance::Real, event.count).has_value();
+                break;
+            case detail::SlaveQueueRawEventKind::TxLoadedFill:
+                commit = _queued_tx_ledger.load(detail::SlaveTxProvenance::Fill, event.count).has_value();
+                break;
+            case detail::SlaveQueueRawEventKind::FifoOccupancy: {
+                auto observed = _queued_tx_ledger.observeFifoOccupancy(event.value);
+                commit        = observed.has_value() && confirm(*observed, true);
+                break;
+            }
+            case detail::SlaveQueueRawEventKind::StopBoundary:
+            case detail::SlaveQueueRawEventKind::TxEmptyBoundary:
+            case detail::SlaveQueueRawEventKind::AbortBoundary: {
+                const auto evidence = event.kind == detail::SlaveQueueRawEventKind::TxEmptyBoundary
+                                          ? detail::SlaveTxBoundaryEvidence::ShifterDrained
+                                          : detail::SlaveTxBoundaryEvidence::ShifterAmbiguous;
+                auto stopped        = _queued_tx_ledger.confirmBoundaryAndDiscard(event.value, evidence);
+                if (stopped.has_value()) {
+                    boundary_result = *stopped;
+                    boundary        = true;
+                } else {
+                    commit = false;
+                }
+                break;
+            }
+        }
+        if (!commit || _queued_bridge.workerCommitStep(worker) != detail::SlaveQueueBridgeResult::Accepted) {
+            __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+            publish(slave::SlaveEvent::BusBroken);
+            break;
+        }
+        if (boundary) {
+            if (_queued_bridge.workerResolveTxBoundary(worker, static_cast<uint32_t>(boundary_result.confirmed.real),
+                                                       static_cast<uint32_t>(boundary_result.unclocked.real)) !=
+                    detail::SlaveQueueBridgeResult::Accepted ||
+                !confirm(boundary_result.confirmed, false)) {
+                __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+                publish(slave::SlaveEvent::BusBroken);
+                break;
+            }
+        }
+    }
+
+    if (__atomic_load_n(&_queued_broken, __ATOMIC_ACQUIRE) == 0 &&
+        _queued_bridge.workerState() == detail::SlaveQueueBridgeState::Active) {
+        const size_t writable = _queued_bridge.workerTxWritable();
+        const size_t borrowed = _queued_copied_unique - _queued_popped_confirmed;
+        if (writable != 0) {
+            auto bytes = accessor->backendTxQueue().peekBytes(borrowed + writable);
+            if (bytes.has_value()) {
+                const size_t available  = bytes->first.size + bytes->second.size;
+                const size_t copy_count = available > borrowed ? std::min(writable, available - borrowed) : 0;
+                uint8_t local[kQueuedTxCapacity];
+                for (size_t i = 0; i < copy_count; ++i) {
+                    const size_t source = borrowed + i;
+                    local[i]            = source < bytes->first.size
+                                              ? static_cast<const uint8_t*>(bytes->first.data)[source]
+                                              : static_cast<const uint8_t*>(bytes->second.data)[source - bytes->first.size];
+                }
+                if (copy_count != 0 && _queued_bridge.workerStageTx(worker, local, copy_count) ==
+                                           detail::SlaveQueueBridgeResult::Accepted) {
+                    _queued_copied_unique += copy_count;
+                }
+            }
+        }
+    }
+    portENTER_CRITICAL_SAFE(&_mux);
+    ++_queued_worker_runs;
+    portEXIT_CRITICAL_SAFE(&_mux);
+    if (_queued_bridge.broken()) {
+        __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+        publish(slave::SlaveEvent::BusBroken);
+    }
+    // The worker lease ends before the task-side ISR lease below. Together with
+    // _mux, bridge sessions make the hardware FIFO a sole serialized consumer.
+    resumeQueuedHardwareFromTask();
+}
+
+void SlaveBus_espidf::resumeQueuedHardwareFromTask()
+{
+    portENTER_CRITICAL_SAFE(&_mux);
+    if (!_queued_active || _hw == nullptr || __atomic_load_n(&_queued_broken, __ATOMIC_ACQUIRE) != 0) {
+        portEXIT_CRITICAL_SAFE(&_mux);
+        return;
+    }
+    auto session = _queued_bridge.isrBegin(_queued_generation);
+    if (session.status() != detail::SlaveQueueBridgeResult::Accepted) {
+        portEXIT_CRITICAL_SAFE(&_mux);
+        return;
+    }
+    if (_hold_kind == HoldKind::rx_full) {
+        uint32_t rx = 0;
+        ::i2c_ll_get_rxfifo_cnt(_hw, &rx);
+        auto prepared = _queued_bridge.prepareRx(session, rx);
+        if (prepared.status == detail::SlaveQueueBridgeResult::Accepted) {
+            if (prepared.first.size != 0) {
+                ::i2c_ll_read_rxfifo(_hw, prepared.first.data, static_cast<uint8_t>(prepared.first.size));
+            }
+            if (prepared.second.size != 0) {
+                ::i2c_ll_read_rxfifo(_hw, prepared.second.data, static_cast<uint8_t>(prepared.second.size));
+            }
+            (void)_queued_bridge.commitRx(session);
+            const uint32_t masked = clearHoldLocked();
+            ::i2c_ll_slave_clear_stretch(_hw);
+            enableMaskedInterrupts(masked);
+        }
+    } else if (_hold_kind == HoldKind::address_read || _hold_kind == HoldKind::tx_empty) {
+        uint32_t free = 0;
+        ::i2c_ll_get_txfifo_len(_hw, &free);
+        uint8_t local[SOC_I2C_FIFO_LEN];
+        auto prepared = _queued_bridge.prepareTx(session, local, std::min<size_t>(free, sizeof(local)));
+        if (prepared.status == detail::SlaveQueueBridgeResult::Accepted) {
+            ::i2c_ll_write_txfifo(_hw, local, static_cast<uint32_t>(prepared.count));
+            (void)_queued_bridge.commitTxLoaded(session);
+            const uint32_t masked = clearHoldLocked();
+            ::i2c_ll_slave_clear_stretch(_hw);
+            enableMaskedInterrupts(masked);
+        }
+    }
+    portEXIT_CRITICAL_SAFE(&_mux);
 }
 
 // Drain RX-FIFO bytes into the current transaction's rx ring as raw stream bytes
@@ -458,9 +1044,9 @@ bool SlaveBus_espidf::drainRxLocked(uint32_t count, bool can_hold)
             while (count) {
                 uint8_t c = (count > SOC_I2C_FIFO_LEN) ? SOC_I2C_FIFO_LEN : static_cast<uint8_t>(count);
                 ::i2c_ll_read_rxfifo(_hw, scratch, c);
+                _rx_overflow_count += c;
                 count -= c;
             }
-            ++_rx_overflow_count;
             return false;
         }
     }
@@ -656,6 +1242,17 @@ void SlaveBus_espidf::handleIsr()
 
     portENTER_CRITICAL_ISR(&_mux);
 
+    if (_queued_active) {
+        (void)handleQueuedIsrLocked(hw, ints, rx, is_read, woken);
+        portEXIT_CRITICAL_ISR(&_mux);
+#if defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)
+        // Deterministic worker-context seam: the host fake has no scheduler.
+        processQueuedWorker();
+#endif
+        if (woken) portYIELD_FROM_ISR();
+        return;
+    }
+
     // RX water-mark: drain the written bytes (raw) into the current transaction.
     // If the ring fills (consumer behind), assert the back-pressure hold so the
     // master is stretched until read() frees space -- no byte is dropped.
@@ -830,6 +1427,136 @@ void SlaveBus_espidf::handleIsr()
     }
 }
 
+bool SlaveBus_espidf::handleQueuedIsrLocked(::i2c_dev_t* hw, uint32_t ints, uint32_t rx, bool is_read, bool& task_woken)
+{
+    auto session = _queued_bridge.isrBegin(_queued_generation);
+    if (session.status() != detail::SlaveQueueBridgeResult::Accepted) return false;
+    bool activity = false;
+
+    auto drain_rx = [&](uint32_t count) __attribute__((always_inline))
+    {
+        if (count == 0) return true;
+        auto prepared = _queued_bridge.prepareRx(session, count);
+        if (prepared.status == detail::SlaveQueueBridgeResult::NoSpace) {
+            enterRxHoldFromIsrLocked();
+            return false;
+        }
+        if (prepared.status != detail::SlaveQueueBridgeResult::Accepted) return false;
+        if (prepared.first.size != 0) {
+            ::i2c_ll_read_rxfifo(hw, prepared.first.data, static_cast<uint8_t>(prepared.first.size));
+        }
+        if (prepared.second.size != 0) {
+            ::i2c_ll_read_rxfifo(hw, prepared.second.data, static_cast<uint8_t>(prepared.second.size));
+        }
+        if (_queued_bridge.commitRx(session) != detail::SlaveQueueBridgeResult::Accepted) return false;
+        activity = true;
+        return true;
+    };
+    auto load_tx = [&](bool address_read) __attribute__((always_inline))
+    {
+        uint32_t free = 0;
+        ::i2c_ll_get_txfifo_len(hw, &free);
+        if (free == 0) return true;
+        uint8_t local[SOC_I2C_FIFO_LEN];
+        auto prepared = _queued_bridge.prepareTx(session, local, std::min<size_t>(free, sizeof(local)));
+        if (prepared.status != detail::SlaveQueueBridgeResult::Accepted) {
+            enterTxHoldFromIsrLocked(task_woken, address_read);
+            return false;
+        }
+        ::i2c_ll_write_txfifo(hw, local, static_cast<uint32_t>(prepared.count));
+        if (_queued_bridge.commitTxLoaded(session) != detail::SlaveQueueBridgeResult::Accepted) return false;
+        activity = true;
+        return true;
+    };
+
+    if ((ints & I2C_RXFIFO_WM_INT_ENA_M) && rx) {
+        if (drain_rx(rx)) rx = 0;
+    }
+
+#if M5HAL_DETAIL_I2C_SLAVE_TX_WATERMARK_
+    if (ints & I2C_TXFIFO_WM_INT_ENA_M) {
+        if (is_read) {
+            uint32_t free = 0;
+            ::i2c_ll_get_txfifo_len(hw, &free);
+            const uint32_t occupancy = free >= SOC_I2C_FIFO_LEN ? 0 : SOC_I2C_FIFO_LEN - free;
+            if (_queued_bridge.observeFifo(session, occupancy) == detail::SlaveQueueBridgeResult::Accepted) {
+                activity = true;
+            }
+            if (!load_tx(false)) ::i2c_ll_disable_intr_mask(hw, I2C_TXFIFO_WM_INT_ENA_M);
+        } else {
+            ::i2c_ll_disable_intr_mask(hw, I2C_TXFIFO_WM_INT_ENA_M);
+        }
+    }
+#endif
+
+    if (ints & I2C_TRANS_COMPLETE_INT_ENA_M) {
+        if (rx) {
+            if (!drain_rx(rx)) {
+                uint8_t scratch[SOC_I2C_FIFO_LEN];
+                uint32_t remaining = rx;
+                while (remaining != 0) {
+                    const uint32_t count = std::min<uint32_t>(remaining, sizeof(scratch));
+                    ::i2c_ll_read_rxfifo(hw, scratch, count);
+                    remaining -= count;
+                }
+                __atomic_fetch_add(&_queued_dropped_rx, rx, __ATOMIC_RELAXED);
+                __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+                ::i2c_ll_set_slave_addr(hw, 0x3FFu, true);
+                ::i2c_ll_disable_intr_mask(hw, I2C_LL_INTR_MASK);
+                ::i2c_ll_update(hw);
+            }
+            rx = 0;
+        }
+        uint32_t free = 0;
+        ::i2c_ll_get_txfifo_len(hw, &free);
+        const uint32_t occupancy = free >= SOC_I2C_FIFO_LEN ? 0 : SOC_I2C_FIFO_LEN - free;
+        if (_queued_bridge.stopBoundary(session, occupancy) != detail::SlaveQueueBridgeResult::Accepted) {
+            __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+        } else {
+            activity = true;
+        }
+        ::i2c_ll_disable_intr_mask(hw, I2C_TXFIFO_WM_INT_ENA_M);
+        ::i2c_ll_txfifo_rst(hw);
+        const uint32_t masked = clearHoldLocked();
+        if (masked != 0 && __atomic_load_n(&_queued_broken, __ATOMIC_ACQUIRE) == 0) {
+            ::i2c_ll_slave_clear_stretch(hw);
+            enableMaskedInterrupts(masked);
+        }
+    }
+
+    if (ints & I2C_SLAVE_STRETCH_INT_ENA_M) {
+        ::i2c_slave_stretch_cause_t cause;
+        ::i2c_ll_slave_get_stretch_cause(hw, &cause);
+        if (cause == I2C_SLAVE_STRETCH_CAUSE_ADDRESS_MATCH) {
+            if (rx && drain_rx(rx)) rx = 0;
+            if (is_read) {
+                if (load_tx(true)) {
+                    ::i2c_ll_slave_clear_stretch(hw);
+#if M5HAL_DETAIL_I2C_SLAVE_TX_WATERMARK_
+                    ::i2c_ll_enable_intr_mask(hw, I2C_TXFIFO_WM_INT_ENA_M);
+#endif
+                }
+            } else if (_hold_kind != HoldKind::rx_full) {
+                ::i2c_ll_slave_clear_stretch(hw);
+            }
+        } else if (cause == I2C_SLAVE_STRETCH_CAUSE_TX_EMPTY) {
+            if (_queued_bridge.txEmptyBoundary(session, 0) == detail::SlaveQueueBridgeResult::Accepted) {
+                activity = true;
+            }
+            enterTxHoldFromIsrLocked(task_woken, false);
+        } else if (cause == I2C_SLAVE_STRETCH_CAUSE_RX_FULL) {
+            if (rx && drain_rx(rx)) {
+                rx = 0;
+                ::i2c_ll_slave_clear_stretch(hw);
+            }
+        } else {
+            ::i2c_ll_slave_clear_stretch(hw);
+        }
+    }
+    if (activity) notifyTaskFromISR(task_woken);
+    return activity;
+}
+
 #elif M5HAL_ESPIDF_I2C_SLAVE_LL_BE
 // ---------------------------------------------------------------------------
 // Classic ESP32 path: LL best-effort (no clock stretch). Same GPIO-matrix /
@@ -839,6 +1566,9 @@ void SlaveBus_espidf::handleIsr()
 
 result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
 {
+    if (!initializationAllowed(false)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
     if (cfg.pin_scl < 0 || cfg.pin_sda < 0 || cfg.address_is_10bit || cfg.address > 0x7Fu) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
@@ -857,9 +1587,9 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
     }
 
     if (_hw != nullptr || _task != nullptr || _intr != nullptr) {
-        auto released = release();
-        if (!released.has_value()) {
-            return m5::stl::make_unexpected(released.error());
+        auto reset = resetForInitialization();
+        if (!reset.has_value()) {
+            return reset;
         }
     }
     _config  = cfg;
@@ -869,10 +1599,19 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
     {
         portENTER_CRITICAL_SAFE(&_mux);
         resetStateLocked();
-        _resp_len     = 0;
-        _resp_pos     = 0;
-        _task_stop    = false;
-        _task_running = true;
+        _resp_len                 = 0;
+        _resp_pos                 = 0;
+        _task_stop                = false;
+        _task_running             = true;
+        _queued_active            = false;
+        _queued_lifecycle_used    = false;
+        _queued_be_reload_pending = false;
+        _queued_closing           = false;
+        _queued_accessor          = nullptr;
+        _queued_context           = nullptr;
+        _queued_generation        = 0;
+        __atomic_store_n(&_queued_broken, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&_queued_dropped_rx, 0, __ATOMIC_RELAXED);
         portEXIT_CRITICAL_SAFE(&_mux);
     }
     if (::xTaskCreate(&SlaveBus_espidf::taskThunk, "m5hal_i2c_slave", 3072, this, configMAX_PRIORITIES - 1, &_task) !=
@@ -886,6 +1625,7 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
     const ::i2c_port_t port = static_cast<::i2c_port_t>(port_r.value());
     ::i2c_dev_t* const hw   = I2C_LL_GET_HW(port);
     _hw                     = hw;
+    _port                   = port_r.value();
 
 #if defined(SOC_RCC_IS_INDEPENDENT) && SOC_RCC_IS_INDEPENDENT
     i2c_ll_enable_bus_clock(port, true);
@@ -931,9 +1671,17 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
     hw->ctr.sda_force_out = 1;
     hw->ctr.scl_force_out = 1;
     ::i2c_ll_master_rx_full_ack_level(hw, 0);
+#if M5HAL_DETAIL_ESPIDF_I2C_SLAVE_LL_V54_API_
     ::i2c_ll_slave_enable_auto_start(hw, true);
+#else
+    ::i2c_ll_slave_tx_auto_start_en(hw, true);
+#endif
 
-    ::i2c_ll_set_slave_addr(hw, cfg.address, false);
+    if (cfg.legacy_wire_frame_window) {
+        ::i2c_ll_set_slave_addr(hw, cfg.address, false);
+    } else {
+        ::i2c_ll_set_slave_addr(hw, 0x3FFu, true);
+    }
     ::i2c_ll_set_tout(hw, I2C_LL_MAX_TIMEOUT);
 
     ::i2c_ll_set_sda_timing(hw, 10, 10);
@@ -950,7 +1698,11 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
     // resets to 1 but this keeps FIFO pointer control explicit.
     hw->fifo_conf.fifo_prt_en = 1;
 #endif
+#if M5HAL_DETAIL_ESPIDF_I2C_SLAVE_LL_V54_API_
     ::i2c_ll_enable_fifo_mode(hw, true);
+#else
+    ::i2c_ll_slave_set_fifo_mode(hw, true);
+#endif
     hw->fifo_conf.fifo_addr_cfg_en = 0;
 
     // No clock-stretch enable block here: i2c_ll_slave_enable_scl_stretch is a
@@ -960,25 +1712,34 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
 
     if (::esp_intr_alloc(i2c_periph_signal[port].irq, M5HAL_DETAIL_I2C_SLAVE_ISR_INTR_FLAGS_,
                          &SlaveBus_espidf::isrThunk, this, &_intr) != ESP_OK) {
-        auto released = release();
-        if (!released.has_value()) {
-            return m5::stl::make_unexpected(released.error());
+        auto reset = resetForInitialization();
+        if (!reset.has_value()) {
+            return reset;
         }
         return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
     }
-    ::i2c_ll_enable_intr_mask(
-        hw, impl_espidf_slave::kBeRxWmIntr | I2C_TRANS_COMPLETE_INT_ENA_M | impl_espidf_slave::kBeTxWmIntr);
+    if (cfg.legacy_wire_frame_window) {
+        ::i2c_ll_enable_intr_mask(
+            hw, impl_espidf_slave::kBeRxWmIntr | I2C_TRANS_COMPLETE_INT_ENA_M | impl_espidf_slave::kBeTxWmIntr);
+    }
     ::i2c_ll_update(hw);
 
     // Prime the TX FIFO (allocate a transaction and top it up with fill bytes,
     // same as the STOP handler in handleIsr()) so a read arriving before any
     // write()/STOP still gets fill bytes instead of stale/garbage data.
-    portENTER_CRITICAL_SAFE(&_mux);
-    _current = allocateTransactionLocked();
-    snapshotResponseLocked();
-    fillTxFromRespLocked();
-    portEXIT_CRITICAL_SAFE(&_mux);
+    if (cfg.legacy_wire_frame_window) {
+        portENTER_CRITICAL_SAFE(&_mux);
+        _current = allocateTransactionLocked();
+        snapshotResponseLocked();
+        fillTxFromRespLocked();
+        portEXIT_CRITICAL_SAFE(&_mux);
+    }
 
+    auto initialized = markInitializationSucceeded(false);
+    if (!initialized.has_value()) {
+        (void)resetForInitialization();
+        return initialized;
+    }
     return {};
 }
 
@@ -994,14 +1755,19 @@ void SlaveBus_espidf::restorePins()
     _pin_sda = -1;
 }
 
-result_t<void> SlaveBus_espidf::release(void)
+bus::CloseOutcome SlaveBus_espidf::teardownBackend(void)
 {
+    if (_queued_active && _queued_accessor != nullptr && _queued_context != nullptr) {
+        (void)endOperationBackend(*_queued_context);
+    }
     if (_intr != nullptr) {
         if (_hw != nullptr) {
             ::i2c_ll_disable_intr_mask(_hw, I2C_LL_INTR_MASK);
             ::i2c_ll_clear_intr_mask(_hw, I2C_LL_INTR_MASK);
         }
-        (void)::esp_intr_free(_intr);
+        if (::esp_intr_free(_intr) != ESP_OK) {
+            return bus::CloseOutcome::partialOrUnknown(error::error_t::I2C_BUS_ERROR);
+        }
         _intr = nullptr;
     }
 
@@ -1011,20 +1777,60 @@ result_t<void> SlaveBus_espidf::release(void)
         portEXIT_CRITICAL_SAFE(&_mux);
         notifyTaskFromTask();
         if (!impl_espidf_slave::waitTaskStopped(&_mux, _task_running)) {
-            return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+            ::vTaskDelete(_task);
+            portENTER_CRITICAL_SAFE(&_mux);
+            _task_running = false;
+            portEXIT_CRITICAL_SAFE(&_mux);
         }
         _task = nullptr;
     }
 
-    _hw = nullptr;
+    _queued_bridge.workerRecoverAfterAllProducersStopped();
+    if (!_queued_bridge.workerReset()) {
+        return bus::CloseOutcome::partialOrUnknown(error::error_t::INVALID_STATE);
+    }
+
     restorePins();
+    if (_hw != nullptr && _port >= 0) {
+#if M5HAL_DEBUG_ESPIDF_I2C_SLAVE_NO_CONTROLLER_CLOCK
+        // The matching controller-clock enable was intentionally skipped.
+#elif defined(SOC_PERIPH_CLK_CTRL_SHARED) && SOC_PERIPH_CLK_CTRL_SHARED
+        PERIPH_RCC_ATOMIC()
+        {
+            i2c_ll_enable_controller_clock(_hw, false);
+        }
+#else
+        i2c_ll_enable_controller_clock(_hw, false);
+#endif
+
+        const ::i2c_port_t port = static_cast<::i2c_port_t>(_port);
+#if defined(SOC_RCC_IS_INDEPENDENT) && SOC_RCC_IS_INDEPENDENT
+        i2c_ll_enable_bus_clock(port, false);
+#else
+        PERIPH_RCC_ATOMIC()
+        {
+            i2c_ll_enable_bus_clock(port, false);
+        }
+#endif
+    }
+    _port = -1;
+    _hw   = nullptr;
 
     portENTER_CRITICAL_SAFE(&_mux);
     resetStateLocked();
-    _resp_len     = 0;
-    _resp_pos     = 0;
-    _task_stop    = false;
-    _task_running = false;
+    _resp_len                 = 0;
+    _resp_pos                 = 0;
+    _task_stop                = false;
+    _task_running             = false;
+    _queued_active            = false;
+    _queued_lifecycle_used    = false;
+    _queued_be_reload_pending = false;
+    _queued_closing           = false;
+    _queued_accessor          = nullptr;
+    _queued_context           = nullptr;
+    _queued_generation        = 0;
+    __atomic_store_n(&_queued_broken, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&_queued_dropped_rx, 0, __ATOMIC_RELAXED);
     // Drop the regmap fast-path binding along with the rest of the HW state --
     // a re-init starts from a clean slate; the accessor that owns the binding
     // struct still holds it and re-binds on its next setOnRead/setOnWrite (or
@@ -1032,7 +1838,419 @@ result_t<void> SlaveBus_espidf::release(void)
     // struct itself (we do not own it).
     _isr_binding = nullptr;
     portEXIT_CRITICAL_SAFE(&_mux);
+    return bus::CloseOutcome::success();
+}
+
+result_t<void> SlaveBus_espidf::beginOperationBackend(bus::OperationContext<i2c::SlaveAccessConfig>& context)
+{
+    auto& accessor = operationOwner(context);
+    if (context.config.tx_mode != slave::QueueMode::Byte || context.config.rx_mode != slave::QueueMode::Byte ||
+        _config.tx_underrun != i2c::TxUnderrun::Fill || _config.legacy_wire_frame_window) {
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
+#if M5HAL_DETAIL_I2C_SLAVE_HAS_INTERNAL_PTR_CHECK_
+    if (!::esp_ptr_internal(&_queued_bridge)) return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+#endif
+    portENTER_CRITICAL_SAFE(&_mux);
+    bool legacy_in_use = false;
+    for (const auto& transaction : _transactions) legacy_in_use = legacy_in_use || transaction.in_use;
+    if (_hw == nullptr || _queued_active || legacy_in_use || _open != nullptr || _current != nullptr ||
+        _isr_binding != nullptr || __atomic_load_n(&_queued_broken, __ATOMIC_ACQUIRE) != 0 ||
+        !_queued_bridge.workerBegin(context.runtime.generation, _config.tx_fill_byte)) {
+        portEXIT_CRITICAL_SAFE(&_mux);
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    _queued_accessor          = static_cast<SlaveAccessor*>(&accessor);
+    _queued_context           = &context;
+    _queued_generation        = context.runtime.generation;
+    _queued_copied_unique     = 0;
+    _queued_popped_confirmed  = 0;
+    _queued_active            = true;
+    _queued_lifecycle_used    = true;
+    _queued_be_reload_pending = true;
+    _queued_closing           = false;
+    _queued_tx_ledger.reset();
+    __atomic_store_n(&_queued_dropped_rx, 0, __ATOMIC_RELAXED);
+    ::i2c_ll_disable_intr_mask(_hw, I2C_LL_INTR_MASK);
+    ::i2c_ll_clear_intr_mask(_hw, I2C_LL_INTR_MASK);
+    ::i2c_ll_txfifo_rst(_hw);
+    ::i2c_ll_rxfifo_rst(_hw);
+    portEXIT_CRITICAL_SAFE(&_mux);
+    processQueuedWorker();
+
+    portENTER_CRITICAL_SAFE(&_mux);
+    const bool ready = _queued_active && _queued_accessor == &accessor && _queued_context == &context &&
+                       !_queued_be_reload_pending && __atomic_load_n(&_queued_broken, __ATOMIC_ACQUIRE) == 0;
+    portEXIT_CRITICAL_SAFE(&_mux);
+    if (ready) return {};
+    (void)_queued_bridge.workerRequestClose(context.runtime.generation);
+    const auto aborted = stopQueuedProducerAndQuiesce(context.runtime.generation);
+    portENTER_CRITICAL_SAFE(&_mux);
+    _queued_active            = false;
+    _queued_be_reload_pending = false;
+    _queued_closing           = false;
+    _queued_accessor          = nullptr;
+    _queued_context           = nullptr;
+    _queued_generation        = 0;
+    portEXIT_CRITICAL_SAFE(&_mux);
+    const bool reset = _queued_bridge.workerReset();
+    if (!reset) return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    if (!aborted.has_value()) return m5::stl::make_unexpected(aborted.error());
+    return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+}
+
+result_t<void> SlaveBus_espidf::endOperationBackend(bus::OperationContext<i2c::SlaveAccessConfig>& context)
+{
+    auto& accessor            = operationOwner(context);
+    const uint32_t generation = context.runtime.generation;
+    uint32_t dropped_rx       = 0;
+    bool hard_stopped         = false;
+    portENTER_CRITICAL_SAFE(&_mux);
+    if (!_queued_active || _queued_accessor != &accessor || _queued_context != &context || _hw == nullptr) {
+        portEXIT_CRITICAL_SAFE(&_mux);
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    ::i2c_ll_set_slave_addr(_hw, 0x3FFu, true);
+    ::i2c_ll_update(_hw);
+    _queued_closing = true;
+    portEXIT_CRITICAL_SAFE(&_mux);
+#if defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)
+    if (_test_run_worker_during_queued_end) {
+        _test_run_worker_during_queued_end = false;
+        processQueuedWorker();
+    }
+#endif
+    while (::i2c_ll_is_bus_busy(_hw)) {
+        if (bus::remainingTimeout(context.runtime, runtime::millis()) == 0) {
+            hard_stopped = true;
+            break;
+        }
+        ::vTaskDelay(1);
+    }
+    portENTER_CRITICAL_SAFE(&_mux);
+    ::i2c_ll_disable_intr_mask(_hw, I2C_LL_INTR_MASK);
+    if (hard_stopped) {
+#if defined(SOC_PERIPH_CLK_CTRL_SHARED) && SOC_PERIPH_CLK_CTRL_SHARED
+        PERIPH_RCC_ATOMIC()
+        {
+            i2c_ll_enable_controller_clock(_hw, false);
+        }
+#else
+        i2c_ll_enable_controller_clock(_hw, false);
+#endif
+        __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+    }
+    uint32_t free = 0;
+    if (!hard_stopped) ::i2c_ll_get_txfifo_len(_hw, &free);
+    const uint32_t occupancy = free >= SOC_I2C_FIFO_LEN ? 0 : SOC_I2C_FIFO_LEN - free;
+    if (!hard_stopped) {
+        auto session = _queued_bridge.isrBegin(generation);
+        if (session.status() == detail::SlaveQueueBridgeResult::Accepted) {
+            uint32_t rx = 0;
+            ::i2c_ll_get_rxfifo_cnt(_hw, &rx);
+            if (rx != 0) {
+                auto prepared = _queued_bridge.prepareRx(session, rx);
+                if (prepared.status == detail::SlaveQueueBridgeResult::Accepted) {
+                    if (prepared.first.size != 0)
+                        ::i2c_ll_read_rxfifo(_hw, prepared.first.data, static_cast<uint32_t>(prepared.first.size));
+                    if (prepared.second.size != 0)
+                        ::i2c_ll_read_rxfifo(_hw, prepared.second.data, static_cast<uint32_t>(prepared.second.size));
+                    if (_queued_bridge.commitRx(session) != detail::SlaveQueueBridgeResult::Accepted)
+                        __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+                } else {
+                    uint8_t scratch[SOC_I2C_FIFO_LEN];
+                    while (rx != 0) {
+                        const uint32_t count = std::min<uint32_t>(rx, sizeof(scratch));
+                        ::i2c_ll_read_rxfifo(_hw, scratch, count);
+                        dropped_rx += count;
+                        rx -= count;
+                    }
+                }
+            }
+            if (_queued_bridge.boundaryRequired()) (void)_queued_bridge.abortBoundary(session, occupancy);
+        } else {
+            __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+        }
+        ::i2c_ll_txfifo_rst(_hw);
+        ::i2c_ll_rxfifo_rst(_hw);
+    }
+    _queued_be_reload_pending = false;
+    (void)_queued_bridge.workerRequestClose(generation);
+    portEXIT_CRITICAL_SAFE(&_mux);
+    if (dropped_rx != 0) {
+        auto& queued_accessor = static_cast<SlaveAccessor&>(accessor);
+        queued_accessor.backendRecordDroppedBytes(dropped_rx);
+        queued_accessor.backendEvents().publish(slave::SlaveEvent::Overflow, queued_accessor.readable(),
+                                                queued_accessor.writable(), generation);
+    }
+    if (hard_stopped) restorePins();
+    notifyTaskFromTask();
+#if defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)
+    processQueuedWorker();
+#endif
+    bool forced      = false;
+    bool abort_error = false;
+    for (;;) {
+        if (_queued_bridge.workerTryQuiesce(generation)) break;
+        if (bus::remainingTimeout(context.runtime, runtime::millis()) == 0) {
+            forced      = true;
+            abort_error = !stopQueuedProducerAndQuiesce(generation).has_value();
+            break;
+        }
+        notifyTaskFromTask();
+        ::vTaskDelay(1);
+    }
+    portENTER_CRITICAL_SAFE(&_mux);
+    _queued_active     = false;
+    _queued_closing    = false;
+    _queued_accessor   = nullptr;
+    _queued_context    = nullptr;
+    _queued_generation = 0;
+    __atomic_store_n(&_queued_broken,
+                     (__atomic_load_n(&_queued_broken, __ATOMIC_ACQUIRE) != 0 || _queued_bridge.broken()) ? 1u : 0u,
+                     __ATOMIC_RELEASE);
+    portEXIT_CRITICAL_SAFE(&_mux);
+    const bool reset = _queued_bridge.workerReset();
+    if (!reset) return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    const bool broken = __atomic_load_n(&_queued_broken, __ATOMIC_ACQUIRE) != 0;
+    if (abort_error) return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    if (hard_stopped || forced) return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+    if (broken) return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
     return {};
+}
+
+void SlaveBus_espidf::notifyOperationActivity(bus::IAccessor* owner)
+{
+    portENTER_CRITICAL_SAFE(&_mux);
+    const bool notify = _queued_active && _queued_accessor == owner;
+    if (notify && _hw != nullptr && !::i2c_ll_is_bus_busy(_hw)) {
+        // Replace the mandatory fill preload when real bytes arrive before
+        // the next transaction, without claiming the fill was clocked.
+        ::i2c_ll_set_slave_addr(_hw, 0x3FFu, true);
+        ::i2c_ll_update(_hw);
+        _queued_be_reload_pending = true;
+    }
+    portEXIT_CRITICAL_SAFE(&_mux);
+    if (notify) notifyTaskFromTask();
+#if defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)
+    if (notify) {
+        processQueuedWorker();
+        processQueuedWorker();
+    }
+#endif
+}
+
+void SlaveBus_espidf::processQueuedWorker()
+{
+    SlaveAccessor* accessor                                = nullptr;
+    bus::OperationContext<i2c::SlaveAccessConfig>* context = nullptr;
+    uint32_t generation                                    = 0;
+    portENTER_CRITICAL_SAFE(&_mux);
+    if (_queued_active) {
+        accessor   = _queued_accessor;
+        context    = _queued_context;
+        generation = _queued_generation;
+    }
+    portEXIT_CRITICAL_SAFE(&_mux);
+    if (accessor == nullptr || context == nullptr) return;
+
+    auto worker = _queued_bridge.workerBeginSession(generation);
+    if (worker.status() != detail::SlaveQueueBridgeResult::Accepted) return;
+#if defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)
+    if (_test_fail_next_queued_begin) {
+        _test_fail_next_queued_begin = false;
+        _test_held_queued_worker = new QueuedBridge::WorkerSession(static_cast<QueuedBridge::WorkerSession&&>(worker));
+        __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+        return;
+    }
+#endif
+
+    auto publish = [&](slave::SlaveEvent events) {
+        accessor->backendEvents().publish(events, accessor->readable(), accessor->writable(), generation);
+    };
+    const uint32_t dropped_rx = __atomic_exchange_n(&_queued_dropped_rx, 0, __ATOMIC_ACQ_REL);
+    if (dropped_rx != 0) {
+        accessor->backendRecordDroppedBytes(dropped_rx);
+        publish(slave::SlaveEvent::Overflow);
+    }
+    if (__atomic_load_n(&_queued_broken, __ATOMIC_ACQUIRE) != 0 || _queued_bridge.broken()) {
+        __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+        publish(slave::SlaveEvent::BusBroken);
+    }
+    auto confirm = [&](const detail::SlaveTxTotals& totals, bool confirm_bridge_real) -> bool {
+        if (totals.real != 0) {
+            if (confirm_bridge_real && _queued_bridge.workerConfirmTxReal(worker, static_cast<uint32_t>(totals.real)) !=
+                                           detail::SlaveQueueBridgeResult::Accepted) {
+                return false;
+            }
+            auto popped = accessor->backendTxQueue().popBytes(totals.real);
+            if (!popped.has_value()) {
+                return false;
+            }
+            _queued_popped_confirmed += totals.real;
+            publish(slave::SlaveEvent::TxSpace);
+        }
+        if (totals.fill != 0) {
+            accessor->backendTxQueue().recordUnderrun(static_cast<uint32_t>(totals.fill));
+            publish(slave::SlaveEvent::Underrun);
+        }
+        return true;
+    };
+
+    for (size_t iteration = 0; iteration < kQueuedEventCapacity; ++iteration) {
+        detail::SlaveQueueRawEvent event;
+        uint8_t rx_bytes[kQueuedRxCapacity];
+        const auto peeked = _queued_bridge.workerPeekStep(worker, event, rx_bytes, sizeof(rx_bytes));
+        if (peeked == detail::SlaveQueueWorkerStep::Empty) break;
+        if (peeked != detail::SlaveQueueWorkerStep::Ready) {
+            __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+            publish(slave::SlaveEvent::BusBroken);
+            break;
+        }
+
+        bool commit   = true;
+        bool boundary = false;
+        detail::SlaveTxBoundaryResult boundary_result{};
+        switch (event.kind) {
+            case detail::SlaveQueueRawEventKind::RxPayload: {
+                if (accessor->backendRxWritable() < event.count) return;
+                auto written = accessor->backendWriteRx({rx_bytes, event.count});
+                if (!written.has_value() || *written != event.count) return;
+                publish(slave::SlaveEvent::RxAvailable);
+                break;
+            }
+            case detail::SlaveQueueRawEventKind::TxLoadedReal:
+                commit = _queued_tx_ledger.load(detail::SlaveTxProvenance::Real, event.count).has_value();
+                break;
+            case detail::SlaveQueueRawEventKind::TxLoadedFill:
+                commit = _queued_tx_ledger.load(detail::SlaveTxProvenance::Fill, event.count).has_value();
+                break;
+            case detail::SlaveQueueRawEventKind::FifoOccupancy: {
+                auto observed = _queued_tx_ledger.observeFifoOccupancy(event.value);
+                commit        = observed.has_value() && confirm(*observed, true);
+                break;
+            }
+            case detail::SlaveQueueRawEventKind::StopBoundary:
+            case detail::SlaveQueueRawEventKind::TxEmptyBoundary:
+            case detail::SlaveQueueRawEventKind::AbortBoundary: {
+                const auto evidence = event.kind == detail::SlaveQueueRawEventKind::TxEmptyBoundary
+                                          ? detail::SlaveTxBoundaryEvidence::ShifterDrained
+                                          : detail::SlaveTxBoundaryEvidence::ShifterAmbiguous;
+                auto stopped        = _queued_tx_ledger.confirmBoundaryAndDiscard(event.value, evidence);
+                if (stopped.has_value()) {
+                    boundary_result = *stopped;
+                    boundary        = true;
+                } else {
+                    commit = false;
+                }
+                break;
+            }
+        }
+        if (!commit || _queued_bridge.workerCommitStep(worker) != detail::SlaveQueueBridgeResult::Accepted) {
+            __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+            publish(slave::SlaveEvent::BusBroken);
+            break;
+        }
+        if (boundary) {
+            if (_queued_bridge.workerResolveTxBoundary(worker, static_cast<uint32_t>(boundary_result.confirmed.real),
+                                                       static_cast<uint32_t>(boundary_result.unclocked.real)) !=
+                    detail::SlaveQueueBridgeResult::Accepted ||
+                !confirm(boundary_result.confirmed, false)) {
+                __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+                publish(slave::SlaveEvent::BusBroken);
+                break;
+            }
+        }
+    }
+
+    if (__atomic_load_n(&_queued_broken, __ATOMIC_ACQUIRE) == 0 &&
+        _queued_bridge.workerState() == detail::SlaveQueueBridgeState::Active) {
+        const size_t writable = _queued_bridge.workerTxWritable();
+        const size_t borrowed = _queued_copied_unique - _queued_popped_confirmed;
+        if (writable != 0) {
+            auto bytes = accessor->backendTxQueue().peekBytes(borrowed + writable);
+            if (bytes.has_value()) {
+                const size_t available  = bytes->first.size + bytes->second.size;
+                const size_t copy_count = available > borrowed ? std::min(writable, available - borrowed) : 0;
+                uint8_t local[kQueuedTxCapacity];
+                for (size_t i = 0; i < copy_count; ++i) {
+                    const size_t source = borrowed + i;
+                    local[i]            = source < bytes->first.size
+                                              ? static_cast<const uint8_t*>(bytes->first.data)[source]
+                                              : static_cast<const uint8_t*>(bytes->second.data)[source - bytes->first.size];
+                }
+                if (copy_count != 0 && _queued_bridge.workerStageTx(worker, local, copy_count) ==
+                                           detail::SlaveQueueBridgeResult::Accepted) {
+                    _queued_copied_unique += copy_count;
+                }
+            }
+        }
+    }
+    portENTER_CRITICAL_SAFE(&_mux);
+    ++_queued_worker_runs;
+    portEXIT_CRITICAL_SAFE(&_mux);
+    if (_queued_bridge.broken()) {
+        __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+        publish(slave::SlaveEvent::BusBroken);
+    }
+    // The worker lease ends before the task-side ISR lease below. Together with
+    // _mux, bridge sessions make the hardware FIFO a sole serialized consumer.
+    resumeQueuedHardwareFromTask();
+}
+
+void SlaveBus_espidf::resumeQueuedHardwareFromTask()
+{
+    portENTER_CRITICAL_SAFE(&_mux);
+    if (!_queued_active || _queued_closing || !_queued_be_reload_pending || _hw == nullptr ||
+        __atomic_load_n(&_queued_broken, __ATOMIC_ACQUIRE) != 0 || _queued_bridge.txPaused()) {
+        portEXIT_CRITICAL_SAFE(&_mux);
+        return;
+    }
+    if (::i2c_ll_is_bus_busy(_hw)) {
+        // An address may have won just before the task-side fence. Its STOP
+        // ISR establishes the real boundary and requests the same reload.
+        portEXIT_CRITICAL_SAFE(&_mux);
+        return;
+    }
+    auto session = _queued_bridge.isrBegin(_queued_generation);
+    if (session.status() != detail::SlaveQueueBridgeResult::Accepted) {
+        portEXIT_CRITICAL_SAFE(&_mux);
+        return;
+    }
+    if (_queued_bridge.boundaryRequired()) {
+        uint32_t free = 0;
+        ::i2c_ll_get_txfifo_len(_hw, &free);
+        const uint32_t occupancy = free >= SOC_I2C_FIFO_LEN ? 0 : SOC_I2C_FIFO_LEN - free;
+        if (_queued_bridge.abortBoundary(session, occupancy) != detail::SlaveQueueBridgeResult::Accepted) {
+            __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+        } else {
+            ::i2c_ll_disable_intr_mask(_hw, I2C_LL_INTR_MASK);
+            ::i2c_ll_txfifo_rst(_hw);
+        }
+        portEXIT_CRITICAL_SAFE(&_mux);
+        notifyTaskFromTask();
+        return;
+    }
+    ::i2c_ll_txfifo_rst(_hw);
+    uint8_t local[SOC_I2C_FIFO_LEN];
+    auto prepared = _queued_bridge.prepareTx(session, local, sizeof(local));
+    if (prepared.status != detail::SlaveQueueBridgeResult::Accepted) {
+        __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+        portEXIT_CRITICAL_SAFE(&_mux);
+        return;
+    }
+    ::i2c_ll_write_txfifo(_hw, local, static_cast<uint32_t>(prepared.count));
+    if (_queued_bridge.commitTxLoaded(session) != detail::SlaveQueueBridgeResult::Accepted) {
+        __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+        portEXIT_CRITICAL_SAFE(&_mux);
+        return;
+    }
+    _queued_be_reload_pending = false;
+    ::i2c_ll_set_slave_addr(_hw, _config.address, false);
+    ::i2c_ll_enable_intr_mask(
+        _hw, impl_espidf_slave::kBeRxWmIntr | I2C_TRANS_COMPLETE_INT_ENA_M | impl_espidf_slave::kBeTxWmIntr);
+    ::i2c_ll_update(_hw);
+    portEXIT_CRITICAL_SAFE(&_mux);
 }
 
 bool SlaveBus_espidf::bindIsrRegMap(IsrRegMapBinding* binding)
@@ -1041,6 +2259,10 @@ bool SlaveBus_espidf::bindIsrRegMap(IsrRegMapBinding* binding)
         return false;
     }
     portENTER_CRITICAL_SAFE(&_mux);
+    if (_queued_active) {
+        portEXIT_CRITICAL_SAFE(&_mux);
+        return false;
+    }
     // Last-bind-wins: just take the slot. The superseded binding (if any) is
     // left untouched -- its owner still believes it is bound until it calls
     // unbindIsrRegMap, which is then a no-op (ownership check there).
@@ -1088,9 +2310,9 @@ void SlaveBus_espidf::drainRxLocked(uint32_t count)
             while (count) {
                 uint8_t c = (count > SOC_I2C_FIFO_LEN) ? SOC_I2C_FIFO_LEN : static_cast<uint8_t>(count);
                 ::i2c_ll_read_rxfifo(_hw, scratch, c);
+                _rx_overflow_count += c;
                 count -= c;
             }
-            ++_rx_overflow_count;
             return;
         }
     }
@@ -1237,6 +2459,124 @@ void SlaveBus_espidf::isrThunk(void* arg)
     static_cast<SlaveBus_espidf*>(arg)->handleIsr();
 }
 
+bool SlaveBus_espidf::handleQueuedBeIsrLocked(::i2c_dev_t* hw, uint32_t ints, uint32_t rx, bool& task_woken)
+{
+    if (__atomic_load_n(&_queued_broken, __ATOMIC_ACQUIRE) != 0) {
+        uint8_t scratch[SOC_I2C_FIFO_LEN];
+        uint32_t remaining = rx;
+        while (remaining != 0) {
+            const uint32_t chunk = std::min<uint32_t>(remaining, sizeof(scratch));
+            ::i2c_ll_read_rxfifo(hw, scratch, chunk);
+            remaining -= chunk;
+        }
+        if (rx != 0) __atomic_fetch_add(&_queued_dropped_rx, rx, __ATOMIC_RELAXED);
+        if (ints & I2C_TRANS_COMPLETE_INT_ENA_M) {
+            ::i2c_ll_disable_intr_mask(hw, I2C_LL_INTR_MASK);
+            ::i2c_ll_txfifo_rst(hw);
+            ::i2c_ll_rxfifo_rst(hw);
+        } else {
+            // Keep RX/STOP enabled until the accepted write reaches STOP so
+            // every subsequently clocked byte is drained and counted exactly.
+            ::i2c_ll_disable_intr_mask(hw, impl_espidf_slave::kBeTxWmIntr);
+        }
+        notifyTaskFromISR(task_woken);
+        return false;
+    }
+    auto session = _queued_bridge.isrBegin(_queued_generation);
+    if (session.status() != detail::SlaveQueueBridgeResult::Accepted) return false;
+    bool activity      = false;
+    auto break_backend = [&]() __attribute__((always_inline))
+    {
+        __atomic_store_n(&_queued_broken, 1, __ATOMIC_RELEASE);
+        ::i2c_ll_set_slave_addr(hw, 0x3FFu, true);
+        ::i2c_ll_disable_intr_mask(hw, impl_espidf_slave::kBeTxWmIntr);
+        ::i2c_ll_update(hw);
+    };
+    auto drain_rx = [&](uint32_t count) __attribute__((always_inline))
+    {
+        if (count == 0) return true;
+        auto prepared = _queued_bridge.prepareRx(session, count);
+        if (prepared.status != detail::SlaveQueueBridgeResult::Accepted) {
+            uint8_t scratch[SOC_I2C_FIFO_LEN];
+            uint32_t remaining = count;
+            while (remaining != 0) {
+                const uint32_t chunk = std::min<uint32_t>(remaining, sizeof(scratch));
+                ::i2c_ll_read_rxfifo(hw, scratch, chunk);
+                remaining -= chunk;
+            }
+            __atomic_fetch_add(&_queued_dropped_rx, count, __ATOMIC_RELAXED);
+            break_backend();
+            return false;
+        }
+        if (prepared.first.size != 0)
+            ::i2c_ll_read_rxfifo(hw, prepared.first.data, static_cast<uint32_t>(prepared.first.size));
+        if (prepared.second.size != 0)
+            ::i2c_ll_read_rxfifo(hw, prepared.second.data, static_cast<uint32_t>(prepared.second.size));
+        if (_queued_bridge.commitRx(session) != detail::SlaveQueueBridgeResult::Accepted) {
+            break_backend();
+            return false;
+        }
+        activity = true;
+        return true;
+    };
+    auto refill_tx = [&]() __attribute__((always_inline))
+    {
+        uint32_t free = 0;
+        ::i2c_ll_get_txfifo_len(hw, &free);
+        const uint32_t occupancy = free >= SOC_I2C_FIFO_LEN ? 0 : SOC_I2C_FIFO_LEN - free;
+        if (_queued_bridge.observeFifo(session, occupancy) != detail::SlaveQueueBridgeResult::Accepted) {
+            break_backend();
+            return false;
+        }
+        if (free != 0) {
+            uint8_t local[SOC_I2C_FIFO_LEN];
+            auto prepared = _queued_bridge.prepareTx(session, local, std::min<size_t>(free, sizeof(local)));
+            if (prepared.status != detail::SlaveQueueBridgeResult::Accepted) {
+                break_backend();
+                return false;
+            }
+            ::i2c_ll_write_txfifo(hw, local, static_cast<uint32_t>(prepared.count));
+            if (_queued_bridge.commitTxLoaded(session) != detail::SlaveQueueBridgeResult::Accepted) {
+                break_backend();
+                return false;
+            }
+        }
+        activity = true;
+        return true;
+    };
+    if ((ints & impl_espidf_slave::kBeRxWmIntr) && rx) {
+        (void)drain_rx(rx);
+        rx = 0;
+    }
+    if (__atomic_load_n(&_queued_broken, __ATOMIC_ACQUIRE) == 0 && (ints & impl_espidf_slave::kBeTxWmIntr))
+        (void)refill_tx();
+    if (__atomic_load_n(&_queued_broken, __ATOMIC_ACQUIRE) == 0 && (ints & I2C_TRANS_COMPLETE_INT_ENA_M)) {
+        if (rx) (void)drain_rx(rx);
+        if (__atomic_load_n(&_queued_broken, __ATOMIC_ACQUIRE) == 0) {
+            uint32_t free = 0;
+            ::i2c_ll_get_txfifo_len(hw, &free);
+            const uint32_t occupancy = free >= SOC_I2C_FIFO_LEN ? 0 : SOC_I2C_FIFO_LEN - free;
+            if (_queued_bridge.stopBoundary(session, occupancy) != detail::SlaveQueueBridgeResult::Accepted) {
+                break_backend();
+            } else {
+                ::i2c_ll_set_slave_addr(hw, 0x3FFu, true);
+                ::i2c_ll_disable_intr_mask(hw, I2C_LL_INTR_MASK);
+                ::i2c_ll_txfifo_rst(hw);
+                ::i2c_ll_update(hw);
+                _queued_be_reload_pending = true;
+                activity                  = true;
+            }
+        }
+    }
+    if (__atomic_load_n(&_queued_broken, __ATOMIC_ACQUIRE) != 0 && (ints & I2C_TRANS_COMPLETE_INT_ENA_M)) {
+        ::i2c_ll_disable_intr_mask(hw, I2C_LL_INTR_MASK);
+        ::i2c_ll_txfifo_rst(hw);
+        ::i2c_ll_rxfifo_rst(hw);
+    }
+    if (activity || __atomic_load_n(&_queued_broken, __ATOMIC_ACQUIRE) != 0) notifyTaskFromISR(task_woken);
+    return activity;
+}
+
 void SlaveBus_espidf::handleIsr()
 {
     ::i2c_dev_t* hw = _hw;
@@ -1253,6 +2593,16 @@ void SlaveBus_espidf::handleIsr()
     ::i2c_ll_get_rxfifo_cnt(hw, &rx);
 
     portENTER_CRITICAL_ISR(&_mux);
+
+    if (_queued_active) {
+        (void)handleQueuedBeIsrLocked(hw, ints, rx, woken);
+        portEXIT_CRITICAL_ISR(&_mux);
+#if defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)
+        processQueuedWorker();
+#endif
+        if (woken) portYIELD_FROM_ISR();
+        return;
+    }
 
     // Snapshot once per pass: bindIsrRegMap/unbindIsrRegMap only run in task
     // context under this same _mux, so this cannot flip mid-pass.
@@ -1342,6 +2692,9 @@ void SlaveBus_espidf::handleIsr()
 
 result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
 {
+    if (!initializationAllowed(false)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
     if (cfg.pin_scl < 0 || cfg.pin_sda < 0 || cfg.address_is_10bit || cfg.address > 0x7Fu) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
@@ -1353,15 +2706,21 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
 #endif
+    // The callback driver cannot provide the ordered read-completion facts
+    // required by the exact queue contract. Keep it legacy-only and reject the
+    // default lifecycle before creating a slave device that would already ACK.
+    if (!cfg.legacy_wire_frame_window) {
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
     const auto port_r = impl_espidf_slave::resolveSlaveControllerPort(cfg.controller);
     if (!port_r.has_value()) {
         return m5::stl::make_unexpected(port_r.error());
     }
 
     if (_handle != nullptr || _task != nullptr) {
-        auto released = release();
-        if (!released.has_value()) {
-            return m5::stl::make_unexpected(released.error());
+        auto reset = resetForInitialization();
+        if (!reset.has_value()) {
+            return reset;
         }
     }
     _config = cfg;
@@ -1395,9 +2754,9 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
 
     auto mapped = impl_espidf_slave::mapEspErr(::i2c_new_slave_device(&native_cfg, &_handle));
     if (error::isError(mapped)) {
-        auto released = release();
-        if (!released.has_value()) {
-            return m5::stl::make_unexpected(released.error());
+        auto reset = resetForInitialization();
+        if (!reset.has_value()) {
+            return reset;
         }
         return m5::stl::make_unexpected(mapped);
     }
@@ -1407,16 +2766,21 @@ result_t<void> SlaveBus_espidf::init(const i2c::SlaveBusConfig& cfg)
     callbacks.on_request                    = &SlaveBus_espidf::onRequest;
     mapped = impl_espidf_slave::mapEspErr(::i2c_slave_register_event_callbacks(_handle, &callbacks, this));
     if (error::isError(mapped)) {
-        auto released = release();
-        if (!released.has_value()) {
-            return m5::stl::make_unexpected(released.error());
+        auto reset = resetForInitialization();
+        if (!reset.has_value()) {
+            return reset;
         }
         return m5::stl::make_unexpected(mapped);
+    }
+    auto initialized = markInitializationSucceeded(false);
+    if (!initialized.has_value()) {
+        (void)resetForInitialization();
+        return initialized;
     }
     return {};
 }
 
-result_t<void> SlaveBus_espidf::release(void)
+bus::CloseOutcome SlaveBus_espidf::teardownBackend(void)
 {
     if (_task != nullptr) {
         portENTER_CRITICAL_SAFE(&_mux);
@@ -1424,7 +2788,7 @@ result_t<void> SlaveBus_espidf::release(void)
         portEXIT_CRITICAL_SAFE(&_mux);
         notifyTaskFromTask();
         if (!impl_espidf_slave::waitTaskStopped(&_mux, _task_running)) {
-            return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+            return bus::CloseOutcome::partialOrUnknown(error::error_t::TIMEOUT_ERROR);
         }
         _task = nullptr;
     }
@@ -1432,7 +2796,7 @@ result_t<void> SlaveBus_espidf::release(void)
     if (_handle != nullptr) {
         auto mapped = impl_espidf_slave::mapEspErr(::i2c_del_slave_device(_handle));
         if (error::isError(mapped)) {
-            return m5::stl::make_unexpected(mapped);
+            return bus::CloseOutcome::partialOrUnknown(mapped);
         }
         _handle = nullptr;
     }
@@ -1442,7 +2806,7 @@ result_t<void> SlaveBus_espidf::release(void)
     _task_stop    = false;
     _task_running = false;
     portEXIT_CRITICAL_SAFE(&_mux);
-    return {};
+    return bus::CloseOutcome::success();
 }
 
 bool SlaveBus_espidf::onReceive(::i2c_slave_dev_handle_t handle, const ::i2c_slave_rx_done_event_data_t* evt_data,
@@ -1455,7 +2819,11 @@ bool SlaveBus_espidf::onReceive(::i2c_slave_dev_handle_t handle, const ::i2c_sla
     }
     bool task_woken = false;
     portENTER_CRITICAL_ISR(&self->_mux);
-    auto* txn = self->allocateTransactionLocked();
+    // ESP-IDF defines length as the size of the callback's received buffer.
+    // A non-zero length with a null buffer violates that contract, so it
+    // contributes no valid bytes and must not create readable zero-filled data.
+    const size_t received_len = evt_data->buffer != nullptr ? static_cast<size_t>(evt_data->length) : 0;
+    auto* txn                 = self->allocateTransactionLocked();
     if (txn != nullptr) {
         // Non-LL callback path: the driver delivers the WHOLE transaction post-STOP
         // in one buffer, so there is no mid-transaction draining to make room. Unlike
@@ -1464,17 +2832,17 @@ bool SlaveBus_espidf::onReceive(::i2c_slave_dev_handle_t handle, const ::i2c_sla
         // rxOverflowCount). The bytes land at rx[0..copy_len) with rx_read = 0, which
         // is the ring's natural start, so the wrap-aware read() handles this path
         // unchanged.
-        const size_t copy_len = std::min(static_cast<size_t>(evt_data->length), kRxArrayCapacity);
-        if (copy_len > 0 && evt_data->buffer != nullptr) {
+        const size_t copy_len = std::min(received_len, kRxArrayCapacity);
+        if (copy_len > 0) {
             ::memcpy(txn->rx, evt_data->buffer, copy_len);
         }
         txn->rx_size   = copy_len;
         txn->rx_read   = 0;
         txn->complete  = true;
         self->_current = txn;
-        if (copy_len < static_cast<size_t>(evt_data->length)) {
-            ++self->_rx_overflow_count;
-        }
+        self->_rx_overflow_count += received_len - copy_len;
+    } else {
+        self->_rx_overflow_count += received_len;
     }
     // Wake the serve() consumer parked in waitForActivity() so a completed
     // transaction is drained promptly instead of waiting out its safety timeout.
@@ -1514,17 +2882,22 @@ bool SlaveBus_espidf::onRequest(::i2c_slave_dev_handle_t handle, const ::i2c_sla
 #endif  // M5HAL_ESPIDF_I2C_SLAVE_LL / M5HAL_ESPIDF_I2C_SLAVE_LL_BE / v2 driver
 
 // ===========================================================================
-// Shared transaction-window state machine (HW independent)
+// Shared legacy wire-frame-window state machine (HW independent)
 // ===========================================================================
 
-result_t<void> SlaveBus_espidf::beginTransaction(bus::IAccessor* owner, uint32_t timeout_ms)
+result_t<void> SlaveBus_espidf::tryOpenWireFrame(bus::IAccessor* owner)
 {
-    (void)timeout_ms;
     if (owner == nullptr) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
     bool should_notify = false;
     portENTER_CRITICAL_SAFE(&_mux);
+#if M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_SLAVE_LL_BE
+    if (!_config.legacy_wire_frame_window || _queued_lifecycle_used) {
+        portEXIT_CRITICAL_SAFE(&_mux);
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+#endif
     if (_open != nullptr) {
         portEXIT_CRITICAL_SAFE(&_mux);
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
@@ -1545,7 +2918,7 @@ result_t<void> SlaveBus_espidf::beginTransaction(bus::IAccessor* owner, uint32_t
     return {};
 }
 
-result_t<void> SlaveBus_espidf::endTransaction(bus::IAccessor* owner)
+result_t<void> SlaveBus_espidf::closeWireFrame(bus::IAccessor* owner)
 {
     portENTER_CRITICAL_SAFE(&_mux);
     if (!isOpenOwnerLocked(owner)) {
@@ -1727,7 +3100,7 @@ result_t<size_t> SlaveBus_espidf::readableBytes(bus::IAccessor* owner)
     return result;
 }
 
-result_t<bool> SlaveBus_espidf::transactionComplete(bus::IAccessor* owner)
+result_t<bool> SlaveBus_espidf::wireFrameComplete(bus::IAccessor* owner)
 {
     portENTER_CRITICAL_SAFE(&_mux);
     if (!isOpenOwnerLocked(owner)) {
@@ -1754,7 +3127,6 @@ void SlaveBus_espidf::resetStateLocked()
     _open               = nullptr;
     _open_owner         = nullptr;
     _request_pending    = false;
-    _pending_fill       = false;
     _pending_commit_len = 0;
     _pending_commit_txn = nullptr;
     _pending_commit_seq = 0;
@@ -1788,6 +3160,14 @@ SlaveBus_espidf::Transaction* SlaveBus_espidf::allocateTransactionLocked()
         }
     }
     if (oldest != nullptr) {
+        // Recycling a full transaction table discards any RX backlog that the
+        // consumer did not open/drain. Surface the actual number of lost bytes,
+        // not one overflow event. rx_read normally cannot exceed rx_size (read()
+        // advances it by min(requested, readable)), but keep this subtraction
+        // defensive so a corrupted transaction can never underflow the counter.
+        if (oldest->rx_read < oldest->rx_size) {
+            _rx_overflow_count += oldest->rx_size - oldest->rx_read;
+        }
         *oldest        = Transaction{};
         oldest->in_use = true;
         oldest->seq    = _next_seq++;
@@ -1905,6 +3285,9 @@ void SlaveBus_espidf::requestTaskLoop()
         ::TickType_t wait_ticks = portMAX_DELAY;
         portENTER_CRITICAL_SAFE(&_mux);
         const bool stop = _task_stop;
+#if M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_SLAVE_LL_BE
+        const bool queued = _queued_active;
+#endif
         // Only arm the finite stretch-budget wait when an actual TX read-stretch hold
         // is in flight. _request_pending stays true from a read's address-match until
         // its STOP, but once the hold is released (fill-byte fallback or write(), so
@@ -1926,9 +3309,37 @@ void SlaveBus_espidf::requestTaskLoop()
             break;
         }
 
+#if M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_SLAVE_LL_BE
+        if (queued) {
+            // Drain work that may already have been queued before this loop
+            // observed queued mode. A notification arriving between this pass
+            // and the take remains latched by FreeRTOS for the next pass.
+            processQueuedWorker();
+            (void)::ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            continue;
+        }
+#endif
+
         (void)::ulTaskNotifyTake(pdTRUE, wait_ticks);
 
+#if M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_SLAVE_LL_BE
+        // beginOperation() can switch this task from the legacy wire-frame
+        // window while it is already parked above. Re-check after every wake:
+        // otherwise the first queued write notification could be consumed by
+        // the legacy wait and the task would park again without staging it.
+        portENTER_CRITICAL_SAFE(&_mux);
+        const bool queued_after_wake = _queued_active;
+        const bool stop_after_wake   = _task_stop;
+        portEXIT_CRITICAL_SAFE(&_mux);
+        if (stop_after_wake) continue;
+        if (queued_after_wake) {
+            processQueuedWorker();
+            continue;
+        }
+#endif
+
 #if M5HAL_ESPIDF_I2C_SLAVE_LL
+
         // LL path: a read stretch is held by the ISR. Compose the reply from the
         // open transaction's tx queue, then release the stretch.
         //
@@ -1982,7 +3393,7 @@ void SlaveBus_espidf::requestTaskLoop()
         // BE has no clock stretch to hold, so there is nothing to release here:
         // the ISR fills/streams TX directly (see handleIsr()'s TX water-mark
         // and STOP handling). This task exists only to satisfy the shared
-        // wake/stop machinery (waitForActivity, release()); its loop body is a
+        // wake/stop machinery (waitForActivity, teardown); its loop body is a
         // deliberate no-op for this flavor.
 #else
         for (;;) {
@@ -2037,7 +3448,6 @@ bool SlaveBus_espidf::collectPendingWrite(uint8_t* dst, size_t& len, bool& gener
         _pending_commit_len = len;
         _pending_commit_txn = txn;
         _pending_commit_seq = txn->seq;
-        _pending_fill       = false;
         const size_t start  = txn->tx_read & (kTxCapacity - 1);
         const size_t first  = std::min(len, kTxCapacity - start);
         ::memcpy(dst, txn->tx + start, first);
@@ -2052,7 +3462,6 @@ bool SlaveBus_espidf::collectPendingWrite(uint8_t* dst, size_t& len, bool& gener
         _pending_commit_len = 0;
         _pending_commit_txn = nullptr;
         _pending_commit_seq = 0;
-        _pending_fill       = true;
         generated_fill      = true;
         should_write        = true;
     }
@@ -2074,7 +3483,6 @@ void SlaveBus_espidf::markWriteCommitted(size_t len)
     _pending_commit_len = 0;
     _pending_commit_txn = nullptr;
     _pending_commit_seq = 0;
-    _pending_fill       = false;
     portEXIT_CRITICAL_SAFE(&_mux);
 }
 

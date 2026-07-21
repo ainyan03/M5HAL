@@ -30,18 +30,19 @@ M5HAL_INLINE_V2 namespace v2
       uint32_t micros(void);        // wall-clock µs since start, wraps
       void     delayMs(uint32_t);   // at least ms; yields the task
       void     delayUs(uint32_t);   // busy-wait precision, short delays
-      class    Mutex;               // bool lock(uint32_t timeout_ms);
-                                    // void unlock();
-      class    Task;                // bool start(entry_fn_t, void*, ...);
+      class    Mutex;               // result_t<void> lock(uint32_t timeout_ms);
+                                    // result_t<void> unlock();
+      class    Task;                // result_t<void> start(entry_fn_t, void*, ...);
                                     // void join(); bool joinable() const;
-      class    Event;               // bool wait(uint32_t timeout_ms);
+      class    Event;               // result_t<void> wait(uint32_t timeout_ms);
                                     // void notify();
       void*    currentTaskId(void); // opaque per-task identity, ==-only
 
   Event semantics: a latching binary event for task-context
   wait/notify pairs (single waiter, at most one notify latched;
   repeated notifies may merge). `wait` blocks up to timeout_ms for a
-  notify and consumes it (true); 0 = non-blocking check,
+  notify and consumes it (success); timeout returns TIMEOUT_ERROR;
+  0 = non-blocking check,
   `types::TIMEOUT_FOREVER` = block until notified (the stub fake
   fails immediately instead, same documented exception as Mutex).
   A notify that arrives BEFORE the wait is not lost — the next wait
@@ -50,20 +51,25 @@ M5HAL_INLINE_V2 namespace v2
   context only; destroy only when no waiter exists and no concurrent
   notify can occur. Full contract: spec/design/runtime.md.
 
-  Mutex semantics: `lock` waits up to timeout_ms and returns
-  whether the mutex was taken; 0 = immediate try-lock,
+  Mutex semantics: `lock` waits up to timeout_ms and returns success
+  when acquired or TIMEOUT_ERROR when the budget expires; 0 = immediate try-lock,
   `types::TIMEOUT_FOREVER` = block until acquired (the stub fake is
   the documented exception: with no second task to release the lock
-  it fails immediately instead of hanging). Non-recursive — a re-lock
-  from the holding task waits until the timeout and fails; with
-  TIMEOUT_FOREVER it deadlocks (fail-loud: the task watchdog fires).
-  Task context only; never call from an ISR. Timeout granularity
+  it returns TIMEOUT_ERROR immediately instead of hanging). Non-recursive:
+  re-lock by the owning task is a contract violation. `unlock` must be
+  called by that same task; a backend-detectable invalid state is reported
+  as INVALID_STATE, but wrong-owner detection is not guaranteed. Task
+  context only; never call from an ISR. Timeout granularity
   follows the variant (one FreeRTOS tick — 10 ms by default — on the
   embedded targets).
 
   Task semantics: `start` creates one task/thread for a plain
-  `void (*)(void*)` entry point. The task stays joinable until `join`
-  observes the entry point return; the destructor joins if needed.
+  `void (*)(void*)` entry point and returns result_t<void>. Invalid
+  input/state, resource exhaustion, unsupported thread creation and
+  host OS errors remain distinguishable; see spec/design/runtime.md.
+  The task stays joinable until the idempotent void `join` observes
+  the entry point return; the destructor joins if needed. Self-join
+  and destruction from the running task are contract violations.
   Cancellation and stop flags belong to the user's argument object,
   not to runtime::Task.
 
@@ -80,8 +86,8 @@ M5HAL_INLINE_V2 namespace v2
   EARLY SCAN: unlike the bus kinds, runtime is resolved HERE rather
   than at the end of M5HAL_v2.hpp, because bus::IBus embeds
   runtime::Mutex by value and therefore needs the complete type. The
-  passes below mirror the main scan's framework order (arduino ->
-  espidf -> posix -> stub; software does not offer runtime) and ride
+  passes below mirror the main scan's framework order (freertos ->
+  arduino -> espidf -> posix -> stub; software does not offer runtime) and ride
   the same dispatch block in offer_all.inl with the non-runtime kinds
   masked (_macro/offer_runtime_only.inl). Platform variants do not
   currently offer runtime; when one does, add its pass FIRST here so
@@ -138,6 +144,25 @@ M5HAL_INLINE_V2 namespace v2
 #include "../../../variants/frameworks/stub/_offer.hpp"
 #include "../../../_macro/offer_runtime_only.inl"
 
+// An explicit provider must participate in this build and offer the requested
+// runtime sub-kind. Keep these diagnostics ahead of the fallback invariants so
+// configuration errors name the rejected input directly.
+#if M5HAL_CONFIG_VARIANT_RUNTIME != M5HAL_V2_VARIANT_ID_NONE && !defined(M5HAL_DETAIL_VARIANT_SELECTED_RUNTIME_)
+#error "M5HAL_CONFIG_VARIANT_RUNTIME selects an unavailable variant or one that does not offer RUNTIME"
+#endif
+#if M5HAL_CONFIG_VARIANT_RUNTIME_MUTEX != M5HAL_V2_VARIANT_ID_NONE && \
+    !defined(M5HAL_DETAIL_VARIANT_SELECTED_RUNTIME_MUTEX_)
+#error "M5HAL_CONFIG_VARIANT_RUNTIME_MUTEX selects an unavailable variant or one that does not offer RUNTIME_MUTEX"
+#endif
+#if M5HAL_CONFIG_VARIANT_RUNTIME_TASK != M5HAL_V2_VARIANT_ID_NONE && \
+    !defined(M5HAL_DETAIL_VARIANT_SELECTED_RUNTIME_TASK_)
+#error "M5HAL_CONFIG_VARIANT_RUNTIME_TASK selects an unavailable variant or one that does not offer RUNTIME_TASK"
+#endif
+#if M5HAL_CONFIG_VARIANT_RUNTIME_EVENT != M5HAL_V2_VARIANT_ID_NONE && \
+    !defined(M5HAL_DETAIL_VARIANT_SELECTED_RUNTIME_EVENT_)
+#error "M5HAL_CONFIG_VARIANT_RUNTIME_EVENT selects an unavailable variant or one that does not offer RUNTIME_EVENT"
+#endif
+
 // The stub fallback always offers runtime, so unlike the bus kinds
 // the selected-variant marker can never stay NONE — bus::IBus depends
 // on the type existing. Fail loudly if the invariant ever breaks.
@@ -178,6 +203,79 @@ M5HAL_INLINE_V2 namespace v2
 #else
 #error "runtime: currentTaskId has no mapping for the selected RUNTIME_TASK variant"
 #endif
+    }  // namespace runtime
+}
+}  // namespace hal
+}  // namespace m5
+
+#include "../types.hpp"  // types::TIMEOUT_FOREVER
+
+#include <cstdlib>
+
+namespace m5 {
+namespace hal {
+M5HAL_INLINE_V2 namespace v2
+{
+    namespace runtime {
+
+    /*!
+      @brief Unlock-or-abort scope guard adopting an already-locked Mutex.
+
+      The caller lock()s (and handles the lock error) first; the guard only
+      releases on scope exit. An unlock() failure means the lock state is
+      corrupted (wrong owner / backend fault) and no caller can continue
+      safely, so it aborts — the policy every call site previously
+      hand-rolled as a local struct.
+     */
+    class ScopedUnlock {
+    public:
+        explicit ScopedUnlock(Mutex& mutex) : _mutex{mutex}
+        {
+        }
+        ~ScopedUnlock()
+        {
+            if (!_mutex.unlock().has_value()) {
+                std::abort();
+            }
+        }
+        ScopedUnlock(const ScopedUnlock&)            = delete;
+        ScopedUnlock& operator=(const ScopedUnlock&) = delete;
+
+    private:
+        Mutex& _mutex;
+    };
+
+    /*!
+      @brief Lock-forever critical-section guard: aborts when lock() or
+             unlock() fails.
+
+      For internal tables whose critical sections are short and whose lock
+      can only fail on a corrupted mutex — there is no caller-visible error
+      path to report into (previously duplicated as a private `Guard` in the
+      bus registry/pool headers). Use ScopedUnlock instead when the caller
+      has a real timeout or wants to propagate the lock error.
+     */
+    class MutexGuard {
+    public:
+        explicit MutexGuard(Mutex& mutex) : _mutex{mutex}
+        {
+            if (!_mutex.lock(types::TIMEOUT_FOREVER).has_value()) {
+                std::abort();
+            }
+        }
+        ~MutexGuard()
+        {
+            if (!_mutex.unlock().has_value()) {
+                std::abort();
+            }
+        }
+        MutexGuard(const MutexGuard&)            = delete;
+        MutexGuard& operator=(const MutexGuard&) = delete;
+
+    private:
+        Mutex& _mutex;
+    };
+
     }  // namespace runtime
 }
 }  // namespace hal

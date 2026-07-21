@@ -66,6 +66,15 @@ static void scanI2C(m5hal::Hal& hal)
         return;
     }
 
+    // Hal::capabilities() describes the connection advertisement. This
+    // snapshot describes this acquired I2C Bus instance and its session.
+    const auto instance_caps = bus.value()->capabilities();
+    ::printf("I2C instance: master=%s tx=%s rx=%s generation=%u\n",
+             instance_caps.supports(m5hal::bus::BusFeature::MasterTransfer) ? "yes" : "no",
+             instance_caps.supports(m5hal::bus::BusFeature::Transmit) ? "yes" : "no",
+             instance_caps.supports(m5hal::bus::BusFeature::Receive) ? "yes" : "no",
+             static_cast<unsigned>(instance_caps.generation()));
+
     ::printf("I2C scan (SCL=22, SDA=21):\n");
     int found_count     = 0;
     uint16_t first_addr = 0xFFFF;
@@ -101,14 +110,14 @@ static void scanI2C(m5hal::Hal& hal)
         }
     }
 
-    // Explicitly release the bus. For remote backends this sends
+    // Explicitly close the bus. For remote backends this sends
     // BusRelease to the peer so the device frees the hardware resource. All
-    // accessors must be gone first; release consumes and clears this owner.
-    auto rel = hal.I2C.release(bus.value());
+    // accessors must be gone first; close consumes and clears this owner.
+    auto rel = hal.I2C.close(bus.value());
     if (rel.has_value()) {
-        ::printf("  I2C bus released.\n");
+        ::printf("  I2C bus closed.\n");
     } else {
-        ::printf("  I2C release failed: %s\n", m5hal::error::toString(rel.error()));
+        ::printf("  I2C close failed: %s\n", m5hal::error::toString(rel.error()));
     }
 }
 

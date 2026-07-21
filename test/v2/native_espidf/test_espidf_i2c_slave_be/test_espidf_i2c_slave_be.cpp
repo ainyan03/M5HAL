@@ -11,7 +11,7 @@
 // M5HAL_ESPIDF_I2C_SLAVE_LL -- see ../fakes/README.md.
 //
 // The LL flavor's harness (../test_espidf_i2c_slave/) exercises the shared
-// transaction-window machinery (RX/TX rings, STOP races); this one is scoped
+// legacy wire-frame-window machinery (RX/TX rings, STOP races); this one is scoped
 // to what is DIFFERENT about the BE fast path: the ISR interprets RX bytes as
 // register-map pointer/data directly (bypassing the Transaction rx[]/tx[]
 // rings entirely) and keeps the TX FIFO pre-composed from reg_file/onRead.
@@ -24,12 +24,12 @@
 // happens INSIDE one ISR pass rather than needing a later task wakeup.
 //
 // serve()'s fast-path branch itself (SlaveRegMapAccessor::serve() waiting on
-// transactionComplete()) is NOT exercised here: this harness's fake
+// wireFrameComplete()) is NOT exercised here: this harness's fake
 // FreeRTOS never actually blocks a task (../fakes/README.md "No scheduler"),
 // so a serve() call on a transaction that has not yet been completed by a
 // STOP fireIsr() would spin the test process forever instead of failing.
 // Every scenario below instead drives the underlying SlaveStreamAccessor
-// (acc.stream()) directly with a non-blocking beginTransaction(0), mirroring
+// (acc.stream()) directly with a non-blocking openWireFrame(0), mirroring
 // ../test_espidf_i2c_slave/'s kBeginNonBlocking pattern.
 
 #include <gtest/gtest.h>
@@ -51,33 +51,56 @@
 #include <soc/i2c_struct.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <memory>
+#include <numeric>
 #include <utility>
 #include <vector>
 
 namespace {
 
 using m5::hal::v2::data::DataSpan;
+using m5::hal::v2::i2c::SlaveAccessConfig;
+using m5::hal::v2::i2c::SlaveAccessor;
 using m5::hal::v2::i2c::SlaveBus_espidf;
 using m5::hal::v2::i2c::SlaveBusConfig;
 using m5::hal::v2::i2c::SlaveRegMapAccessor;
+using m5::hal::v2::i2c::SlaveStreamAccessor;
 
 // Same non-blocking-open rationale as ../test_espidf_i2c_slave/: every
 // scenario fires the ISR before the accessor opens, so the transaction it
 // wants is ALWAYS already allocated.
 constexpr uint32_t kBeginNonBlocking = 0;
 
+i2c_dev_t& fakeHw();
+
 SlaveBusConfig makeConfig()
 {
     SlaveBusConfig cfg;
-    cfg.pin_scl = 1;
-    cfg.pin_sda = 2;
-    cfg.address = 0x42;
+    cfg.pin_scl                  = 1;
+    cfg.pin_sda                  = 2;
+    cfg.address                  = 0x42;
+    cfg.legacy_wire_frame_window = true;
     // TxUnderrun::Fill is the default already -- BE rejects ::Stretch at
     // init() (no clock stretch to hold a reply compose on), so this is the
     // only legal value here.
     return cfg;
+}
+
+TEST(EspidfI2cSlaveBeHostHarness, DefaultQueuedLifecycleStartsFenced)
+{
+    SlaveBus_espidf bus;
+    SlaveBusConfig cfg;
+    cfg.pin_scl = 1;
+    cfg.pin_sda = 2;
+    cfg.address = 0x42;
+
+    auto initialized = bus.init(cfg);
+    ASSERT_TRUE(initialized.has_value());
+    EXPECT_EQ(fakeHw().slave_address, 0x3FFu);
+    EXPECT_TRUE(fakeHw().slave_address_10bit);
+    EXPECT_EQ(fakeHw().int_ena, 0u);
 }
 
 // Fake device model access -- see ../test_espidf_i2c_slave/'s identical
@@ -177,6 +200,42 @@ struct Harness {
     }
 };
 
+struct StreamHarness {
+    SlaveBus_espidf bus;
+    SlaveStreamAccessor acc{bus};
+
+    StreamHarness()
+    {
+        auto r = bus.init(makeConfig());
+        if (!r.has_value()) {
+            ADD_FAILURE() << "bus.init failed: err=" << m5::hal::v2::error::toString(r.error());
+        }
+    }
+};
+
+SlaveAccessConfig byteQueueConfig()
+{
+    SlaveAccessConfig config;
+    config.tx_mode = m5::hal::v2::slave::QueueMode::Byte;
+    config.rx_mode = m5::hal::v2::slave::QueueMode::Byte;
+    return config;
+}
+
+struct QueueHarness {
+    SlaveBus_espidf bus;
+    m5::hal::v2::slave::StaticSlaveQueueStorage<128, 128, 1, 1> queues;
+    m5::hal::v2::i2c::StaticI2cSegmentStorage<1> segments;
+    SlaveAccessor acc{bus, queues.tx(), queues.rx(), segments.storage(), byteQueueConfig()};
+
+    QueueHarness()
+    {
+        auto cfg                     = makeConfig();
+        cfg.legacy_wire_frame_window = false;
+        auto r                       = bus.init(cfg);
+        if (!r.has_value()) ADD_FAILURE() << "bus.init failed: " << m5::hal::v2::error::toString(r.error());
+    }
+};
+
 // Expected register-map window starting at `pointer`, `count` bytes, 8-bit
 // wrap -- matches reg_file[i] == i (Harness's default content).
 std::vector<uint8_t> expectedWindow(uint8_t pointer, size_t count)
@@ -189,6 +248,202 @@ std::vector<uint8_t> expectedWindow(uint8_t pointer, size_t count)
 }
 
 }  // namespace
+
+TEST(EspidfI2cSlaveBeQueuedHostHarness, ByteRxAndEndLifecycle)
+{
+    QueueHarness h;
+    const unsigned updates_before_begin = fakeHw().update_count;
+    ASSERT_TRUE(h.acc.beginAccess(100).has_value());
+    EXPECT_GT(fakeHw().update_count, updates_before_begin);
+    EXPECT_EQ(fakeHw().slave_address, 0x42u);
+    const std::array<uint8_t, 3> wire{0x11, 0x22, 0x33};
+    primeRxFifo(wire);
+    fireIsr(I2C_RXFIFO_WM_INT_ENA_M, false);
+    std::array<uint8_t, 3> received{};
+    auto read = h.acc.read({received.data(), received.size()});
+    ASSERT_TRUE(read.has_value());
+    EXPECT_EQ(*read, received.size());
+    EXPECT_EQ(received, wire);
+    const unsigned updates_before_end = fakeHw().update_count;
+    EXPECT_TRUE(h.acc.endAccess(100).has_value());
+    EXPECT_GT(fakeHw().update_count, updates_before_end);
+    EXPECT_EQ(fakeHw().slave_address, 0x3FFu);
+}
+
+TEST(EspidfI2cSlaveBeQueuedHostHarness, EndFenceCannotBeReopenedByPendingWorker)
+{
+    QueueHarness h;
+    ASSERT_TRUE(h.acc.beginAccess(100).has_value());
+    EXPECT_EQ(fakeHw().slave_address, 0x42u);
+    h.bus.testRunWorkerDuringQueuedEnd();
+    ASSERT_TRUE(h.acc.endAccess(100).has_value());
+    EXPECT_EQ(fakeHw().slave_address, 0x3FFu);
+    EXPECT_TRUE(fakeHw().slave_address_10bit);
+    EXPECT_EQ(fakeHw().int_ena, 0u);
+    EXPECT_TRUE(h.bus.testQueuedEndpointsDetached());
+}
+
+TEST(EspidfI2cSlaveBeQueuedHostHarness, RegMapBindingIsRejectedDuringQueuedAccess)
+{
+    QueueHarness h;
+    const std::array<uint8_t, 3> reply{0x61, 0x62, 0x63};
+    ASSERT_TRUE(h.acc.write({reply.data(), reply.size()}).has_value());
+    ASSERT_TRUE(h.acc.beginAccess(100).has_value());
+    ASSERT_GE(fakeHw().txfifo_count, reply.size());
+    const std::array<uint8_t, 3> queued_prefix{fakeHw().txfifo[0], fakeHw().txfifo[1], fakeHw().txfifo[2]};
+
+    std::array<uint8_t, 256> registers{};
+    m5::hal::v2::i2c::IsrRegMapBinding binding;
+    binding.reg_file = {registers.data(), registers.size()};
+    EXPECT_FALSE(h.bus.bindIsrRegMap(&binding));
+    EXPECT_EQ(fakeHw().txfifo_count, i2c_dev_t::kFifoLen);
+    EXPECT_TRUE(std::equal(queued_prefix.begin(), queued_prefix.end(), fakeHw().txfifo));
+    ASSERT_TRUE(h.acc.endAccess(100).has_value());
+    EXPECT_TRUE(h.bus.bindIsrRegMap(&binding));
+    h.bus.unbindIsrRegMap(&binding);
+}
+
+TEST(EspidfI2cSlaveBeQueuedHostHarness, StuckWorkerEndDeletesTaskDetachesAndKeepsBackendBroken)
+{
+    QueueHarness h;
+    const uint32_t deleted_before = m5hal_hostharness::deletedTaskCount();
+    ASSERT_TRUE(h.acc.beginAccess(100).has_value());
+    h.bus.testHoldQueuedWorkerSession();
+    auto ended = h.acc.endAccess(0);
+    ASSERT_FALSE(ended.has_value());
+    EXPECT_EQ(ended.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+    EXPECT_TRUE(h.bus.testQueuedEndpointsDetached());
+    EXPECT_FALSE(h.bus.testQueuedProducerTaskPresent());
+    EXPECT_EQ(m5hal_hostharness::deletedTaskCount(), deleted_before + 1);
+    EXPECT_FALSE(h.acc.beginAccess(0).has_value());
+    h.bus.testReleaseHeldQueuedWorkerSession();
+    ASSERT_TRUE(h.bus.close().has_value());
+    auto cfg                     = makeConfig();
+    cfg.legacy_wire_frame_window = false;
+    ASSERT_TRUE(h.bus.init(cfg).has_value());
+    ASSERT_TRUE(h.acc.beginAccess(100).has_value());
+    ASSERT_TRUE(h.acc.endAccess(100).has_value());
+}
+
+TEST(EspidfI2cSlaveBeQueuedHostHarness, BeginRollbackStopsStuckWorkerAndDetaches)
+{
+    QueueHarness h;
+    const uint32_t deleted_before = m5hal_hostharness::deletedTaskCount();
+    h.bus.testFailNextQueuedBeginWithHeldWorker();
+    auto begun = h.acc.beginAccess(100);
+    ASSERT_FALSE(begun.has_value());
+    EXPECT_EQ(begun.error(), m5::hal::v2::error::error_t::INVALID_STATE);
+    EXPECT_TRUE(h.bus.testQueuedEndpointsDetached());
+    EXPECT_FALSE(h.bus.testQueuedProducerTaskPresent());
+    EXPECT_EQ(m5hal_hostharness::deletedTaskCount(), deleted_before + 1);
+    h.bus.testReleaseHeldQueuedWorkerSession();
+}
+
+TEST(EspidfI2cSlaveBeQueuedHostHarness, FrameAndLegacyOperationAreExplicitlyUnsupported)
+{
+    {
+        SlaveBus_espidf bus;
+        auto cfg                     = makeConfig();
+        cfg.legacy_wire_frame_window = false;
+        ASSERT_TRUE(bus.init(cfg).has_value());
+        m5::hal::v2::slave::StaticSlaveQueueStorage<128, 128, 1, 1> queues;
+        m5::hal::v2::i2c::StaticI2cSegmentStorage<1> segments;
+        SlaveAccessConfig frame_config;
+        frame_config.rx_mode = m5::hal::v2::slave::QueueMode::Frame;
+        SlaveAccessor acc{bus, queues.tx(), queues.rx(), segments.storage(), frame_config};
+        auto begun = acc.beginAccess(0);
+        ASSERT_FALSE(begun.has_value());
+        EXPECT_EQ(begun.error(), m5::hal::v2::error::error_t::UNSUPPORTED);
+        m5hal_hostharness::runCreatedTaskOnNextDelay();
+    }
+    {
+        SlaveBus_espidf bus;
+        ASSERT_TRUE(bus.init(makeConfig()).has_value());
+        m5::hal::v2::slave::StaticSlaveQueueStorage<128, 128, 1, 1> queues;
+        m5::hal::v2::i2c::StaticI2cSegmentStorage<1> segments;
+        SlaveAccessor acc{bus, queues.tx(), queues.rx(), segments.storage(), byteQueueConfig()};
+        auto begun = acc.beginAccess(0);
+        ASSERT_FALSE(begun.has_value());
+        EXPECT_EQ(begun.error(), m5::hal::v2::error::error_t::UNSUPPORTED);
+        m5hal_hostharness::runCreatedTaskOnNextDelay();
+    }
+}
+
+TEST(EspidfI2cSlaveBeQueuedHostHarness, TxIsPoppedOnlyAfterStopAndEarlyNackSuffixIsReplayed)
+{
+    QueueHarness h;
+    const std::array<uint8_t, 4> reply{0xA0, 0xA1, 0xA2, 0xA3};
+    ASSERT_TRUE(h.acc.write({reply.data(), reply.size()}).has_value());
+    ASSERT_TRUE(h.acc.beginAccess(100).has_value());
+    EXPECT_EQ(h.acc.writable(), 128u - reply.size());
+    ASSERT_EQ(fakeHw().txfifo_count, i2c_dev_t::kFifoLen);
+    EXPECT_TRUE(std::equal(reply.begin(), reply.end(), fakeHw().txfifo))
+        << std::hex << static_cast<int>(fakeHw().txfifo[0]) << ' ' << static_cast<int>(fakeHw().txfifo[1]) << ' '
+        << static_cast<int>(fakeHw().txfifo[2]);
+
+    // Two bytes reached the master and the next byte moved into the shifter
+    // before the early NACK. FIFO occupancy alone cannot confirm that third byte.
+    fakeHw().txfifo_count = i2c_dev_t::kFifoLen - 3;
+    fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, true);
+    EXPECT_EQ(h.acc.writable(), 126u);
+    EXPECT_EQ(fakeHw().slave_address, 0x42u) << "host worker reload reopens acceptance after resolving suffix";
+    ASSERT_EQ(fakeHw().txfifo_count, i2c_dev_t::kFifoLen);
+    EXPECT_EQ(fakeHw().txfifo[0], 0xA2);
+    EXPECT_EQ(fakeHw().txfifo[1], 0xA3);
+    fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, true);
+    EXPECT_TRUE(h.acc.endAccess(100).has_value());
+}
+
+TEST(EspidfI2cSlaveBeQueuedHostHarness, IdleWriteReplacesFillPreloadBeforeFirstRead)
+{
+    QueueHarness h;
+    ASSERT_TRUE(h.acc.beginAccess(100).has_value());
+    ASSERT_EQ(fakeHw().txfifo[0], 0xFFu);
+    const std::array<uint8_t, 3> reply{0x51, 0x52, 0x53};
+    ASSERT_TRUE(h.acc.write({reply.data(), reply.size()}).has_value());
+    ASSERT_EQ(fakeHw().txfifo_count, i2c_dev_t::kFifoLen);
+    EXPECT_TRUE(std::equal(reply.begin(), reply.end(), fakeHw().txfifo))
+        << std::hex << static_cast<int>(fakeHw().txfifo[0]) << ' ' << static_cast<int>(fakeHw().txfifo[1]) << ' '
+        << static_cast<int>(fakeHw().txfifo[2]);
+    fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, true);
+    EXPECT_TRUE(h.acc.endAccess(100).has_value());
+}
+
+TEST(EspidfI2cSlaveBeQueuedHostHarness, RxOverflowAccountsBytesAndPersistsBrokenFence)
+{
+    QueueHarness h;
+    ASSERT_TRUE(h.acc.beginAccess(100).has_value());
+    std::array<uint8_t, i2c_dev_t::kFifoLen> batch{};
+    std::iota(batch.begin(), batch.end(), uint8_t{0});
+    for (size_t i = 0; i < 8; ++i) {
+        primeRxFifo(batch);
+        fireIsr(I2C_RXFIFO_WM_INT_ENA_M, false);
+    }
+    // The first overflow happens before STOP. BE cannot stretch, so it fences
+    // new addresses but keeps RX/STOP live to drain and count the remainder of
+    // this already-accepted write exactly.
+    primeRxFifo(batch);
+    fireIsr(I2C_RXFIFO_WM_INT_ENA_M, false);
+    primeRxFifo(batch);
+    fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, false);
+    EXPECT_EQ(fakeHw().rxfifo_count, 0u);
+    EXPECT_EQ(fakeHw().slave_address, 0x3FFu);
+    EXPECT_EQ(h.acc.rxStatus().dropped_bytes, batch.size() * 2);
+    EXPECT_FALSE(h.acc.endAccess(100).has_value());
+    EXPECT_FALSE(h.acc.beginAccess(0).has_value());
+}
+
+TEST(EspidfI2cSlaveBeQueuedHostHarness, BusyEndHardStopsAndKeepsBackendBroken)
+{
+    QueueHarness h;
+    ASSERT_TRUE(h.acc.beginAccess(100).has_value());
+    fakeHw().bus_busy = true;
+    auto ended        = h.acc.endAccess(0);
+    ASSERT_FALSE(ended.has_value());
+    EXPECT_EQ(ended.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+    EXPECT_FALSE(h.acc.beginAccess(0).has_value());
+    fakeHw().bus_busy = false;
+}
 
 // ---------------------------------------------------------------------------
 // 1. WTR-equivalent: the pointer byte's RX_WM ISR pass ingests the pointer
@@ -209,32 +464,90 @@ TEST(EspidfI2cSlaveBeHostHarness, PointerByteComposesReplyWithinSameIsrPass)
     const auto want = expectedWindow(0x10, i2c_dev_t::kFifoLen);
     EXPECT_TRUE(std::equal(want.begin(), want.end(), fakeHw().txfifo));
 
-    ASSERT_TRUE(h.acc->stream().beginTransaction(kBeginNonBlocking).has_value());
+    ASSERT_TRUE(h.acc->stream().openWireFrame(kBeginNonBlocking).has_value());
     auto readable = h.acc->stream().readableBytes();
     ASSERT_TRUE(readable.has_value());
     EXPECT_EQ(*readable, 0u) << "the pointer byte itself is not a readable payload byte";
 
     fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, /*is_read=*/true);  // STOP
-    auto complete = h.acc->stream().transactionComplete();
+    auto complete = h.acc->stream().wireFrameComplete();
     ASSERT_TRUE(complete.has_value());
     EXPECT_TRUE(*complete);
-    EXPECT_TRUE(h.acc->stream().endTransaction().has_value());
+    EXPECT_TRUE(h.acc->stream().closeWireFrame().has_value());
     EXPECT_EQ(h.bus.rxOverflowCount(), 0u) << "the fast path never touches Transaction.rx[], so it cannot overflow";
 }
 
-TEST(EspidfI2cSlaveBeHostHarness, ReleaseTimeoutReturnsErrorAndInitDoesNotReenter)
+TEST(EspidfI2cSlaveBeHostHarness, ForcedCloseCompletesCleanupAndAllowsReinit)
 {
+    using m5hal_hostharness::I2cClockEvent;
+    m5hal_hostharness::resetI2cClockTrace();
+
     SlaveBus_espidf bus;
     auto init = bus.init(makeConfig());
     ASSERT_TRUE(init.has_value()) << m5::hal::v2::error::toString(init.error());
+    EXPECT_EQ(m5hal_hostharness::i2cClockTrace(),
+              (std::vector<I2cClockEvent>{I2cClockEvent::BusEnable, I2cClockEvent::ControllerEnable}));
 
-    auto released = bus.release();
-    ASSERT_FALSE(released.has_value());
-    EXPECT_EQ(released.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+    auto closed = bus.close();
+    ASSERT_TRUE(closed.has_value());
+    EXPECT_EQ(m5hal_hostharness::i2cClockTrace(),
+              (std::vector<I2cClockEvent>{I2cClockEvent::BusEnable, I2cClockEvent::ControllerEnable,
+                                          I2cClockEvent::ControllerDisable, I2cClockEvent::BusDisable}));
 
     auto reinit = bus.init(makeConfig());
-    ASSERT_FALSE(reinit.has_value());
-    EXPECT_EQ(reinit.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+    ASSERT_TRUE(reinit.has_value());
+    EXPECT_EQ(m5hal_hostharness::i2cClockTrace(),
+              (std::vector<I2cClockEvent>{I2cClockEvent::BusEnable, I2cClockEvent::ControllerEnable,
+                                          I2cClockEvent::ControllerDisable, I2cClockEvent::BusDisable,
+                                          I2cClockEvent::BusEnable, I2cClockEvent::ControllerEnable}));
+}
+
+TEST(EspidfI2cSlaveBeHostHarness, SuccessfulCloseDisablesClocksInReverseOrder)
+{
+    using m5hal_hostharness::I2cClockEvent;
+    m5hal_hostharness::resetI2cClockTrace();
+
+    SlaveBus_espidf bus;
+    auto init = bus.init(makeConfig());
+    ASSERT_TRUE(init.has_value()) << m5::hal::v2::error::toString(init.error());
+    EXPECT_EQ(m5hal_hostharness::i2cClockTrace(),
+              (std::vector<I2cClockEvent>{I2cClockEvent::BusEnable, I2cClockEvent::ControllerEnable}));
+
+    m5hal_hostharness::runCreatedTaskOnNextDelay();
+    auto closed = bus.close();
+    ASSERT_TRUE(closed.has_value()) << m5::hal::v2::error::toString(closed.error());
+    EXPECT_EQ(m5hal_hostharness::i2cClockTrace(),
+              (std::vector<I2cClockEvent>{I2cClockEvent::BusEnable, I2cClockEvent::ControllerEnable,
+                                          I2cClockEvent::ControllerDisable, I2cClockEvent::BusDisable}));
+}
+
+TEST(EspidfI2cSlaveBeHostHarness, RxOverflowCountsDroppedBytesNotEvents)
+{
+    StreamHarness h;
+
+    std::vector<uint8_t> first(i2c_dev_t::kFifoLen, 0x11);
+    std::vector<uint8_t> second(i2c_dev_t::kFifoLen, 0x22);
+    std::vector<uint8_t> dropped(7, 0x33);
+    primeRxFifo(first);
+    fireIsr(I2C_RXFIFO_WM_INT_ENA_M, /*is_read=*/false);
+    primeRxFifo(second);
+    fireIsr(I2C_RXFIFO_WM_INT_ENA_M, /*is_read=*/false);
+    primeRxFifo(dropped);
+    fireIsr(I2C_RXFIFO_WM_INT_ENA_M, /*is_read=*/false);
+
+    EXPECT_EQ(h.bus.rxOverflowCount(), dropped.size());
+    auto opened = h.acc.openWireFrame(kBeginNonBlocking);
+    ASSERT_TRUE(opened.has_value()) << "err=" << m5::hal::v2::error::toString(opened.error());
+    std::vector<uint8_t> received(SlaveBus_espidf::kRxArrayCapacity);
+    auto read = h.acc.read(DataSpan{received.data(), received.size()});
+    ASSERT_TRUE(read.has_value()) << "err=" << m5::hal::v2::error::toString(read.error());
+    ASSERT_EQ(*read, received.size());
+    EXPECT_TRUE(std::equal(first.begin(), first.end(), received.begin()));
+    EXPECT_TRUE(std::equal(second.begin(), second.end(), received.begin() + first.size()));
+
+    fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, /*is_read=*/false);
+    auto ended = h.acc.closeWireFrame();
+    ASSERT_TRUE(ended.has_value()) << "err=" << m5::hal::v2::error::toString(ended.error());
 }
 
 // ---------------------------------------------------------------------------
@@ -251,9 +564,9 @@ TEST(EspidfI2cSlaveBeHostHarness, SplitReadAfterStopUsesPersistedPointer)
 
     primeRxFifo(std::vector<uint8_t>{0x30});
     fireIsr(I2C_RXFIFO_WM_INT_ENA_M, /*is_read=*/false);
-    ASSERT_TRUE(h.acc->stream().beginTransaction(kBeginNonBlocking).has_value());
+    ASSERT_TRUE(h.acc->stream().openWireFrame(kBeginNonBlocking).has_value());
     fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, /*is_read=*/false);  // STOP of the write
-    EXPECT_TRUE(h.acc->stream().endTransaction().has_value());
+    EXPECT_TRUE(h.acc->stream().closeWireFrame().has_value());
 
     // No RX_WM at all for the follow-up pure read -- the STOP rebuild above
     // already composed this window from the persisted pointer.
@@ -261,9 +574,9 @@ TEST(EspidfI2cSlaveBeHostHarness, SplitReadAfterStopUsesPersistedPointer)
     const auto want = expectedWindow(0x30, i2c_dev_t::kFifoLen);
     EXPECT_TRUE(std::equal(want.begin(), want.end(), fakeHw().txfifo));
 
-    ASSERT_TRUE(h.acc->stream().beginTransaction(kBeginNonBlocking).has_value());
+    ASSERT_TRUE(h.acc->stream().openWireFrame(kBeginNonBlocking).has_value());
     fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, /*is_read=*/true);  // STOP of the read
-    EXPECT_TRUE(h.acc->stream().endTransaction().has_value());
+    EXPECT_TRUE(h.acc->stream().closeWireFrame().has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -308,14 +621,14 @@ TEST(EspidfI2cSlaveBeHostHarness, StopResetsPointerReceivedForNextTransaction)
 
     primeRxFifo(std::vector<uint8_t>{0x05, 0xAA});
     fireIsr(I2C_RXFIFO_WM_INT_ENA_M, /*is_read=*/false);
-    ASSERT_TRUE(h.acc->stream().beginTransaction(kBeginNonBlocking).has_value());
+    ASSERT_TRUE(h.acc->stream().openWireFrame(kBeginNonBlocking).has_value());
     EXPECT_EQ(h.reg_file[0x05], 0xAA) << "regMapWriteByte applies synchronously, in the ISR pass itself";
     fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, /*is_read=*/false);  // STOP
-    EXPECT_TRUE(h.acc->stream().endTransaction().has_value());
+    EXPECT_TRUE(h.acc->stream().closeWireFrame().has_value());
 
     primeRxFifo(std::vector<uint8_t>{0xBB});
     fireIsr(I2C_RXFIFO_WM_INT_ENA_M, /*is_read=*/false);
-    ASSERT_TRUE(h.acc->stream().beginTransaction(kBeginNonBlocking).has_value());
+    ASSERT_TRUE(h.acc->stream().openWireFrame(kBeginNonBlocking).has_value());
 
     // If STOP had NOT reset pointer-received, 0xBB would have been stored as
     // DATA at reg_file[0x05 + 1] = reg_file[0x06] instead of becoming the new
@@ -326,7 +639,7 @@ TEST(EspidfI2cSlaveBeHostHarness, StopResetsPointerReceivedForNextTransaction)
     EXPECT_TRUE(std::equal(want.begin(), want.end(), fakeHw().txfifo)) << "TX FIFO rebuilt from the NEW pointer 0xBB";
 
     fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, /*is_read=*/true);  // STOP
-    EXPECT_TRUE(h.acc->stream().endTransaction().has_value());
+    EXPECT_TRUE(h.acc->stream().closeWireFrame().has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -340,9 +653,9 @@ TEST(EspidfI2cSlaveBeHostHarness, PointerPersistsAcrossRepeatedPureReads)
 
     primeRxFifo(std::vector<uint8_t>{0x50});
     fireIsr(I2C_RXFIFO_WM_INT_ENA_M, /*is_read=*/false);
-    ASSERT_TRUE(h.acc->stream().beginTransaction(kBeginNonBlocking).has_value());
+    ASSERT_TRUE(h.acc->stream().openWireFrame(kBeginNonBlocking).has_value());
     fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, /*is_read=*/false);  // STOP of the write
-    EXPECT_TRUE(h.acc->stream().endTransaction().has_value());
+    EXPECT_TRUE(h.acc->stream().closeWireFrame().has_value());
 
     const auto want = expectedWindow(0x50, i2c_dev_t::kFifoLen);
 
@@ -351,9 +664,9 @@ TEST(EspidfI2cSlaveBeHostHarness, PointerPersistsAcrossRepeatedPureReads)
     for (int i = 0; i < 2; ++i) {
         ASSERT_EQ(fakeHw().txfifo_count, i2c_dev_t::kFifoLen);
         EXPECT_TRUE(std::equal(want.begin(), want.end(), fakeHw().txfifo)) << "iteration " << i;
-        ASSERT_TRUE(h.acc->stream().beginTransaction(kBeginNonBlocking).has_value());
+        ASSERT_TRUE(h.acc->stream().openWireFrame(kBeginNonBlocking).has_value());
         fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, /*is_read=*/true);  // STOP
-        EXPECT_TRUE(h.acc->stream().endTransaction().has_value());
+        EXPECT_TRUE(h.acc->stream().closeWireFrame().has_value());
     }
 }
 
@@ -381,7 +694,7 @@ TEST(EspidfI2cSlaveBeHostHarness, HooksFireExpectedByteCounts)
 
     primeRxFifo(std::vector<uint8_t>{0x20, 0x01, 0x02, 0x03});
     fireIsr(I2C_RXFIFO_WM_INT_ENA_M, /*is_read=*/false);
-    ASSERT_TRUE(h.acc->stream().beginTransaction(kBeginNonBlocking).has_value());
+    ASSERT_TRUE(h.acc->stream().openWireFrame(kBeginNonBlocking).has_value());
 
     EXPECT_EQ(counters.on_write_calls, 3) << "3 data bytes after the pointer byte";
     const std::vector<std::pair<uint8_t, uint8_t>> want_writes = {{0x20, 0x01}, {0x21, 0x02}, {0x22, 0x03}};
@@ -392,7 +705,7 @@ TEST(EspidfI2cSlaveBeHostHarness, HooksFireExpectedByteCounts)
     EXPECT_EQ(counters.on_read_calls - baseline_reads, static_cast<int>(i2c_dev_t::kFifoLen));
 
     fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, /*is_read=*/false);  // STOP: another full rebuild.
-    EXPECT_TRUE(h.acc->stream().endTransaction().has_value());
+    EXPECT_TRUE(h.acc->stream().closeWireFrame().has_value());
     EXPECT_EQ(counters.on_read_calls - baseline_reads, static_cast<int>(i2c_dev_t::kFifoLen) * 2);
     EXPECT_EQ(counters.on_write_calls, 3) << "STOP does not re-ingest already-applied writes";
 }
@@ -409,12 +722,12 @@ TEST(EspidfI2cSlaveBeHostHarness, AccessorPointerReflectsIsrFastPathPointer)
 
     primeRxFifo(std::vector<uint8_t>{0x77});
     fireIsr(I2C_RXFIFO_WM_INT_ENA_M, /*is_read=*/false);
-    ASSERT_TRUE(h.acc->stream().beginTransaction(kBeginNonBlocking).has_value());
+    ASSERT_TRUE(h.acc->stream().openWireFrame(kBeginNonBlocking).has_value());
 
     EXPECT_EQ(h.acc->pointer(), 0x77) << "pointer() must reflect the ISR fast path's wire-side pointer";
 
     fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, /*is_read=*/false);  // STOP
-    EXPECT_TRUE(h.acc->stream().endTransaction().has_value());
+    EXPECT_TRUE(h.acc->stream().closeWireFrame().has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -453,9 +766,9 @@ TEST(EspidfI2cSlaveBeHostHarness, LaterAccessorBindSurvivesEarlierAccessorDestru
     EXPECT_TRUE(std::equal(want_b.begin(), want_b.end(), fakeHw().txfifo))
         << "fast path still serves acc_b's reg_file after acc_a (the superseded binder) was destroyed";
 
-    ASSERT_TRUE(acc_b->stream().beginTransaction(kBeginNonBlocking).has_value());
+    ASSERT_TRUE(acc_b->stream().openWireFrame(kBeginNonBlocking).has_value());
     fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, /*is_read=*/false);  // STOP
-    EXPECT_TRUE(acc_b->stream().endTransaction().has_value());
+    EXPECT_TRUE(acc_b->stream().closeWireFrame().has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -474,7 +787,7 @@ TEST(EspidfI2cSlaveBeHostHarness, RebindResetsPerTransactionState)
     // and write_offset are now both live in the mid-transaction binding.
     primeRxFifo(std::vector<uint8_t>{0x40, 0xCC});
     fireIsr(I2C_RXFIFO_WM_INT_ENA_M, /*is_read=*/false);
-    ASSERT_TRUE(h.acc->stream().beginTransaction(kBeginNonBlocking).has_value());
+    ASSERT_TRUE(h.acc->stream().openWireFrame(kBeginNonBlocking).has_value());
     EXPECT_EQ(h.reg_file[0x40], 0xCC);
 
     // Re-bind mid-transaction (a hook change): per the bind contract this
@@ -489,7 +802,7 @@ TEST(EspidfI2cSlaveBeHostHarness, RebindResetsPerTransactionState)
     EXPECT_EQ(h.acc->pointer(), 0x99);
 
     fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, /*is_read=*/false);  // STOP
-    EXPECT_TRUE(h.acc->stream().endTransaction().has_value());
+    EXPECT_TRUE(h.acc->stream().closeWireFrame().has_value());
 }
 
 int main(int argc, char** argv)

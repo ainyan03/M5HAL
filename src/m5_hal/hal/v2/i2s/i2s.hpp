@@ -13,6 +13,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <atomic>
 #include <memory>
 #include <new>
 
@@ -181,6 +182,9 @@ struct IBusConfig : public bus::IBusConfig {
     }
 };
 
+/*! @brief Variant-independent portable I2S bus configuration. */
+using BusConfig = IBusConfig;
+
 /*!
   @brief Pin + intent acquire request for the unified BusView surface.
 
@@ -232,15 +236,10 @@ struct IBus;
   @brief TX-side accessor; locks only the TX channel.
 
   TX and RX are independent channel locks, so one owner can write while another
-  reads on a full-duplex bus. `beginAccess` / `endAccess` (TX channel) nest
-  through a depth counter, and the write sugars open the window themselves.
-
-  An I2S transaction is a TX channel exclusion scope plus byte-count
-  aggregation; it has no physical CS or bus-occupancy side effect. Accessors
-  must not be shared between threads. The transaction depth is only for
-  same-owner reentry, while sharing the Bus through separate accessors is
-  supported. `setConfig` fails with `INVALID_STATE` while an access window is
-  open.
+  reads on a full-duplex bus. An Access is non-nesting and establishes the TX
+  backend operation once. Write sugar borrows an active Access or opens a
+  temporary one. Accessors must not be shared between threads. `setConfig`
+  fails with `INVALID_STATE` while an Access is active.
  */
 struct TxAccessor : public bus::IAccessor, public data::StreamWriter {
     TxAccessor(IBus& bus, const AccessConfig& access_config);
@@ -248,34 +247,30 @@ struct TxAccessor : public bus::IAccessor, public data::StreamWriter {
     TxAccessor(std::shared_ptr<IBus> bus, const AccessConfig& access_config);
 
     /*! @name Unbound construction + typed bind (gate: `beginAccess` on TX channel). @{ */
-    TxAccessor(void) = default;
-    explicit TxAccessor(const AccessConfig& access_config) : _access_config{access_config}
+    TxAccessor(void) : _context{makeOperationContext(AccessConfig{})}
+    {
+    }
+    explicit TxAccessor(const AccessConfig& access_config) : _context{makeOperationContext(access_config)}
     {
     }
     /*! @brief Bind (or rebind) to an I2S bus; rejected while the TX window is open. */
-    m5::hal::v2::result_t<void> bind(IBus& bus);
+    [[nodiscard]] m5::hal::v2::result_t<void> bind(IBus& bus);
     /*! @} */
 
     const AccessConfig& getConfig(void) const override
     {
-        return _access_config;
+        return _context.config;
     }
     IBus& getBus(void) const;
 
-    result_t<void> setConfig(const AccessConfig& cfg);
-    result_t<void> beginAccess(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
-    result_t<void> endAccess(void);
+    [[nodiscard]] result_t<void> setConfig(const AccessConfig& cfg);
+    [[nodiscard]] result_t<void> beginAccess(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+    [[nodiscard]] result_t<void> endAccess(uint32_t timeout_ms = 1000);
     bool inAccess(void) const
     {
-        return _tx_access_depth > 0;
+        return _inOperationAccess();
     }
-
-    result_t<void> beginTransaction(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
-    result_t<bus::TransferTotals> endTransaction(void);
-    bool inTransaction(void) const
-    {
-        return _tx_txn_depth > 0;
-    }
+    result_t<bus::TransferStatus> getLastTransferStatus(void) const;
 
     result_t<size_t> write(data::ConstDataSpan src_bytes) override;
     result_t<size_t> write(data::Source& src, size_t len);
@@ -285,27 +280,24 @@ struct TxAccessor : public bus::IAccessor, public data::StreamWriter {
     result_t<size_t> writableBytes(void);
 
 protected:
-    AccessConfig _access_config;
+    friend struct Accessor;
+    bus::OperationContext<AccessConfig> _context;
 
 private:
-    uint32_t _tx_access_depth = 0;
-    uint32_t _tx_txn_depth    = 0;
-    bus::TransferTotals _tx_txn_totals;
+    result_t<size_t> writeInCurrentAccess(data::Source& src, size_t len);
+    void recordTransferResult(const result_t<size_t>& result, size_t requested);
+
+    bus::TransferStatus _last_transfer_status{};
+    uint32_t _next_transfer_id = 0;
 };
 
 /*!
   @brief RX-side accessor; locks only the RX channel.
 
-  The mirror of `TxAccessor`: independent RX channel lock, depth counter via
-  `beginAccess` / `endAccess` (RX channel), and `setConfig` fails with
-  `INVALID_STATE` while an access window is open. There is no `readUntil`
-  sugar (it is line-oriented and meaningless on a continuous I2S stream).
-
-  An I2S transaction is an RX channel exclusion scope plus byte-count
-  aggregation; it has no physical CS or bus-occupancy side effect. Accessors
-  must not be shared between threads. The transaction depth is only for
-  same-owner reentry, while sharing the Bus through separate accessors is
-  supported.
+  The mirror of `TxAccessor`: independent RX channel lock and a non-nesting
+  Access that establishes the RX backend operation once. There is no
+  `readUntil` sugar (it is line-oriented and meaningless on a continuous I2S
+  stream). Accessors must not be shared between threads.
  */
 struct RxAccessor : public bus::IAccessor, public data::StreamReader {
     RxAccessor(IBus& bus, const AccessConfig& access_config);
@@ -313,34 +305,30 @@ struct RxAccessor : public bus::IAccessor, public data::StreamReader {
     RxAccessor(std::shared_ptr<IBus> bus, const AccessConfig& access_config);
 
     /*! @name Unbound construction + typed bind (gate: `beginAccess` on RX channel). @{ */
-    RxAccessor(void) = default;
-    explicit RxAccessor(const AccessConfig& access_config) : _access_config{access_config}
+    RxAccessor(void) : _context{makeOperationContext(AccessConfig{})}
+    {
+    }
+    explicit RxAccessor(const AccessConfig& access_config) : _context{makeOperationContext(access_config)}
     {
     }
     /*! @brief Bind (or rebind) to an I2S bus; rejected while the RX window is open. */
-    m5::hal::v2::result_t<void> bind(IBus& bus);
+    [[nodiscard]] m5::hal::v2::result_t<void> bind(IBus& bus);
     /*! @} */
 
     const AccessConfig& getConfig(void) const override
     {
-        return _access_config;
+        return _context.config;
     }
     IBus& getBus(void) const;
 
-    result_t<void> setConfig(const AccessConfig& cfg);
-    result_t<void> beginAccess(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
-    result_t<void> endAccess(void);
+    [[nodiscard]] result_t<void> setConfig(const AccessConfig& cfg);
+    [[nodiscard]] result_t<void> beginAccess(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+    [[nodiscard]] result_t<void> endAccess(uint32_t timeout_ms = 1000);
     bool inAccess(void) const
     {
-        return _rx_access_depth > 0;
+        return _inOperationAccess();
     }
-
-    result_t<void> beginTransaction(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
-    result_t<bus::TransferTotals> endTransaction(void);
-    bool inTransaction(void) const
-    {
-        return _rx_txn_depth > 0;
-    }
+    result_t<bus::TransferStatus> getLastTransferStatus(void) const;
 
     result_t<size_t> read(data::DataSpan dst_bytes) override;
     result_t<size_t> read(data::Sink& dst, size_t len);
@@ -350,12 +338,15 @@ struct RxAccessor : public bus::IAccessor, public data::StreamReader {
     result_t<size_t> readableBytes(void) override;
 
 protected:
-    AccessConfig _access_config;
+    friend struct Accessor;
+    bus::OperationContext<AccessConfig> _context;
 
 private:
-    uint32_t _rx_access_depth = 0;
-    uint32_t _rx_txn_depth    = 0;
-    bus::TransferTotals _rx_txn_totals;
+    result_t<size_t> readInCurrentAccess(data::Sink& dst, size_t len);
+    void recordTransferResult(const result_t<size_t>& result, size_t requested);
+
+    bus::TransferStatus _last_transfer_status{};
+    uint32_t _next_transfer_id = 0;
 };
 
 /*!
@@ -381,7 +372,7 @@ struct Accessor {
     {
     }
     /*! @brief Bind (or rebind) both channel accessors; rejected while either window is open. */
-    result_t<void> bind(IBus& bus);
+    [[nodiscard]] result_t<void> bind(IBus& bus);
     /*! @} */
 
     const AccessConfig& getConfig(void) const
@@ -407,12 +398,12 @@ struct Accessor {
         return _rx;
     }
 
-    result_t<void> setConfig(const AccessConfig& cfg);
-    result_t<void> beginAccess(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
-    result_t<void> endAccess(void);
+    [[nodiscard]] result_t<void> setConfig(const AccessConfig& cfg);
+    [[nodiscard]] result_t<void> beginAccess(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+    [[nodiscard]] result_t<void> endAccess(uint32_t timeout_ms = 1000);
     bool inAccess(void) const
     {
-        return _tx.inAccess() || _rx.inAccess();
+        return _combined_active || _tx.inAccess() || _rx.inAccess();
     }
 
     result_t<size_t> write(data::ConstDataSpan src_bytes);
@@ -425,11 +416,20 @@ struct Accessor {
     result_t<size_t> read(uint8_t* dst, size_t len);
     result_t<bus::TransferTotals> transfer(data::Source& src, size_t tx_len, data::Sink& dst, size_t rx_len);
     result_t<bus::TransferTotals> transfer(data::ConstDataSpan src_bytes, data::DataSpan dst_bytes);
+    result_t<bus::TransferStatus> getLastTransferStatus(void) const;
     result_t<size_t> readableBytes(void);
 
 protected:
     TxAccessor _tx;
     RxAccessor _rx;
+
+private:
+    void adoptTransferStatus(const result_t<bus::TransferStatus>& before, const result_t<bus::TransferStatus>& after);
+    void recordTransferResult(const result_t<bus::TransferTotals>& result, size_t requested_tx, size_t requested_rx);
+
+    bus::TransferStatus _last_transfer_status{};
+    uint32_t _next_transfer_id = 0;
+    bool _combined_active      = false;
 };
 
 struct IBus : public bus::IBus {
@@ -440,12 +440,12 @@ struct IBus : public bus::IBus {
 
     /// Returns the byte count accepted within write_timeout_ms; a short return is normal.
     /// Underrun is not an error: the DMA outputs silence and resumes on the next write.
-    virtual result_t<size_t> write(bus::IAccessor* owner, const AccessConfig& cfg, data::Source* src, size_t len);
-    virtual result_t<size_t> writableBytes(bus::IAccessor* owner, const AccessConfig& cfg);
+    result_t<size_t> write(bus::OperationContext<AccessConfig>& context, data::Source* src, size_t len);
+    result_t<size_t> writableBytes(bus::OperationContext<AccessConfig>& context);
 
     /// Returns the byte count captured within read_timeout_ms; a short return is normal.
     /// Overrun (a slow reader) drops the oldest DMA data; it is not an error here.
-    virtual result_t<size_t> read(bus::IAccessor* owner, const AccessConfig& cfg, data::Sink* dst, size_t len);
+    result_t<size_t> read(bus::OperationContext<AccessConfig>& context, data::Sink* dst, size_t len);
     /*!
       @brief Transfer bytes in both independent I2S directions.
 
@@ -456,26 +456,85 @@ struct IBus : public bus::IBus {
       it. If either step fails, the error is returned immediately, and bytes
       from the earlier step may already have moved.
      */
-    virtual result_t<bus::TransferTotals> transfer(bus::IAccessor* owner, const AccessConfig& cfg, data::Source* src,
-                                                   size_t tx_len, data::Sink* dst, size_t rx_len);
-    virtual result_t<size_t> readableBytes(bus::IAccessor* owner, const AccessConfig& cfg);
+    result_t<bus::TransferTotals> transfer(bus::OperationContext<AccessConfig>& tx_context,
+                                           bus::OperationContext<AccessConfig>& rx_context, data::Source* src,
+                                           size_t tx_len, data::Sink* dst, size_t rx_len);
+    result_t<size_t> readableBytes(bus::OperationContext<AccessConfig>& context);
 
-    result_t<void> lock(bus::IAccessor* owner, uint32_t timeout_ms = types::TIMEOUT_FOREVER) override;
-    result_t<void> unlock(bus::IAccessor* owner) override;
-    virtual result_t<void> lockChannel(bus::IAccessor* owner, Channel ch, uint32_t timeout_ms = types::TIMEOUT_FOREVER);
-    virtual result_t<void> unlockChannel(bus::IAccessor* owner, Channel ch);
+    result_t<void> beginOperation(bus::OperationContext<AccessConfig>& context);
+    result_t<void> endOperation(bus::OperationContext<AccessConfig>& context);
 
 protected:
+    virtual result_t<void> beginOperationBackend(bus::OperationContext<AccessConfig>& context);
+    virtual result_t<void> endOperationBackend(bus::OperationContext<AccessConfig>& context);
+    virtual result_t<size_t> writeBackend(bus::OperationContext<AccessConfig>& context, data::Source* src, size_t len);
+    virtual result_t<size_t> writableBytesBackend(bus::OperationContext<AccessConfig>& context);
+    virtual result_t<size_t> readBackend(bus::OperationContext<AccessConfig>& context, data::Sink* dst, size_t len);
+    virtual result_t<bus::TransferTotals> transferBackend(bus::OperationContext<AccessConfig>& tx_context,
+                                                          bus::OperationContext<AccessConfig>& rx_context,
+                                                          data::Source* src, size_t tx_len, data::Sink* dst,
+                                                          size_t rx_len);
+    virtual result_t<size_t> readableBytesBackend(bus::OperationContext<AccessConfig>& context);
+
+    static result_t<void> beginOperationOn(IBus& backend, bus::OperationContext<AccessConfig>& context)
+    {
+        return backend.beginOperationBackend(context);
+    }
+    static result_t<void> endOperationOn(IBus& backend, bus::OperationContext<AccessConfig>& context)
+    {
+        return backend.endOperationBackend(context);
+    }
+    static result_t<size_t> writeOn(IBus& backend, bus::OperationContext<AccessConfig>& context, data::Source* src,
+                                    size_t len)
+    {
+        return backend.writeBackend(context, src, len);
+    }
+    static result_t<size_t> writableBytesOn(IBus& backend, bus::OperationContext<AccessConfig>& context)
+    {
+        return backend.writableBytesBackend(context);
+    }
+    static result_t<size_t> readOn(IBus& backend, bus::OperationContext<AccessConfig>& context, data::Sink* dst,
+                                   size_t len)
+    {
+        return backend.readBackend(context, dst, len);
+    }
+    static result_t<bus::TransferTotals> transferOn(IBus& backend, bus::OperationContext<AccessConfig>& tx_context,
+                                                    bus::OperationContext<AccessConfig>& rx_context, data::Source* src,
+                                                    size_t tx_len, data::Sink* dst, size_t rx_len)
+    {
+        return backend.transferBackend(tx_context, rx_context, src, tx_len, dst, rx_len);
+    }
+    static result_t<size_t> readableBytesOn(IBus& backend, bus::OperationContext<AccessConfig>& context)
+    {
+        return backend.readableBytesBackend(context);
+    }
+    bus::OperationSlot* operationSlot(bus::OperationContext<AccessConfig>& context);
+    const bus::OperationSlot* operationSlot(const bus::OperationContext<AccessConfig>& context) const;
+    bus::IAccessor* operationOwner(bus::OperationContext<AccessConfig>& context);
+
+    friend struct TxAccessor;
+    friend struct RxAccessor;
+    result_t<void> acquireAccessLock(bus::IAccessor& owner, uint32_t timeout_ms = types::TIMEOUT_FOREVER) override;
+    result_t<void> releaseAccessLock(bus::IAccessor& owner) override;
+    virtual result_t<void> lockChannel(bus::IAccessor& owner, Channel ch, uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+    virtual result_t<void> unlockChannel(bus::IAccessor& owner, Channel ch);
+    result_t<void> tryAcquireCloseBarrier(void) override;
+    result_t<void> releaseCloseBarrier(void) override;
+
     IBusConfig _config;
     // I2S splits the bus lock into independent TX / RX channels, so it carries
     // one runtime::Mutex per channel (the composite txrx lock takes both, TX
     // first); the base Bus mutex stays unused here. Lock semantics per channel
-    // match Bus::lock: wait up to timeout_ms, TIMEOUT_ERROR on expiry,
+    // match the common Access lock: wait up to timeout_ms, TIMEOUT_ERROR on expiry,
     // non-recursive, task context only.
     runtime::Mutex _tx_mutex;
     runtime::Mutex _rx_mutex;
     bus::IAccessor* _tx_lock_owner = nullptr;
     bus::IAccessor* _rx_lock_owner = nullptr;
+    std::atomic<void*> _tx_lock_task{nullptr};
+    std::atomic<void*> _rx_lock_task{nullptr};
+    bus::OperationSlot _tx_operation_slot;
+    bus::OperationSlot _rx_operation_slot;
 };
 
 //-------------------------------------------------------------------------
@@ -508,15 +567,8 @@ inline m5::hal::v2::result_t<void> Accessor::bind(IBus& bus)
     return {};
 }
 
-/*!
-  @brief Maps a variant BusConfig_<variant> to its backend Bus_<variant>.
-
-  Undefined primary on purpose: passing a config type without a
-  specialization to Bus::init is a compile error. Each variant header
-  specializes this next to its Bus_<variant>.
- */
-template <class CfgT>
-struct BackendFor;
+template <class Policy>
+struct NativeProvider;
 
 struct Bus;  // the facade, defined just below
 
@@ -524,9 +576,9 @@ struct Bus;  // the facade, defined just below
   @brief Per-kind Traits for the shared `bus::FacadeCore` and BusView.
 
   I2S's `Bus` shares the base spine (backend ownership + `init` +
-  `release` + the query mirror). Its plain `BusView` uses the same traits for
-  typed acquire identity: concrete kind `IBus`, the bus-level config base, the
-  variant selector (`FacadeCore`), the public `BusType`, kind tag, and the 4-pin
+  `close` + the query mirror). Its plain `BusView` uses the same traits for
+  portable acquire identity: concrete kind `IBus`, the bus-level config base,
+  the public `BusType`, kind tag, and the 4-pin
   (BCLK/WS/DOUT/DIN) identity projection. I2S has no intent / hot-swap
   surface, so the master-only Traits members are intentionally absent. `Bus` is
   forward-declared at namespace scope so `BusType` names the public `i2s::Bus`,
@@ -537,8 +589,8 @@ struct BusTraits {
     using IBusConfig       = i2s::IBusConfig;
     using LogicalBusConfig = i2s::LogicalBusConfig;
     using BusType          = Bus;
-    template <class CfgT>
-    using BackendFor = i2s::BackendFor<CfgT>;
+    template <class Policy>
+    using NativeProvider = i2s::NativeProvider<Policy>;
 
     static constexpr types::bus_kind_t KIND = types::bus_kind_t::I2S;
     /*! @brief I2S uses the static-backend policy: `BusView::hardwareInUse()`
@@ -546,13 +598,13 @@ struct BusTraits {
                policy). */
     static constexpr bool MANAGED_ALLOCATION = false;
 
-    static bus::IdentityKey identityFromConfig(const IBusConfig& cfg)
+    static bus::ResourceKey identityFromConfig(const IBusConfig& cfg)
     {
-        return bus::IdentityKey::fromPins({cfg.pin_bclk, cfg.pin_ws, cfg.pin_dout, cfg.pin_din});
+        return bus::ResourceKey::fromPins(KIND, {cfg.pin_bclk, cfg.pin_ws, cfg.pin_dout, cfg.pin_din});
     }
-    static bus::IdentityKey identityFromLogical(const LogicalBusConfig& req)
+    static bus::ResourceKey identityFromLogical(const LogicalBusConfig& req)
     {
-        return bus::IdentityKey::fromPins({req.pin_bclk, req.pin_ws, req.pin_dout, req.pin_din});
+        return bus::ResourceKey::fromPins(KIND, {req.pin_bclk, req.pin_ws, req.pin_dout, req.pin_din});
     }
     static bool configCompatible(const IBusConfig& current, const IBusConfig& requested)
     {
@@ -566,7 +618,7 @@ struct BusTraits {
 /*!
   @brief Runtime facade for an I2S bus (the unsuffixed i2s::Bus).
 
-  All of the backend spine -- the `unique_ptr`-held backend, `init`, `release`,
+  All of the backend spine -- the `unique_ptr`-held backend, `init`, `close`,
   and the lock-free backend-query mirror -- lives in
   `bus::FacadeCore<BusTraits>`. This derived type adds only the I2S data-path
   forwards (write / read / writableBytes / readableBytes). The TX / RX channel
@@ -578,37 +630,51 @@ struct BusTraits {
   hot-swap extensions.
  */
 struct Bus : public bus::FacadeCore<BusTraits> {
-    result_t<size_t> write(bus::IAccessor* owner, const AccessConfig& cfg, data::Source* src, size_t len) override
+    [[nodiscard]] result_t<void> init(const IBusConfig& config);
+
+protected:
+    result_t<void> beginOperationBackend(bus::OperationContext<AccessConfig>& context) override
     {
-        return forwardBackend([&](IBus& b) { return b.write(owner, cfg, src, len); });
+        return forwardBackend([&](IBus& b) { return beginOperationOn(b, context); });
     }
 
-    result_t<size_t> writableBytes(bus::IAccessor* owner, const AccessConfig& cfg) override
+    result_t<void> endOperationBackend(bus::OperationContext<AccessConfig>& context) override
     {
-        return forwardBackend([&](IBus& b) { return b.writableBytes(owner, cfg); });
+        return forwardBackend([&](IBus& b) { return endOperationOn(b, context); });
     }
 
-    result_t<size_t> read(bus::IAccessor* owner, const AccessConfig& cfg, data::Sink* dst, size_t len) override
+    result_t<size_t> writeBackend(bus::OperationContext<AccessConfig>& context, data::Source* src, size_t len) override
     {
-        return forwardBackend([&](IBus& b) { return b.read(owner, cfg, dst, len); });
+        return forwardBackend([&](IBus& b) { return writeOn(b, context, src, len); });
     }
 
-    result_t<bus::TransferTotals> transfer(bus::IAccessor* owner, const AccessConfig& cfg, data::Source* src,
-                                           size_t tx_len, data::Sink* dst, size_t rx_len) override
+    result_t<size_t> writableBytesBackend(bus::OperationContext<AccessConfig>& context) override
     {
-        return forwardBackend([&](IBus& b) { return b.transfer(owner, cfg, src, tx_len, dst, rx_len); });
+        return forwardBackend([&](IBus& b) { return writableBytesOn(b, context); });
     }
 
-    result_t<size_t> readableBytes(bus::IAccessor* owner, const AccessConfig& cfg) override
+    result_t<size_t> readBackend(bus::OperationContext<AccessConfig>& context, data::Sink* dst, size_t len) override
     {
-        return forwardBackend([&](IBus& b) { return b.readableBytes(owner, cfg); });
+        return forwardBackend([&](IBus& b) { return readOn(b, context, dst, len); });
+    }
+
+    result_t<bus::TransferTotals> transferBackend(bus::OperationContext<AccessConfig>& tx_context,
+                                                  bus::OperationContext<AccessConfig>& rx_context, data::Source* src,
+                                                  size_t tx_len, data::Sink* dst, size_t rx_len) override
+    {
+        return forwardBackend([&](IBus& b) { return transferOn(b, tx_context, rx_context, src, tx_len, dst, rx_len); });
+    }
+
+    result_t<size_t> readableBytesBackend(bus::OperationContext<AccessConfig>& context) override
+    {
+        return forwardBackend([&](IBus& b) { return readableBytesOn(b, context); });
     }
 };
 
 /*!
   @brief Typed I2S view delegating registry access to the HAL backend.
 
-  Shares the acquire / logical-acquire / commit / release spine with every
+  Shares the acquire / logical-acquire / commit / close spine with every
   other kind through `bus::BusViewCore<BusTraits>` (see bus/bus_view.hpp);
   this derived type adds only the I2S-specific `createBusConfig()` pin
   overloads. Parity with i2c::BusView and spi::BusView: I2S buses are

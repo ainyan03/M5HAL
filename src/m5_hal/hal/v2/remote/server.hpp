@@ -65,6 +65,7 @@ public:
     m5::hal::v2::result_t<void> registerI2S(uint8_t bus_id, i2s::Accessor& acc);
     m5::hal::v2::result_t<void> registerI2S(uint8_t bus_id, i2s::TxAccessor& acc);
     m5::hal::v2::result_t<void> registerI2S(uint8_t bus_id, i2s::RxAccessor& acc);
+    m5::hal::v2::result_t<void> registerPDM(uint8_t bus_id, pdm::RxAccessor& acc);
     void setGPIOGroup(gpio::GPIOGroup& group)
     {
         _runner.setGPIOGroup(group);
@@ -85,9 +86,14 @@ public:
     }
 
     /*! @brief The i-th registered bus capability (0 <= i < capabilityCount()). */
-    const Capabilities::BusEntry& capabilityAt(size_t i) const
+    Capabilities::BusEntry capabilityAt(size_t i) const
     {
-        return _caps[i];
+        auto entry   = _caps[i];
+        auto current = _runner.busCapabilities(entry.kind, entry.bus_id);
+        if (current.has_value()) {
+            entry.capabilities = current.value();
+        }
+        return entry;
     }
 
     using bus_create_app_fn_t = m5::hal::v2::result_t<void> (*)(void* ctx, bool create, types::bus_kind_t kind,
@@ -161,7 +167,8 @@ private:
     m5::hal::v2::result_t<void> handleStreamTransfer(const bytecode::BytecodeRunner::StreamTransferDesc& desc);
     m5::hal::v2::result_t<void> completePendingStream(data::MuxFrameEncoder& enc, m5::hal::v2::error::error_t status);
     m5::hal::v2::result_t<void> writeDeferredResponse(data::MuxFrameEncoder& enc, uint8_t seq,
-                                                      m5::hal::v2::error::error_t status);
+                                                      m5::hal::v2::error::error_t status, size_t actual_tx,
+                                                      size_t actual_rx);
     data::ConstDataSpan pendingMeta() const
     {
         return data::ConstDataSpan{_pending_stream.meta, _pending_stream.meta_size};

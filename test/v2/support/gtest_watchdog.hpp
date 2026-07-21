@@ -13,8 +13,8 @@
 // exits 124 and prints WHICH test overran.
 //
 // This is the generic safety net, not the first line of defense: tests should
-// still use finite or non-blocking timeouts (delegation-guardrails.md
-// §テスト規約) so a regression fails at the exact assertion, not by budget.
+// still use finite or non-blocking timeouts so a regression fails at the exact
+// assertion, not by the watchdog budget.
 //
 // Usage (after InitGoogleTest, before RUN_ALL_TESTS):
 //     ::testing::InitGoogleTest(&argc, argv);

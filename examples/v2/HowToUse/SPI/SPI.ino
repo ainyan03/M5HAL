@@ -15,9 +15,9 @@
 // actually reach the display. Define M5HAL_EXAMPLE_SPI_LCD_DEMO=0 to skip
 // the LCD part (e.g. when running on a board without an ILI9342C).
 //
-// To force a backend, pass a suffixed config type (spi::BusConfig_software /
-// _arduino / _espidf) to acquire. The default spi::BusConfig selects the first
-// backend offered by the active build environment.
+// BusConfig is portable and uses the provider selected by this build. To force
+// one, define M5HAL_CONFIG_VARIANT_SPI to its M5HAL_V2_VARIANT_ID_* value (see
+// spec/design/configuration.md).
 // =============================================================================
 
 #include <Arduino.h>
@@ -31,8 +31,8 @@ namespace m5hal = m5::hal::v2;
 constexpr int PIN_SPI_CLK  = 18;
 constexpr int PIN_SPI_MOSI = 23;
 constexpr int PIN_SPI_MISO = 19;
-constexpr int PIN_SPI_DC = 27;
-constexpr int PIN_SPI_CS = 14;
+constexpr int PIN_SPI_DC   = 27;
+constexpr int PIN_SPI_CS   = 14;
 
 #ifndef M5HAL_EXAMPLE_SPI_FREQUENCY_HZ
 #define M5HAL_EXAMPLE_SPI_FREQUENCY_HZ 40000000
@@ -106,11 +106,11 @@ static void demoReadCommand(m5hal::spi::MasterAccessor& dev)
                   static_cast<unsigned>(r.value()));
 }
 
-static void demoManualTransaction(m5hal::spi::MasterAccessor& dev)
+static void demoManualAccess(m5hal::spi::MasterAccessor& dev)
 {
-    auto bt = dev.beginTransaction();
+    auto bt = dev.beginAccess();
     if (!bt.has_value()) {
-        printError("beginTransaction", bt.error());
+        printError("beginAccess", bt.error());
         return;
     }
 
@@ -119,7 +119,7 @@ static void demoManualTransaction(m5hal::spi::MasterAccessor& dev)
     auto a                            = dev.write(first, sizeof(first));
     auto b                            = dev.write(second, sizeof(second));
 
-    auto et = dev.endTransaction();
+    auto et = dev.endAccess();
     if (!a.has_value()) {
         printError("transaction write A", a.error());
         return;
@@ -129,7 +129,7 @@ static void demoManualTransaction(m5hal::spi::MasterAccessor& dev)
         return;
     }
     if (!et.has_value()) {
-        printError("endTransaction", et.error());
+        printError("endAccess", et.error());
         return;
     }
     Serial.println("manual transaction: two writes under one CS assertion");
@@ -147,14 +147,28 @@ static void demoLcdDraw(m5hal::spi::MasterAccessor& dev)
     digitalWrite(PIN_LCD_RST, HIGH);
     delay(120);
 
-    dev.writeCommand(0x01);
+    auto ok = [](const char* label, auto&& r) {
+        if (!r.has_value()) {
+            printError(label, r.error());
+            return false;
+        }
+        return true;
+    };
+
+    if (!ok("SWRESET (0x01)", dev.writeCommand(0x01))) {
+        return;
+    }
     delay(120);
-    dev.writeCommand(0x11);
+    if (!ok("SLPOUT (0x11)", dev.writeCommand(0x11))) {
+        return;
+    }
     delay(120);
-    dev.writeCommand(0x21);
     uint8_t colmod = 0x55;
-    dev.writeCommandData(0x3A, m5hal::data::ConstDataSpan{&colmod, 1});
-    dev.writeCommand(0x29);
+    if (!ok("INVON (0x21)", dev.writeCommand(0x21)) ||
+        !ok("COLMOD (0x3A)", dev.writeCommandData(0x3A, m5hal::data::ConstDataSpan{&colmod, 1})) ||
+        !ok("DISPON (0x29)", dev.writeCommand(0x29))) {
+        return;
+    }
 
     digitalWrite(PIN_LCD_BL, HIGH);
 
@@ -164,14 +178,16 @@ static void demoLcdDraw(m5hal::spi::MasterAccessor& dev)
     constexpr int BAR_H = LCD_HEIGHT / 8;
 
     for (int bar = 0; bar < 8; ++bar) {
-        int y0 = bar * BAR_H;
-        int y1 = y0 + BAR_H - 1;
+        int y0          = bar * BAR_H;
+        int y1          = y0 + BAR_H - 1;
         uint8_t caset[] = {0, 0, static_cast<uint8_t>((LCD_WIDTH - 1) >> 8),
                            static_cast<uint8_t>((LCD_WIDTH - 1) & 0xFF)};
         uint8_t raset[] = {static_cast<uint8_t>(y0 >> 8), static_cast<uint8_t>(y0 & 0xFF),
                            static_cast<uint8_t>(y1 >> 8), static_cast<uint8_t>(y1 & 0xFF)};
-        dev.writeCommandData(0x2A, m5hal::data::ConstDataSpan{caset, sizeof(caset)});
-        dev.writeCommandData(0x2B, m5hal::data::ConstDataSpan{raset, sizeof(raset)});
+        if (!ok("CASET (0x2A)", dev.writeCommandData(0x2A, m5hal::data::ConstDataSpan{caset, sizeof(caset)})) ||
+            !ok("RASET (0x2B)", dev.writeCommandData(0x2B, m5hal::data::ConstDataSpan{raset, sizeof(raset)}))) {
+            return;
+        }
 
         uint16_t c   = COLORS[bar];
         uint16_t cbe = static_cast<uint16_t>((c >> 8) | (c << 8));
@@ -179,13 +195,18 @@ static void demoLcdDraw(m5hal::spi::MasterAccessor& dev)
         for (int i = 0; i < LCD_WIDTH * BAR_H; ++i) {
             tile[i] = cbe;
         }
-        auto bt = dev.beginTransaction();
-        dev.writeCommand(0x2C);
-        auto pixels = reinterpret_cast<const uint8_t*>(tile);
-        for (int row = 0; row < BAR_H; ++row) {
-            dev.write(pixels + row * LCD_WIDTH * 2, LCD_WIDTH * 2);
+        if (!ok("beginAccess", dev.beginAccess())) {
+            return;
         }
-        dev.endTransaction();
+        bool bar_ok = ok("RAMWR (0x2C)", dev.writeCommand(0x2C));
+        auto pixels = reinterpret_cast<const uint8_t*>(tile);
+        for (int row = 0; bar_ok && row < BAR_H; ++row) {
+            bar_ok = ok("pixel write", dev.write(pixels + row * LCD_WIDTH * 2, LCD_WIDTH * 2));
+        }
+        // Close the CS window even when a write inside it failed.
+        if (!ok("endAccess", dev.endAccess()) || !bar_ok) {
+            return;
+        }
     }
 
     Serial.println("LCD demo: colour bars drawn");
@@ -202,8 +223,7 @@ void setup()
                   PIN_SPI_DC, PIN_SPI_CS, static_cast<unsigned>(M5HAL_EXAMPLE_SPI_FREQUENCY_HZ));
 
     // Tag-typed core pins (CLK / MOSI / MISO): a swapped wiring will not compile.
-    // BusConfig selects the build's default backend; use BusConfig_espidf or
-    // BusConfig_arduino to force a specific one.
+    // BusConfig is portable; provider selection is independent of its C++ type.
     m5hal::spi::BusConfig bus_cfg{m5hal::spi::Clk{PIN_SPI_CLK}, m5hal::spi::Mosi{PIN_SPI_MOSI},
                                   m5hal::spi::Miso{PIN_SPI_MISO}};
 
@@ -228,15 +248,15 @@ void setup()
 
     m5hal::spi::MasterAccessor dev{spi_bus, acc_cfg};  // co-owns the acquired bus
 
-    Serial.printf("backend: %s\n",
-                  spi_bus->backendKind() == m5hal::types::backend_kind_t::Hardware ? "Hardware (dedicated SPI controller)"
-                                                                                    : "Software (bit-bang)");
+    Serial.printf("backend: %s\n", spi_bus->backendKind() == m5hal::types::backend_kind_t::Hardware
+                                       ? "Hardware (dedicated SPI controller)"
+                                       : "Software (bit-bang)");
 
     demoPlainWrite(dev);
     demoCommandData(dev);
     demoDummyClock(dev);
     demoReadCommand(dev);
-    demoManualTransaction(dev);
+    demoManualAccess(dev);
 
 #if M5HAL_EXAMPLE_SPI_LCD_DEMO
     demoLcdDraw(dev);

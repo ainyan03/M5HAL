@@ -42,9 +42,9 @@ static void demoAcquireSharing()
 {
     Serial.println("== acquire: same wiring -> one shared bus ==");
 
-    // The bit-bang backend keeps this demo from holding a hardware controller,
-    // leaving both for the intent demo below.
-    m5hal::i2c::BusConfig_software cfg{m5hal::i2c::Scl{22}, m5hal::i2c::Sda{21}};
+    // Both handles drop at return, so the selected provider's resources are
+    // available again before the intent demo below.
+    m5hal::i2c::BusConfig cfg{m5hal::i2c::Scl{22}, m5hal::i2c::Sda{21}};
 
     auto a = m5hal::M5_Hal.I2C.acquire(cfg);
     if (!a) {
@@ -61,7 +61,7 @@ static void demoAcquireSharing()
     Serial.printf("  probe 0x68 over the shared bus: %s\n", a.value()->probe(0x68).has_value() ? "ACK" : "no device");
 
     // The bus lives while any shared_ptr holds it; both a and b drop at return,
-    // so the bus is released and its registry slot reclaimed.
+    // so the bus is destroyed and its registry slot reclaimed.
 }
 
 // --- 2. intent: declare HOW, then commit + query --------------------------

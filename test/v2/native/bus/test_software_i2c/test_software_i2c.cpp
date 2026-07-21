@@ -16,6 +16,7 @@
 
 #include "i2c_virtual_bus.hpp"
 
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -44,26 +45,66 @@
 
 namespace {
 
+#define ASSERT_SERVICE_OK(expression)                                                                \
+    do {                                                                                             \
+        const auto result_ = (expression);                                                           \
+        ASSERT_TRUE(result_.has_value()) << "err=" << m5::hal::v2::error::toString(result_.error()); \
+    } while (false)
+
+#define EXPECT_SERVICE_OK(expression)                                                                \
+    do {                                                                                             \
+        const auto result_ = (expression);                                                           \
+        EXPECT_TRUE(result_.has_value()) << "err=" << m5::hal::v2::error::toString(result_.error()); \
+    } while (false)
+
+#define EXPECT_SERVICE_RUN(expression, expected_progress)                                            \
+    do {                                                                                             \
+        const auto result_ = (expression);                                                           \
+        ASSERT_TRUE(result_.has_value()) << "err=" << m5::hal::v2::error::toString(result_.error()); \
+        EXPECT_EQ(result_.value(), (expected_progress));                                             \
+    } while (false)
+
 // Field-assignment helper: the positional pin ctor is gone (SCL/SDA
 // share one integer type, so swapped arguments would compile).
-m5::hal::v2::i2c::BusConfig_software makeSoftwareBusConfig(m5::hal::v2::types::gpio_number_t scl,
-                                                           m5::hal::v2::types::gpio_number_t sda)
+m5::hal::v2::i2c::BusConfig makeSoftwareBusConfig(m5::hal::v2::types::gpio_number_t scl,
+                                                  m5::hal::v2::types::gpio_number_t sda)
 {
-    m5::hal::v2::i2c::BusConfig_software cfg;
+    m5::hal::v2::i2c::BusConfig cfg;
     cfg.pin_scl = scl;
     cfg.pin_sda = sda;
     return cfg;
+}
+
+m5::hal::v2::result_t<m5::hal::v2::bus::TransferTotals> transferThroughAccessor(
+    m5::hal::v2::i2c::IBus& bus, const m5::hal::v2::i2c::MasterAccessConfig& config,
+    const m5::hal::v2::i2c::TransferDesc& desc, m5::hal::v2::data::Source* src, size_t tx_len,
+    m5::hal::v2::data::Sink* dst, size_t rx_len)
+{
+    m5::hal::v2::i2c::MasterAccessor accessor{bus, config};
+    auto begun = accessor.beginAccess();
+    if (!begun.has_value()) {
+        return m5::stl::make_unexpected(begun.error());
+    }
+    auto transferred = accessor.transfer(desc, src, tx_len, dst, rx_len);
+    auto ended       = accessor.endAccess();
+    if (!transferred.has_value()) {
+        return transferred;
+    }
+    if (!ended.has_value()) {
+        return m5::stl::make_unexpected(ended.error());
+    }
+    return transferred;
 }
 
 class ScopedServiceRunnerClear {
 public:
     ScopedServiceRunnerClear()
     {
-        m5::hal::v2::M5_Hal.Services.clear();
+        (void)m5::hal::v2::M5_Hal.Services.clear();
     }
     ~ScopedServiceRunnerClear()
     {
-        m5::hal::v2::M5_Hal.Services.clear();
+        (void)m5::hal::v2::M5_Hal.Services.clear();
     }
 };
 
@@ -81,7 +122,8 @@ std::vector<std::unique_ptr<IdleService>> fillGlobalServiceRunner()
     services.reserve(m5::hal::v2::service::ServiceRunner::kMaxServices);
     for (size_t i = 0; i < m5::hal::v2::service::ServiceRunner::kMaxServices; ++i) {
         services.emplace_back(new IdleService());
-        EXPECT_TRUE(m5::hal::v2::M5_Hal.Services.add(*services.back())) << i;
+        const auto added = m5::hal::v2::M5_Hal.Services.add(*services.back());
+        EXPECT_TRUE(added.has_value()) << "index=" << i << " err=" << m5::hal::v2::error::toString(added.error());
     }
     return services;
 }
@@ -760,51 +802,7 @@ TEST(SoftwareI2CMasterReadByte, ReportsTimeoutWhenClockStretchDoesNotRelease)
     EXPECT_EQ(reader.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
 }
 
-TEST(SoftwareI2CMasterTransaction, RunsStartWriteReadAndStopPrimitives)
-{
-    using namespace m5::variants::frameworks::software::hal::v2::i2c::detail;
-
-    FakeMasterLineDriver lines;
-    MasterTiming timing;
-    timing.half_period  = 10;
-    lines.sda_read_high = false;  // ACK for write byte
-
-    MasterTransactionService transaction;
-    transaction.beginStart(lines, timing, 1000);
-
-    auto run_until_done = [&](uint32_t now_tick) {
-        m5::hal::v2::service::ServiceResult result = m5::hal::v2::service::ServiceResult::Idle;
-        for (size_t i = 0; i < 64 && result != m5::hal::v2::service::ServiceResult::Done; ++i) {
-            result = transaction.service(now_tick);
-            now_tick += 10;
-        }
-        return result;
-    };
-
-    EXPECT_EQ(run_until_done(1000), m5::hal::v2::service::ServiceResult::Done);
-    EXPECT_EQ(transaction.operation(), MasterTransactionService::Operation::Idle);
-
-    transaction.beginWriteByte(lines, timing, 0xA5, 2000);
-    EXPECT_EQ(run_until_done(2000), m5::hal::v2::service::ServiceResult::Done);
-    EXPECT_TRUE(transaction.acked());
-
-    lines.sda_read_high = true;
-    transaction.beginReadByte(lines, timing, false, 3000);
-    m5::hal::v2::service::ServiceResult result = m5::hal::v2::service::ServiceResult::Idle;
-    for (uint32_t now_tick = 3000; now_tick < 4000 && result != m5::hal::v2::service::ServiceResult::Done;
-         now_tick += 10) {
-        result = transaction.service(now_tick);
-    }
-    EXPECT_EQ(result, m5::hal::v2::service::ServiceResult::Done);
-    EXPECT_EQ(transaction.byte(), 0xFF);
-
-    lines.sda_read_high = true;
-    transaction.beginStop(lines, timing, 4000);
-    EXPECT_EQ(run_until_done(4000), m5::hal::v2::service::ServiceResult::Done);
-    EXPECT_EQ(transaction.operation(), MasterTransactionService::Operation::Idle);
-}
-
-TEST(SoftwareI2CMasterTransaction, PropagatesPrimitiveErrors)
+TEST(SoftwareI2CMasterTransaction, PropagatesAddressErrors)
 {
     using namespace m5::variants::frameworks::software::hal::v2::i2c::detail;
 
@@ -814,7 +812,7 @@ TEST(SoftwareI2CMasterTransaction, PropagatesPrimitiveErrors)
     timing.half_period = 10;
 
     MasterTransactionService transaction;
-    transaction.beginWriteByte(lines, timing, 0x00, 1000);
+    transaction.beginAddress(lines, timing, 0x68 << 1, 1000);
 
     m5::hal::v2::service::ServiceResult result = m5::hal::v2::service::ServiceResult::Idle;
     for (size_t i = 0; i < 64 && result != m5::hal::v2::service::ServiceResult::Error; ++i) {
@@ -899,8 +897,9 @@ TEST(SoftwareIBus, TransferRecordsPinEventsViaPrefix)
     // state machine actually ran. Protocol-level checks below use
     // SlaveBus_software on VirtualOpenDrainBus.
     //
-    // `owner` is reserved for future lock semantics and accepts nullptr here.
-    (void)bus.transfer(nullptr, acc_cfg, desc, nullptr, 0, nullptr, 0);
+    // The helper constructs a real accessor, so the checked operation context
+    // and lock-owner contract remain active even though wire ACK is irrelevant here.
+    (void)transferThroughAccessor(bus, acc_cfg, desc, nullptr, 0, nullptr, 0);
     EXPECT_GT(scl_port.events().size(), baseline_scl);
     EXPECT_GT(sda_port.events().size(), baseline_sda);
 }
@@ -918,7 +917,7 @@ TEST(SoftwareIBus, TransferRejectsInvalidFrequency)
     acc_cfg.i2c_addr = 0x68;
     acc_cfg.freq     = 0;
 
-    auto r = bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{}, nullptr, 0, nullptr, 0);
+    auto r = transferThroughAccessor(bus, acc_cfg, m5::hal::v2::i2c::TransferDesc{}, nullptr, 0, nullptr, 0);
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), m5::hal::v2::error::error_t::INVALID_ARGUMENT);
 }
@@ -948,7 +947,7 @@ TEST(SoftwareIBus, TransferRecordsPinEventsViaSource)
     const size_t baseline_sda = sda_port.events().size();
 
     m5::hal::v2::i2c::TransferDesc desc;  // No prefix.
-    (void)bus.transfer(nullptr, acc_cfg, desc, &tx_src, SIZE_MAX, nullptr, 0);
+    (void)transferThroughAccessor(bus, acc_cfg, desc, &tx_src, SIZE_MAX, nullptr, 0);
     EXPECT_GT(scl_port.events().size(), baseline_scl);
     EXPECT_GT(sda_port.events().size(), baseline_sda);
 }
@@ -998,7 +997,7 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareAcksProbe)
     VirtualOpenDrainBus lines;
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
-    runner.add(slave.service());
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -1017,7 +1016,7 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareAcksProbe)
     EXPECT_TRUE(r.has_value());
 }
 
-TEST(SoftwareIBus, AccessorTransferRunsInServiceRunnerUntilEndTransaction)
+TEST(SoftwareIBus, AccessorTransferWaitsForItsOwnCompletion)
 {
     using namespace service_proto;
 
@@ -1026,8 +1025,8 @@ TEST(SoftwareIBus, AccessorTransferRunsInServiceRunnerUntilEndTransaction)
     ServiceRunner slave_runner;
     SlaveEndpoint slave{lines, 0x42};
     SlaveTransactionResponder responder{slave, {}, 0, true};
-    slave_runner.add(slave.service());
-    slave_runner.add(responder);
+    EXPECT_SERVICE_OK(slave_runner.add(slave.service()));
+    EXPECT_SERVICE_OK(slave_runner.add(responder));
     lines.setRunner(&slave_runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -1044,25 +1043,15 @@ TEST(SoftwareIBus, AccessorTransferRunsInServiceRunnerUntilEndTransaction)
     m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     const uint8_t tx[] = {0x10, 0x11, 0x12, 0x13};
-    ASSERT_TRUE(accessor.beginTransaction().has_value());
-    auto started = accessor.transfer(m5::hal::v2::i2c::TransferDesc{}, m5::hal::v2::data::ConstDataSpan{tx, sizeof(tx)},
-                                     m5::hal::v2::data::DataSpan{});
-    ASSERT_TRUE(started.has_value());
-    EXPECT_TRUE(accessor.transferBusy());
-    EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), 1u);
-
-    for (size_t i = 0; i < 400 && m5::hal::v2::M5_Hal.Services.size() != 0; ++i) {
-        lines.advance(1000);
-        (void)m5::hal::v2::M5_Hal.Services.runOnce(
-            m5::hal::v2::service::ServiceContext{1000, m5::hal::v2::service::fastTick()});
-    }
-    EXPECT_FALSE(accessor.transferBusy());
-    EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), 0u);
-
-    auto totals = accessor.endTransaction();
+    ASSERT_TRUE(accessor.beginAccess().has_value());
+    auto totals = accessor.transfer(m5::hal::v2::i2c::TransferDesc{}, m5::hal::v2::data::ConstDataSpan{tx, sizeof(tx)},
+                                    m5::hal::v2::data::DataSpan{});
     ASSERT_TRUE(totals.has_value());
     EXPECT_EQ(totals->tx, sizeof(tx));
     EXPECT_EQ(totals->rx, size_t{0});
+    EXPECT_FALSE(accessor.transferBusy());
+    EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), 0u);
+    EXPECT_TRUE(accessor.endAccess().has_value());
     EXPECT_EQ(responder.received(), std::vector<uint8_t>({0x10, 0x11, 0x12, 0x13}));
 }
 
@@ -1076,8 +1065,8 @@ TEST(SoftwareIBus, AccessorTransferFailsWhenServiceRunnerIsFull)
     ServiceRunner slave_runner;
     SlaveEndpoint slave{lines, 0x42};
     SlaveTransactionResponder responder{slave, {}, 0, true};
-    slave_runner.add(slave.service());
-    slave_runner.add(responder);
+    EXPECT_SERVICE_OK(slave_runner.add(slave.service()));
+    EXPECT_SERVICE_OK(slave_runner.add(responder));
     lines.setRunner(&slave_runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -1094,23 +1083,19 @@ TEST(SoftwareIBus, AccessorTransferFailsWhenServiceRunnerIsFull)
     m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     const uint8_t tx[] = {0x10, 0x11, 0x12, 0x13};
-    ASSERT_TRUE(accessor.beginTransaction().has_value());
+    ASSERT_TRUE(accessor.beginAccess().has_value());
     auto started = accessor.transfer(m5::hal::v2::i2c::TransferDesc{}, m5::hal::v2::data::ConstDataSpan{tx, sizeof(tx)},
                                      m5::hal::v2::data::DataSpan{});
     ASSERT_FALSE(started.has_value());
     EXPECT_EQ(started.error(), m5::hal::v2::error::error_t::OUT_OF_RESOURCE);
     EXPECT_FALSE(accessor.transferBusy());
 
-    // The failed segment poisons the transaction (unified latch contract,
-    // spec/design/i2c.md §transaction 中のエラー).
-    auto ended = accessor.endTransaction();
-    ASSERT_FALSE(ended.has_value());
-    EXPECT_EQ(ended.error(), m5::hal::v2::error::error_t::OUT_OF_RESOURCE);
+    EXPECT_TRUE(accessor.endAccess().has_value());
     EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), m5::hal::v2::service::ServiceRunner::kMaxServices);
     (void)fillers;
 }
 
-TEST(SoftwareIBus, NextAccessorTransferDrainsPreviousBeforeStarting)
+TEST(SoftwareIBus, ConsecutiveAccessorTransfersReturnIndividualTotals)
 {
     using namespace service_proto;
 
@@ -1119,8 +1104,8 @@ TEST(SoftwareIBus, NextAccessorTransferDrainsPreviousBeforeStarting)
     ServiceRunner slave_runner;
     SlaveEndpoint slave{lines, 0x42};
     SlaveTransactionResponder responder{slave, {}, 0, true};
-    slave_runner.add(slave.service());
-    slave_runner.add(responder);
+    EXPECT_SERVICE_OK(slave_runner.add(slave.service()));
+    EXPECT_SERVICE_OK(slave_runner.add(responder));
     lines.setRunner(&slave_runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -1139,25 +1124,18 @@ TEST(SoftwareIBus, NextAccessorTransferDrainsPreviousBeforeStarting)
     const uint8_t first[]  = {0x20, 0x21};
     const uint8_t second[] = {0x30};
 
-    ASSERT_TRUE(accessor.beginTransaction().has_value());
-    ASSERT_TRUE(accessor
-                    .transfer(m5::hal::v2::i2c::TransferDesc{}, m5::hal::v2::data::ConstDataSpan{first, sizeof(first)},
-                              m5::hal::v2::data::DataSpan{})
-                    .has_value());
-    EXPECT_TRUE(accessor.transferBusy());
-    EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), 1u);
-
-    ASSERT_TRUE(accessor
-                    .transfer(m5::hal::v2::i2c::TransferDesc{},
-                              m5::hal::v2::data::ConstDataSpan{second, sizeof(second)}, m5::hal::v2::data::DataSpan{})
-                    .has_value());
-    EXPECT_TRUE(accessor.transferBusy());
-    EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), 1u);
-
-    auto totals = accessor.endTransaction();
-    ASSERT_TRUE(totals.has_value());
-    EXPECT_EQ(totals->tx, sizeof(first) + sizeof(second));
-    EXPECT_EQ(totals->rx, size_t{0});
+    ASSERT_TRUE(accessor.beginAccess().has_value());
+    auto first_totals =
+        accessor.transfer(m5::hal::v2::i2c::TransferDesc{}, m5::hal::v2::data::ConstDataSpan{first, sizeof(first)},
+                          m5::hal::v2::data::DataSpan{});
+    ASSERT_TRUE(first_totals.has_value());
+    EXPECT_EQ(first_totals->tx, sizeof(first));
+    auto second_totals =
+        accessor.transfer(m5::hal::v2::i2c::TransferDesc{}, m5::hal::v2::data::ConstDataSpan{second, sizeof(second)},
+                          m5::hal::v2::data::DataSpan{});
+    ASSERT_TRUE(second_totals.has_value());
+    EXPECT_EQ(second_totals->tx, sizeof(second));
+    EXPECT_TRUE(accessor.endAccess().has_value());
     EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), 0u);
     EXPECT_EQ(responder.received(), std::vector<uint8_t>({0x20, 0x21, 0x30}));
 }
@@ -1199,6 +1177,71 @@ TEST(SlaveBusSoftware, MaxAckedWriteBytesSurvivesInit)
     EXPECT_EQ(slave.maxAckedWriteBytes(), 3u);
 }
 
+TEST(SlaveBusSoftware, SdaRiseWhileSclFallsIsNotStop)
+{
+    using namespace service_proto;
+
+    VirtualOpenDrainBus lines;
+    ServiceRunner runner;
+    SlaveEndpoint slave{lines, 0x42};
+    ASSERT_SERVICE_OK(runner.add(slave.service()));
+    lines.setRunner(&runner);
+
+    // Start followed by address 0x42 + write. The final low phase releases
+    // the slave ACK and leaves an open transaction with both lines released.
+    lines.masterWriteSda(false);
+    lines.masterWriteScl(false);
+    constexpr uint8_t address_write = 0x42u << 1;
+    for (uint8_t mask = 0x80; mask != 0; mask >>= 1) {
+        lines.masterWriteSda((address_write & mask) != 0);
+        lines.masterWriteScl(true);
+        lines.masterWriteScl(false);
+    }
+    lines.masterWriteSda(true);
+    lines.masterWriteScl(true);
+    lines.masterWriteScl(false);
+
+    auto opened = slave.accessor().openWireFrame(0);
+    ASSERT_TRUE(opened.has_value()) << "err=" << m5::hal::v2::error::toString(opened.error());
+    auto complete = slave.bus().wireFrameComplete(&slave.accessor());
+    ASSERT_TRUE(complete.has_value()) << "err=" << m5::hal::v2::error::toString(complete.error());
+    EXPECT_FALSE(complete.value());
+    EXPECT_EQ(slave.stopCount(), 0u);
+
+    // Make the previous observation SCL=high/SDA=low, then change both
+    // physical lines while polling is paused. The next poll observes
+    // SCL=low/SDA=high: SDA rose, but not while SCL was high.
+    lines.setRunner(nullptr);
+    lines.masterWriteScl(true);
+    lines.masterWriteSda(false);
+    lines.setRunner(&runner);
+    (void)lines.masterReadScl();
+
+    lines.setRunner(nullptr);
+    lines.masterWriteScl(false);
+    lines.masterWriteSda(true);
+    lines.setRunner(&runner);
+    (void)lines.masterReadScl();
+
+    complete = slave.bus().wireFrameComplete(&slave.accessor());
+    ASSERT_TRUE(complete.has_value()) << "err=" << m5::hal::v2::error::toString(complete.error());
+    EXPECT_FALSE(complete.value());
+    EXPECT_EQ(slave.stopCount(), 0u);
+
+    // A normal SDA rise sampled while SCL remains high is still STOP.
+    lines.masterWriteSda(false);
+    lines.masterWriteScl(true);
+    lines.masterWriteSda(true);
+
+    complete = slave.bus().wireFrameComplete(&slave.accessor());
+    ASSERT_TRUE(complete.has_value()) << "err=" << m5::hal::v2::error::toString(complete.error());
+    EXPECT_TRUE(complete.value());
+    EXPECT_EQ(slave.stopCount(), 1u);
+
+    auto ended = slave.accessor().closeWireFrame();
+    ASSERT_TRUE(ended.has_value()) << "err=" << m5::hal::v2::error::toString(ended.error());
+}
+
 TEST(SlaveBusSoftwareRegistration, RegistersAndRemovesBusService)
 {
     class CountingService : public m5::hal::v2::service::IService {
@@ -1219,19 +1262,23 @@ TEST(SlaveBusSoftwareRegistration, RegistersAndRemovesBusService)
         {
             return {};
         }
-        m5::hal::v2::result_t<void> release() override
+
+    protected:
+        m5::hal::v2::bus::CloseOutcome closeBackend(void) override
         {
-            return {};
+            return m5::hal::v2::bus::CloseOutcome::success();
         }
+
+    public:
         m5::hal::v2::service::IService* service() override
         {
             return svc;
         }
-        m5::hal::v2::result_t<void> beginTransaction(m5::hal::v2::bus::IAccessor*, uint32_t) override
+        m5::hal::v2::result_t<void> tryOpenWireFrame(m5::hal::v2::bus::IAccessor*) override
         {
             return {};
         }
-        m5::hal::v2::result_t<void> endTransaction(m5::hal::v2::bus::IAccessor*) override
+        m5::hal::v2::result_t<void> closeWireFrame(m5::hal::v2::bus::IAccessor*) override
         {
             return {};
         }
@@ -1247,7 +1294,7 @@ TEST(SlaveBusSoftwareRegistration, RegistersAndRemovesBusService)
         {
             return size_t{0};
         }
-        m5::hal::v2::result_t<bool> transactionComplete(m5::hal::v2::bus::IAccessor*) override
+        m5::hal::v2::result_t<bool> wireFrameComplete(m5::hal::v2::bus::IAccessor*) override
         {
             return true;
         }
@@ -1264,12 +1311,12 @@ TEST(SlaveBusSoftwareRegistration, RegistersAndRemovesBusService)
         ASSERT_TRUE(r.has_value());
         EXPECT_TRUE(registration.registered());
         EXPECT_EQ(runner.size(), size_t{1});
-        EXPECT_TRUE(runner.runOnce(m5::hal::v2::service::ServiceContext{0, 0}));
+        EXPECT_SERVICE_RUN(runner.runOnce(m5::hal::v2::service::ServiceContext{0, 0}), true);
         EXPECT_EQ(service.calls, size_t{1});
     }
 
     EXPECT_EQ(runner.size(), size_t{0});
-    EXPECT_FALSE(runner.runOnce(m5::hal::v2::service::ServiceContext{0, 0}));
+    EXPECT_SERVICE_RUN(runner.runOnce(m5::hal::v2::service::ServiceContext{0, 0}), false);
     EXPECT_EQ(service.calls, size_t{1});
 }
 
@@ -1291,19 +1338,23 @@ TEST(SlaveBusSoftwareRegistration, RejectsNullOrDuplicateService)
         {
             return {};
         }
-        m5::hal::v2::result_t<void> release() override
+
+    protected:
+        m5::hal::v2::bus::CloseOutcome closeBackend(void) override
         {
-            return {};
+            return m5::hal::v2::bus::CloseOutcome::success();
         }
+
+    public:
         m5::hal::v2::service::IService* service() override
         {
             return svc;
         }
-        m5::hal::v2::result_t<void> beginTransaction(m5::hal::v2::bus::IAccessor*, uint32_t) override
+        m5::hal::v2::result_t<void> tryOpenWireFrame(m5::hal::v2::bus::IAccessor*) override
         {
             return {};
         }
-        m5::hal::v2::result_t<void> endTransaction(m5::hal::v2::bus::IAccessor*) override
+        m5::hal::v2::result_t<void> closeWireFrame(m5::hal::v2::bus::IAccessor*) override
         {
             return {};
         }
@@ -1319,7 +1370,7 @@ TEST(SlaveBusSoftwareRegistration, RejectsNullOrDuplicateService)
         {
             return size_t{0};
         }
-        m5::hal::v2::result_t<bool> transactionComplete(m5::hal::v2::bus::IAccessor*) override
+        m5::hal::v2::result_t<bool> wireFrameComplete(m5::hal::v2::bus::IAccessor*) override
         {
             return true;
         }
@@ -1336,10 +1387,10 @@ TEST(SlaveBusSoftwareRegistration, RejectsNullOrDuplicateService)
     ASSERT_FALSE(null_result.has_value());
     EXPECT_EQ(null_result.error(), m5::hal::v2::error::error_t::INVALID_ARGUMENT);
 
-    ASSERT_TRUE(runner.add(service));
+    ASSERT_SERVICE_OK(runner.add(service));
     auto duplicate_result = registration.registerTo(runner, driver);
     ASSERT_FALSE(duplicate_result.has_value());
-    EXPECT_EQ(duplicate_result.error(), m5::hal::v2::error::error_t::BUSY);
+    EXPECT_EQ(duplicate_result.error(), m5::hal::v2::error::error_t::INVALID_STATE);
     EXPECT_FALSE(registration.registered());
     EXPECT_EQ(runner.size(), size_t{1});
 }
@@ -1351,7 +1402,7 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareReceivesWriteBytes)
     VirtualOpenDrainBus lines;
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
-    runner.add(slave.service());
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -1370,7 +1421,7 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareReceivesWriteBytes)
     m5::hal::v2::data::MemorySource tx_src{m5::hal::v2::data::ConstDataSpan{tx_bytes, sizeof(tx_bytes)}};
 
     m5::hal::v2::i2c::TransferDesc desc{uint8_t{0xAB}};
-    auto r = bus.transfer(nullptr, acc_cfg, desc, &tx_src, SIZE_MAX, nullptr, 0);
+    auto r = transferThroughAccessor(bus, acc_cfg, desc, &tx_src, SIZE_MAX, nullptr, 0);
     ASSERT_TRUE(r.has_value());
     EXPECT_TRUE(tx_src.eof());
 
@@ -1386,8 +1437,8 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareSupportsWriteThenReadWithRestart)
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
     SlaveTransactionResponder responder{slave, {0xDE, 0xAD}, 1};
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -1407,7 +1458,7 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareSupportsWriteThenReadWithRestart)
     m5::hal::v2::data::MemorySink rx_sink{m5::hal::v2::data::DataSpan{rx_bytes, sizeof(rx_bytes)}};
 
     m5::hal::v2::i2c::TransferDesc desc{uint8_t{0x10}};
-    auto r = bus.transfer(nullptr, acc_cfg, desc, nullptr, 0, &rx_sink, SIZE_MAX);
+    auto r = transferThroughAccessor(bus, acc_cfg, desc, nullptr, 0, &rx_sink, SIZE_MAX);
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(rx_sink.written(), size_t{2});
 
@@ -1425,8 +1476,8 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareSupportsReadOnly)
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
     SlaveTransactionResponder responder{slave, {0xA5, 0x5A}};
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -1445,7 +1496,7 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareSupportsReadOnly)
     m5::hal::v2::data::MemorySink rx_sink{m5::hal::v2::data::DataSpan{rx_bytes, sizeof(rx_bytes)}};
 
     m5::hal::v2::i2c::TransferDesc desc;
-    auto r = bus.transfer(nullptr, acc_cfg, desc, nullptr, 0, &rx_sink, SIZE_MAX);
+    auto r = transferThroughAccessor(bus, acc_cfg, desc, nullptr, 0, &rx_sink, SIZE_MAX);
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(rx_sink.written(), size_t{2});
 
@@ -1465,8 +1516,8 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareSupportsWriteThenReadWithoutRestart)
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
     SlaveTransactionResponder responder{slave, {0xBE, 0xEF}, 0, true};
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -1486,7 +1537,7 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareSupportsWriteThenReadWithoutRestart)
     m5::hal::v2::data::MemorySink rx_sink{m5::hal::v2::data::DataSpan{rx_bytes, sizeof(rx_bytes)}};
 
     m5::hal::v2::i2c::TransferDesc desc{uint8_t{0x20}};
-    auto r = bus.transfer(nullptr, acc_cfg, desc, nullptr, 0, &rx_sink, SIZE_MAX);
+    auto r = transferThroughAccessor(bus, acc_cfg, desc, nullptr, 0, &rx_sink, SIZE_MAX);
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(rx_sink.written(), size_t{2});
 
@@ -1503,7 +1554,7 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareNacksAddressMismatch)
     VirtualOpenDrainBus lines;
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
-    runner.add(slave.service());
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -1535,8 +1586,8 @@ TEST(SoftwareIBus, VirtualSlaveBusesShareBusByAddress)
     VirtualOpenDrainSlaveLineDriver slave43_lines{lines, 1};
     SlaveEndpoint slave42{slave42_lines, 0x42};
     SlaveEndpoint slave43{slave43_lines, 0x43};
-    runner.add(slave42.service());
-    runner.add(slave43.service());
+    EXPECT_SERVICE_OK(runner.add(slave42.service()));
+    EXPECT_SERVICE_OK(runner.add(slave43.service()));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -1555,7 +1606,7 @@ TEST(SoftwareIBus, VirtualSlaveBusesShareBusByAddress)
     m5::hal::v2::data::MemorySource tx_src{m5::hal::v2::data::ConstDataSpan{tx_bytes, sizeof(tx_bytes)}};
 
     m5::hal::v2::i2c::TransferDesc desc{uint8_t{0x22}};
-    auto r = bus.transfer(nullptr, acc_cfg, desc, &tx_src, SIZE_MAX, nullptr, 0);
+    auto r = transferThroughAccessor(bus, acc_cfg, desc, &tx_src, SIZE_MAX, nullptr, 0);
     ASSERT_TRUE(r.has_value());
     EXPECT_TRUE(tx_src.eof());
 
@@ -1574,7 +1625,7 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareNacksWriteData)
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
     slave.setMaxAckedWriteBytes(1);
-    runner.add(slave.service());
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -1593,7 +1644,7 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareNacksWriteData)
     m5::hal::v2::data::MemorySource tx_src{m5::hal::v2::data::ConstDataSpan{tx_bytes, sizeof(tx_bytes)}};
 
     m5::hal::v2::i2c::TransferDesc desc{uint8_t{0xAB}};
-    auto r = bus.transfer(nullptr, acc_cfg, desc, &tx_src, SIZE_MAX, nullptr, 0);
+    auto r = transferThroughAccessor(bus, acc_cfg, desc, &tx_src, SIZE_MAX, nullptr, 0);
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), m5::hal::v2::error::error_t::I2C_NO_ACK);
 
@@ -1610,8 +1661,8 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareObservesFinalReadNack)
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
     SlaveTransactionResponder responder{slave, {0x11, 0x22}};
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -1630,7 +1681,7 @@ TEST(SoftwareIBus, VirtualSlaveBusSoftwareObservesFinalReadNack)
     m5::hal::v2::data::MemorySink rx_sink{m5::hal::v2::data::DataSpan{rx_bytes, sizeof(rx_bytes)}};
 
     m5::hal::v2::i2c::TransferDesc desc;
-    auto r = bus.transfer(nullptr, acc_cfg, desc, nullptr, 0, &rx_sink, SIZE_MAX);
+    auto r = transferThroughAccessor(bus, acc_cfg, desc, nullptr, 0, &rx_sink, SIZE_MAX);
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(rx_sink.written(), size_t{2});
 
@@ -1647,7 +1698,7 @@ TEST(SlaveStreamAccessorWindow, CompletedMasterTransferOpensReadableWindow)
     VirtualOpenDrainBus lines;
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
-    runner.add(slave.service());
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -1664,11 +1715,11 @@ TEST(SlaveStreamAccessorWindow, CompletedMasterTransferOpensReadableWindow)
 
     const uint8_t tx_bytes[] = {0x12, 0x34};
     m5::hal::v2::data::MemorySource tx_src{m5::hal::v2::data::ConstDataSpan{tx_bytes, sizeof(tx_bytes)}};
-    ASSERT_TRUE(
-        bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0xAB}}, &tx_src, SIZE_MAX, nullptr, 0)
-            .has_value());
+    ASSERT_TRUE(transferThroughAccessor(bus, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0xAB}}, &tx_src, SIZE_MAX,
+                                        nullptr, 0)
+                    .has_value());
 
-    ASSERT_TRUE(slave.accessor().beginTransaction(0).has_value());
+    ASSERT_TRUE(slave.accessor().openWireFrame(0).has_value());
     uint8_t rx[3] = {};
     auto read     = slave.accessor().read(m5::hal::v2::data::DataSpan{rx, sizeof(rx)});
     ASSERT_TRUE(read.has_value());
@@ -1676,7 +1727,7 @@ TEST(SlaveStreamAccessorWindow, CompletedMasterTransferOpensReadableWindow)
     EXPECT_EQ(rx[0], 0xAB);
     EXPECT_EQ(rx[1], 0x12);
     EXPECT_EQ(rx[2], 0x34);
-    EXPECT_TRUE(slave.accessor().endTransaction().has_value());
+    EXPECT_TRUE(slave.accessor().closeWireFrame().has_value());
 }
 
 TEST(SlaveStreamAccessorWindow, ConsecutiveMasterTransfersOpenSeparateWindows)
@@ -1686,7 +1737,7 @@ TEST(SlaveStreamAccessorWindow, ConsecutiveMasterTransfersOpenSeparateWindows)
     VirtualOpenDrainBus lines;
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
-    runner.add(slave.service());
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -1701,27 +1752,29 @@ TEST(SlaveStreamAccessorWindow, ConsecutiveMasterTransfersOpenSeparateWindows)
     acc_cfg.freq            = 100000;
     acc_cfg.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
 
-    ASSERT_TRUE(bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x10}}, nullptr, 0, nullptr, 0)
-                    .has_value());
-    ASSERT_TRUE(bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x20}}, nullptr, 0, nullptr, 0)
-                    .has_value());
+    ASSERT_TRUE(
+        transferThroughAccessor(bus, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x10}}, nullptr, 0, nullptr, 0)
+            .has_value());
+    ASSERT_TRUE(
+        transferThroughAccessor(bus, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x20}}, nullptr, 0, nullptr, 0)
+            .has_value());
 
-    ASSERT_TRUE(slave.accessor().beginTransaction(0).has_value());
+    ASSERT_TRUE(slave.accessor().openWireFrame(0).has_value());
     uint8_t first[2] = {};
     auto first_read  = slave.accessor().read(m5::hal::v2::data::DataSpan{first, sizeof(first)});
     ASSERT_TRUE(first_read.has_value());
     EXPECT_EQ(first_read.value(), size_t{1});
     EXPECT_EQ(first[0], 0x10);
     EXPECT_EQ(first[1], 0x00);
-    EXPECT_TRUE(slave.accessor().endTransaction().has_value());
+    EXPECT_TRUE(slave.accessor().closeWireFrame().has_value());
 
-    ASSERT_TRUE(slave.accessor().beginTransaction(0).has_value());
+    ASSERT_TRUE(slave.accessor().openWireFrame(0).has_value());
     uint8_t second[1] = {};
     auto second_read  = slave.accessor().read(m5::hal::v2::data::DataSpan{second, sizeof(second)});
     ASSERT_TRUE(second_read.has_value());
     EXPECT_EQ(second_read.value(), size_t{1});
     EXPECT_EQ(second[0], 0x20);
-    EXPECT_TRUE(slave.accessor().endTransaction().has_value());
+    EXPECT_TRUE(slave.accessor().closeWireFrame().has_value());
 }
 
 TEST(SlaveStreamAccessorWindow, TxQueuedInWindowExpiresAtStop)
@@ -1732,8 +1785,8 @@ TEST(SlaveStreamAccessorWindow, TxQueuedInWindowExpiresAtStop)
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
     SlaveTransactionResponder responder{slave, {0x01, 0x02, 0x03}};
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -1750,15 +1803,17 @@ TEST(SlaveStreamAccessorWindow, TxQueuedInWindowExpiresAtStop)
 
     uint8_t rx_first[2] = {};
     m5::hal::v2::data::MemorySink first_sink{m5::hal::v2::data::DataSpan{rx_first, sizeof(rx_first)}};
-    ASSERT_TRUE(bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{}, nullptr, 0, &first_sink, SIZE_MAX)
-                    .has_value());
+    ASSERT_TRUE(
+        transferThroughAccessor(bus, acc_cfg, m5::hal::v2::i2c::TransferDesc{}, nullptr, 0, &first_sink, SIZE_MAX)
+            .has_value());
     EXPECT_EQ(rx_first[0], 0x01);
     EXPECT_EQ(rx_first[1], 0x02);
 
     uint8_t rx_second[2] = {};
     m5::hal::v2::data::MemorySink second_sink{m5::hal::v2::data::DataSpan{rx_second, sizeof(rx_second)}};
-    ASSERT_TRUE(bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{}, nullptr, 0, &second_sink, SIZE_MAX)
-                    .has_value());
+    ASSERT_TRUE(
+        transferThroughAccessor(bus, acc_cfg, m5::hal::v2::i2c::TransferDesc{}, nullptr, 0, &second_sink, SIZE_MAX)
+            .has_value());
     EXPECT_EQ(rx_second[0], 0xFF);
     EXPECT_EQ(rx_second[1], 0xFF);
 }
@@ -1770,7 +1825,7 @@ TEST(SlaveStreamAccessorWindow, UnderrunReturnsConfiguredFillByte)
     VirtualOpenDrainBus lines;
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
-    runner.add(slave.service());
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -1787,8 +1842,8 @@ TEST(SlaveStreamAccessorWindow, UnderrunReturnsConfiguredFillByte)
 
     uint8_t rx[2] = {};
     m5::hal::v2::data::MemorySink rx_sink{m5::hal::v2::data::DataSpan{rx, sizeof(rx)}};
-    ASSERT_TRUE(
-        bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{}, nullptr, 0, &rx_sink, SIZE_MAX).has_value());
+    ASSERT_TRUE(transferThroughAccessor(bus, acc_cfg, m5::hal::v2::i2c::TransferDesc{}, nullptr, 0, &rx_sink, SIZE_MAX)
+                    .has_value());
     EXPECT_EQ(rx[0], 0xFF);
     EXPECT_EQ(rx[1], 0xFF);
 }
@@ -1801,8 +1856,8 @@ TEST(SlaveStreamAccessorWindow, WriteThenReadIsHandledInsideOneWindow)
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
     SlaveTransactionResponder responder{slave, {0xCA, 0xFE}, 1};
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -1820,9 +1875,9 @@ TEST(SlaveStreamAccessorWindow, WriteThenReadIsHandledInsideOneWindow)
 
     uint8_t rx[2] = {};
     m5::hal::v2::data::MemorySink rx_sink{m5::hal::v2::data::DataSpan{rx, sizeof(rx)}};
-    ASSERT_TRUE(
-        bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x7A}}, nullptr, 0, &rx_sink, SIZE_MAX)
-            .has_value());
+    ASSERT_TRUE(transferThroughAccessor(bus, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x7A}}, nullptr, 0,
+                                        &rx_sink, SIZE_MAX)
+                    .has_value());
 
     const std::vector<uint8_t> expected_written{0x7A};
     EXPECT_EQ(responder.received(), expected_written);
@@ -1849,7 +1904,7 @@ TEST(SlaveStreamAccessorWindow, RxOverflowSurfacesTruncatedLongWrite)
     VirtualOpenDrainBus lines;
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
-    runner.add(slave.service());
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -1877,7 +1932,8 @@ TEST(SlaveStreamAccessorWindow, RxOverflowSurfacesTruncatedLongWrite)
         payload[i] = static_cast<uint8_t>(i);
     }
     m5::hal::v2::data::MemorySource tx_src{m5::hal::v2::data::ConstDataSpan{payload, sizeof(payload)}};
-    (void)bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x00}}, &tx_src, SIZE_MAX, nullptr, 0);
+    (void)transferThroughAccessor(bus, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x00}}, &tx_src, SIZE_MAX,
+                                  nullptr, 0);
 
     EXPECT_GT(slave.bus().rxOverflowCount(), size_t{0});
 }
@@ -1897,8 +1953,8 @@ TEST(SlaveStreamAccessorWindow, LongMasterWriteRoundTripsThroughStreamRing)
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
     SlaveTransactionResponder responder{slave, {}};  // empty reply: pure RX capture
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -1922,7 +1978,7 @@ TEST(SlaveStreamAccessorWindow, LongMasterWriteRoundTripsThroughStreamRing)
     }
     m5::hal::v2::data::MemorySource tx_src{m5::hal::v2::data::ConstDataSpan{payload.data() + 1, payload.size() - 1}};
     ASSERT_TRUE(
-        bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{payload[0]}, &tx_src, SIZE_MAX, nullptr, 0)
+        transferThroughAccessor(bus, acc_cfg, m5::hal::v2::i2c::TransferDesc{payload[0]}, &tx_src, SIZE_MAX, nullptr, 0)
             .has_value());
 
     EXPECT_EQ(responder.received(), payload);
@@ -1946,8 +2002,8 @@ TEST(SlaveStreamAccessorWindow, VeryLongMasterWriteHasNoPerTransactionLimit)
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
     SlaveTransactionResponder responder{slave, {}};  // empty reply: pure RX capture
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -1968,7 +2024,7 @@ TEST(SlaveStreamAccessorWindow, VeryLongMasterWriteHasNoPerTransactionLimit)
     }
     m5::hal::v2::data::MemorySource tx_src{m5::hal::v2::data::ConstDataSpan{payload.data() + 1, payload.size() - 1}};
     ASSERT_TRUE(
-        bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{payload[0]}, &tx_src, SIZE_MAX, nullptr, 0)
+        transferThroughAccessor(bus, acc_cfg, m5::hal::v2::i2c::TransferDesc{payload[0]}, &tx_src, SIZE_MAX, nullptr, 0)
             .has_value());
 
     EXPECT_EQ(responder.received().size(), kStreamLen);
@@ -1998,8 +2054,8 @@ TEST(SlaveStreamAccessorWindow, LongMasterReadStreamsReplyThroughTxRing)
         reply[i] = static_cast<uint8_t>(i * 11 + 3);  // value != index, period > 256
     }
     SlaveStreamReplyResponder responder{slave, reply};
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -2017,7 +2073,7 @@ TEST(SlaveStreamAccessorWindow, LongMasterReadStreamsReplyThroughTxRing)
     std::vector<uint8_t> rx(kReplyLen);
     m5::hal::v2::data::MemorySink rx_sink{m5::hal::v2::data::DataSpan{rx.data(), rx.size()}};
     m5::hal::v2::i2c::TransferDesc desc;  // pure read, no register prefix
-    auto r = bus.transfer(nullptr, acc_cfg, desc, nullptr, 0, &rx_sink, SIZE_MAX);
+    auto r = transferThroughAccessor(bus, acc_cfg, desc, nullptr, 0, &rx_sink, SIZE_MAX);
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(rx_sink.written(), kReplyLen);
     EXPECT_EQ(rx, reply);
@@ -2039,19 +2095,23 @@ TEST(SlaveStreamAccessorWaitForActivity, ReportsActivityVersusTimeout)
         {
             return {};
         }
-        result_t<void> release() override
+
+    protected:
+        v2::bus::CloseOutcome closeBackend(void) override
         {
-            return {};
+            return v2::bus::CloseOutcome::success();
         }
+
+    public:
         v2::service::IService* service() override
         {
             return nullptr;
         }
-        result_t<void> beginTransaction(v2::bus::IAccessor*, uint32_t) override
+        result_t<void> tryOpenWireFrame(v2::bus::IAccessor*) override
         {
             return {};
         }
-        result_t<void> endTransaction(v2::bus::IAccessor*) override
+        result_t<void> closeWireFrame(v2::bus::IAccessor*) override
         {
             return {};
         }
@@ -2067,7 +2127,7 @@ TEST(SlaveStreamAccessorWaitForActivity, ReportsActivityVersusTimeout)
         {
             return size_t{0};
         }
-        result_t<bool> transactionComplete(v2::bus::IAccessor*) override
+        result_t<bool> wireFrameComplete(v2::bus::IAccessor*) override
         {
             return false;
         }
@@ -2113,7 +2173,7 @@ TEST(SoftwareI2CMasterSourceSink, WriteSourceSendsBytes)
     VirtualOpenDrainBus lines;
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
-    runner.add(slave.service());
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -2147,8 +2207,8 @@ TEST(SoftwareI2CMasterSourceSink, ReadSinkReceivesBytes)
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
     SlaveTransactionResponder responder{slave, {0xDE, 0xAD}};
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -2181,7 +2241,7 @@ TEST(SoftwareI2CMasterSourceSink, WriteRegisterTypedSourceSendsPrefix)
     VirtualOpenDrainBus lines;
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
-    runner.add(slave.service());
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -2216,7 +2276,7 @@ TEST(SoftwareI2CMasterSourceSink, WriteRegisterLiteralSourceSendsPrefix)
     VirtualOpenDrainBus lines;
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
-    runner.add(slave.service());
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -2252,8 +2312,8 @@ TEST(SoftwareI2CMasterSourceSink, ReadRegisterTypedSinkReceivesData)
     SlaveEndpoint slave{lines, 0x42};
     // min_rx_bytes_before_write=1: wait for the register prefix byte before replying.
     SlaveTransactionResponder responder{slave, {0x5A, 0x3C}, 1};
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -2293,8 +2353,8 @@ TEST(SoftwareI2CMasterSourceSink, ReadRegisterLiteralSinkReceivesData)
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
     SlaveTransactionResponder responder{slave, {0xBE, 0xEF}, 1};
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -2332,7 +2392,7 @@ TEST(SoftwareI2CMasterSourceSink, WriteCapsBytesAtLen)
     VirtualOpenDrainBus lines;
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
-    runner.add(slave.service());
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -2369,8 +2429,8 @@ TEST(SoftwareI2CMasterSourceSink, ReadCapsBytesAtLen)
     SlaveEndpoint slave{lines, 0x42};
     // Responder offers 8 bytes; the master's capped Sink must accept only 4.
     SlaveTransactionResponder responder{slave, {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7}};
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -2427,8 +2487,8 @@ TEST(SoftwareI2CMasterSourceSink, ReadWithShortReserveSinkReceivesAllBytesAcross
     SlaveEndpoint slave{lines, 0x42};
     const std::vector<uint8_t> tx_bytes{0x10, 0x11, 0x12, 0x13, 0x14, 0x15};
     SlaveTransactionResponder responder{slave, tx_bytes};
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -2563,7 +2623,7 @@ public:
             return m5::hal::v2::service::ServiceResult::Idle;
         }
         if (!_opened) {
-            if (!acc.beginTransaction(0).has_value()) {
+            if (!acc.openWireFrame(0).has_value()) {
                 return m5::hal::v2::service::ServiceResult::Idle;
             }
             _regmap.beginExchange();
@@ -2611,9 +2671,9 @@ public:
             // Post-compose: every further byte is write data; apply incrementally.
             _regmap.ingest(m5::hal::v2::data::ConstDataSpan{buffer, n});
         }
-        auto complete = acc.transactionComplete();
+        auto complete = acc.wireFrameComplete();
         if (complete.has_value() && complete.value()) {
-            (void)acc.endTransaction();
+            (void)acc.closeWireFrame();
             _ended = true;
             if (_repeat) {
                 _opened = false;
@@ -2889,8 +2949,8 @@ TEST(SlaveRegMapAccessorWire, WriteThenReadReturnsRegisterWindow)
     m5::hal::v2::i2c::SlaveRegMapAccessor regmap{slave.bus(), m5::hal::v2::data::DataSpan{reg_file, sizeof(reg_file)}};
     RegMapTickResponder responder{regmap, /*min_rx_before_compose=*/1};
 
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -2908,9 +2968,9 @@ TEST(SlaveRegMapAccessorWire, WriteThenReadReturnsRegisterWindow)
 
     uint8_t rx[4] = {};
     m5::hal::v2::data::MemorySink rx_sink{m5::hal::v2::data::DataSpan{rx, sizeof(rx)}};
-    ASSERT_TRUE(
-        bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x10}}, nullptr, 0, &rx_sink, SIZE_MAX)
-            .has_value());
+    ASSERT_TRUE(transferThroughAccessor(bus, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x10}}, nullptr, 0,
+                                        &rx_sink, SIZE_MAX)
+                    .has_value());
 
     EXPECT_EQ(rx[0], 0x10);
     EXPECT_EQ(rx[1], 0x11);
@@ -2935,8 +2995,8 @@ TEST(SlaveRegMapAccessorWire, SplitWriteThenSeparateReadUsesPersistedPointer)
     // (the master never reads it) and the second transaction is a pure read.
     RegMapTickResponder responder{regmap, /*min_rx_before_compose=*/0};
 
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -2954,14 +3014,14 @@ TEST(SlaveRegMapAccessorWire, SplitWriteThenSeparateReadUsesPersistedPointer)
     // Transaction 1: write the register pointer only, STOP.
     const uint8_t ptr_byte[] = {0x40};
     m5::hal::v2::data::MemorySource ptr_src{m5::hal::v2::data::ConstDataSpan{ptr_byte, sizeof(ptr_byte)}};
-    ASSERT_TRUE(
-        bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{}, &ptr_src, SIZE_MAX, nullptr, 0).has_value());
+    ASSERT_TRUE(transferThroughAccessor(bus, acc_cfg, m5::hal::v2::i2c::TransferDesc{}, &ptr_src, SIZE_MAX, nullptr, 0)
+                    .has_value());
 
     // Transaction 2: a pure read resolves against the pointer set above.
     uint8_t rx[3] = {};
     m5::hal::v2::data::MemorySink rx_sink{m5::hal::v2::data::DataSpan{rx, sizeof(rx)}};
-    ASSERT_TRUE(
-        bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{}, nullptr, 0, &rx_sink, SIZE_MAX).has_value());
+    ASSERT_TRUE(transferThroughAccessor(bus, acc_cfg, m5::hal::v2::i2c::TransferDesc{}, nullptr, 0, &rx_sink, SIZE_MAX)
+                    .has_value());
 
     EXPECT_EQ(rx[0], 0x40);
     EXPECT_EQ(rx[1], 0x41);
@@ -2980,8 +3040,8 @@ TEST(SlaveRegMapAccessorWire, MultiByteWriteStoresIntoRegisterFile)
     m5::hal::v2::i2c::SlaveRegMapAccessor regmap{slave.bus(), m5::hal::v2::data::DataSpan{reg_file, sizeof(reg_file)}};
     RegMapTickResponder responder{regmap, /*min_rx_before_compose=*/0};
 
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -2999,9 +3059,9 @@ TEST(SlaveRegMapAccessorWire, MultiByteWriteStoresIntoRegisterFile)
     // Write [0x50, 0xDE, 0xAD, 0xBE]: pointer 0x50, then three data bytes.
     const uint8_t payload[] = {0xDE, 0xAD, 0xBE};
     m5::hal::v2::data::MemorySource tx_src{m5::hal::v2::data::ConstDataSpan{payload, sizeof(payload)}};
-    ASSERT_TRUE(
-        bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x50}}, &tx_src, SIZE_MAX, nullptr, 0)
-            .has_value());
+    ASSERT_TRUE(transferThroughAccessor(bus, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x50}}, &tx_src, SIZE_MAX,
+                                        nullptr, 0)
+                    .has_value());
 
     EXPECT_EQ(reg_file[0x50], 0xDE);
     EXPECT_EQ(reg_file[0x51], 0xAD);
@@ -3027,8 +3087,8 @@ TEST(SlaveRegMapAccessorWire, LongWriteBeyondRxWindowFillsRegisterFileViaRing)
     m5::hal::v2::i2c::SlaveRegMapAccessor regmap{slave.bus(), m5::hal::v2::data::DataSpan{reg_file, sizeof(reg_file)}};
     RegMapTickResponder responder{regmap, /*min_rx_before_compose=*/0};
 
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -3050,9 +3110,9 @@ TEST(SlaveRegMapAccessorWire, LongWriteBeyondRxWindowFillsRegisterFileViaRing)
         payload[i] = static_cast<uint8_t>(i + 1);
     }
     m5::hal::v2::data::MemorySource tx_src{m5::hal::v2::data::ConstDataSpan{payload, sizeof(payload)}};
-    ASSERT_TRUE(
-        bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x00}}, &tx_src, SIZE_MAX, nullptr, 0)
-            .has_value());
+    ASSERT_TRUE(transferThroughAccessor(bus, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x00}}, &tx_src, SIZE_MAX,
+                                        nullptr, 0)
+                    .has_value());
 
     for (size_t i = 0; i < sizeof(payload); ++i) {
         EXPECT_EQ(reg_file[i], payload[i]) << "register file mismatch at offset " << i;
@@ -3074,8 +3134,8 @@ TEST(SlaveRegMapAccessorWire, OnReadSuppliesLiveValuesOverTheWire)
     regmap.setOnRead(&regMapOnReadCounter, &counter);
     RegMapTickResponder responder{regmap, /*min_rx_before_compose=*/1};
 
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -3095,9 +3155,9 @@ TEST(SlaveRegMapAccessorWire, OnReadSuppliesLiveValuesOverTheWire)
     // window is a live sequence rather than the (zeroed) backing store.
     uint8_t rx[3] = {};
     m5::hal::v2::data::MemorySink rx_sink{m5::hal::v2::data::DataSpan{rx, sizeof(rx)}};
-    ASSERT_TRUE(
-        bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x00}}, nullptr, 0, &rx_sink, SIZE_MAX)
-            .has_value());
+    ASSERT_TRUE(transferThroughAccessor(bus, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x00}}, nullptr, 0,
+                                        &rx_sink, SIZE_MAX)
+                    .has_value());
 
     EXPECT_EQ(rx[0], 0x00);
     EXPECT_EQ(rx[1], 0x01);
@@ -3125,8 +3185,8 @@ TEST(SlaveRegMapAccessorWire, SameTransactionWriteThenReadSeesPreWriteValue)
     m5::hal::v2::i2c::SlaveRegMapAccessor regmap{slave.bus(), m5::hal::v2::data::DataSpan{reg_file, sizeof(reg_file)}};
     RegMapTickResponder responder{regmap, /*min_rx_before_compose=*/1};
 
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -3147,8 +3207,8 @@ TEST(SlaveRegMapAccessorWire, SameTransactionWriteThenReadSeesPreWriteValue)
     m5::hal::v2::data::MemorySource tx_src{m5::hal::v2::data::ConstDataSpan{payload, sizeof(payload)}};
     uint8_t rx[1] = {};
     m5::hal::v2::data::MemorySink rx_sink{m5::hal::v2::data::DataSpan{rx, sizeof(rx)}};
-    ASSERT_TRUE(bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x10}}, &tx_src, SIZE_MAX,
-                             &rx_sink, SIZE_MAX)
+    ASSERT_TRUE(transferThroughAccessor(bus, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x10}}, &tx_src, SIZE_MAX,
+                                        &rx_sink, SIZE_MAX)
                     .has_value());
 
     EXPECT_EQ(rx[0], 0x10);           // pre-write reg_file[0x10], composed before the store
@@ -3170,8 +3230,8 @@ TEST(SlaveRegMapAccessorWire, LongReadStreamsBeyondOneReplyChunk)
     m5::hal::v2::i2c::SlaveRegMapAccessor regmap{slave.bus(), m5::hal::v2::data::DataSpan{reg_file, sizeof(reg_file)}};
     RegMapTickResponder responder{regmap, /*min_rx_before_compose=*/1};
 
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -3192,9 +3252,9 @@ TEST(SlaveRegMapAccessorWire, LongReadStreamsBeyondOneReplyChunk)
     // clocking (the reply-pump streaming fix; previously a read was capped at one window).
     uint8_t rx[96] = {};
     m5::hal::v2::data::MemorySink rx_sink{m5::hal::v2::data::DataSpan{rx, sizeof(rx)}};
-    ASSERT_TRUE(
-        bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x00}}, nullptr, 0, &rx_sink, SIZE_MAX)
-            .has_value());
+    ASSERT_TRUE(transferThroughAccessor(bus, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x00}}, nullptr, 0,
+                                        &rx_sink, SIZE_MAX)
+                    .has_value());
 
     for (int i = 0; i < 96; ++i) {
         ASSERT_EQ(rx[i], static_cast<uint8_t>(i)) << "at offset " << i;
@@ -3218,8 +3278,8 @@ TEST(SlaveRegMapAccessorWire, OneByteReadComposeReadAheadIsBounded)
     regmap.setOnRead(&regMapOnReadCountCalls, &counter);
     RegMapTickResponder responder{regmap, /*min_rx_before_compose=*/1};
 
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -3241,9 +3301,9 @@ TEST(SlaveRegMapAccessorWire, OneByteReadComposeReadAheadIsBounded)
     // two of them (regression pin for the public contract's caveat).
     uint8_t rx[1] = {};
     m5::hal::v2::data::MemorySink rx_sink{m5::hal::v2::data::DataSpan{rx, sizeof(rx)}};
-    ASSERT_TRUE(
-        bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x20}}, nullptr, 0, &rx_sink, SIZE_MAX)
-            .has_value());
+    ASSERT_TRUE(transferThroughAccessor(bus, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0x20}}, nullptr, 0,
+                                        &rx_sink, SIZE_MAX)
+                    .has_value());
 
     EXPECT_EQ(rx[0], 0x20);
     EXPECT_GE(counter.calls, size_t{64});
@@ -3265,8 +3325,8 @@ TEST(SlaveRegMapAccessorWire, LongReadContinuationWrapsPastRegisterFileEnd)
     m5::hal::v2::i2c::SlaveRegMapAccessor regmap{slave.bus(), m5::hal::v2::data::DataSpan{reg_file, sizeof(reg_file)}};
     RegMapTickResponder responder{regmap, /*min_rx_before_compose=*/1};
 
-    runner.add(slave.service());
-    runner.add(responder);
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
+    EXPECT_SERVICE_OK(runner.add(responder));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -3287,9 +3347,9 @@ TEST(SlaveRegMapAccessorWire, LongReadContinuationWrapsPastRegisterFileEnd)
     // auto-increment regmap behavior, unbounded by the chunk size.
     uint8_t rx[200] = {};
     m5::hal::v2::data::MemorySink rx_sink{m5::hal::v2::data::DataSpan{rx, sizeof(rx)}};
-    ASSERT_TRUE(
-        bus.transfer(nullptr, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0xC0}}, nullptr, 0, &rx_sink, SIZE_MAX)
-            .has_value());
+    ASSERT_TRUE(transferThroughAccessor(bus, acc_cfg, m5::hal::v2::i2c::TransferDesc{uint8_t{0xC0}}, nullptr, 0,
+                                        &rx_sink, SIZE_MAX)
+                    .has_value());
 
     for (int i = 0; i < 200; ++i) {
         ASSERT_EQ(rx[i], static_cast<uint8_t>(0xC0 + i)) << "at offset " << i;
@@ -3300,6 +3360,7 @@ TEST(SoftwareIBus, VirtualOpenDrainBusReportsTimeoutWhenSclHeldLow)
 {
     using namespace service_proto;
 
+    ScopedServiceRunnerClear clear_services;
     VirtualOpenDrainBus lines;
     lines.slavePullSclLow(true);
 
@@ -3319,6 +3380,8 @@ TEST(SoftwareIBus, VirtualOpenDrainBusReportsTimeoutWhenSclHeldLow)
     auto r = accessor.probe();
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+    EXPECT_FALSE(accessor.transferBusy());
+    EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), 0u);
 }
 
 TEST(SoftwareIBus, VirtualOpenDrainBusReportsBusErrorWhenSdaHeldLowAtStop)
@@ -3347,9 +3410,8 @@ TEST(SoftwareIBus, VirtualOpenDrainBusReportsBusErrorWhenSdaHeldLowAtStop)
 }
 
 // ---------------------------------------------------------------------------
-// Behaviour of `Bus::lock` / `unlock`,
-// `Accessor::beginAccess` / `endAccess`, and the RAII helpers
-// `ScopedAccess` / `ScopedLock`.
+// Behaviour of the internal Access lock seam, the public
+// `Accessor::beginAccess` / `endAccess`, and `ScopedAccess`.
 // ---------------------------------------------------------------------------
 
 namespace stage2 {
@@ -3365,11 +3427,13 @@ public:
     {
         return _config;
     }
-    m5::hal::v2::result_t<void> transfer(m5::hal::v2::bus::IAccessor* owner,
-                                         const m5::hal::v2::i2c::MasterAccessConfig& cfg,
-                                         const m5::hal::v2::i2c::TransferDesc& desc, m5::hal::v2::data::Source* tx,
-                                         size_t tx_len, m5::hal::v2::data::Sink* rx, size_t rx_len) override
+    m5::hal::v2::result_t<void> transferBackend(
+        m5::hal::v2::bus::OperationContext<m5::hal::v2::i2c::MasterAccessConfig>& context,
+        const m5::hal::v2::i2c::TransferDesc& desc, m5::hal::v2::data::Source* tx, size_t tx_len,
+        m5::hal::v2::data::Sink* rx, size_t rx_len) override
     {
+        auto* owner     = &m5::hal::v2::bus::OperationSlot::contextOwner(context);
+        const auto& cfg = context.config;
         ++transfer_count;
         last_cfg                        = cfg;
         last_desc                       = desc;
@@ -3378,7 +3442,7 @@ public:
         last_owner_in_transaction       = false;
         last_owner_in_transaction_known = (owner != nullptr);
         if (owner != nullptr) {
-            last_owner_in_transaction = static_cast<const m5::hal::v2::i2c::MasterAccessor*>(owner)->inTransaction();
+            last_owner_in_transaction = static_cast<const m5::hal::v2::i2c::MasterAccessor*>(owner)->inAccess();
         }
         last_totals.clear();
         if (tx) {
@@ -3411,11 +3475,10 @@ public:
         }
         return {};
     }
-    m5::hal::v2::result_t<m5::hal::v2::bus::TransferTotals> waitTransfer(
-        m5::hal::v2::bus::IAccessor* owner, const m5::hal::v2::i2c::MasterAccessConfig& cfg) override
+    m5::hal::v2::result_t<m5::hal::v2::bus::TransferTotals> waitTransferBackend(
+        m5::hal::v2::bus::OperationContext<m5::hal::v2::i2c::MasterAccessConfig>& context) override
     {
-        (void)owner;
-        (void)cfg;
+        (void)context;
         auto totals = last_totals;
         last_totals.clear();
         return totals;
@@ -3424,6 +3487,15 @@ public:
     const m5::hal::v2::bus::IAccessor* lockOwner(void) const
     {
         return _lock_owner;
+    }
+    m5::hal::v2::result_t<void> testAcquire(m5::hal::v2::bus::IAccessor& owner,
+                                            uint32_t timeout_ms = m5::hal::v2::types::TIMEOUT_FOREVER)
+    {
+        return acquireAccessLock(owner, timeout_ms);
+    }
+    m5::hal::v2::result_t<void> testRelease(m5::hal::v2::bus::IAccessor& owner)
+    {
+        return releaseAccessLock(owner);
     }
     size_t transfer_count = 0;
     m5::hal::v2::i2c::MasterAccessConfig last_cfg;
@@ -3453,21 +3525,13 @@ TEST(BusLock, LockSetsOwnerUnlockClears)
     m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     EXPECT_EQ(bus.lockOwner(), nullptr);
-    auto lk = bus.lock(&accessor);
+    auto lk = bus.testAcquire(accessor);
     EXPECT_TRUE(lk.has_value());
     EXPECT_EQ(bus.lockOwner(), &accessor);
 
-    auto ul = bus.unlock(&accessor);
+    auto ul = bus.testRelease(accessor);
     EXPECT_TRUE(ul.has_value());
     EXPECT_EQ(bus.lockOwner(), nullptr);
-}
-
-TEST(BusLock, LockRejectsNullOwner)
-{
-    StubBus bus;
-    auto r = bus.lock(nullptr);
-    EXPECT_FALSE(r.has_value());
-    EXPECT_EQ(r.error(), m5::hal::v2::error::error_t::INVALID_ARGUMENT);
 }
 
 TEST(BusLock, SecondLockTimesOut)
@@ -3477,16 +3541,16 @@ TEST(BusLock, SecondLockTimesOut)
     m5::hal::v2::i2c::MasterAccessor a1{bus, acc_cfg};
     m5::hal::v2::i2c::MasterAccessor a2{bus, acc_cfg};
 
-    ASSERT_TRUE(bus.lock(&a1).has_value());
+    ASSERT_TRUE(bus.testAcquire(a1).has_value());
 
     // The default timeout now waits forever; pass a small finite budget
     // so the contention check stays deterministic.
-    auto r = bus.lock(&a2, 10);
+    auto r = bus.testAcquire(a2, 10);
     EXPECT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
     EXPECT_EQ(bus.lockOwner(), &a1);  // The owner is unchanged.
 
-    (void)bus.unlock(&a1);
+    (void)bus.testRelease(a1);
 }
 
 TEST(BusLock, UnlockByWrongOwnerFails)
@@ -3496,14 +3560,14 @@ TEST(BusLock, UnlockByWrongOwnerFails)
     m5::hal::v2::i2c::MasterAccessor a1{bus, acc_cfg};
     m5::hal::v2::i2c::MasterAccessor a2{bus, acc_cfg};
 
-    ASSERT_TRUE(bus.lock(&a1).has_value());
+    ASSERT_TRUE(bus.testAcquire(a1).has_value());
 
-    auto r = bus.unlock(&a2);
+    auto r = bus.testRelease(a2);
     EXPECT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), m5::hal::v2::error::error_t::INVALID_ARGUMENT);
     EXPECT_EQ(bus.lockOwner(), &a1);  // The owner is unchanged.
 
-    (void)bus.unlock(&a1);
+    (void)bus.testRelease(a1);
 }
 
 TEST(AccessorAccess, BeginEndManageBusLock)
@@ -3522,23 +3586,19 @@ TEST(AccessorAccess, BeginEndManageBusLock)
     EXPECT_EQ(bus.lockOwner(), nullptr);
 }
 
-TEST(AccessorAccess, NestedBeginEndOnlyLocksOnce)
+TEST(AccessorAccess, NestedBeginIsRejectedAndOneEndUnlocks)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x10);
     m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
 
     ASSERT_TRUE(accessor.beginAccess().has_value());
-    ASSERT_TRUE(accessor.beginAccess().has_value());  // Inner call (analogous to a sugar method).
+    auto nested = accessor.beginAccess();
+    ASSERT_FALSE(nested.has_value());
+    EXPECT_EQ(nested.error(), m5::hal::v2::error::error_t::INVALID_STATE);
     EXPECT_TRUE(accessor.inAccess());
     EXPECT_EQ(bus.lockOwner(), &accessor);
 
-    // Inner `endAccess` — depth is still > 0, so the bus stays locked.
-    ASSERT_TRUE(accessor.endAccess().has_value());
-    EXPECT_TRUE(accessor.inAccess());
-    EXPECT_EQ(bus.lockOwner(), &accessor);
-
-    // Outer `endAccess` — depth hits zero, the bus unlocks here.
     ASSERT_TRUE(accessor.endAccess().has_value());
     EXPECT_FALSE(accessor.inAccess());
     EXPECT_EQ(bus.lockOwner(), nullptr);
@@ -3555,65 +3615,7 @@ TEST(AccessorAccess, EndAccessWithoutBeginFails)
     EXPECT_EQ(r.error(), m5::hal::v2::error::error_t::INVALID_STATE);
 }
 
-TEST(AccessorTransaction, BeginEndManageBusLockAndReturnTotals)
-{
-    StubBus bus;
-    auto acc_cfg = makeAcc(0x10);
-    m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
-
-    EXPECT_FALSE(accessor.inTransaction());
-    EXPECT_FALSE(accessor.inAccess());
-    ASSERT_TRUE(accessor.beginTransaction().has_value());
-    EXPECT_TRUE(accessor.inTransaction());
-    EXPECT_TRUE(accessor.inAccess());
-    EXPECT_EQ(bus.lockOwner(), &accessor);
-
-    auto totals = accessor.endTransaction();
-    ASSERT_TRUE(totals.has_value());
-    EXPECT_EQ(totals->tx, size_t{0});
-    EXPECT_EQ(totals->rx, size_t{0});
-    EXPECT_FALSE(accessor.inTransaction());
-    EXPECT_FALSE(accessor.inAccess());
-    EXPECT_EQ(bus.lockOwner(), nullptr);
-}
-
-TEST(AccessorTransaction, NestedBeginEndOnlyLocksOnce)
-{
-    StubBus bus;
-    auto acc_cfg = makeAcc(0x10);
-    m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
-
-    ASSERT_TRUE(accessor.beginTransaction().has_value());
-    ASSERT_TRUE(accessor.beginTransaction().has_value());
-    EXPECT_TRUE(accessor.inTransaction());
-    EXPECT_TRUE(accessor.inAccess());
-    EXPECT_EQ(bus.lockOwner(), &accessor);
-
-    auto inner = accessor.endTransaction();
-    ASSERT_TRUE(inner.has_value());
-    EXPECT_TRUE(accessor.inTransaction());
-    EXPECT_TRUE(accessor.inAccess());
-    EXPECT_EQ(bus.lockOwner(), &accessor);
-
-    auto outer = accessor.endTransaction();
-    ASSERT_TRUE(outer.has_value());
-    EXPECT_FALSE(accessor.inTransaction());
-    EXPECT_FALSE(accessor.inAccess());
-    EXPECT_EQ(bus.lockOwner(), nullptr);
-}
-
-TEST(AccessorTransaction, EndTransactionWithoutBeginFails)
-{
-    StubBus bus;
-    auto acc_cfg = makeAcc(0x10);
-    m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
-
-    auto r = accessor.endTransaction();
-    EXPECT_FALSE(r.has_value());
-    EXPECT_EQ(r.error(), m5::hal::v2::error::error_t::INVALID_STATE);
-}
-
-TEST(AccessorTransaction, TransferInsideTransactionKeepsLockUntilEnd)
+TEST(AccessorAccess, TransfersInsideAccessKeepLockAndReturnPerIoTotals)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x10);
@@ -3621,7 +3623,7 @@ TEST(AccessorTransaction, TransferInsideTransactionKeepsLockUntilEnd)
 
     const uint8_t tx[] = {0x12, 0x34};
     uint8_t rx[3]      = {};
-    ASSERT_TRUE(accessor.beginTransaction().has_value());
+    ASSERT_TRUE(accessor.beginAccess().has_value());
     EXPECT_EQ(bus.lockOwner(), &accessor);
 
     auto w = accessor.transfer(m5::hal::v2::i2c::TransferDesc{}, m5::hal::v2::data::ConstDataSpan{tx, sizeof(tx)},
@@ -3632,13 +3634,15 @@ TEST(AccessorTransaction, TransferInsideTransactionKeepsLockUntilEnd)
     EXPECT_TRUE(r.has_value());
     EXPECT_EQ(bus.transfer_count, 2u);
     EXPECT_EQ(bus.lockOwner(), &accessor);
-    EXPECT_TRUE(accessor.inTransaction());
     EXPECT_TRUE(accessor.inAccess());
 
-    auto totals = accessor.endTransaction();
-    ASSERT_TRUE(totals.has_value());
-    EXPECT_EQ(totals->tx, sizeof(tx));
-    EXPECT_EQ(totals->rx, sizeof(rx));
+    ASSERT_TRUE(w.has_value());
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(w->tx, sizeof(tx));
+    EXPECT_EQ(w->rx, 0u);
+    EXPECT_EQ(r->tx, 0u);
+    EXPECT_EQ(r->rx, sizeof(rx));
+    ASSERT_TRUE(accessor.endAccess().has_value());
     EXPECT_EQ(bus.lockOwner(), nullptr);
 }
 
@@ -3721,7 +3725,7 @@ TEST(ScopedAccess, FailureLeavesBusUnlocked)
     m5::hal::v2::i2c::MasterAccessor blocker{bus, acc_cfg};
     m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
 
-    ASSERT_TRUE(bus.lock(&blocker).has_value());
+    ASSERT_TRUE(blocker.beginAccess(10).has_value());
 
     {
         // Finite budget: the default would wait forever on the blocker.
@@ -3734,46 +3738,10 @@ TEST(ScopedAccess, FailureLeavesBusUnlocked)
     // The blocker's lock must not be unlocked accidentally by the failed scope's dtor.
     EXPECT_EQ(bus.lockOwner(), &blocker);
 
-    (void)bus.unlock(&blocker);
+    (void)blocker.endAccess(10);
 }
 
-TEST(ScopedLock, AcquiresAndReleasesAtScopeExit)
-{
-    StubBus bus;
-    auto acc_cfg = makeAcc(0x10);
-    m5::hal::v2::i2c::MasterAccessor accessor{bus, acc_cfg};
-
-    {
-        m5::hal::v2::bus::ScopedLock scope{bus, &accessor};
-        EXPECT_FALSE(scope.has_error());
-        EXPECT_TRUE(scope.ok());  // positive view == !has_error()
-        EXPECT_EQ(bus.lockOwner(), &accessor);
-    }
-    EXPECT_EQ(bus.lockOwner(), nullptr);
-}
-
-TEST(ScopedLock, ContendedAcquireSurfacesTimeout)
-{
-    StubBus bus;
-    auto acc_cfg = makeAcc(0x10);
-    m5::hal::v2::i2c::MasterAccessor a1{bus, acc_cfg};
-    m5::hal::v2::i2c::MasterAccessor a2{bus, acc_cfg};
-
-    ASSERT_TRUE(bus.lock(&a1).has_value());
-
-    {
-        // Finite budget: the default would wait forever on the holder.
-        m5::hal::v2::bus::ScopedLock scope{bus, &a2, 10};
-        EXPECT_TRUE(scope.has_error());
-        EXPECT_FALSE(scope.ok());  // positive view == !has_error()
-        EXPECT_EQ(scope.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
-    }
-    EXPECT_EQ(bus.lockOwner(), &a1);
-
-    (void)bus.unlock(&a1);
-}
-
-TEST(AccessorCoreTransfer, RequiresOpenTransaction)
+TEST(AccessorCoreTransfer, RequiresOpenAccess)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x10);
@@ -3785,11 +3753,11 @@ TEST(AccessorCoreTransfer, RequiresOpenTransaction)
     EXPECT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), m5::hal::v2::error::error_t::INVALID_STATE);
     EXPECT_EQ(bus.transfer_count, 0u);
-    EXPECT_FALSE(accessor.inTransaction());
+    EXPECT_FALSE(accessor.inAccess());
     EXPECT_EQ(bus.lockOwner(), nullptr);
 }
 
-TEST(AccessorSugar, WriteLocksDuringCallAndAccumulatesTx)
+TEST(AccessorSugar, WriteLocksDuringCallAndReturnsTx)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x10);
@@ -3802,12 +3770,12 @@ TEST(AccessorSugar, WriteLocksDuringCallAndAccumulatesTx)
     EXPECT_EQ(bus.transfer_count, 1u);
     EXPECT_TRUE(bus.last_owner_in_transaction_known);
     EXPECT_TRUE(bus.last_owner_in_transaction);
-    EXPECT_FALSE(accessor.inTransaction());
+    EXPECT_FALSE(accessor.inAccess());
     EXPECT_EQ(bus.tx_recorded, (std::vector<uint8_t>{0x12, 0x34}));
     EXPECT_EQ(bus.lockOwner(), nullptr);
 }
 
-TEST(AccessorSugar, ReadReturnsRxCountFromEndTransaction)
+TEST(AccessorSugar, ReadReturnsItsRxCount)
 {
     StubBus bus;
     auto acc_cfg = makeAcc(0x10);
@@ -3820,7 +3788,7 @@ TEST(AccessorSugar, ReadReturnsRxCountFromEndTransaction)
     EXPECT_EQ(bus.transfer_count, 1u);
     EXPECT_TRUE(bus.last_owner_in_transaction_known);
     EXPECT_TRUE(bus.last_owner_in_transaction);
-    EXPECT_FALSE(accessor.inTransaction());
+    EXPECT_FALSE(accessor.inAccess());
 }
 
 TEST(AccessorSugar, WriteInsideScopedAccessOnlyLocksOnce)
@@ -3834,8 +3802,7 @@ TEST(AccessorSugar, WriteInsideScopedAccessOnlyLocksOnce)
         ASSERT_FALSE(scope.has_error());
         EXPECT_EQ(bus.lockOwner(), &accessor);
 
-        // The sugar runs through a transaction while the outer access window
-        // keeps the bus lock alive after each call returns.
+        // The sugar borrows the outer access and keeps the bus lock alive.
         const uint8_t tx1[] = {0x12};
         const uint8_t tx2[] = {0x34};
         auto r1             = accessor.write(m5::hal::v2::data::ConstDataSpan{tx1, sizeof(tx1)});
@@ -3845,7 +3812,7 @@ TEST(AccessorSugar, WriteInsideScopedAccessOnlyLocksOnce)
         EXPECT_EQ(bus.transfer_count, 2u);
         EXPECT_TRUE(bus.last_owner_in_transaction_known);
         EXPECT_TRUE(bus.last_owner_in_transaction);
-        EXPECT_FALSE(accessor.inTransaction());
+        EXPECT_TRUE(accessor.inAccess());
         EXPECT_EQ(bus.lockOwner(), &accessor);  // Stays locked until the scope exits.
     }
     EXPECT_EQ(bus.lockOwner(), nullptr);
@@ -4271,14 +4238,14 @@ namespace spec_polish_a1 {
 
 TEST(IBusConfig, DefaultCtorLeavesPinsInvalid)
 {
-    m5::hal::v2::i2c::BusConfig_software cfg;
+    m5::hal::v2::i2c::BusConfig cfg;
     EXPECT_LT(cfg.pin_scl, 0);
     EXPECT_LT(cfg.pin_sda, 0);
 }
 
 TEST(IBusConfig, SoftwareVariantRejectsInvalidPins)
 {
-    m5::hal::v2::i2c::BusConfig_software cfg;
+    m5::hal::v2::i2c::BusConfig cfg;
     // `pin_scl` / `pin_sda` keep their default value (-1).
 
     m5::hal::v2::i2c::Bus_software bus;
@@ -4300,7 +4267,9 @@ TEST(IBusConfig, FieldAssignedGpioNumbersResolveViaGPIOGroup)
     m5::hal::v2::i2c::Bus_software bus;
     auto err = bus.init(cfg);
     EXPECT_TRUE(err.has_value());
-    (void)bus.release();
+    ASSERT_TRUE(bus.close().has_value());
+    ASSERT_TRUE(bus.init(cfg).has_value());
+    ASSERT_TRUE(bus.close().has_value());
 }
 
 TEST(IBusConfig, SoftwareVariantAcceptsRecordingGPIOViaGPIOGroup)
@@ -4320,7 +4289,7 @@ TEST(IBusConfig, SoftwareVariantAcceptsRecordingGPIOViaGPIOGroup)
     m5::hal::v2::i2c::Bus_software bus;
     auto err = bus.init(cfg);
     EXPECT_TRUE(err.has_value());
-    (void)bus.release();
+    (void)bus.close();
 }
 
 }  // namespace spec_polish_a1
@@ -4422,7 +4391,7 @@ TEST(BusProbe, ReleasesLockAfterCall)
 // Tag-pin constructors. One-line construction with strong-typed
 // pin tags (`Scl` / `Sda`) — either argument order lands on the right
 // field, an untagged positional call stays a compile error, and the
-// variant configs expose the constructors through ctor inheritance.
+// the portable BusConfig alias exposes the same constructors.
 // ---------------------------------------------------------------------------
 
 namespace s20_tag_pin_ctor {
@@ -4436,9 +4405,9 @@ static_assert(std::is_constructible<i2c::IBusConfig, i2c::Scl, i2c::Sda>::value,
 static_assert(std::is_constructible<i2c::IBusConfig, i2c::Sda, i2c::Scl>::value, "tag ctor (Sda, Scl)");
 static_assert(!std::is_constructible<i2c::IBusConfig, int, int>::value, "no untagged positional ctor");
 static_assert(!std::is_convertible<types::gpio_number_t, i2c::Scl>::value, "tags take no implicit integer");
-static_assert(std::is_constructible<i2c::BusConfig_software, i2c::Scl, i2c::Sda>::value,
-              "variant config inherits the tag ctors");
-static_assert(!std::is_constructible<i2c::BusConfig_software, i2c::Sda, i2c::Sda>::value, "no duplicate-tag ctor");
+static_assert(std::is_constructible<i2c::BusConfig, i2c::Scl, i2c::Sda>::value,
+              "portable config exposes the tag ctors");
+static_assert(!std::is_constructible<i2c::BusConfig, i2c::Sda, i2c::Sda>::value, "no duplicate-tag ctor");
 
 TEST(IBusConfig, TagCtorEitherOrderLandsOnTheRightField)
 {
@@ -4456,19 +4425,19 @@ TEST(IBusConfig, TagCtorKeepsTheBusKind)
     EXPECT_EQ(cfg.getBusKind(), types::bus_kind_t::I2C);
 }
 
-TEST(IBusConfig, TagConstructedVariantConfigInitsTheBus)
+TEST(IBusConfig, TagConstructedPortableConfigInitsTheBus)
 {
     // Equivalent to the field-assignment path of
-    // `FieldAssignedGpioNumbersResolveViaGPIOGroup`, through the
-    // inherited tag ctor on the variant config.
-    i2c::BusConfig_software cfg{i2c::Scl{21}, i2c::Sda{22}};
+    // `FieldAssignedGpioNumbersResolveViaGPIOGroup`, through the portable tag
+    // constructor.
+    i2c::BusConfig cfg{i2c::Scl{21}, i2c::Sda{22}};
     EXPECT_EQ(cfg.pin_scl, 21);
     EXPECT_EQ(cfg.pin_sda, 22);
 
     i2c::Bus_software bus;
     auto err = bus.init(cfg);
     EXPECT_TRUE(err.has_value());
-    (void)bus.release();
+    (void)bus.close();
 }
 
 }  // namespace s20_tag_pin_ctor
@@ -4477,7 +4446,7 @@ TEST(IBusConfig, TagConstructedVariantConfigInitsTheBus)
 // serve(Source/Sink) consumer loop + RegMap serve() over a SCRIPTED ISlaveBus.
 //
 // The blocking serve() / RegMap serve() drive the bus through ISlaveBus
-// (readableBytes / read / write / transactionComplete). A real software bus needs
+// (readableBytes / read / write / wireFrameComplete). A real software bus needs
 // a concurrent master to feed those, which a single-threaded test cannot run
 // alongside a blocking serve(). ScriptedSlaveBus replaces the backend: it hands
 // serve() a fixed "received" payload and captures the reply, and reports the
@@ -4499,11 +4468,11 @@ public:
     {
         return {};
     }
-    m5::hal::v2::result_t<void> beginTransaction(m5::hal::v2::bus::IAccessor*, uint32_t) override
+    m5::hal::v2::result_t<void> tryOpenWireFrame(m5::hal::v2::bus::IAccessor*) override
     {
         return {};
     }
-    m5::hal::v2::result_t<void> endTransaction(m5::hal::v2::bus::IAccessor*) override
+    m5::hal::v2::result_t<void> closeWireFrame(m5::hal::v2::bus::IAccessor*) override
     {
         return {};
     }
@@ -4526,7 +4495,7 @@ public:
         tx_capture.insert(tx_capture.end(), p, p + src.size);
         return src.size;
     }
-    m5::hal::v2::result_t<bool> transactionComplete(m5::hal::v2::bus::IAccessor*) override
+    m5::hal::v2::result_t<bool> wireFrameComplete(m5::hal::v2::bus::IAccessor*) override
     {
         return rx_pos >= rx_script.size();
     }
@@ -4537,7 +4506,7 @@ public:
 };
 
 // A master that goes inactive mid-transaction: the scripted bytes arrive but the
-// STOP never does (transactionComplete stays false), modeling a master that died
+// STOP never does (wireFrameComplete stays false), modeling a master that died
 // or aborted with no visible STOP. The tx side is bounded like a real backend's
 // tx ring, so the reply pump cannot register endless fake progress. This is the
 // case a finite serve(timeout) must escape from instead of waiting forever.
@@ -4553,7 +4522,7 @@ public:
         tx_capture.insert(tx_capture.end(), p, p + n);
         return n;
     }
-    m5::hal::v2::result_t<bool> transactionComplete(m5::hal::v2::bus::IAccessor*) override
+    m5::hal::v2::result_t<bool> wireFrameComplete(m5::hal::v2::bus::IAccessor*) override
     {
         return false;
     }
@@ -4670,7 +4639,7 @@ TEST(SlaveStreamServe, ClosedSinkEscapesUnderForeverTimeout)
     EXPECT_EQ(sink.written(), size_t{2});
     EXPECT_EQ(rx[0], 0x09);
     EXPECT_EQ(rx[1], 0x08);
-    EXPECT_EQ(bus.rx_pos, size_t{50});  // the rest drained to discard (bus released)
+    EXPECT_EQ(bus.rx_pos, size_t{50});  // the remaining frame bytes were discarded
 }
 
 TEST(SlaveStreamServe, MasterInactiveMidTransactionEscapesWithFiniteTimeout)
@@ -4679,7 +4648,7 @@ TEST(SlaveStreamServe, MasterInactiveMidTransactionEscapesWithFiniteTimeout)
     // room (no local stall), yet no progress is possible -- a finite timeout
     // must abandon the transaction instead of waiting for a STOP that will
     // never come. (Pre-fix the escape drain still waited on
-    // transactionComplete() forever even after the deadline expired.)
+    // wireFrameComplete() forever even after the deadline expired.)
     StalledSlaveBus bus;
     bus.rx_script = {0x31, 0x32, 0x33};
     m5::hal::v2::i2c::SlaveStreamAccessor acc{bus};
@@ -4815,7 +4784,7 @@ TEST(SlaveRegMapServe, MasterInactiveMidTransactionEscapesWithFiniteTimeout)
 // A backend that reports a bound ISR regmap fast path (SlaveRegMapAccessor::
 // serve() then takes its fast-path branch) and confirms activity on every
 // waitForActivity() call, each of which sleeps past a short finite deadline.
-// transactionComplete() only flips true once `complete_after_activity` such
+// wireFrameComplete() only flips true once `complete_after_activity` such
 // calls have happened.
 class FastPathActiveSlaveBus : public m5::hal::v2::i2c::ISlaveBus {
 public:
@@ -4826,11 +4795,11 @@ public:
     {
         return {};
     }
-    m5::hal::v2::result_t<void> beginTransaction(m5::hal::v2::bus::IAccessor*, uint32_t) override
+    m5::hal::v2::result_t<void> tryOpenWireFrame(m5::hal::v2::bus::IAccessor*) override
     {
         return {};
     }
-    m5::hal::v2::result_t<void> endTransaction(m5::hal::v2::bus::IAccessor*) override
+    m5::hal::v2::result_t<void> closeWireFrame(m5::hal::v2::bus::IAccessor*) override
     {
         return {};
     }
@@ -4846,7 +4815,7 @@ public:
     {
         return size_t{0};
     }
-    m5::hal::v2::result_t<bool> transactionComplete(m5::hal::v2::bus::IAccessor*) override
+    m5::hal::v2::result_t<bool> wireFrameComplete(m5::hal::v2::bus::IAccessor*) override
     {
         return activity_calls >= complete_after_activity;
     }
@@ -4859,7 +4828,7 @@ public:
         ++activity_calls;
         // Real elapsed time across all calls exceeds the finite deadline used
         // below well before complete_after_activity calls accumulate, so a
-        // deadline that does NOT refresh on confirmed activity (the F1 bug)
+        // deadline that does NOT refresh on confirmed activity (the original bug)
         // would time out first.
         m5::hal::v2::runtime::delayMs(8);
         return true;
@@ -4874,13 +4843,13 @@ public:
     }
 };
 
-// F1 regression: SlaveRegMapAccessor::serve()'s ISR fast-path branch must
+// Regression: SlaveRegMapAccessor::serve()'s ISR fast-path branch must
 // treat timeout_ms as a NO-PROGRESS stall deadline (refreshed by every
 // CONFIRMED waitForActivity() wake), not a wall-clock total -- see the
 // fast-path branch's doc comment. Each waitForActivity() call here sleeps
 // 8ms and confirms activity; with a 20ms deadline that never refreshes, this
 // would return TIMEOUT_ERROR well before the 4th call. With the no-progress
-// fix it must complete OK once transactionComplete() flips true.
+// fix it must complete OK once wireFrameComplete() flips true.
 TEST(SlaveRegMapServe, FastPathNoProgressDeadlineRefreshesOnConfirmedActivity)
 {
     FastPathActiveSlaveBus bus;
@@ -4898,11 +4867,10 @@ TEST(SlaveRegMapServe, FastPathNoProgressDeadlineRefreshesOnConfirmedActivity)
 // i2c::Bus runtime facade
 //
 // `i2c::Bus` is now a runtime facade that owns the lock + accessor binding and
-// delegates transfer to a backend (`Bus_<variant>`) created by `init()` via the
-// config->backend trait. Driving the facade through the normal accessor path
-// over the virtual open-drain bus proves: init() created the software backend
-// (from the explicit BusConfig_software), the accessor locked the FACADE, and
-// transfer was delegated to the backend's wire.
+// delegates transfer to the provider backend selected by portable `init()`.
+// Driving the facade through the normal accessor path over the virtual
+// open-drain bus proves that init() created the software backend, the accessor
+// locked the FACADE, and transfer was delegated to the backend's wire.
 // ===========================================================================
 
 TEST(I2cBusFacade, DelegatesAccessorTransferToBackend)
@@ -4912,7 +4880,7 @@ TEST(I2cBusFacade, DelegatesAccessorTransferToBackend)
     VirtualOpenDrainBus lines;
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
-    runner.add(slave.service());
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -4934,19 +4902,18 @@ TEST(I2cBusFacade, DelegatesAccessorTransferToBackend)
     // transfer delegates to the backend.
     m5::hal::v2::i2c::MasterAccessor dev{facade, acc_cfg};
     const uint8_t tx_bytes[] = {0x12, 0x34};
-    ASSERT_TRUE(dev.beginTransaction().has_value());
-    ASSERT_TRUE(dev.transfer(m5::hal::v2::i2c::TransferDesc{uint8_t{0xAB}},
-                             m5::hal::v2::data::ConstDataSpan{tx_bytes, sizeof(tx_bytes)},
-                             m5::hal::v2::data::DataSpan{})
-                    .has_value());
-    auto end = dev.endTransaction();
-    ASSERT_TRUE(end.has_value());
-    EXPECT_EQ(end->tx, sizeof(tx_bytes));
-    EXPECT_EQ(end->rx, 0u);
+    ASSERT_TRUE(dev.beginAccess().has_value());
+    auto transfer =
+        dev.transfer(m5::hal::v2::i2c::TransferDesc{uint8_t{0xAB}},
+                     m5::hal::v2::data::ConstDataSpan{tx_bytes, sizeof(tx_bytes)}, m5::hal::v2::data::DataSpan{});
+    ASSERT_TRUE(transfer.has_value());
+    EXPECT_EQ(transfer->tx, sizeof(tx_bytes));
+    EXPECT_EQ(transfer->rx, 0u);
+    ASSERT_TRUE(dev.endAccess().has_value());
 
     // The slave received prefix + payload -> the wire was driven through the
     // delegated backend.
-    ASSERT_TRUE(slave.accessor().beginTransaction(0).has_value());
+    ASSERT_TRUE(slave.accessor().openWireFrame(0).has_value());
     uint8_t rx[3] = {};
     auto read     = slave.accessor().read(m5::hal::v2::data::DataSpan{rx, sizeof(rx)});
     ASSERT_TRUE(read.has_value());
@@ -4954,7 +4921,7 @@ TEST(I2cBusFacade, DelegatesAccessorTransferToBackend)
     EXPECT_EQ(rx[0], 0xAB);
     EXPECT_EQ(rx[1], 0x12);
     EXPECT_EQ(rx[2], 0x34);
-    EXPECT_TRUE(slave.accessor().endTransaction().has_value());
+    EXPECT_TRUE(slave.accessor().closeWireFrame().has_value());
 }
 
 TEST(I2cBusFacade, ProbeRoutesThroughFacade)
@@ -4964,7 +4931,7 @@ TEST(I2cBusFacade, ProbeRoutesThroughFacade)
     VirtualOpenDrainBus lines;
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
-    runner.add(slave.service());
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -4980,14 +4947,14 @@ TEST(I2cBusFacade, ProbeRoutesThroughFacade)
     EXPECT_FALSE(facade.probe(0x21).has_value());  // no device -> NACK
 }
 
-TEST(I2cBusFacade, ReleaseIsIdempotent)
+TEST(I2cBusFacade, RepeatedCloseReportsClosedWithoutRepeatingTeardown)
 {
     using namespace service_proto;
 
     VirtualOpenDrainBus lines;
     ServiceRunner runner;
     SlaveEndpoint slave{lines, 0x42};
-    runner.add(slave.service());
+    EXPECT_SERVICE_OK(runner.add(slave.service()));
     lines.setRunner(&runner);
 
     VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
@@ -4996,12 +4963,316 @@ TEST(I2cBusFacade, ReleaseIsIdempotent)
 
     m5::hal::v2::i2c::Bus facade;
     ASSERT_TRUE(facade.init(makeSoftwareBusConfig(gpio.scl(), gpio.sda())).has_value());
-    EXPECT_TRUE(facade.release().has_value());
-    EXPECT_TRUE(facade.release().has_value());  // backend already gone -> OK, no crash
+    EXPECT_TRUE(facade.close().has_value());
+    auto repeated = facade.close();
+    ASSERT_FALSE(repeated.has_value());
+    EXPECT_EQ(repeated.error(), m5::hal::v2::error::error_t::CLOSED);
     // dtor runs here with a null backend -> safe.
 }
 
+template <size_t TxBytes, size_t RxBytes, size_t TxFrames, size_t RxFrames, size_t Segments>
+class QueuedSoftwareSlaveEndpoint {
+public:
+    QueuedSoftwareSlaveEndpoint(m5::hal::v2::i2c::SlaveLineDriver& lines, uint8_t address,
+                                const m5::hal::v2::i2c::SlaveAccessConfig& access_config = {})
+        : accessor{bus, queues.tx(), queues.rx(), segment_storage.storage(), access_config}
+    {
+        m5::hal::v2::i2c::SlaveBusConfig config;
+        config.address   = address;
+        auto initialized = bus.init(lines, config);
+        assert(initialized.has_value() && "queued software slave init failed");
+        (void)initialized;
+    }
+
+    m5::hal::v2::i2c::SlaveBus_software bus;
+    m5::hal::v2::slave::StaticSlaveQueueStorage<TxBytes, RxBytes, TxFrames, RxFrames> queues;
+    m5::hal::v2::i2c::StaticI2cSegmentStorage<Segments> segment_storage;
+    m5::hal::v2::i2c::SlaveAccessor accessor;
+};
+
+class AtomicIdleSlaveLines : public m5::hal::v2::i2c::SlaveLineDriver {
+public:
+    bool readScl() const override
+    {
+        return true;
+    }
+    bool readSda() const override
+    {
+        return true;
+    }
+    void pullSdaLow(bool pull_low) override
+    {
+        sda_low.store(pull_low, std::memory_order_relaxed);
+    }
+    void pullSclLow(bool pull_low) override
+    {
+        scl_low.store(pull_low, std::memory_order_relaxed);
+    }
+
+    std::atomic<bool> sda_low{false};
+    std::atomic<bool> scl_low{false};
+};
+
+TEST(QueuedSoftwareI2cSlave, WireAcceptanceIsScopedToAccess)
+{
+    using namespace service_proto;
+    namespace v2 = m5::hal::v2;
+
+    VirtualOpenDrainBus lines;
+    ServiceRunner runner;
+    QueuedSoftwareSlaveEndpoint<2, 2, 0, 1, 1> slave{lines, 0x42};
+    ASSERT_SERVICE_OK(runner.add(slave.bus));
+    lines.setRunner(&runner);
+
+    VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
+    VirtualI2CPort sda_port{lines, VirtualI2CPort::Line::SDA};
+    ScopedVirtualI2CGPIO gpio{scl_port, sda_port};
+    v2::i2c::Bus_software master_bus;
+    ASSERT_TRUE(master_bus.init(makeSoftwareBusConfig(gpio.scl(), gpio.sda())).has_value());
+    v2::i2c::MasterAccessConfig master_config;
+    master_config.i2c_addr        = 0x42;
+    master_config.freq            = 100000;
+    master_config.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
+    v2::i2c::MasterAccessor master{master_bus, master_config};
+
+    EXPECT_FALSE(master.probe().has_value());
+    ASSERT_TRUE(slave.accessor.beginAccess(0).has_value());
+    EXPECT_TRUE(master.probe().has_value());
+    ASSERT_TRUE(slave.accessor.endAccess(0).has_value());
+    EXPECT_FALSE(master.probe().has_value());
+}
+
+TEST(QueuedSoftwareI2cSlave, LifecycleIsSerializedAgainstAutoRunPoll)
+{
+    using namespace service_proto;
+
+    AtomicIdleSlaveLines lines;
+    ServiceRunner runner;
+    QueuedSoftwareSlaveEndpoint<2, 2, 0, 1, 1> slave{lines, 0x42};
+    ASSERT_SERVICE_OK(runner.add(slave.bus));
+    ASSERT_SERVICE_OK(runner.startAutoRun());
+    for (size_t i = 0; i < 100; ++i) {
+        ASSERT_TRUE(slave.accessor.beginAccess(100).has_value());
+        ASSERT_TRUE(slave.accessor.endAccess(100).has_value());
+    }
+    EXPECT_SERVICE_OK(runner.stopAutoRun());
+    EXPECT_FALSE(lines.sda_low.load(std::memory_order_relaxed));
+    EXPECT_FALSE(lines.scl_low.load(std::memory_order_relaxed));
+}
+
+TEST(QueuedSoftwareI2cSlave, LegacyWindowFailsImmediatelyAfterQueuedLifecycleMigration)
+{
+    namespace v2 = m5::hal::v2;
+
+    AtomicIdleSlaveLines lines;
+    QueuedSoftwareSlaveEndpoint<2, 2, 0, 1, 1> slave{lines, 0x42};
+    ASSERT_TRUE(slave.accessor.beginAccess(0).has_value());
+    ASSERT_TRUE(slave.accessor.endAccess(0).has_value());
+
+    v2::i2c::SlaveStreamAccessor legacy{slave.bus};
+    auto begun = legacy.openWireFrame(0);
+    ASSERT_FALSE(begun.has_value());
+    EXPECT_EQ(begun.error(), v2::error::error_t::INVALID_STATE);
+}
+
+TEST(QueuedSoftwareI2cSlave, ExactWriteRestartReadFramePersistsAfterEnd)
+{
+    using namespace service_proto;
+    namespace v2 = m5::hal::v2;
+
+    VirtualOpenDrainBus lines;
+    ServiceRunner runner;
+    v2::i2c::SlaveAccessConfig slave_config;
+    slave_config.rx_mode = v2::slave::QueueMode::Frame;
+    QueuedSoftwareSlaveEndpoint<8, 8, 0, 2, 4> slave{lines, 0x42, slave_config};
+    ASSERT_SERVICE_OK(runner.add(slave.bus));
+    lines.setRunner(&runner);
+    ASSERT_TRUE(slave.accessor.beginAccess(0).has_value());
+    const uint8_t reply[] = {0xDE, 0xAD};
+    ASSERT_TRUE(slave.accessor.write({reply, sizeof(reply)}).has_value());
+
+    VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
+    VirtualI2CPort sda_port{lines, VirtualI2CPort::Line::SDA};
+    ScopedVirtualI2CGPIO gpio{scl_port, sda_port};
+    v2::i2c::Bus_software master_bus;
+    ASSERT_TRUE(master_bus.init(makeSoftwareBusConfig(gpio.scl(), gpio.sda())).has_value());
+    v2::i2c::MasterAccessConfig master_config;
+    master_config.i2c_addr        = 0x42;
+    master_config.freq            = 100000;
+    master_config.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
+    master_config.use_restart     = true;
+    v2::i2c::MasterAccessor master{master_bus, master_config};
+    uint8_t received[2] = {};
+    ASSERT_TRUE(master.beginAccess().has_value());
+    auto transfer = master.transfer(v2::i2c::TransferDesc{uint8_t{0x10}}, {}, {received, sizeof(received)});
+    ASSERT_TRUE(transfer.has_value()) << v2::error::toString(transfer.error());
+    EXPECT_EQ(received[0], 0xDE);
+    EXPECT_EQ(received[1], 0xAD);
+    ASSERT_TRUE(master.endAccess().has_value());
+    ASSERT_TRUE(slave.accessor.endAccess(0).has_value());
+
+    auto frame = slave.accessor.rxFrames().peekFrame();
+    ASSERT_TRUE(frame.has_value()) << v2::error::toString(frame.error());
+    EXPECT_EQ(frame->frame.metadata.wire_bytes, 3u);
+    EXPECT_EQ(frame->frame.metadata.stored_bytes, 1u);
+    EXPECT_EQ(frame->frame.metadata.segment_count, 2u);
+    ASSERT_EQ(frame->segments.first.size + frame->segments.second.size, 2u);
+    const auto& write_segment = frame->segments.first.data[0];
+    const auto& read_segment  = frame->segments.first.data[1];
+    EXPECT_EQ(write_segment.offset, 0u);
+    EXPECT_EQ(write_segment.length, 1u);
+    EXPECT_EQ(write_segment.direction, v2::i2c::I2cFrameDirection::Write);
+    EXPECT_EQ(read_segment.offset, 1u);
+    EXPECT_EQ(read_segment.length, 2u);
+    EXPECT_EQ(read_segment.direction, v2::i2c::I2cFrameDirection::Read);
+    EXPECT_TRUE(v2::i2c::any(read_segment.flags & v2::i2c::I2cSegmentFlags::RepeatedStart));
+    ASSERT_TRUE(slave.accessor.rxFrames().popFrame().has_value());
+
+    auto stopped_probe = master.probe();
+    EXPECT_FALSE(stopped_probe.has_value());
+}
+
+TEST(QueuedSoftwareI2cSlave, FrameOverflowPreservesPrefixAndExactWireLength)
+{
+    using namespace service_proto;
+    namespace v2 = m5::hal::v2;
+
+    VirtualOpenDrainBus lines;
+    ServiceRunner runner;
+    v2::i2c::SlaveAccessConfig slave_config;
+    slave_config.rx_mode = v2::slave::QueueMode::Frame;
+    QueuedSoftwareSlaveEndpoint<1, 1, 0, 1, 1> slave{lines, 0x42, slave_config};
+    ASSERT_SERVICE_OK(runner.add(slave.bus));
+    lines.setRunner(&runner);
+    ASSERT_TRUE(slave.accessor.beginAccess(0).has_value());
+
+    VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
+    VirtualI2CPort sda_port{lines, VirtualI2CPort::Line::SDA};
+    ScopedVirtualI2CGPIO gpio{scl_port, sda_port};
+    v2::i2c::Bus_software master_bus;
+    ASSERT_TRUE(master_bus.init(makeSoftwareBusConfig(gpio.scl(), gpio.sda())).has_value());
+    v2::i2c::MasterAccessConfig master_config;
+    master_config.i2c_addr        = 0x42;
+    master_config.freq            = 100000;
+    master_config.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
+    v2::i2c::MasterAccessor master{master_bus, master_config};
+    const uint8_t tail[] = {0xA1, 0xA2};
+    ASSERT_TRUE(master.beginAccess().has_value());
+    auto transfer = master.transfer(v2::i2c::TransferDesc{uint8_t{0xA0}}, {tail, sizeof(tail)}, {});
+    ASSERT_TRUE(transfer.has_value()) << v2::error::toString(transfer.error());
+    ASSERT_TRUE(master.endAccess().has_value());
+    ASSERT_TRUE(slave.accessor.endAccess(0).has_value());
+
+    auto frame = slave.accessor.rxFrames().peekFrame();
+    ASSERT_TRUE(frame.has_value()) << v2::error::toString(frame.error());
+    EXPECT_EQ(frame->frame.metadata.wire_bytes, 3u);
+    EXPECT_EQ(frame->frame.metadata.stored_bytes, 1u);
+    EXPECT_EQ(frame->frame.metadata.dropped_bytes, 2u);
+    EXPECT_TRUE(v2::slave::any(frame->frame.metadata.flags & v2::slave::FrameFlags::Overflow));
+    EXPECT_EQ(frame->frame.first.data[0], 0xA0);
+    EXPECT_EQ(frame->segments.first.data[0].length, 3u);
+    EXPECT_EQ(slave.accessor.rxStatus().dropped_bytes, 2u);
+}
+
+TEST(QueuedSoftwareI2cSlave, ByteRxModeUsesLocalReadWithoutFrameCursor)
+{
+    using namespace service_proto;
+    namespace v2 = m5::hal::v2;
+
+    VirtualOpenDrainBus lines;
+    ServiceRunner runner;
+    v2::i2c::SlaveAccessConfig slave_config;
+    slave_config.rx_mode = v2::slave::QueueMode::Byte;
+    QueuedSoftwareSlaveEndpoint<1, 4, 0, 0, 0> slave{lines, 0x42, slave_config};
+    ASSERT_SERVICE_OK(runner.add(slave.bus));
+    lines.setRunner(&runner);
+    ASSERT_TRUE(slave.accessor.beginAccess(0).has_value());
+
+    VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
+    VirtualI2CPort sda_port{lines, VirtualI2CPort::Line::SDA};
+    ScopedVirtualI2CGPIO gpio{scl_port, sda_port};
+    v2::i2c::Bus_software master_bus;
+    ASSERT_TRUE(master_bus.init(makeSoftwareBusConfig(gpio.scl(), gpio.sda())).has_value());
+    v2::i2c::MasterAccessConfig master_config;
+    master_config.i2c_addr        = 0x42;
+    master_config.freq            = 100000;
+    master_config.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
+    v2::i2c::MasterAccessor master{master_bus, master_config};
+    const uint8_t payload[] = {1, 2, 3};
+    ASSERT_TRUE(master.beginAccess().has_value());
+    auto transfer = master.transfer({}, {payload, sizeof(payload)}, {});
+    ASSERT_TRUE(transfer.has_value()) << v2::error::toString(transfer.error());
+    ASSERT_TRUE(master.endAccess().has_value());
+    ASSERT_TRUE(slave.accessor.endAccess(0).has_value());
+    uint8_t drained[3] = {};
+    auto read          = slave.accessor.read({drained, sizeof(drained)});
+    ASSERT_TRUE(read.has_value()) << v2::error::toString(read.error());
+    EXPECT_EQ(*read, 3u);
+    EXPECT_EQ(std::vector<uint8_t>(drained, drained + 3), (std::vector<uint8_t>{1, 2, 3}));
+    EXPECT_EQ(slave.accessor.rxFrames().peekFrame().error(), v2::error::error_t::INVALID_STATE);
+}
+
+TEST(QueuedSoftwareI2cSlave, ReadUnderrunUsesFillAndMarksObservedFrame)
+{
+    using namespace service_proto;
+    namespace v2 = m5::hal::v2;
+
+    VirtualOpenDrainBus lines;
+    ServiceRunner runner;
+    v2::i2c::SlaveAccessConfig slave_config;
+    slave_config.rx_mode = v2::slave::QueueMode::Frame;
+    QueuedSoftwareSlaveEndpoint<2, 1, 0, 1, 1> slave{lines, 0x42, slave_config};
+    ASSERT_SERVICE_OK(runner.add(slave.bus));
+    lines.setRunner(&runner);
+    ASSERT_TRUE(slave.accessor.beginAccess(0).has_value());
+
+    VirtualI2CPort scl_port{lines, VirtualI2CPort::Line::SCL};
+    VirtualI2CPort sda_port{lines, VirtualI2CPort::Line::SDA};
+    ScopedVirtualI2CGPIO gpio{scl_port, sda_port};
+    v2::i2c::Bus_software master_bus;
+    ASSERT_TRUE(master_bus.init(makeSoftwareBusConfig(gpio.scl(), gpio.sda())).has_value());
+    v2::i2c::MasterAccessConfig master_config;
+    master_config.i2c_addr        = 0x42;
+    master_config.freq            = 100000;
+    master_config.wire_timeout_ms = M5HAL_TEST_WIRE_TIMEOUT_MS;
+    v2::i2c::MasterAccessor master{master_bus, master_config};
+    uint8_t received[2] = {};
+    ASSERT_TRUE(master.beginAccess().has_value());
+    auto transfer = master.transfer({}, {}, {received, sizeof(received)});
+    ASSERT_TRUE(transfer.has_value()) << v2::error::toString(transfer.error());
+    ASSERT_TRUE(master.endAccess().has_value());
+    ASSERT_TRUE(slave.accessor.endAccess(0).has_value());
+    EXPECT_EQ(received[0], 0xFF);
+    EXPECT_EQ(received[1], 0xFF);
+    EXPECT_GT(slave.accessor.txStatus().underrun_count, 0u);
+    auto frame = slave.accessor.rxFrames().peekFrame();
+    ASSERT_TRUE(frame.has_value()) << v2::error::toString(frame.error());
+    EXPECT_EQ(frame->frame.metadata.wire_bytes, 2u);
+    EXPECT_EQ(frame->segments.first.data[0].direction, v2::i2c::I2cFrameDirection::Read);
+    EXPECT_EQ(frame->segments.first.data[0].length, 2u);
+    EXPECT_TRUE(v2::slave::any(frame->frame.metadata.flags & v2::slave::FrameFlags::Underrun));
+}
+
+TEST(QueuedSoftwareI2cSlave, TxFrameModeFailsExplicitlyBeforeAcceptance)
+{
+    using namespace service_proto;
+    namespace v2 = m5::hal::v2;
+
+    VirtualOpenDrainBus lines;
+    v2::i2c::SlaveAccessConfig config;
+    config.tx_mode = v2::slave::QueueMode::Frame;
+    QueuedSoftwareSlaveEndpoint<2, 2, 1, 1, 1> slave{lines, 0x42, config};
+    auto begun = slave.accessor.beginAccess(0);
+    ASSERT_FALSE(begun.has_value());
+    EXPECT_EQ(begun.error(), v2::error::error_t::UNSUPPORTED);
+    EXPECT_FALSE(slave.accessor.inAccess());
+}
+
 }  // namespace
+
+#undef ASSERT_SERVICE_OK
+#undef EXPECT_SERVICE_OK
+#undef EXPECT_SERVICE_RUN
 
 int main(int argc, char** argv)
 {

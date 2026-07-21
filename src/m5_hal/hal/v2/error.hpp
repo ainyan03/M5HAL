@@ -30,7 +30,7 @@ enum class ErrorType : int8_t {
     UNKNOWN_ERROR    = -1,   ///< Last-resort fallback; prefer specific codes (see spec/design/data_io.md).
     TIMEOUT_ERROR    = -2,   ///< Operation timed out before completion.
     INVALID_ARGUMENT = -3,   ///< A caller-supplied argument violated the API contract.
-    NOT_IMPLEMENTED  = -4,   ///< The operation is not implemented by the current variant.
+    NOT_IMPLEMENTED  = -4,   ///< No implementation path exists in the selected build or variant.
     I2C_BUS_ERROR    = -5,   ///< Low-level I2C bus error (arbitration loss, stretch timeout, etc).
     I2C_NO_ACK       = -6,   ///< Addressed I2C target did not acknowledge.
     BUSY             = -7,   ///< Resource is currently locked by another owner.
@@ -44,13 +44,14 @@ enum class ErrorType : int8_t {
     PROTOCOL_ERROR   = -15,  ///< Well-formed bytes violated the protocol state / semantics.
     DISCONNECTED     = -16,  ///< Reserved for future disconnect detection; current transport hang-ups report CLOSED
                              ///< (for TCP, see BsdTcpStream in bsd_tcp.hpp).
-    REMOTE_FAULT    = -17,   ///< The remote endpoint reported an internal failure (or an unknown code).
-    UNSUPPORTED     = -18,   ///< The remote endpoint does not support the requested capability.
-    DEVICE_MISMATCH = -19,   ///< A probed/identified device is not the one the caller expected (e.g. a chip-ID check
-                             ///< failed). Reserved for driver layers; the HAL core never returns it.
-    INVALID_STATE = -20,  ///< Operation is valid but the current object state does not allow it (e.g. setConfig while
-                          ///< a transaction is open, endAccess without a matching begin).
+    REMOTE_FAULT = -17,      ///< The remote endpoint reported an internal failure (or an unknown code).
+    UNSUPPORTED  = -18,  ///< A valid operation or capability is unavailable on this instance, configuration, or peer.
+    DEVICE_MISMATCH = -19,  ///< A probed/identified device is not the one the caller expected (e.g. a chip-ID check
+                            ///< failed). Reserved for driver layers; the HAL core never returns it.
+    INVALID_STATE = -20,    ///< Operation is valid but the current object state does not allow it (e.g. setConfig while
+                            ///< a transaction is open, endAccess without a matching begin).
     NOT_CONNECTED = -21,  ///< A Hal facade has no backend binding or no remote connection for a remote-only operation.
+    WOULD_BLOCK = -22,  ///< A non-blocking queue/stream operation cannot make progress now; retry after state changes.
 };
 using error_t = ErrorType;
 
@@ -135,6 +136,8 @@ constexpr const char* toString(const error_t e)
             return "INVALID_STATE";
         case error_t::NOT_CONNECTED:
             return "NOT_CONNECTED";
+        case error_t::WOULD_BLOCK:
+            return "WOULD_BLOCK";
     }
     return "UNKNOWN";
 }

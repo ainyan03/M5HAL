@@ -154,7 +154,7 @@ public:
       single-source rule the shadow-XOR edge detection relies on
       (not asserted; documented UB).
      */
-    [[nodiscard]] result_t<void> notifyPinStateChanged(types::gpio_number_t gpio_num, bool level);
+    result_t<void> notifyPinStateChanged(types::gpio_number_t gpio_num, bool level);
 
     const IGPIO* getGPIO(types::gpio_slot_t slot) const;
 
@@ -188,7 +188,7 @@ public:
       @brief Checked resolution. Invalid or denied input recovers
              through the `expected` error path.
      */
-    [[nodiscard]] result_t<Pin> tryGetPin(types::gpio_number_t gpio_num) const;
+    result_t<Pin> tryGetPin(types::gpio_number_t gpio_num) const;
 
     /*!
       @brief Unchecked fast-path resolution. Contract violations

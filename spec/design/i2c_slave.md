@@ -2,28 +2,42 @@
 
 > **読者**: 実装者・レビュー向け（設計仕様）。
 
-I2C slave の Bus / Accessor / 設定型 / 給仕モデルの仕様。 master 体系は [i2c.md](i2c.md)、 共通基底は [bus_accessor.md](bus_accessor.md) を参照。
+I2C slaveのBus / Accessor / 設定型 / 給仕モデルの仕様。master体系は[i2c.md](i2c.md)、
+共通lifecycleは[bus_accessor.md](bus_accessor.md)、queue共通契約は[slave_queue.md](slave_queue.md)を参照。
 
 ## 目次
 
 - [API 概要](#api-概要)
 - [backend の構築とコントローラの占有](#backend-の構築とコントローラの占有)
 - [serve() の polarity と timeout](#serve-の-polarity-と-timeout)
-- [トランザクション窓モデル](#トランザクション窓モデル)
+- [legacy wire-frame窓モデル](#legacy-wire-frame窓モデル)
 - [アクセサの選択 (Stream vs RegMap)](#アクセサの選択-stream-vs-regmap)
 - [応答ポリシーの詳細](#応答ポリシーの詳細)
+  - [RegMap 利用者契約](#regmap-利用者契約)
+  - [RegMap backend 制約と診断](#regmap-backend-制約と診断)
 - [ISR regmap fast path (`bindIsrRegMap`)](#isr-regmap-fast-path-bindisrregmap)
 - [backend 実装](#backend-実装)
 - [関連](#関連)
 
 ## API 概要
 
-I2C slave は基本機能として master 体系と相似の型で提供する:
-`ISlaveBus` (抽象基底) / `SlaveBus_<variant>` (具象 backend) / `SlaveBusConfig` /
-`SlaveStreamAccessor` (基底のストリームアクセサ)。 応答ポリシーは後述のとおり
-ストリーム基底 + レジスタマップ・アダプタ (`SlaveRegMapAccessor`) に分岐する。
+I2C slaveは`ISlaveBus` (抽象基底) / `SlaveBus_<variant>` (具象backend) /
+`SlaveBusConfig`に対し、次の二つのsurfaceを持つ。
 
-**高レベル API = `serve(Source* src, Sink* dst, timeout)`**: master の
+- **正準**: caller-owned SPSC queueを持つ`SlaveAccessor`。`beginAccess()`でaddress受付とslave
+  engineを開始し、`endAccess()`で受付停止・進行中frameの有界cleanup・lock解放を行う。
+  TXはAccess前にpreloadでき、RXはAccess終了後にもdrainできる。
+- **legacy opt-in**: blocking `SlaveStreamAccessor::serve()`と低レベルwire-frame seam。
+  `SlaveBusConfig::legacy_wire_frame_window = true`を明示した場合だけinit直後から受付する。
+  queue駆動lifecycleとの同時使用は拒否する。
+
+正準`SlaveAccessor`のlocal queue I/OはAccess外でも利用でき、wire発生時刻とapplication taskを
+分離する。byte modeでは`write`でTX enqueue、`read`でRX dequeueし、満杯・空のnon-zero操作は
+`WOULD_BLOCK`。frame modeでは最大2 spanのview/reservationを使うが、backendがframe境界やI2C
+segmentを正確に観測できない場合は`beginAccess`を`UNSUPPORTED`で拒否する。既定はportableな
+Byte/Byteである。
+
+**legacy高レベル API = `serve(Source* src, Sink* dst, timeout)`**: master の
 `transfer(desc, Source*, Sink*)` ([i2c.md](i2c.md) §transfer の wire semantics)
 と対称な per-transaction blocking 給仕。 1 取引 = master の 1 `transfer()` を、 write 取引なら
 受信を `dst` Sink へ流し込み、 read 取引なら `src` Source から応答を送出して、 STOP まで処理する。
@@ -32,14 +46,15 @@ I2C slave は基本機能として master 体系と相似の型で提供する:
 容量上限は無く (back-pressure で律速)、 ストリーム消費者は
 backend の ISR / service tick が起こす (polling 固定遅延ではない)。 SPI の `transfer` と同じ
 使い勝手で、 タスク↔Source/Sink のコールバックは内部実装としてユーザーに開示しない。
-低レベルの窓 seam (`beginTransaction`/`read`/`write`/`endTransaction`) は serve() が内部で合成
-する素として残し、 自作 tick ループや特殊プロトコル向けに直接叩ける (`beginTransaction` =
-ロック内側の取引単位を開く seam。 master 体系の `beginAccess` ロック取得とは別概念軸 —
-[bus_accessor.md](bus_accessor.md) §排他制御の意味論 (常時 mutex))。
+低レイヤ窓seam (`openWireFrame`/`read`/`write`/`closeWireFrame`) はserve()が内部で合成する。
+`openWireFrame`は外部masterが既に開始しbackendが観測したSTART〜STOP frameをclaimする操作で、
+STARTを生成せず、Access lifecycleも開始しない。`closeWireFrame`もSTOPを生成せずlocal claimを
+release/discardするprotocol primitiveである。
 **Bus 型は master と分離** — 実装実態 (ESP-IDF は master/slave が
 別ドライバ) と排他意味論が別物のため。 同一ピンの役割切替は
-**「一方を `release()` → 他方を `init()`」を正規パターン**とする (バスを手放さない
-役割反転が必要になったら統合ファサードを後から非破壊で追加できる)。
+**「一方を `close()` → 他方を `init()`」を正規パターン**とする (バスを手放さない
+役割反転が必要になったら統合ファサードを後から非破壊で追加できる)。 ESP-IDF backend の
+`close()`はGPIO routeを外した後、占有中に有効化したcontroller clockとbus clockもこの順で返す。
 
 ```cpp
 namespace m5::hal::v2::i2c {
@@ -55,7 +70,27 @@ struct SlaveBusConfig : public bus::IBusConfig {
     TxUnderrun tx_underrun       = TxUnderrun::Fill;
     uint8_t tx_fill_byte         = 0xFF;
     uint32_t stretch_timeout_ms  = 100;    // TxUnderrun::Stretch の応答待ち上限 (超過で TxUnderrun::Fill へ)
+    bool legacy_wire_frame_window = false; // trueだけ旧Stream windowをinit直後から受付
     int8_t controller            = -1;     // 占有するハードウェアコントローラ (§コントローラの占有)
+};
+
+struct SlaveAccessConfig : public bus::IAccessConfig {
+    slave::QueueMode tx_mode = slave::QueueMode::Byte;
+    slave::QueueMode rx_mode = slave::QueueMode::Byte;
+};
+
+class SlaveAccessor {
+    SlaveAccessor(ISlaveBus&, slave::QueueStorage<> tx, slave::QueueStorage<> rx,
+                  I2cSegmentStorage, const SlaveAccessConfig& = {});
+    result_t<void> beginAccess(uint32_t timeout_ms = TIMEOUT_FOREVER);
+    result_t<void> endAccess(uint32_t timeout_ms = 1000);
+    result_t<size_t> write(data::ConstDataSpan); // local TX enqueue
+    result_t<size_t> read(data::DataSpan);       // local RX dequeue
+    slave::FrameSinkView txFrames();
+    I2cFrameSourceView rxFrames();
+    result_t<void> setEventCallback(slave::SlaveEventCallback, void* user);
+    result_t<void> dispatchEvents();
+    result_t<void> acknowledgeEvents(slave::SlaveEvent);
 };
 
 class SlaveStreamAccessor /* : StreamReader, StreamWriter */ {
@@ -78,19 +113,19 @@ class SlaveStreamAccessor /* : StreamReader, StreamWriter */ {
     // イベント駆動の待ち。ISR backend は通知で起こす (既定 = 1ms poll)。バスは止めない。
     // 戻り値 = true:活動 wake を確認 / false:timeout 経過 (poll fallback は常に false)。
     // unbound は INVALID_ARGUMENT。bool は advisory で、いずれにせよ readableBytes /
-    // transactionComplete で状態を再確認する。
+    // wireFrameComplete で状態を再確認する。
     result_t<bool> waitForActivity(uint32_t timeout_ms);
 
     // 低レベル窓 seam — serve() / 取引ステップ API が内部で合成する素。自作 tick ループや
     // 特殊プロトコル向けに直接叩ける (通常は serve() を使う)。
-    result_t<void> beginTransaction(uint32_t timeout_ms = TIMEOUT_FOREVER);
-    result_t<void> endTransaction();
+    result_t<void> openWireFrame(uint32_t timeout_ms = TIMEOUT_FOREVER);
+    result_t<void> closeWireFrame();
     result_t<size_t> read(data::DataSpan dst);       // 現窓のデータのみ
-    result_t<void> write(data::ConstDataSpan src); // 現窓への応答キュー
+    result_t<size_t> write(data::ConstDataSpan src); // 現窓への応答キュー
     result_t<size_t> readableBytes();
-    result_t<bool> transactionComplete();            // master が STOP したか
+    result_t<bool> wireFrameComplete();            // master が STOP したか
 };
-// RAII: ScopedSlaveTransaction (spi::ScopedTransaction と同 polarity)
+// legacy wire claim RAII: ScopedWireFrame
 
 class SlaveRegMapAccessor {  // SlaveStreamAccessor を内部に合成するアダプタ
     SlaveRegMapAccessor(ISlaveBus& bus, data::DataSpan reg_file);
@@ -134,7 +169,7 @@ master 体系と同じ有限プールを共有する物理資源であり、 台
 コントローラを占有するかを指定する欄で、 正しい値は `bus::BusView::claimController(intent)`
 (既定 = Auto、 最小空きコントローラ) で取得する:
 
-claim / release はI2Cのaccess/transaction windowを一つも保持していない箇所で呼ぶ。commitは
+claim / release はI2CのAccess/wire-frame windowを一つも保持していない箇所で呼ぶ。commitは
 allocation lockを保持したままbus lockを待つため、window内からのclaim / releaseはlock順を逆転させる。
 
 ```cpp
@@ -149,7 +184,7 @@ if (!init.has_value()) {
 // 使い終わったら「先に slave を止め、止まってから」claim を返却する。
 // 逆順 (claim を先に返す) は、slave がまだ ISR とレジスタを掴んでいる間に
 // master 側の再配置が同じ港を確保・再設定できてしまう
-if (slave_bus.release().has_value()) {
+if (slave_bus.close().has_value()) {
     M5_Hal.I2C.releaseClaimedController(claim.value());
 }
 ```
@@ -186,9 +221,9 @@ accessor が送る / 受ける」向き。 slave 視点ではなく master 動�
 | `SlaveBusConfig::timeout_ms` | 低レベル `read()` が現窓の RX byte を待つ予算 | 0 byte の短読み (通常 error ではない) |
 | `SlaveBusConfig::stretch_timeout_ms` | `tx_underrun=TxUnderrun::Stretch` で窓未オープン / 応答未投入の read を stretch 保持する上限 | `tx_fill_byte` 送出へ fallback |
 
-## トランザクション窓モデル
+## legacy wire-frame窓モデル
 
-**トランザクション窓モデル**: 1 窓 = master の 1 `transfer()` (write-then-read を
+この節はlegacy opt-inの`SlaveStreamAccessor`だけを扱う。**wire-frame窓モデル**: 1 窓 = master の 1 `transfer()` (write-then-read を
 repeated start で繋いだ全体、STOP まで)。 「トランザクション = データの寿命スコープ」:
 
 - **repeated start は窓を跨がない** — レジスタ読み出しエミュレーションは
@@ -211,12 +246,8 @@ repeated start で繋いだ全体、STOP まで)。 「トランザクション 
 **どちらのアクセサを使うか**:
 - レジスタアドレス + auto-increment + ポインタ保持の I2C 定番デバイス (センサ / PMIC / 設定
   レジスタ) を作る → **`SlaveRegMapAccessor`**。 `serve()` を回すだけで、 `onRead` で live 値・
-  `onWrite` でコマンド副作用を挿す。 read 長は無制限 (`kReplyWindowBytes` = 64B はストリームの
-  compose チャンクであって上限ではない。 master が読み続ける限り 8bit wrap で auto-increment
-  し続ける — 定番デバイスと同じ)。 注意: 応答はワイヤより先行して compose される (上界 =
-  backend TX キュー深さ + 1 チャンク。 同梱 backend では 1 byte read でも最大 2 チャンク =
-  128B 分 `onRead` が発火し得る。 旧・単窓設計でも read 長に依らず 64B 分発火していた)。
-  read-to-clear 型レジスタは先行発火を許容できる設計にする。
+  `onWrite` でコマンド副作用を挿す。 wire意味論とhookの注意は[RegMap利用者契約](#regmap-利用者契約)、
+  ring/stretch/SoC差は[RegMap backend制約と診断](#regmap-backend-制約と診断)を参照する。
 - 可変長フレーム / echo / ブリッジ / 独自プロトコル → 基底
   **`SlaveStreamAccessor::serve(Source*, Sink*)`** で能動給仕。
 
@@ -282,87 +313,82 @@ I2C echo は **write 取引で受けた内容を、続く別取引の read で�
     割込通知で起こすため、 sub-1ms の小 write でも ring 境界でテールを落とさず即ドレインできる。
     polling backend (software / v2 driver) は既定 1ms poll にフォールバックする。
   - **低レベル窓 seam**: 自作 tick ループや特殊プロトコルでは `read` → `write` で応答を能動構成
-    できる。 応答を `write` した後は `transactionComplete()` が真になるまで取引を開いたまま待って
-    から `endTransaction` する (早い `endTransaction` は read 途中の応答を破棄)。 純粋な write 取引
-    は STOP で即 `transactionComplete()` が真。 serve() はこの seam を検証済み順序で合成したもの。
-- **`SlaveRegMapAccessor`** (基底の上のアダプタ): レジスタファイル
-  (`data::DataSpan`、 アプリ所有の backing 配列) + 8-bit ポインタ + auto-increment を持ち、
-  master の write `[reg][data...]` でポインタ設定 + レジスタ書込み、 read はポインタから
-  auto-increment 供給 (write-then-read は 1 窓完結) を**自動給仕**する。 アプリ側は
-  `getRegister`/`setRegister` で backing 配列を直接読み書きし (hook は発火しない)、 任意 hook
-  (`onWrite(reg,val)` = 書込副作用 / `onRead(reg)->val` = just-in-time の live・計算値) を挿せる。
-  hook は **関数ポインタ + `void* ctx`** (hal/v2 house style、 `std::function` 不使用)。
-  内部に `SlaveStreamAccessor` を合成する。 **byte 意味論**: read 1 byte =
-  `onRead(p)` があればその戻り値、 無ければ `reg_file[p]` (p は窓内 auto-increment、 8-bit wrap)。
-  write の先頭 byte = ポインタ設定、 以降の byte = `reg_file[p+offset]=val` + `onWrite(p+offset,val)`。
-  **ポインタは取引を跨いで保持**され、 SPLIT (register write → STOP → 別取引の pure read) は
-  先行 write が設定したポインタに対して解決する。 アクセサは受信を逐次適用するため自前バッファの
-  上限を持たない。 backend の RX は **2 の冪リング**で、 上限は取引あたりの通算でなく
-  **未読バックログ** に対して効く — 利用側 (`serve()` / tick ループ) が `read()` で捌き続ける
-  限り、 1 取引でリングを遥かに超えるバイト (例: 256B レジスタファイルの一括 write) を受信
-  できる。 バックログ超過時の挙動は backend で異なる: **software backend** (64B) は超過バイトを
-  破棄し `rxOverflowCount()` で検知できる (非ゼロ = consumer 遅延または read 未実行)。
-  **espidf LL backend** は未読が back-pressure 閾値 `kRxCapacity` (32B) に達すると **SCL
-  stretch hold で master を停止し、 破棄しない** (read() の空き待ち)。 STOP 時だけは以後の
-  stretch で master を止められないため、 HW FIFO に残った尻尾 (≤32B) を閾値の先の **STOP 尻尾
-  予備領域** (リング物理 `kRxArrayCapacity` = 64B) へ格納する — consumer が微遅延しても
-  33〜64B write の尻尾は失われず、 `rxOverflowCount()` は防御経路 (取引スロット枯渇等) でしか
-  増えない。 **espidf BE flavor** (ESP32 無印の既定、 後述) は ISR が逐次 drain するが
-  stretch が無いため back-pressure は掛けられない — リング超過は破棄され
-  `rxOverflowCount()` が増える。 ただし regmap ISR fast path が bind されている間は受信を
-  リング非経由でレジスタファイルへ直接適用するため、 この経路では増えない。 なお espidf の
-  **非 LL callback 経路** (v2 driver、 BE の LL ヘッダが揃わない構成のみのフォールバック) は
-  STOP 後に取引全体を一括受領しドレイン余地が無いため、 そこでは `kRxArrayCapacity` (64B)
-  が硬い取引あたり上限 (末尾切り詰め、 `rxOverflowCount()` で検知)。 **read 側 (master の >64B
-  読み出し)**: backend の TX は上記のとおり `kTxCapacity` リング + ストリーミングで取引あたり
-  上限が無く、 `SlaveRegMapAccessor::serve()` もリングの空きに合わせて `kReplyWindowBytes` = 64B
-  チャンクを継続 compose するため、 **1 回の RegMap read に長さ上限は無い** (8-bit wrap の
-  auto-increment で読み続けられる。 参考実装 ESP32_I2C_slave_example と同じ意味論)。 compose は
-  ワイヤより最大 1 チャンク先行し、 読まれなかった分は STOP で破棄される (`onRead` の先行発火に
-  注意 — §どちらのアクセサを使うか)。 独自プロトコルの純ストリーム read は基底の
-  `SlaveStreamAccessor` を直接使う (応答を逐次 `write` で供給する。 echo デバイスがこの形)。
+    できる。 応答を `write` した後は `wireFrameComplete()` が真になるまで取引を開いたまま待って
+    から `closeWireFrame` する (早い `closeWireFrame` は read 途中の応答を破棄)。 純粋な write 取引
+    は STOP で即 `wireFrameComplete()` が真。 serve() はこの seam を検証済み順序で合成したもの。
 
-  最小例 (温度センサ風、 `onRead` で live 値を just-in-time 合成):
+### RegMap 利用者契約
 
-  ```cpp
-  struct State { uint8_t regs[256] = {}; int16_t temp = 0; };
-  State state;
+`SlaveRegMapAccessor`は`SlaveStreamAccessor`を内部に合成し、アプリ所有の
+`data::DataSpan`を8-bit pointer + auto-incrementのレジスタファイルとして自動給仕する。
+利用者が依存してよいwire契約は次のとおり:
 
-  uint8_t onRead(uint8_t reg, void* ctx) {        // hook 無しなら reg_file[reg] が返る
-      auto* s = static_cast<State*>(ctx);
-      if (reg == 0x10) return uint8_t(s->temp & 0xFF);
-      if (reg == 0x11) return uint8_t((s->temp >> 8) & 0xFF);
-      return s->regs[reg];                         // それ以外は backing 配列を返す
-  }
+| master操作 | 観測される意味 |
+|---|---|
+| write `[reg]` | pointerを`reg`へ設定する |
+| write `[reg][data...]` | pointer設定後、順にbackingへ書き、各byteで`onWrite(reg, value)`を呼ぶ |
+| repeated-start read | 同じ取引のwriteで設定したpointerから読む。応答はdata write適用前にcomposeされる |
+| STOP後のpure read | 前の取引から保持したpointerから読む |
+| long read/write | pointerは8-bitでwrapしながらauto-incrementする |
 
-  SlaveRegMapAccessor regs{bus, data::DataSpan{state.regs, sizeof(state.regs)}};
-  regs.setOnRead(onRead, &state);
-  for (;;) { state.temp = readSensor(); regs.serve(); }  // serve は 1 取引 → ループ必須
-  ```
+read byteは`onRead(reg)`があればその戻り値、無ければ`reg_file[reg]`である。hookは
+関数ポインタ + `void* ctx`で、`getRegister`/`setRegister`によるアプリ側の直接操作では発火しない。
+read/writeのwire処理でのみ発火する。backing span外のreadはhookが無ければ0、span外のwriteは
+backingを変更しないが`onWrite`には通知する。
 
-  給仕は 2 形態:
-  - **`serve(timeout)`** = ブロッキング便利関数 (`while(running) acc.serve();`)。 backend ISR が
-    bus を進める espidf 系の app ループ向け。 検証済みの順序 = 「初回 read でポインタ確定 →
-    応答 compose (書込適用前) → write → 書込相を complete まで完全ドレイン (available を全部
-    読んでから complete 判定) → end」。 待ちは基底アクセサと同じ `waitForActivity` で
-    イベント駆動 (ISR backend は通知で起床)。 `timeout_ms` の stall-escape も同義 (既定
-    `TIMEOUT_FOREVER` は完走まで給仕、 有限値は無進展でその取引を諦めて返る)。 regmap の
-    consumer はワイヤが動く限り必ず進む (受信は即レジスタ適用・応答 pump は tx ring 有界) ため、
-    取引中の stall = master 側の無活動のみ — escape は discard 段階を持たず即時放棄で、 放棄前に
-    適用済みのレジスタ書込はそのまま残る (書込途中で切断された実レジスタデバイスと同じ意味論)。
-  - **取引ステップ API** (`beginExchange`/`ingest`/`composeReply`) = 純レジスタマップ・ロジックを
-    bus I/O から分離して公開したもの。 `serve()` が上記順序で合成する素であり、 **単一スレッドで
-    bus が ServiceRunner tick で進むモデル** (`serve()` のブロッキング poll が使えない) 向けに
-    自作 tick ループを組む素材になる。 同じ seam を native 決定論テストが叩く。
+RegMap readの取引長にAPI上限はない。`kReplyWindowBytes` = 64Bはcompose chunkであり、masterが
+読み続ける限り次chunkを供給する。ただし応答はwireより先行してcomposeされる。同梱backendでは
+TX queue + 1 chunk、すなわち1 byte readでも最大128B分の`onRead`が先に発火し得る。未読分はSTOPで
+破棄されるため、read-to-clearなど副作用を持つhookはこの先行実行を許容できる設計にする。
 
-  **実行モデルの要点**: espidf は `serve()` をブロッキングで app ループから回せる (bus は
-  ISR で進む)。 software backend の native は単一スレッドで bus が ServiceRunner tick で進むため、
-  `serve()` のブロッキング poll はデッドラインを生む — そのモデルでは取引ステップ API を tick
-  ループから駆動する。
+給仕方法は二つある:
 
-応答の組成は既定で**タスク文脈** (stretch が master を保持する間にアクセサ層が応答を作る)。
-stretch を持つ SoC では応答に遅延があっても master を確実に待たせられるため、 ISR 同期でなく
-タスク文脈での任意ロジックが成立する。
+- **`serve(timeout_ms)`**: 1取引をblocking給仕して返るため、アプリはループで呼ぶ。既定
+  `TIMEOUT_FOREVER`は完走まで待ち、有限値は無進展の取引を放棄して`TIMEOUT_ERROR`を返す。
+  放棄前に適用済みのregister writeは残る。
+- **step API** (`beginExchange` / `ingest` / `composeReply`): wire I/Oから分離した同じRegMapロジック。
+  busが同一threadの`ServiceRunner` tickで進みblocking pollできない場合の自作loopと、決定論testに使う。
+
+最小例 (温度センサ風、`onRead`でlive値を合成):
+
+```cpp
+struct State { uint8_t regs[256] = {}; int16_t temp = 0; };
+State state;
+
+uint8_t onRead(uint8_t reg, void* ctx) {
+    auto* s = static_cast<State*>(ctx);
+    if (reg == 0x10) return uint8_t(s->temp & 0xFF);
+    if (reg == 0x11) return uint8_t((s->temp >> 8) & 0xFF);
+    return s->regs[reg];
+}
+
+SlaveRegMapAccessor regs{bus, data::DataSpan{state.regs, sizeof(state.regs)}};
+regs.setOnRead(onRead, &state);
+for (;;) { state.temp = readSensor(); regs.serve(); }
+```
+
+### RegMap backend 制約と診断
+
+RX容量はRegMapのwire長上限ではなく、consumerがまだ適用していない**未読backlog**への制約である。
+`rxOverflowCount()`はoverflow event数ではなく、init以降に破棄した受信byteの累積数を返す。
+
+| backend経路 | RX back-pressure / 上限 | overflowの扱い |
+|---|---|---|
+| software | 64B ring。consumerが捌けば取引長は無制限 | backlog超過byteを破棄してcountへ加算 |
+| ESP-IDF LL | 32BでSCL stretch、物理ring 64Bの後半はSTOP時のFIFO tail予約 | 通常は破棄なし。取引slot枯渇など防御経路だけcountへ加算 |
+| ESP-IDF BE + ISR RegMap fast path | RX FIFOからbackingへ直接適用しringを経由しない | この経路ではoverflowなし |
+| ESP-IDF BE stream path | stretchなしのbest effort ring | backlog超過byteを破棄してcountへ加算 |
+| ESP-IDF callback fallback | STOP後に取引全体を一括受領。64B/取引がhard limit | tail切り詰めをcountへ加算 |
+
+LL経路で取引slotを再利用するときは、最古の未open取引の受信総量ではなく未読量
+`rx_size - rx_read`だけを破棄数へ加算する。TX側は全経路で64B ringを継続補充するため、RegMap readの
+取引長上限にはならない。独自protocolで逐次応答を制御したい場合はRegMapではなく
+`SlaveStreamAccessor`を使う。
+
+実行文脈もbackendで異なる。通常の応答composeとhookは、bus自体がISRで進むESP-IDFでも
+**タスク文脈**で動く。stretch対応SoCはその間masterを保持できる。software backendのnative
+single-thread modelではbusもServiceRunner tickで進むため、step APIをtick loopから駆動する。
+stretchを持たないESP32無印でのhook文脈だけは、次節のISR fast path契約に従う。
 
 ## ISR regmap fast path (`bindIsrRegMap`)
 
@@ -418,9 +444,31 @@ backend では受信の解釈 (先頭 byte = ポインタ、 以降 = レジス�
   `VirtualOpenDrainBus` と組み合わせ、 probe ACK、 write、 read-only、 write-then-read、
   address NACK、 data NACK、 clock stretch timeout、 STOP 時 SDA stuck-low、 read 末尾
   master NACK 観測に加え、 窓の分離・Tx 自動消滅・underrun fill を固定している。
-- 実機向け ESP-IDF backend (`SlaveBus_espidf`) は 2 flavor をコンパイル時に自動選択する:
+- 実機向け ESP-IDF backend (`SlaveBus_espidf`) は3 flavorをコンパイル時に自動選択する:
   ESP-IDF 5.0付属の`hal/i2c_ll.h`はC++からincludeできないためslave backendを公開せず、
   ESP-IDF 5.1以降で以下のflavorを提供する (M5HALの他backendとI2C masterは5.0でも利用可能)。
+  queue駆動`SlaveAccessor`のcapabilityは次のとおり。要求を近似できない場合は`beginAccess()`または
+  `init()`で`UNSUPPORTED`を返し、異なるframe境界や消費量を申告しない。
+
+  | flavor | queue lifecycle | frame / segment | legacy wire-frame window |
+  |---|---|---|---|
+  | LL stretch | Byte TX / Byte RX + `TxUnderrun::Fill` | `UNSUPPORTED` | opt-in |
+  | BE direct LL | Byte TX / Byte RX + `TxUnderrun::Fill` | `UNSUPPORTED` | opt-in。ISR RegMap fast pathとqueueは排他 |
+  | v2 callback fallback | `UNSUPPORTED`。read STOP、実TX量、repeated START理由を観測不能 | `UNSUPPORTED` | opt-inのみ |
+
+  LL/BEのqueue経路はISR内でcaller queueを直接操作せず、backend-owned固定staging/event ringからworker taskが
+  replayする。TX byteはFIFOへloadした時点でpopせず、STOP/TX_EMPTYで実消費を確定できたprefixだけをpopし、
+  未clock suffixは順序を保って次回へ残す。実機では、STOP時のFIFO departureが1 byteだけならprefetchはなく全量を
+  確定し、複数byteなら最後の1 byteをshifter候補として保留する。TX_EMPTY等でshifterまでdrainした証拠がある場合は
+  全departureを確定する。この規則をearly NACKの1/3/5 byte readで受け入れている。
+  `beginAccess/endAccess`で動的にslave addressを切り替えるLL backendは、shadow register書込み後に
+  `i2c_ll_update()`を発行してから受付状態を変更する。inactive fenceにはconfigured 7-bit addressと重ならない
+  10-bit `0x3FF`を使うため、通常の7-bit masterに対する受付停止は保証するが、共有bus上のmasterが10-bit
+  `0x3FF`をtargetにする構成は非対応である。`endAccess(timeout)`はaddress/interrupt受付を先にfenceし、worker停止を
+  有界待機する。退去しないworkerはhard-abortし、ISR/task producerを停止してからcaller pointerをdetachする。
+  timeout/abort後はBusをpersistent brokenとし、`close()`後の再initまで後続Accessを拒否する。終了APIが返った後に
+  backendがcaller-owned storageへ触れてはならない。
+
   **LL flavor** (stretch-cause SoC: S2/S3/C3/C6/H2/P4 等) は HW clock stretch で上記
   プリミティブを提供し、 write-then-read を HW 保証する。 **BE (best-effort) flavor**
   (ESP32 無印) は同じ `i2c_ll_*` 直叩き構造 (IDF driver / Kconfig 非依存) で、 stretch の
@@ -428,7 +476,7 @@ backend では受信の解釈 (先頭 byte = ポインタ、 以降 = レジス�
   100/400kHz、 800kHz は参考 (informational)。 fast path を bind しない純ストリーム利用
   (`SlaveStreamAccessor`) の BE は **fill 意味論**: read 開始までに応答が投入されて
   いなければ、 その read は `tx_fill_byte` で埋まる (途中投入の反映は FIFO 水位補充以降)。
-  remote 公開と arduino backend は後続段階 (BE flavor 自体は Kconfig 非依存のため
+  remote 公開とarduino backendは現行スコープ外 (BE flavor 自体は Kconfig 非依存のため
   arduino ビルドでもコンパイル対象になる)。
   - **ISR の IRAM 配置 (`M5HAL_CONFIG_ESPIDF_I2C_SLAVE_IRAM_ISR`、 既定 1)**: LL stretch backend の
     slave ISR と到達コードは既定で IRAM に置き、 `ESP_INTR_FLAG_IRAM` で登録する — flash cache が
@@ -437,6 +485,11 @@ backend では受信の解釈 (先頭 byte = ポインタ、 以降 = レジス�
     この堅牢性は IRAM を ~1〜2KB 消費する。 **I2C slave 稼働中に flash を書かないと保証できるビルドは
     `M5HAL_CONFIG_ESPIDF_I2C_SLAVE_IRAM_ISR=0` で opt-out** でき、 IRAM_ATTR と IRAM 割込フラグの両方が外れて
     IRAM を回収する (代償 = flash-cache 無効窓中の slave 応答は保証されない)。
+  - **queue state の32-bit atomic**: multi-core targetではCPUのnative atomic命令を必須とする。S2/C3等の
+    single-core targetで命令としてlock-freeでない場合は、ESP-IDFの割込みマスク付き32-bit atomic helperを使う。
+    これはmutex/spinlock待ちを行わないboundedなISR-safe操作だが、ISO C++上のlock-free保証とは区別する。
+    IRAM ISRを有効にするsingle-core buildではhelperもIRAM常駐でなければならず、ESP-IDFの
+    `CONFIG_LIBC_MISC_IN_IRAM`を必須とする。対応できない構成はcompile時に拒否する。
   - **既知の限界 (LL flavor 一部 SoC・800kHz)**: H2 系など一部 SoC では、 multi-slave バス上で
     エラーが高頻度に連続する 800kHz 運用下において、 slave 側が SW 再初期化 (release/init・
     クロックゲート再構成を含む) でも回復しない状態に陥りうることが実測で確認されている

@@ -79,11 +79,14 @@ private / protected メンバ (**変数・関数の両方**) は先頭アンダ�
 
 | 動詞ペア | 用途 | 例 |
 |---|---|---|
-| `init` / `release` | オブジェクトのライフサイクル | `Bus::init(BusConfig)`, `IBus::release()` |
-| `attach` / (`detach`) | 外部 native handle との紐付け | `Bus::attach(TwoWire&)` |
-| `lock` / `unlock` | Bus 排他制御 (引数 `IAccessor*` 必須) | `IBus::lock(IAccessor*, timeout)`, `IBus::unlock(IAccessor*)` |
-| `beginAccess` / `endAccess` | Accessor アクセス期間 (depth counter で nest 対応) | `IAccessor::beginAccess(timeout)`, `IAccessor::endAccess()` |
-| `beginTransaction` / `endTransaction` | kind 固有 transaction 期間。SPI では CS assert/deassert 区間 | `MasterAccessor::beginTransaction()`, `MasterAccessor::endTransaction()` |
+| `init` / `close` | direct Busオブジェクトのライフサイクル | `Bus::init(BusConfig)`, `bus.close()` |
+| `acquire` / `close` | registry管理Busの取得 / consuming final close | `Hal.I2C.acquire(cfg)`, `Hal.I2C.close(handle)` |
+| `native::borrowed` / `native::managed` | native resourceの非所有 / 所有方針 | `Hal.I2C.acquire(cfg, native::borrowed(wire))` |
+| `acquireAccessLock` / `releaseAccessLock` | Busのprotected内部排他seam | `IBus::acquireAccessLock(IAccessor&, timeout)` |
+| `beginAccess` / `endAccess` | Accessorのnon-nestable lifecycle | `MasterAccessor::beginAccess(timeout)`, `MasterAccessor::endAccess(timeout)` |
+| `beginOperation` / `endOperation` | 最外Accessに対応するBusのnon-virtual checked入口 | `IBus::beginOperation(context)` |
+| `beginOperationBackend` / `endOperationBackend` | checked入口から呼ばれるprotected provider hook | `IBus::beginOperationBackend(context)` |
+| `openWireFrame` / `closeWireFrame` | 外部masterが作ったprotocol frameのclaim/release | `i2c::SlaveStreamAccessor::openWireFrame()` |
 | `transfer` | atomic な I/O 動作 | `IBus::transfer(...)`, `MasterAccessor::transfer(...)` |
 | `read` / `write` | Accessor の利用者 sugar | `MasterAccessor::write(tx)` |
 | `peek` / `advance` | Source: 借用 Span 取得 / cursor 前進 (連続 peek は monotonic non-decreasing 冪等) | `Source::peek(max_len)`, `Source::advance(N)` |
@@ -93,14 +96,16 @@ private / protected メンバ (**変数・関数の両方**) は先頭アンダ�
 RAII 型:
 
 - `ScopedAccess` — Accessor の `beginAccess` / `endAccess` を RAII で
-- `ScopedLock` — Bus の `lock` / `unlock` を RAII で (引数は `Accessor*` 必須)
 
 ### 開始/終了動詞の使い分け原則
 
-- `init` / `release`: lifecycle 全体 (構築後 1 回 ↔ 破棄前 1 回)
-- `attach` / `detach`: 外部の物との接続/切断 (M5HAL が所有しない handle と紐付ける)
-- `lock` / `unlock`: 排他のみ (mutex 風)
-- `begin*` / `end*`: scope (RAII 風期間) の開始 / 終了
+- `init` / `close`: direct Busのlifecycle全体。成功した`close()`後は同じ具象Busを`init()`で再利用可能
+- `acquire` / `close`: registry管理Busの共有取得と、exact instanceかつsole ownerを要求するconsuming final close
+- native resourceとの関連付けは、対応providerに限り`acquire(cfg, native::borrowed(...))` / `native::managed(...)`で表す。Bus取得目的の`attach` / `open`は公開しない
+- `acquire*` / `release*`: 内部resource取得・解放
+- `beginAccess` / `endAccess`: 公開Accessor lifecycle
+- `beginOperation` / `endOperation`: Bus backendのAccess参加hook
+- `open*` / `close*`: 既存protocol object/windowのclaim・release。wire START/STOP生成を意味しない
 - `transfer`: 1 アクションで完結する atomic I/O
 - `peek` / `advance`: cursor 操作 (peek は冪等な lookahead、 advance は副作用ある cursor 前進)
 - `reserve` / `commit`: 書き込み領域の借用と確定 (transactional)
@@ -111,6 +116,7 @@ RAII 型:
 
 - `start*` / `stop*` (例: `startWrite`, `startRead`, `stop`) — chain 中間状態を持つ旧設計の遺物、 atomic な `transfer` で代替
 - `Bus::beginAccess(AccessConfig&)` / `endAccess(Accessor*)` — 旧 factory + lock 混在 API、 利用者が Accessor を直接構築する方式に変更
+- bus lifecycleとしての`release` / `attach` / `open` — portable `acquire`、native ownership policy、`close`へ統一
 
 責務分離の詳細は [../design/bus_accessor.md](../design/bus_accessor.md)。
 
@@ -159,11 +165,29 @@ inline 展開」を意味する。基準:
 
 ## マクロ
 
-M5HAL のマクロは用途で 2 系統に分かれる (実態に基づく規約):
+マクロは役割を名前から判別できるよう、次の分類を使う。
 
-- **機能・設定マクロは `M5HAL_` プレフィックス** (アンダースコアなし) + UPPER_SNAKE_CASE — 機能フラグ・外部定義の上書き・assert 等。 例: `M5HAL_FRAMEWORK_HAS_*`, `M5HAL_V2_VARIANT_ID_*`, `M5HAL_VARIANT_CURRENT_*`, `M5HAL_ASSERT`。 世代間で値が異なり得るものは `M5HAL_V2_` で世代分離する (無印は変更不可の v0 が所有。 [../design/v0_v2_coexistence.md](../design/v0_v2_coexistence.md) §v2 実装者が破ってはならない唯一の不変条件)
-- **ヘッダガードは `M5_HAL_<PATH>_HPP` プレフィックス** (`M5_HAL_` = アンダースコアあり、 ファイルパスベース) — 機能マクロの `M5HAL_` と区別する。 例: `M5_HAL_TYPES_HPP`, `M5_HAL_GPIO_GROUP_HPP_`, `M5_HAL_ASSERT_HPP`
-- 内部用途のマクロは末尾アンダースコアを付けて区別する (例: `M5HAL_VARIANT_CURRENT_*_`)
+1. **サポート対象の入力 `M5HAL_CONFIG_*`**: ライブラリの挙動を変える公開設定。
+   `M5HAL_CONFIG_<領域>_<機能>`で命名し、[configuration.md](../design/configuration.md)に登録する。
+   `#ifndef`で既定値を与え、定義の有無ではなく値で読む。booleanの`1`は名前が示す肯定命題を意味し、
+   `USE_` / `DISABLE_` / `NO_`は使わない。
+2. **サポート対象外の入力 `M5HAL_DEBUG_*`**: backendの診断・fault injection専用。
+   booleanは既定`0`かつ値で読む。`NO_`は正常機構を止めるfault injectionに限る。
+   `M5HAL_CONFIG_DIAG`は利用者向けevent traceであり、この分類には含めない。
+3. **公開read-only output**: `M5HAL_V2_SELECTED_*` / `M5HAL_V2_DETECTED_*` /
+   `M5HAL_FRAMEWORK_HAS_*` / `M5HAL_V2_TARGET_IS_PC`。検出・選択結果としてライブラリが算出し、
+   利用者による外部定義は禁止する。
+4. **内部macro**: `M5HAL_DETAIL_*`または末尾`_`。公開契約ではなく、外部から定義しない。
+5. **header guard**: `M5_HAL_<PATH>_HPP` (`M5_HAL_`はアンダースコアあり) を使い、
+   機能macroの`M5HAL_`と区別する。
+6. **scope-local input**: `M5HAL_TEST_*` / `M5HAL_EXAMPLE_*` / `M5HAL_EXPERIMENT_*` /
+   `M5HAL_HIL_*`。所有するtest、example、experiment、HIL fixture内だけで意味を定義する。
+   公開sampleの`M5HAL_EXAMPLE_*` booleanも`#ifndef`で既定値を与え、定義の有無ではなく値で読む。
+
+世代間で値が異なり得る名前は`M5HAL_V2_`で世代分離する。物理量は`HZ` / `MS` / `US` / `BYTES`、
+個数は`COUNT`、抽象GPIO pinは`PIN`をsuffixに使い、ESP-IDFのtokenは`ESPIDF`と綴る。
+既定値は利用箇所の近くに置き、横断設定だけ`src/m5_hal_config.hpp`に置く。
+`M5HAL_`で始まるruntime environment variableはcompile-time macroではなく、所有するtoolの文書で定義する。
 
 ## variant 機構の規則
 
@@ -185,7 +209,7 @@ variant 機構の実装に関する規則。 全体像は [../design/variants.md
 
 ### variant 名前空間
 
-- variant の**公開型** (`Bus_<variant>` / `BusConfig_<variant>` / gpio の `Port_<variant>` 等) は `m5::hal::v2::<kind>` 直下に variant suffix 付きで定義する ([../design/variants.md](../design/variants.md) §offer 要件。 ディレクトリ階層 1:1 規約の明示的例外 — [../architecture.md](../architecture.md) §namespace と配置)
+- variant の**公開provider symbol** (`Bus_<variant>` / `makePortableBackend_<variant>` / `NativeProvider_<variant>`、gpio の `Port_<variant>` 等) は `m5::hal::v2::<kind>` 直下に variant suffix 付きで定義する。facade bus kindの公開`BusConfig`はsuffix無しのportable型である ([../design/variants.md](../design/variants.md) §offer 要件。ディレクトリ階層1:1規約の明示的例外 — [../architecture.md](../architecture.md) §namespaceと配置)
 - variant の**内部構造** (service 群・レジスタ層・固有ユーティリティ) は `m5::variants::{frameworks,platforms}::<name>[::<chip>]::hal::v2::*` 配下でディレクトリ階層と一致させる (例: `software/hal/i2c/i2c.hpp` の detail 群は `m5::variants::frameworks::software::hal::v2::i2c::detail::*`)
 - **`m5::hal::v2::<kind>` namespace 内** (= variant 公開型の定義場所) では `::m5::hal::v2::` を省略し、 親・sibling namespace を短い相対名で参照する (`result_t<T>` / `bus::IAccessor` / `data::Source` / `types::backend_kind_t` 等)。 ただし **`detail::`** は sibling kind の `detail` namespace が include 経由で見えて曖昧になるため、 `::m5::hal::v2::detail::` のフル修飾を維持する
 - **`m5::variants::...` namespace 内** (= variant 内部構造) では `::m5::hal::v2::` は名前探索の経路にないためフル修飾が必要。 `using namespace ::m5::hal::v2;` を置いて省略することもできる
@@ -204,13 +228,12 @@ variant 機構の実装に関する規則。 全体像は [../design/variants.md
 | 用途 | 形式 | 言語 | 対象読者 |
 |---|---|---|---|
 | 公開 API ドキュメント | `/*! ... */` ブロック (Doxygen) | **英語必須** | ライブラリ利用者 (生成 doc を読む) |
-| 設計意図 / why / workaround | `// ...` (通常コメント) | 英語推奨、 日本語混在許容 | メンテナ (ソースを読む) |
+| 設計意図 / why / workaround | `// ...` (通常コメント) | 英語 | メンテナ (ソースを読む) |
 
 ### 言語ポリシー
 
 - **公開 API ドキュメント (Doxygen) は英語で書く** — Doxygen 生成物がエンドユーザー向けリファレンスになるため
-- **設計意図 / why コメントは英語推奨、 日本語混在許容** — 段階移行中。 新規 / 改変箇所は英語で書く (boy scout rule)
-- 既存日本語コメントはファイル単位で英訳していく。 1 commit で全ファイル一括書き換えはしない (差分把握 / レビュー困難を避ける)
+- **設計意図 / why コメントは英語で書く**。変更対象外の既存日本語コメントは、その変更だけを目的に書き換える必要はない
 - **訳語のブレを防ぐため [glossary.md](glossary.md) を併読** すること。 主要概念 (bus / accessor / access window / contract violation 等) の英訳は固定済
 
 ### Doxygen の最低限ライン
@@ -283,7 +306,7 @@ API 種別ごとに canonical な書き出しを固定し、 同じ役割の型�
 
 - **why を中心に書く**。 what はコードで表現する
 - 公開 API ヘッダ内でも、 private / protected メンバ、 inline detail、 workaround の説明には `/*!` ではなく `//` を使う
-- 新規・改変分は英語で書くが、 既存日本語コメントを保つことを優先 (段階移行)
+- 新規・改変分は英語で書く。変更対象外の既存コメントは維持してよい
 
 ### TODO コメント
 
@@ -291,9 +314,9 @@ API 種別ごとに canonical な書き出しを固定し、 同じ役割の型�
 - Doxygen の `@todo` は使わない (生成 API doc に出さない)
 - `src/m5_hal/hal/v0/` 配下の既存 TODO は freeze 例外とし、 取り込み元との差分を維持するため、 現行 v2 作業のタスク対象外として扱う
 
-### Doxyfile
+### Doxygen生成設定
 
-Doxyfile 自体は将来整備する。 整備時は以下を満たす設定とする:
+Doxyfile は現行未導入 (整備は公式PR前のタスク)。導入する生成設定は以下を満たす:
 
 - `JAVADOC_AUTOBRIEF = NO` — 明示的に `@brief` を要求
 - `EXTRACT_PRIVATE = NO` / `EXTRACT_STATIC = NO` — 公開 API のみを生成 doc に出す

@@ -26,3 +26,9 @@ jobs:
 
       - name: Validate public spec API spellings
         run: python3 .github/scripts/check-spec-api.py
+
+      - name: Reject obsolete v2 API spellings
+        run: python3 .github/scripts/check-obsolete-api.py
+
+      - name: Validate Markdown structure and local links
+        run: python3 .github/scripts/check-docs.py

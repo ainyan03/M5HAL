@@ -4,10 +4,10 @@
 
 #include "../../detail/espidf_version.hpp"
 #include "../../../../../hal/v2/bus/bus.hpp"
+#include "../../../../../hal/v2/bus/hal_backend.hpp"
 #include "../../../../../hal/v2/bus/local_backend.hpp"
+#include "../../../../../hal/v2/bus/portable_factory.hpp"
 #include "../../../../../hal/v2/i2c/i2c.hpp"
-#include "../../../../../hal/v2/memory/allocator.hpp"
-#include "../../../../../hal/v2/service/service.hpp"
 
 #if defined(ESP_PLATFORM) && M5HAL_ESPIDF_I2C_HAS_MASTER
 
@@ -33,21 +33,21 @@
 
 namespace m5::hal::v2::i2c {
 
-struct BusConfig_espidf : public i2c::IBusConfig {
-    // Inherit the tag-pin constructors (Scl / Sda, either order);
-    // `i2c_port` keeps its member initializer and is set by assignment.
-    using i2c::IBusConfig::IBusConfig;
-
 #if M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5
-    int i2c_port = -1;
-#elif M5HAL_ESPIDF_I2C_HAS_MASTER_GEN4
-    ::i2c_port_t i2c_port = I2C_NUM_0;
-#endif
+namespace detail_espidf_i2c {
+// ESP-IDF gen5 documents -1 as automatic selection among free HP ports.
+inline constexpr int8_t kPortableControllerAuto = -1;
+}  // namespace detail_espidf_i2c
 
-    constexpr BusConfig_espidf(void) : i2c::IBusConfig{}
+/*! @brief Caller-owned ESP-IDF v5 master-bus handle. */
+struct NativeMasterBus {
+    ::i2c_master_bus_handle_t value = nullptr;
+
+    constexpr explicit NativeMasterBus(::i2c_master_bus_handle_t handle) : value{handle}
     {
     }
 };
+#endif
 
 #if M5HAL_ESPIDF_I2C_LP_POOL
 // True once `controller` is an LP_I2C port index. ESP-IDF numbers LP
@@ -62,32 +62,22 @@ inline bool isLowPowerControllerForI2C(int8_t controller)
 // ESP-IDF I2C bus. The public Bus_espidf type is stable inside the espidf
 // variant; ESP-IDF driver generation differences live in gen4/gen5 backend
 // implementations selected by detail/espidf_version.hpp.
-class Bus_espidf : public i2c::IBus
-#if M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5
-    ,
-                   private service::IService
-#endif
-{
+class Bus_espidf : public i2c::IBus {
 public:
     ~Bus_espidf() override
     {
-        (void)release();
+        (void)teardownBackend();
     }
 
-    // Typed init: takes this variant's BusConfig_espidf. Passing the
-    // abstract IBusConfig (or a sibling variant's config) is a
-    // compile error instead of a silent bad downcast.
-    result_t<void> init(const BusConfig_espidf& config);
-    result_t<void> release(void) override;
-
-    result_t<void> transfer(bus::IAccessor* owner, const i2c::MasterAccessConfig& cfg, const i2c::TransferDesc& desc,
-                            data::Source* src, size_t tx_len, data::Sink* dst, size_t rx_len) override;
-    result_t<bus::TransferTotals> waitTransfer(bus::IAccessor* owner, const i2c::MasterAccessConfig& cfg) override;
-    bool transferBusy(bus::IAccessor* owner) override;
+    result_t<void> init(const IBusConfig& config);
+    result_t<void> close(void)
+    {
+        return bus::IBus::close();
+    }
 
     // This backend drives a dedicated ESP-IDF I2C peripheral. The
-    // controller pool assigns the port through BusConfig_espidf::i2c_port; the
-    // query API reports it so the resolver's incumbency check and a
+    // controller pool assigns the port through the provider-private init
+    // helper; the query API reports it so the resolver's incumbency check and a
     // holder watching for a downgrade both see the live state.
     types::backend_kind_t backendKind(void) const override
     {
@@ -120,13 +110,29 @@ public:
         // "no declared ceiling", which matches the base default.
         return M5HAL_CONFIG_I2C_MASTER_MAX_CLOCK_HZ;
     }
+    bus::BusCapabilities capabilities(void) const override
+    {
+        auto builder = bus::detail::BusCapabilitiesBuilder{bus::IBus::capabilities()};
+        builder.enable(bus::BusFeature::MasterTransfer)
+            .enable(bus::BusFeature::Transmit)
+            .enable(bus::BusFeature::Receive);
+#if M5HAL_ESPIDF_I2C_LP_POOL
+        builder.enable(bus::BusFeature::LowPowerBackend, isLowPowerControllerForI2C(controllerId()));
+#endif
+        return builder.build();
+    }
 
 #if M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5
-    error::error_t attach(::i2c_master_bus_handle_t bus_handle);
+    result_t<void> adoptBorrowedNative(
+        ::i2c_master_bus_handle_t bus_handle, const IBusConfig& config,
+        bus::FixedNativeInterner<bus::NativeIdentity, bus::BusRegistry::kCapacity>& interner, bus::NativeToken token);
     ::i2c_master_bus_handle_t nativeHandle() const
     {
         return _bus_handle;
     }
+    void retainNativeIdentity(bus::FixedNativeInterner<bus::NativeIdentity, bus::BusRegistry::kCapacity>& interner,
+                              bus::NativeToken token);
+    result_t<void> releaseNativeIdentity(void);
 #endif
 #if !M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5 && M5HAL_ESPIDF_I2C_HAS_MASTER_GEN4
     ::i2c_port_t nativePort() const
@@ -135,8 +141,23 @@ public:
     }
 #endif
 
+protected:
+    result_t<void> transferBackend(bus::OperationContext<i2c::MasterAccessConfig>& context,
+                                   const i2c::TransferDesc& desc, data::Source* src, size_t tx_len, data::Sink* dst,
+                                   size_t rx_len) override;
+    result_t<bus::TransferTotals> waitTransferBackend(bus::OperationContext<i2c::MasterAccessConfig>& context) override;
+    bool transferBusyBackend(bus::OperationContext<i2c::MasterAccessConfig>& context) override;
+    bus::CloseOutcome closeBackend(void) override
+    {
+        return teardownBackend();
+    }
+
 private:
+    bus::CloseOutcome teardownBackend(void);
+    result_t<void> initBackend(const IBusConfig& config, int8_t controller);
+    friend i2c::IBus* makeHardwareBackendForI2C(const bus::LocalResourceContext&, const i2c::LogicalBusConfig&, int8_t);
 #if M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5
+    error::error_t attachBorrowedNative(::i2c_master_bus_handle_t bus_handle);
     result_t<void> ensureDevice(const i2c::MasterAccessConfig& cfg);
     result_t<void> removeDevice(void);
     void recoverBusAfterWireFault(error::error_t mapped, uint32_t wire_timeout_ms);
@@ -147,7 +168,6 @@ private:
     // Wire-fault recovery released the bus but could not rebuild it (e.g.
     // transient NO_MEM); transfer() retries the rebuild lazily.
     bool _rebuild_pending      = false;
-    bool _dev_async            = false;
     uint16_t _dev_addr         = 0;
     uint32_t _dev_freq         = 0;
     uint32_t _dev_scl_wait_us  = 0;
@@ -155,21 +175,6 @@ private:
     // The configured port (gen5 takes it via i2c_master_bus_config_t but keeps
     // no member); cached so controllerId() reports the pool's assignment.
     int _controller_port = -1;
-    service::ServicePoll serviceImpl(const service::ServiceContext& ctx) override;
-    static bool onTransferDone(::i2c_master_dev_handle_t dev, const ::i2c_master_event_data_t* evt, void* arg);
-    service::ServiceResult serviceTransfer(const service::ServiceContext& ctx);
-    void unregisterTransferService(void);
-    void clearTransferState(void);
-
-    bus::IAccessor* _transfer_owner = nullptr;
-    data::Sink* _transfer_dst       = nullptr;
-    memory::TempBuffer _transfer_tx_buf{};
-    size_t _transfer_tx_count                         = 0;
-    size_t _transfer_rx_count                         = 0;
-    bool _transfer_active                             = false;
-    bool _transfer_registered                         = false;
-    bool _transfer_done                               = true;
-    volatile error::error_t _transfer_callback_status = error::error_t::ASYNC_RUNNING;
 #elif M5HAL_ESPIDF_I2C_HAS_MASTER_GEN4
     ::i2c_port_t _port = I2C_NUM_0;
     bool _installed    = false;
@@ -178,34 +183,36 @@ private:
     uint32_t _applied_freq = 0;
 #endif
     bus::TransferTotals _transfer_totals{};
+#if M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5
+    bus::FixedNativeInterner<bus::NativeIdentity, bus::BusRegistry::kCapacity>* _native_interner = nullptr;
+    bus::NativeToken _native_token{};
+#endif
 };
 
-// Facade backend selection: i2c::Bus::init(BusConfig_espidf) -> Bus_espidf.
-template <>
-struct BackendFor<BusConfig_espidf> {
-    using type = Bus_espidf;
-};
+inline result_t<std::unique_ptr<IBus>> makePortableBackend_espidf(const bus::LocalResourceContext& resources,
+                                                                  const IBusConfig& config)
+{
+    return bus::makePortableBackend<IBus, Bus_espidf, IBusConfig>(resources, config);
+}
 
 // hardware backend factory. Builds a Bus_espidf for a logical
 // request, binding the leased controller index to the ESP-IDF I2C port. This is
-// the only code that knows about i2c_port, so the kind-generic BusView / pool
-// stay variant-agnostic. M5HALCore wires this into i2c::BusView when this
-// variant provides hardware I2C (M5HAL_DETAIL_I2C_HAS_HARDWARE_BACKEND_ below).
-inline i2c::IBus* makeHardwareBackendForI2C(const i2c::LogicalBusConfig& logical, int8_t controller)
+// the only code that knows about the ESP-IDF controller number, so the
+// kind-generic BusView / pool stay variant-agnostic. M5HALCore wires this into
+// i2c::BusView when this variant provides hardware I2C
+// (M5HAL_DETAIL_I2C_HAS_HARDWARE_BACKEND_ below).
+inline i2c::IBus* makeHardwareBackendForI2C(const bus::LocalResourceContext& resources,
+                                            const i2c::LogicalBusConfig& logical, int8_t controller)
 {
     auto* backend = new (std::nothrow) Bus_espidf();
     if (backend == nullptr) {
         return nullptr;
     }
-    BusConfig_espidf cfg;
+    backend->bindLocalResources(resources);
+    IBusConfig cfg;
     cfg.pin_scl = logical.pin_scl;
     cfg.pin_sda = logical.pin_sda;
-#if M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5
-    cfg.i2c_port = controller;
-#elif M5HAL_ESPIDF_I2C_HAS_MASTER_GEN4
-    cfg.i2c_port = static_cast< ::i2c_port_t>(controller);
-#endif
-    auto r = backend->init(cfg);
+    auto r      = backend->initBackend(cfg, controller);
     if (!r.has_value()) {
         delete backend;
         return nullptr;
@@ -307,8 +314,8 @@ inline result_t<void> completeLogicalForI2C(LogicalBusConfig& cfg)
         return {};
     }
 #if __has_include(<driver/rtc_io.h>)
-    if (!::rtc_gpio_is_valid_gpio(static_cast< ::gpio_num_t>(cfg.pin_scl)) ||
-        !::rtc_gpio_is_valid_gpio(static_cast< ::gpio_num_t>(cfg.pin_sda))) {
+    if (!::rtc_gpio_is_valid_gpio(static_cast<::gpio_num_t>(cfg.pin_scl)) ||
+        !::rtc_gpio_is_valid_gpio(static_cast<::gpio_num_t>(cfg.pin_sda))) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
 #endif
@@ -321,8 +328,8 @@ inline bool pinsAllowedForI2C(const LogicalBusConfig& cfg, int8_t controller)
         return true;
     }
 #if __has_include(<driver/rtc_io.h>)
-    return ::rtc_gpio_is_valid_gpio(static_cast< ::gpio_num_t>(cfg.pin_scl)) &&
-           ::rtc_gpio_is_valid_gpio(static_cast< ::gpio_num_t>(cfg.pin_sda));
+    return ::rtc_gpio_is_valid_gpio(static_cast<::gpio_num_t>(cfg.pin_scl)) &&
+           ::rtc_gpio_is_valid_gpio(static_cast<::gpio_num_t>(cfg.pin_sda));
 #else
     // driver/rtc_io.h was not available at compile time (unexpected: it
     // ships with esp_driver_gpio, an M5HAL dependency on every target) --
@@ -361,6 +368,22 @@ inline bus::LocalKindAdapter<i2c::BusTraits>::Topology controllerTopologyForI2C(
 // Tells M5HALCore that this build has a poolable hardware I2C backend, so the
 // I2C BusView is wired with the hardware factory + controller pool.
 #define M5HAL_DETAIL_I2C_HAS_HARDWARE_BACKEND_ 1
+
+template <class Policy>
+struct NativeProvider_espidf {
+    static result_t<std::shared_ptr<IBus>> acquire(bus::IHalBackend&, const IBusConfig&, Policy)
+    {
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
+};
+
+#if M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5
+template <>
+struct NativeProvider_espidf<native::Borrowed<NativeMasterBus>> {
+    static result_t<std::shared_ptr<IBus>> acquire(bus::IHalBackend&, const IBusConfig&,
+                                                   native::Borrowed<NativeMasterBus>);
+};
+#endif
 
 }  // namespace m5::hal::v2::i2c
 

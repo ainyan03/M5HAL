@@ -7,11 +7,51 @@
 #if defined(ARDUINO)
 
 #include "../../../../../hal/v2/diag.hpp"
+#include "../../../../../hal/v2/resource_domain.hpp"
+
+#include <cstdlib>
+#include <cstdint>
+#include <new>
 
 namespace m5::hal::v2::uart {
 
 namespace {
 namespace impl_arduino {
+
+constexpr uint16_t kNativeStreamProvider         = 0x0301;
+constexpr uint16_t kNativeHardwareSerialProvider = 0x0302;
+
+struct PendingNativeToken {
+    bus::FixedNativeInterner<bus::NativeIdentity, bus::BusRegistry::kCapacity>* interner = nullptr;
+    bus::NativeToken token{};
+
+    ~PendingNativeToken()
+    {
+        if (interner != nullptr && token.valid()) {
+            (void)interner->release(token);
+        }
+    }
+
+    void dismiss()
+    {
+        interner = nullptr;
+        token    = {};
+    }
+};
+
+bus::BindingDescriptor makeNativeBinding(const IBusConfig& cfg, bus::NativeToken token, uint16_t provider)
+{
+    bus::BindingDescriptor binding;
+    binding.provider    = provider;
+    binding.ownership   = bus::Ownership::Borrowed;
+    binding.native_kind = bus::NativeBindingKind::Native;
+    binding.native      = token;
+    binding.config_primary =
+        static_cast<uint16_t>(cfg.pin_tx) | (static_cast<uint32_t>(static_cast<uint16_t>(cfg.pin_rx)) << 16u);
+    binding.config_secondary =
+        static_cast<uint16_t>(cfg.pin_rts) | (static_cast<uint32_t>(static_cast<uint16_t>(cfg.pin_cts)) << 16u);
+    return binding;
+}
 
 #if !defined(ESP_PLATFORM) && !defined(ARDUINO_ARCH_ESP8266) && !defined(SERIAL_8N1)
 #error "This Arduino core does not define the SERIAL_* uart config macros; extend serialConfig() for it."
@@ -95,44 +135,25 @@ bool sameConfig(const uart::AccessConfig& lhs, const uart::AccessConfig& rhs)
            lhs.parity == rhs.parity && lhs.invert == rhs.invert;
 }
 
-// RAII unlock for a runtime::Mutex critical section (mirrors the pattern in
-// service.inl's ControlUnlock) so an early return can never leak the lock.
-struct MutexUnlock {
-    runtime::Mutex* m;
-    ~MutexUnlock()
-    {
-        m->unlock();
-    }
-};
-
 }  // namespace impl_arduino
 }  // namespace
 
-result_t<void> Bus_arduino::init(const BusConfig_arduino& config)
+result_t<void> Bus_arduino::teardown(void)
 {
-    if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
-        return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+    auto locked = _state_mutex.lock(types::TIMEOUT_FOREVER);
+    if (!locked.has_value()) {
+        return m5::stl::make_unexpected(locked.error());
     }
-    impl_arduino::MutexUnlock state_unlock{&_state_mutex};
+    runtime::ScopedUnlock state_unlock{_state_mutex};
 
-    _config    = config;
-    _serial    = config.serial;
-    _hw_serial = config._hw_serial;
-    if (_serial == nullptr) {
-        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    if (_native_interner != nullptr && _native_token.valid()) {
+        auto released = _native_interner->release(_native_token);
+        if (!released.has_value()) {
+            return released;
+        }
     }
-    _attached = false;
-    _begun    = false;
-    return {};
-}
-
-result_t<void> Bus_arduino::release(void)
-{
-    if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
-        return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
-    }
-    impl_arduino::MutexUnlock state_unlock{&_state_mutex};
-
+    _native_interner = nullptr;
+    _native_token    = {};
     if (_serial != nullptr && _begun && !_attached && _hw_serial) {
         static_cast<::HardwareSerial*>(_serial)->end();
     }
@@ -142,53 +163,180 @@ result_t<void> Bus_arduino::release(void)
     return {};
 }
 
+bus::CloseOutcome Bus_arduino::closeBackend(void)
+{
+    auto closed = teardown();
+    if (!closed.has_value()) {
+        return bus::CloseOutcome::noMutation(closed.error());
+    }
+    return bus::CloseOutcome::success();
+}
+
 uint32_t Bus_arduino::reconfigSkips()
 {
-    if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
+    if (!_state_mutex.lock(types::TIMEOUT_FOREVER).has_value()) {
         return 0;
     }
-    impl_arduino::MutexUnlock state_unlock{&_state_mutex};
+    runtime::ScopedUnlock state_unlock{_state_mutex};
     return _reconfig_skips;
 }
 
-error::error_t Bus_arduino::attach(::HardwareSerial& serial)
+result_t<void> Bus_arduino::adoptBorrowedNative(
+    ::Stream& stream, bool hardware_serial, const IBusConfig& config,
+    bus::FixedNativeInterner<bus::NativeIdentity, bus::BusRegistry::kCapacity>& interner, bus::NativeToken token)
 {
-    (void)release();  // release() takes its own _state_mutex critical section
-    if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
-        return error::error_t::TIMEOUT_ERROR;
+    if (!token.valid()) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
-    impl_arduino::MutexUnlock state_unlock{&_state_mutex};
-    _serial    = &serial;
-    _hw_serial = true;
-    _attached  = true;
-    _begun     = false;
-    return error::error_t::OK;
+    auto initialized = initBorrowedDirect(config, stream, hardware_serial);
+    if (!initialized.has_value()) {
+        return initialized;
+    }
+    _native_interner = &interner;
+    _native_token    = token;
+    return {};
 }
 
-error::error_t Bus_arduino::attach(::Stream& stream)
+result_t<void> Bus_arduino::initBorrowedDirect(const IBusConfig& config, ::Stream& stream, bool hardware_serial)
 {
-    (void)release();
-    if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
-        return error::error_t::TIMEOUT_ERROR;
+    if (!initializationAllowed(false)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
     }
-    impl_arduino::MutexUnlock state_unlock{&_state_mutex};
-    _serial    = &stream;
-    _hw_serial = false;
-    _attached  = true;
-    _begun     = false;
-    return error::error_t::OK;
+    auto reset = teardown();
+    if (!reset.has_value()) {
+        return reset;
+    }
+    auto locked = _state_mutex.lock(types::TIMEOUT_FOREVER);
+    if (!locked.has_value()) {
+        return m5::stl::make_unexpected(locked.error());
+    }
+    runtime::ScopedUnlock state_unlock{_state_mutex};
+    _config          = config;
+    _serial          = &stream;
+    _hw_serial       = hardware_serial;
+    _attached        = true;
+    _begun           = false;
+    auto initialized = markInitializationSucceeded(false);
+    if (!initialized.has_value()) {
+        _serial = nullptr;
+        return initialized;
+    }
+    return {};
 }
 
-result_t<void> Bus_arduino::applyConfig(bus::IAccessor* owner, Channel entered, const uart::AccessConfig& cfg)
+result_t<void> Bus_arduino::init(const IBusConfig& config, native::Borrowed<::HardwareSerial> policy)
+{
+    return initBorrowedDirect(config, policy.resource(), true);
+}
+
+result_t<void> Bus_arduino::init(const IBusConfig& config, native::Borrowed<::Stream> policy)
+{
+    return initBorrowedDirect(config, policy.resource(), false);
+}
+
+result_t<std::shared_ptr<IBus>> Bus_arduino::acquireBorrowed(bus::IHalBackend& backend, const IBusConfig& cfg,
+                                                             ::Stream& stream, bool hardware_serial, uint16_t provider)
+{
+    const auto* domain = backend.localResourceDomain();
+    if (domain == nullptr) {
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
+
+    const uint64_t address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&stream));
+    auto identity          = bus::NativeIdentity::make(bus::NativeIdentityKind::ObjectAddress, {address});
+    if (!identity.has_value()) {
+        return m5::stl::make_unexpected(identity.error());
+    }
+    auto& interner = domain->nativeInterner();
+    auto token     = interner.intern(identity.value());
+    if (!token.has_value()) {
+        return m5::stl::make_unexpected(token.error());
+    }
+    impl_arduino::PendingNativeToken pending{&interner, token.value()};
+    auto key = bus::ResourceKey::makeToken(types::bus_kind_t::UART, bus::ResourceTag::Native, token.value(),
+                                           static_cast<uint32_t>(bus::NativeIdentityKind::ObjectAddress));
+    if (!key.has_value()) {
+        return m5::stl::make_unexpected(key.error());
+    }
+    const auto binding = impl_arduino::makeNativeBinding(cfg, token.value(), provider);
+    auto acquired      = backend.busRegistry().acquireOrFind(
+        key.value(), binding,
+        [&cfg](const std::shared_ptr<bus::IBus>& existing) -> result_t<void> {
+            if (!BusTraits::configCompatible(static_cast<const IBusConfig&>(existing->getConfig()), cfg)) {
+                return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+            }
+            return {};
+        },
+        [&]() -> result_t<std::shared_ptr<bus::IBus>> {
+            std::unique_ptr<Bus_arduino> concrete{new (std::nothrow) Bus_arduino()};
+            if (!concrete) {
+                return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+            }
+            concrete->bindLocalResources(backend.localResources());
+            auto adopted = concrete->adoptBorrowedNative(stream, hardware_serial, cfg, interner, token.value());
+            if (!adopted.has_value()) {
+                return m5::stl::make_unexpected(adopted.error());
+            }
+            pending.dismiss();
+
+            std::shared_ptr<Bus> facade{new (std::nothrow) Bus()};
+            if (!facade) {
+                return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+            }
+            facade->bindLocalResources(backend.localResources());
+            std::unique_ptr<IBus> selected{concrete.release()};
+            auto installed = facade->adoptPortableBackend(std::move(selected), cfg);
+            if (!installed.has_value()) {
+                return m5::stl::make_unexpected(installed.error());
+            }
+            return std::shared_ptr<bus::IBus>{std::move(facade)};
+        });
+    if (!acquired.has_value()) {
+        return m5::stl::make_unexpected(acquired.error());
+    }
+    return std::static_pointer_cast<IBus>(acquired.value());
+}
+
+result_t<std::shared_ptr<IBus>> NativeProvider_arduino<native::Borrowed<::HardwareSerial>>::acquire(
+    bus::IHalBackend& backend, const IBusConfig& cfg, native::Borrowed<::HardwareSerial> policy)
+{
+    return Bus_arduino::acquireBorrowed(backend, cfg, policy.resource(), true,
+                                        impl_arduino::kNativeHardwareSerialProvider);
+}
+
+result_t<std::shared_ptr<IBus>> NativeProvider_arduino<native::Borrowed<::Stream>>::acquire(
+    bus::IHalBackend& backend, const IBusConfig& cfg, native::Borrowed<::Stream> policy)
+{
+    return Bus_arduino::acquireBorrowed(backend, cfg, policy.resource(), false, impl_arduino::kNativeStreamProvider);
+}
+
+result_t<void> Bus_arduino::beginOperationBackend(bus::OperationContext<uart::AccessConfig>& context)
+{
+    const Channel entered = context.runtime.mode == bus::OperationMode::Tx ? Channel::Tx : Channel::Rx;
+    return applyConfig(operationOwner(context), entered, context.config,
+                       bus::remainingTimeout(context.runtime, runtime::millis()));
+}
+
+result_t<void> Bus_arduino::endOperationBackend(bus::OperationContext<uart::AccessConfig>& context)
+{
+    if (context.runtime.mode == bus::OperationMode::Tx && _serial != nullptr) {
+        _serial->flush();
+    }
+    return {};
+}
+
+result_t<void> Bus_arduino::applyConfig(bus::IAccessor* owner, Channel entered, const uart::AccessConfig& cfg,
+                                        uint32_t timeout_ms)
 {
     if (_serial == nullptr) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
 
-    if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
-        return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+    auto locked = _state_mutex.lock(timeout_ms);
+    if (!locked.has_value()) {
+        return m5::stl::make_unexpected(locked.error());
     }
-    impl_arduino::MutexUnlock state_unlock{&_state_mutex};
+    runtime::ScopedUnlock state_unlock{_state_mutex};
 
     if (!_begun) {
         // First apply: no other owner can be mid-transfer yet
@@ -202,7 +350,7 @@ result_t<void> Bus_arduino::applyConfig(bus::IAccessor* owner, Channel entered, 
     if (owner == nullptr) {
         // A reconfigure without an accessor identity cannot prove quiescence.
         ++_reconfig_skips;
-        M5HAL_DIAG("uart reconfig skipped: no accessor identity (skips=%u)", static_cast<unsigned>(_reconfig_skips));
+        M5HAL_DIAG("uart reconfig rejected: no accessor identity (skips=%u)", static_cast<unsigned>(_reconfig_skips));
         return {};
     }
 
@@ -214,8 +362,8 @@ result_t<void> Bus_arduino::applyConfig(bus::IAccessor* owner, Channel entered, 
     auto grant = ibus.tryAcquireOppositeChannel(owner, entered);
     if (!grant.granted) {
         ++_reconfig_skips;
-        M5HAL_DIAG("uart reconfig skipped: opposite channel busy (skips=%u)", static_cast<unsigned>(_reconfig_skips));
-        return {};  // keep serving the currently applied config
+        M5HAL_DIAG("uart reconfig rejected: opposite channel busy (skips=%u)", static_cast<unsigned>(_reconfig_skips));
+        return m5::stl::make_unexpected(error::error_t::BUSY);
     }
     auto applied = applyConfigLocked(cfg);
     ibus.releaseOppositeChannel(owner, grant);
@@ -313,33 +461,22 @@ result_t<size_t> Bus_arduino::rawReadableBytes()
     return static_cast<size_t>(_serial->available());
 }
 
-result_t<size_t> Bus_arduino::write(bus::IAccessor* owner, const uart::AccessConfig& cfg, data::Source* src, size_t len)
+result_t<size_t> Bus_arduino::writeBackend(bus::OperationContext<uart::AccessConfig>& context, data::Source* src,
+                                           size_t len)
 {
-    auto applied = applyConfig(owner, Channel::Tx, cfg);
-    if (!applied.has_value()) {
-        return m5::stl::make_unexpected(applied.error());
-    }
-    auto result = Bus_streaming::write(owner, cfg, src, len);
-    _serial->flush();
+    auto result = Bus_streaming::writeBackend(context, src, len);
     return result;
 }
 
-result_t<size_t> Bus_arduino::read(bus::IAccessor* owner, const uart::AccessConfig& cfg, data::Sink* dst, size_t len)
+result_t<size_t> Bus_arduino::readBackend(bus::OperationContext<uart::AccessConfig>& context, data::Sink* dst,
+                                          size_t len)
 {
-    auto applied = applyConfig(owner, Channel::Rx, cfg);
-    if (!applied.has_value()) {
-        return m5::stl::make_unexpected(applied.error());
-    }
-    return Bus_streaming::read(owner, cfg, dst, len);
+    return Bus_streaming::readBackend(context, dst, len);
 }
 
-result_t<size_t> Bus_arduino::readableBytes(bus::IAccessor* owner, const uart::AccessConfig& cfg)
+result_t<size_t> Bus_arduino::readableBytesBackend(bus::OperationContext<uart::AccessConfig>& context)
 {
-    auto applied = applyConfig(owner, Channel::Rx, cfg);
-    if (!applied.has_value()) {
-        return m5::stl::make_unexpected(applied.error());
-    }
-    return Bus_streaming::readableBytes(owner, cfg);
+    return Bus_streaming::readableBytesBackend(context);
 }
 
 }  // namespace m5::hal::v2::uart

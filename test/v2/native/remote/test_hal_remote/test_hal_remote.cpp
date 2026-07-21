@@ -4,28 +4,6 @@
 #include "support/gtest_watchdog.hpp"
 #include <M5HAL_v2.hpp>
 
-namespace m5::hal::v2::i2s {
-
-struct HalRemoteFakeBusConfig : public IBusConfig {
-    using IBusConfig::IBusConfig;
-};
-
-class HalRemoteFakeBus : public IBus {
-public:
-    result_t<void> init(const HalRemoteFakeBusConfig& cfg)
-    {
-        _config = cfg;
-        return {};
-    }
-};
-
-template <>
-struct BackendFor<HalRemoteFakeBusConfig> {
-    using type = HalRemoteFakeBus;
-};
-
-}  // namespace m5::hal::v2::i2s
-
 namespace {
 
 using namespace m5::hal::v2;
@@ -60,6 +38,8 @@ TEST(HalRemoteFacade, UnboundUserHalReportsNotConnected)
 {
     Hal hal;
 
+    EXPECT_FALSE(hal.hasRemoteConnection());
+
     expectError(hal.I2C.acquire(i2c::BusConfig{i2c::Scl{22}, i2c::Sda{21}}), error::error_t::NOT_CONNECTED);
     expectError(hal.I2C.acquire(i2c::LogicalBusConfig{i2c::Scl{22}, i2c::Sda{21}}), error::error_t::NOT_CONNECTED);
     expectError(hal.I2C.commitBuses(), error::error_t::NOT_CONNECTED);
@@ -74,7 +54,7 @@ TEST(HalRemoteFacade, UnboundUserHalReportsNotConnected)
     expectError(hal.UART.acquire(uart::LogicalBusConfig{uart::Tx{17}, uart::Rx{16}}), error::error_t::NOT_CONNECTED);
     expectError(hal.UART.commitBuses(), error::error_t::NOT_CONNECTED);
 
-    expectError(hal.I2S.acquire(i2s::HalRemoteFakeBusConfig{i2s::Bclk{12}, i2s::Ws{0}, i2s::Dout{2}}),
+    expectError(hal.I2S.acquire(i2s::IBusConfig{i2s::Bclk{12}, i2s::Ws{0}, i2s::Dout{2}}),
                 error::error_t::NOT_CONNECTED);
     expectError(hal.I2S.acquire(i2s::LogicalBusConfig{i2s::Bclk{12}, i2s::Ws{0}, i2s::Dout{2}}),
                 error::error_t::NOT_CONNECTED);
@@ -88,6 +68,7 @@ TEST(HalRemoteFacade, InitBindsLocalAndIsIdempotent)
     Hal hal;
 
     expectOk(hal.init());
+    EXPECT_FALSE(hal.hasRemoteConnection());
     ASSERT_NE(hal.backend(), nullptr);
     expectLocalI2CAcquire(hal);
     EXPECT_TRUE(hal.Gpio.hasGPIO(0));
@@ -137,6 +118,7 @@ TEST(HalRemoteFacade, FailedRemoteConnectKeepsExistingLocalBinding)
 
     auto remote = hal.connect("uart:/nonexistent/path");
     ASSERT_FALSE(remote.has_value());
+    EXPECT_FALSE(hal.hasRemoteConnection());
     EXPECT_EQ(hal.backend(), backend);
     EXPECT_TRUE(hal.Gpio.hasGPIO(0));
     expectLocalI2CAcquire(hal);

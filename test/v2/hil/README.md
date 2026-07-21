@@ -1,62 +1,53 @@
-# test/v2/hil — `pio run` 方式の実機テスト
+# Hardware-in-the-loop テスト
 
-ここは **`pio test` ではなく `pio run` で動かすテスト系**の置き場。現状の主役は
-**HIL（hardware-in-the-loop）**: native ホストプロセスと実機 firmware が実リンク（USB シリアル等）で
-同時に動き、**ホスト側が実機と通信して結果を判定する**検証。
+このディレクトリには、device、host、または独立masterを実リンクして動かす再利用可能なテストを置く。
+HIL programは `pio run` でビルドし、PlatformIO unit testとしては実行しない。
 
-`pio test` で実行する native / embedded スイートとは役割が違う:
+## テストモデル
 
-| 場所 | 主体 | 判定 | CI |
+| 場所 | endpoint | 判定主体 | 実行入口 |
 |---|---|---|---|
-| `test/v2/native/` | host のみ | host gtest（`pio test`） | ✅ 自動・HW 不要 |
-| `test/v2/embedded/` | device のみ | device 自己判定（Unity） | 手動・実機 |
-| **`test/v2/hil/`（ここ）** | **device + host ペア** | **host が device と喋って判定** | 手動・実機＋ポート指定 |
+| `test/v2/native/` | hostのみ | gtest | `pio test` |
+| `test/v2/embedded/` | device 1台 | device自己判定 | `pio test` |
+| `test/v2/hil/` | 接続した複数endpoint | fixtureが指定するhost、master、またはdevice | `pio run`後に実行またはmonitor |
 
-device / host の専用 env が対象ソースを明示しているため、host ドライバは
-**gtest バイナリを `pio run` でビルド → 直接実行**する。
+HIL configは [`../../../pio_envs/v2/hil.ini.cli`](../../../pio_envs/v2/hil.ini.cli) を正本とする。
+各fixtureのREADMEは、そのfixture固有の配線、コマンド、同期点、合否出力の正本である。
 
-## レイアウト
+## 配置と役割
 
-```
+```text
 test/v2/hil/
-  common/hil_host.hpp        共有ホストハーネス（ポート open / sync / drain / readExact / env）
-  hil-run.sh                 ランナー（flash → host ビルド → host 実行）
-  <name>/
-    README.md                配線・実行・期待結果
-    device/<name>.cpp        実機 firmware（M5HAL ベース）
-    host/<name>.cpp          host ドライバ（gtest、hil_host.hpp を使う）
+  common/hil_host.hpp       serial open、同期、I/Oの共通helper
+  hil-run.sh                flash、build、実行を行うone-shot helper
+  <fixture>/
+    README.md               fixture固有の配線、コマンド、合否
+    device/                 device firmware
+    host/ or master/        必要な場合の判定driver
 ```
 
-env は `pio_envs/v2/hil.ini.cli`（GUI に出さない `.ini.cli`。`M5HAL_PIO_EXTRA_CONFIG` で
-オンデマンドにロード、コピー不要）に `v2_hil_<name>_device_esp32` ＋ `v2_hil_<name>_host` の 2 本。
+envの配置と名前は [`../../../pio_envs/README.md`](../../../pio_envs/README.md) とHIL configだけに置く。
+親READMEは共通modelとrunner規則を扱い、子READMEではディレクトリ分類や設計契約を再掲しない。
 
-## 実行
+## One-shot runner
 
-一発（ポート自動検出 / baud 指定可）:
+`hil-run.sh` は `v2_hil_<name>_device_esp32` と `v2_hil_<name>_host` の組を持つfixtureに対応する。
+serial portを自動検出または引数で受け取り、deviceのflash、host programのbuild、実行を順に行う。
 
 ```sh
-test/v2/hil/hil-run.sh uart_echo                       # 既定 115200
+test/v2/hil/hil-run.sh uart_echo
 test/v2/hil/hil-run.sh uart_echo /dev/cu.usbserial-X 3000000
 ```
 
-手動:
+複数device、phase切替、異なるenv命名を持つfixtureは、子READMEの手動コマンドを使う。host programは
+port未指定時にruntime skipしてよいが、それはhost buildを可能にするだけでHIL合格を意味しない。
 
-```sh
-export M5HAL_PIO_EXTRA_CONFIG=pio_envs/v2/hil.ini.cli       # hil env をロード（コピー不要）
-pio run -e v2_hil_uart_echo_device_esp32 -t upload          # 実機に焼く
-pio run -e v2_hil_uart_echo_host                            # host をビルド
-M5HAL_POSIX_UART_PORT=/dev/cu.usbserial-X \
-  .pio/build/v2_hil_uart_echo_host/program                 # host を実行
-```
+## Fixtureの追加
 
-`M5HAL_POSIX_UART_PORT` 未設定なら host は **skip**（HW 無しでもビルドは通る）。
+1. 一つのfixtureディレクトリにdeviceとhost/masterのsourceを追加する。
+2. `pio_envs/v2/hil.ini.cli` に専用envを追加する。
+3. 子READMEには必要なhardware、配線、コマンド、同期点、正確な合否出力だけを書く。
+4. 通常の1 device/1 host lifecycleで足りる場合だけ `hil-run.sh` に登録する。
 
-## 新しい HIL テストの追加
-
-1. `test/v2/hil/<name>/device/<name>.cpp`（実機 firmware）と
-   `test/v2/hil/<name>/host/<name>.cpp`（host gtest、`#include "../../common/hil_host.hpp"`）を作る。
-2. `pio_envs/v2/hil.ini.cli` に `v2_hil_<name>_device_esp32` と `v2_hil_<name>_host` を追加。
-3. `test/v2/hil/<name>/README.md` に配線・実行・期待結果を書く。
-4. `test/v2/hil/hil-run.sh <name>` で動く。
-
-remote バス等の将来の HIL（host transport ↔ device server）も同じ枠に乗る。
+日付付き実績、local device path、常設rigの割当、復帰手順はここへ記録しない。電気的な探索や一時的な
+fault injectionも、再利用可能な公開受入手順とは分離する。

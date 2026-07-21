@@ -5,22 +5,13 @@
 
 namespace m5::hal::v2::i2c {
 
-namespace {
-
-bus::TransferTotals diffTotals(const bus::TransferTotals& after, const bus::TransferTotals& before)
-{
-    return bus::TransferTotals{after.tx - before.tx, after.rx - before.rx};
-}
-
-}  // namespace
-
 MasterAccessor::MasterAccessor(IBus& bus, const MasterAccessConfig& access_config)
-    : bus::IAccessor{bus}, _access_config{access_config}
+    : bus::IAccessor{bus}, _context{makeOperationContext(access_config)}
 {
 }
 
 MasterAccessor::MasterAccessor(std::shared_ptr<IBus> bus, const MasterAccessConfig& access_config)
-    : bus::IAccessor{std::move(bus)}, _access_config{access_config}
+    : bus::IAccessor{std::move(bus)}, _context{makeOperationContext(access_config)}
 {
 }
 
@@ -32,19 +23,7 @@ IBus& MasterAccessor::getBus(void) const
 
 bool MasterAccessor::transferBusy(void)
 {
-    return getBus().transferBusy(this);
-}
-
-m5::hal::v2::result_t<void> MasterAccessor::waitTransfer(void)
-{
-    auto waited = getBus().waitTransfer(this, _access_config);
-    if (!waited.has_value()) {
-        const auto err     = waited.error();
-        _transaction_error = err;
-        return m5::stl::make_unexpected(err);
-    }
-    _transaction_totals.add(waited.value());
-    return {};
+    return getBus().transferBusy(_context);
 }
 
 m5::hal::v2::result_t<void> MasterAccessor::setConfig(const MasterAccessConfig& cfg)
@@ -52,22 +31,48 @@ m5::hal::v2::result_t<void> MasterAccessor::setConfig(const MasterAccessConfig& 
     if (inAccess()) {
         return m5::stl::make_unexpected(m5::hal::v2::error::error_t::INVALID_STATE);
     }
-    _access_config = cfg;
+    _context.config = cfg;
     return {};
 }
 
-m5::hal::v2::result_t<void> MasterAccessor::transfer(const TransferDesc& desc, data::ConstDataSpan src_bytes,
-                                                     data::DataSpan dst_bytes)
+m5::hal::v2::result_t<void> MasterAccessor::beginAccess(uint32_t timeout_ms)
 {
-    if (!inTransaction()) {
-        return m5::stl::make_unexpected(m5::hal::v2::error::error_t::INVALID_STATE);
+    return _beginOperationAccess(_context, timeout_ms, bus::OperationMode::TxRx,
+                                 [&](auto& context) { return getBus().beginOperation(context); });
+}
+
+m5::hal::v2::result_t<void> MasterAccessor::endAccess(uint32_t timeout_ms)
+{
+    return _endOperationAccess(_context, timeout_ms, [&](auto& context) {
+        error::error_t wait_error = error::error_t::OK;
+        if (getBus().transferBusy(context)) {
+            auto waited = getBus().waitTransfer(context);
+            if (!waited.has_value()) {
+                wait_error = waited.error();
+            }
+        }
+        auto ended = getBus().endOperation(context);
+        if (error::isError(wait_error)) {
+            return result_t<void>{m5::stl::make_unexpected(wait_error)};
+        }
+        return ended;
+    });
+}
+
+m5::hal::v2::result_t<bus::TransferStatus> MasterAccessor::getLastTransferStatus(void) const
+{
+    if (_last_transfer_status.transfer_id == 0) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
     }
-    if (error::isError(_transaction_error)) {
-        return m5::stl::make_unexpected(_transaction_error);
-    }
-    auto waited = waitTransfer();
-    if (!waited.has_value()) {
-        return m5::stl::make_unexpected(waited.error());
+    return _last_transfer_status;
+}
+
+m5::hal::v2::result_t<bus::TransferTotals> MasterAccessor::transfer(const TransferDesc& desc,
+                                                                    data::ConstDataSpan src_bytes,
+                                                                    data::DataSpan dst_bytes)
+{
+    if (!_inOperationAccess()) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
     }
     _span_src = data::MemorySource{src_bytes};
     _span_dst = data::MemorySink{dst_bytes};
@@ -75,45 +80,51 @@ m5::hal::v2::result_t<void> MasterAccessor::transfer(const TransferDesc& desc, d
                          dst_bytes.size ? &_span_dst : nullptr, dst_bytes.size);
 }
 
-m5::hal::v2::result_t<void> MasterAccessor::transfer(const TransferDesc& desc, data::Source* src, size_t tx_len,
-                                                     data::Sink* dst, size_t rx_len)
+m5::hal::v2::result_t<bus::TransferTotals> MasterAccessor::transfer(const TransferDesc& desc, data::Source* src,
+                                                                    size_t tx_len, data::Sink* dst, size_t rx_len)
 {
-    if (!inTransaction()) {
-        return m5::stl::make_unexpected(m5::hal::v2::error::error_t::INVALID_STATE);
+    if (!_inOperationAccess()) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
     }
-    if (error::isError(_transaction_error)) {
-        return m5::stl::make_unexpected(_transaction_error);
-    }
-
-    auto waited = waitTransfer();
-    if (!waited.has_value()) {
-        return m5::stl::make_unexpected(waited.error());
-    }
-
     return startTransfer(desc, src, tx_len, dst, rx_len);
 }
 
-m5::hal::v2::result_t<void> MasterAccessor::startTransfer(const TransferDesc& desc, data::Source* src, size_t tx_len,
-                                                          data::Sink* dst, size_t rx_len)
+m5::hal::v2::result_t<bus::TransferTotals> MasterAccessor::startTransfer(const TransferDesc& desc, data::Source* src,
+                                                                         size_t tx_len, data::Sink* dst, size_t rx_len)
 {
-    auto r = getBus().transfer(this, _access_config, desc, (src != nullptr && tx_len > 0) ? src : nullptr, tx_len,
-                               (dst != nullptr && rx_len > 0) ? dst : nullptr, rx_len);
-    if (!r.has_value()) {
-        // Latch like waitTransfer(): transaction segments form one logical
-        // operation, so ANY failed segment — including a pre-flight
-        // rejection that never touched the wire — invalidates the rest of
-        // the transaction. Recovery is a fresh transaction. Contract:
-        // spec/design/i2c.md §transaction 中のエラー.
-        _transaction_error = r.error();
-        return m5::stl::make_unexpected(r.error());
+    ++_next_transfer_id;
+    if (_next_transfer_id == 0) {
+        ++_next_transfer_id;
     }
-    if (!transferBusy()) {
-        auto done = waitTransfer();
-        if (!done.has_value()) {
-            return m5::stl::make_unexpected(done.error());
+    _last_transfer_status             = {};
+    _last_transfer_status.transfer_id = _next_transfer_id;
+
+    if (getBus().transferBusy(_context)) {
+        auto previous = getBus().waitTransfer(_context);
+        if (!previous.has_value()) {
+            _last_transfer_status.error      = previous.error();
+            _last_transfer_status.completion = bus::CompletionLevel::Aborted;
+            return m5::stl::make_unexpected(previous.error());
         }
     }
-    return {};
+
+    auto started = getBus().transfer(_context, desc, (src != nullptr && tx_len > 0) ? src : nullptr, tx_len,
+                                     (dst != nullptr && rx_len > 0) ? dst : nullptr, rx_len);
+    if (!started.has_value()) {
+        _last_transfer_status.error = started.error();
+        return m5::stl::make_unexpected(started.error());
+    }
+    _last_transfer_status.completion = bus::CompletionLevel::Accepted;
+
+    auto waited = getBus().waitTransfer(_context);
+    if (!waited.has_value()) {
+        _last_transfer_status.error      = waited.error();
+        _last_transfer_status.completion = bus::CompletionLevel::Aborted;
+        return m5::stl::make_unexpected(waited.error());
+    }
+    _last_transfer_status.totals     = waited.value();
+    _last_transfer_status.completion = bus::CompletionLevel::Complete;
+    return waited.value();
 }
 
 m5::hal::v2::result_t<bus::TransferTotals> MasterAccessor::transferSync(const TransferDesc& desc,
@@ -129,73 +140,25 @@ m5::hal::v2::result_t<bus::TransferTotals> MasterAccessor::transferSync(const Tr
 m5::hal::v2::result_t<bus::TransferTotals> MasterAccessor::transferSync(const TransferDesc& desc, data::Source* src,
                                                                         size_t tx_len, data::Sink* dst, size_t rx_len)
 {
-    auto b = beginTransaction();
-    if (!b.has_value()) {
-        return m5::stl::make_unexpected(b.error());
-    }
-    const auto before = _transaction_totals;
-    auto t            = transfer(desc, src, tx_len, dst, rx_len);
-    auto e            = endTransaction();
-    if (!t.has_value()) {
-        return m5::stl::make_unexpected(t.error());
-    }
-    if (!e.has_value()) {
-        return m5::stl::make_unexpected(e.error());
-    }
-    return diffTotals(e.value(), before);
-}
-
-m5::hal::v2::result_t<void> MasterAccessor::beginTransaction(uint32_t timeout_ms)
-{
-    if (_transaction_depth != 0) {
-        ++_transaction_depth;
-        return {};
-    }
-
-    auto ba = beginAccess(timeout_ms);
-    if (!ba.has_value()) {
-        return m5::stl::make_unexpected(ba.error());
-    }
-
-    _transaction_totals.clear();
-    _transaction_error = error::error_t::OK;
-    _transaction_depth = 1;
-    return {};
-}
-
-m5::hal::v2::result_t<bus::TransferTotals> MasterAccessor::endTransaction(void)
-{
-    if (_transaction_depth == 0) {
-        return m5::stl::make_unexpected(m5::hal::v2::error::error_t::INVALID_STATE);
-    }
-
-    auto wait                    = waitTransfer();
-    error::error_t primary_error = error::error_t::OK;
-    if (!wait.has_value()) {
-        primary_error = wait.error();
-    } else if (error::isError(_transaction_error)) {
-        primary_error = _transaction_error;
-    }
-
-    --_transaction_depth;
-    if (_transaction_depth != 0) {
-        if (error::isError(primary_error)) {
-            return m5::stl::make_unexpected(primary_error);
+    const bool borrowed = _inOperationAccess();
+    if (!borrowed) {
+        auto begun = beginAccess();
+        if (!begun.has_value()) {
+            return m5::stl::make_unexpected(begun.error());
         }
-        return _transaction_totals;
     }
-
-    const auto totals = _transaction_totals;
-    auto ea           = endAccess();
-    _transaction_totals.clear();
-    _transaction_error = error::error_t::OK;
-    if (error::isError(primary_error)) {
-        return m5::stl::make_unexpected(primary_error);
+    auto transferred = transfer(desc, src, tx_len, dst, rx_len);
+    result_t<void> ended{};
+    if (!borrowed) {
+        ended = endAccess();
     }
-    if (!ea.has_value()) {
-        return m5::stl::make_unexpected(ea.error());
+    if (!transferred.has_value()) {
+        return m5::stl::make_unexpected(transferred.error());
     }
-    return totals;
+    if (!ended.has_value()) {
+        return m5::stl::make_unexpected(ended.error());
+    }
+    return transferred.value();
 }
 
 m5::hal::v2::result_t<size_t> MasterAccessor::write(data::Source& src, size_t len)
@@ -266,30 +229,91 @@ m5::hal::v2::result_t<void> IBus::probe(uint16_t i2c_addr, uint32_t freq, uint32
                         [&] { return sentinel.endAccess(); });
 }
 
-m5::hal::v2::result_t<void> IBus::transfer(bus::IAccessor* owner, const MasterAccessConfig& cfg,
-                                           const TransferDesc& desc, data::Source* src, size_t tx_len, data::Sink* dst,
-                                           size_t rx_len)
+m5::hal::v2::result_t<void> IBus::beginOperation(bus::OperationContext<MasterAccessConfig>& context)
 {
-    (void)owner;
-    (void)cfg;
+    auto registered = _operation_slot.registerContext(context, this, _lock_owner);
+    if (!registered.has_value()) {
+        return registered;
+    }
+    auto begun = beginOperationBackend(context);
+    if (!begun.has_value()) {
+        _operation_slot.invalidate(context);
+    }
+    return begun;
+}
+
+m5::hal::v2::result_t<void> IBus::endOperation(bus::OperationContext<MasterAccessConfig>& context)
+{
+    if (!_operation_slot.valid(context, this, _lock_owner)) {
+        if (_operation_slot.registered(context, this)) {
+            if (_operation_slot.restoreRegisteredRuntime(context, this, _lock_owner)) {
+                (void)endOperationBackend(context);
+            }
+            _operation_slot.invalidate(context);
+        }
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    auto ended = endOperationBackend(context);
+    _operation_slot.invalidate(context);
+    return ended;
+}
+
+m5::hal::v2::result_t<void> IBus::transfer(bus::OperationContext<MasterAccessConfig>& context, const TransferDesc& desc,
+                                           data::Source* src, size_t tx_len, data::Sink* dst, size_t rx_len)
+{
+    if (!_operation_slot.valid(context, this, _lock_owner)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    return transferBackend(context, desc, src, tx_len, dst, rx_len);
+}
+
+m5::hal::v2::result_t<bus::TransferTotals> IBus::waitTransfer(bus::OperationContext<MasterAccessConfig>& context)
+{
+    if (!_operation_slot.valid(context, this, _lock_owner)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    return waitTransferBackend(context);
+}
+
+bool IBus::transferBusy(bus::OperationContext<MasterAccessConfig>& context)
+{
+    return _operation_slot.valid(context, this, _lock_owner) && transferBusyBackend(context);
+}
+
+m5::hal::v2::result_t<void> IBus::beginOperationBackend(bus::OperationContext<MasterAccessConfig>& context)
+{
+    (void)context;
+    return {};
+}
+
+m5::hal::v2::result_t<void> IBus::endOperationBackend(bus::OperationContext<MasterAccessConfig>& context)
+{
+    (void)context;
+    return {};
+}
+
+m5::hal::v2::result_t<void> IBus::transferBackend(bus::OperationContext<MasterAccessConfig>& context,
+                                                  const TransferDesc& desc, data::Source* src, size_t tx_len,
+                                                  data::Sink* dst, size_t rx_len)
+{
+    (void)context;
     (void)desc;
     (void)src;
     (void)tx_len;
     (void)dst;
     (void)rx_len;
-    return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
+    return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
 }
 
-m5::hal::v2::result_t<bus::TransferTotals> IBus::waitTransfer(bus::IAccessor* owner, const MasterAccessConfig& cfg)
+m5::hal::v2::result_t<bus::TransferTotals> IBus::waitTransferBackend(bus::OperationContext<MasterAccessConfig>& context)
 {
-    (void)owner;
-    (void)cfg;
+    (void)context;
     return bus::TransferTotals{};
 }
 
-bool IBus::transferBusy(bus::IAccessor* owner)
+bool IBus::transferBusyBackend(bus::OperationContext<MasterAccessConfig>& context)
 {
-    (void)owner;
+    (void)context;
     return false;
 }
 

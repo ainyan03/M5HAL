@@ -49,7 +49,7 @@
 // TOCTOU race in the M5HAL slave's serve() loops (hal/v2/i2c/slave.inl, both
 // SlaveStreamAccessor::serve and SlaveRegMapAccessor::serve) -- the STOP ISR
 // could deliver a write's final FIFO bytes into the rx ring between a pass's
-// readableBytes()==0 and its transactionComplete() check, so serve() returned
+// readableBytes()==0 and its wireFrameComplete() check, so serve() returned
 // with the tail unread (a 65-byte write surfacing as 64, no overflow count).
 // The following READ was then served one byte short, the slave held the master
 // under a TX_EMPTY stretch for a reply byte that never came, and the Wire
@@ -132,16 +132,16 @@ constexpr size_t kMaxLen = 1024;
 // full FIFO depth (32), not just the water-mark residue.
 constexpr uint16_t kEchoLens[] = {1, 2, 16, 32, 33, 40, 47, 48, 63, 64, 65, 100, 128, 200, 255};
 #else
-constexpr uint16_t kEchoLens[] = {1,  2,  16,  32,  33,  40,  47,  48,   63,   64,  65,
-                                  100, 128, 200, 256, 384, 512, 768, 1000, 1024};
+constexpr uint16_t kEchoLens[] = {1,  2,   16,  32,  33,  40,  47,  48,  63,   64,
+                                  65, 100, 128, 200, 256, 384, 512, 768, 1000, 1024};
 #endif
-constexpr int kNumPatterns      = 5;
+constexpr int kNumPatterns                    = 5;
 const char *const kPatternNames[kNumPatterns] = {"zero", "ones", "count", "rand", "bound"};
 
 uint8_t tx_buf[kMaxLen];
 uint8_t rx_buf[kMaxLen];
-uint32_t ok_count  = 0;
-uint32_t bad_count = 0;
+uint32_t ok_count    = 0;
+uint32_t bad_count   = 0;
 char result_line[80] = "RESULT: not finished";
 
 // Fill tx_buf with one of 5 patterns; pass_index perturbs "rand" and "count"
@@ -152,11 +152,22 @@ void fillPattern(size_t n, int pat, int pass_index)
     uint32_t lcg = 0x12345678u ^ (uint32_t)(n * 2654435761u) ^ (uint32_t)(pass_index * 0x9E3779B9u);
     for (size_t i = 0; i < n; ++i) {
         switch (pat) {
-            case 0:  tx_buf[i] = 0x00; break;
-            case 1:  tx_buf[i] = 0xFF; break;
-            case 2:  tx_buf[i] = (uint8_t)(i + pass_index); break;
-            case 3:  lcg = lcg * 1664525u + 1013904223u; tx_buf[i] = (uint8_t)(lcg >> 24); break;
-            default: tx_buf[i] = (uint8_t)((i & 1) ? 0xFF : 0x00); break;
+            case 0:
+                tx_buf[i] = 0x00;
+                break;
+            case 1:
+                tx_buf[i] = 0xFF;
+                break;
+            case 2:
+                tx_buf[i] = (uint8_t)(i + pass_index);
+                break;
+            case 3:
+                lcg       = lcg * 1664525u + 1013904223u;
+                tx_buf[i] = (uint8_t)(lcg >> 24);
+                break;
+            default:
+                tx_buf[i] = (uint8_t)((i & 1) ? 0xFF : 0x00);
+                break;
         }
     }
 }
@@ -264,7 +275,7 @@ void runSuite(uint32_t freq, int pass_index)
             fillPattern(n, pat, pass_index);
             memset(rx_buf, 0, n);
 
-            bool wr_ok = rawWrite(tx_buf, n);      // WRITE N bytes, own transaction (STOP)
+            bool wr_ok = rawWrite(tx_buf, n);          // WRITE N bytes, own transaction (STOP)
             bool rd_ok = wr_ok && rawRead(rx_buf, n);  // READ N bytes, separate transaction (STOP)
 
             int first_bad = -1;
@@ -275,8 +286,8 @@ void runSuite(uint32_t freq, int pass_index)
                 }
             }
             bool ok = wr_ok && rd_ok && first_bad < 0;
-            LOGF("#%d ECHO scl=%lukHz len=%4u pat=%-5s first_bad=%d [%s]\n", round++,
-                 (unsigned long)(freq / 1000), (unsigned)n, kPatternNames[pat], first_bad, ok ? "OK" : "BAD");
+            LOGF("#%d ECHO scl=%lukHz len=%4u pat=%-5s first_bad=%d [%s]\n", round++, (unsigned long)(freq / 1000),
+                 (unsigned)n, kPatternNames[pat], first_bad, ok ? "OK" : "BAD");
             if (ok) {
                 ++ok_count;
             } else {

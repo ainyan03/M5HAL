@@ -33,11 +33,20 @@ namespace m5::hal::v2::uart {
  */
 class Bus_streaming : public IBus {
 public:
-    result_t<size_t> write(bus::IAccessor* owner, const AccessConfig& cfg, data::Source* src, size_t len) override;
-    result_t<size_t> read(bus::IAccessor* owner, const AccessConfig& cfg, data::Sink* dst, size_t len) override;
-    result_t<size_t> readableBytes(bus::IAccessor* owner, const AccessConfig& cfg) override;
+    bus::BusCapabilities capabilities(void) const override
+    {
+        return bus::detail::BusCapabilitiesBuilder{bus::IBus::capabilities()}
+            .enable(bus::BusFeature::Transmit)
+            .enable(bus::BusFeature::Receive)
+            .enable(bus::BusFeature::FullDuplex)
+            .build();
+    }
 
 protected:
+    result_t<size_t> writeBackend(bus::OperationContext<AccessConfig>& context, data::Source* src, size_t len) override;
+    result_t<size_t> readBackend(bus::OperationContext<AccessConfig>& context, data::Sink* dst, size_t len) override;
+    result_t<size_t> readableBytesBackend(bus::OperationContext<AccessConfig>& context) override;
+
     // Merge a post-write completion/drain status with the accepted byte
     // count. result_t<size_t> cannot carry both; an accepted prefix wins so
     // callers have an unambiguous retry boundary. With zero accepted bytes,

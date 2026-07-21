@@ -180,6 +180,7 @@ void BsdTcpStream::close()
 
 ::m5::hal::v2::result_t<size_t> BsdTcpStream::write(data::ConstDataSpan src)
 {
+    _last_write_accepted = 0;
     if (_fd < 0) {
         return m5::stl::make_unexpected(error_t::CLOSED);
     }
@@ -201,12 +202,15 @@ void BsdTcpStream::close()
                 continue;
             }
             if (errno == EPIPE || errno == ECONNRESET) {
+                _last_write_accepted = done;
                 close();
                 return m5::stl::make_unexpected(error_t::CLOSED);
             }
+            _last_write_accepted = done;
             return m5::stl::make_unexpected(error_t::IO_ERROR);
         }
         done += static_cast<size_t>(n);
+        _last_write_accepted = done;
     }
     return done;
 }

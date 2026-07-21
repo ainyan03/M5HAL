@@ -4,6 +4,8 @@
 
 #include "../../detail/espidf_version.hpp"
 #include "../../../../../hal/v2/bus/bus.hpp"
+#include "../../../../../hal/v2/bus/hal_backend.hpp"
+#include "../../../../../hal/v2/bus/portable_factory.hpp"
 #include "../../../../../hal/v2/spi/spi.hpp"
 
 namespace m5::hal::v2::spi::detail_espidf_spi {
@@ -39,13 +41,6 @@ constexpr bool slaveHostOrdinal(int8_t controller, uint8_t controller_count, int
         return true;
     }
     return hostOrdinalForController(controller, controller_count, first_host, host);
-}
-
-constexpr bool attachedControllerMatches(int host, int8_t claimed_controller, uint8_t controller_count, int first_host)
-{
-    int8_t actual = -1;
-    return claimed_controller >= 0 && controllerForHostOrdinal(host, controller_count, first_host, actual) &&
-           actual == claimed_controller;
 }
 
 // Driver resources must be detached before the worker that services them is
@@ -138,18 +133,6 @@ inline bool hostForSlaveController(int8_t controller, ::spi_host_device_t& host)
 
 }  // namespace detail_espidf_spi
 
-struct BusConfig_espidf : public spi::IBusConfig {
-    // Inherit the tag-pin constructors (Clk / Mosi / Miso); the host is set
-    // by field assignment afterwards.
-    using spi::IBusConfig::IBusConfig;
-
-    ::spi_host_device_t host = SPI2_HOST;
-
-    constexpr BusConfig_espidf(void) : spi::IBusConfig{}
-    {
-    }
-};
-
 // ESP-IDF SPI master bus. CS and D/C are managed by M5HAL so the shared
 // MasterAccessor transaction semantics match the Arduino and software
 // variants. Driver-generation differences stay behind detail/espidf_version.hpp
@@ -158,22 +141,15 @@ class Bus_espidf : public spi::IBus {
 public:
     ~Bus_espidf() override;
 
-    // Typed init: takes this variant's BusConfig_espidf. Passing the
-    // abstract IBusConfig (or a sibling variant's config) is a
-    // compile error instead of a silent bad downcast.
-    result_t<void> init(const BusConfig_espidf& config);
-    result_t<void> release(void) override;
-
-    result_t<void> beginTransaction(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg) override;
-    result_t<void> endTransaction(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg) override;
-    result_t<void> transfer(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg, const spi::TransferDesc& desc,
-                            data::Source* src, size_t tx_len, data::Sink* dst, size_t rx_len) override;
-    result_t<bus::TransferTotals> waitTransfer(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg) override;
-    bool transferBusy(bus::IAccessor* owner) override;
+    result_t<void> init(const IBusConfig& config);
+    result_t<void> close(void)
+    {
+        return bus::IBus::close();
+    }
 
     // This backend drives a dedicated ESP-IDF SPI host. The controller
-    // pool assigns the host through BusConfig_espidf::host; the query API
-    // reports it as a zero-based controller index so the resolver's
+    // pool assigns the host through the provider-private init helper; the
+    // query API reports it as a zero-based controller index so the resolver's
     // incumbency check and a holder watching for a downgrade both see the live
     // state. The index axis is the generic-host axis (SPI2_HOST -> 0,
     // SPI3_HOST -> 1), excluding SPI1 (flash), to match the budget reported by
@@ -194,14 +170,19 @@ public:
         // software, without depending on a SoC-specific macro.
         return 80000000u;
     }
+    bus::BusCapabilities capabilities(void) const override
+    {
+        const bool has_mosi = _config.pin_mosi >= 0;
+        const bool has_miso = _config.pin_miso >= 0;
+        return bus::detail::BusCapabilitiesBuilder{bus::IBus::capabilities()}
+            .enable(bus::BusFeature::MasterTransfer)
+            .enable(bus::BusFeature::Transmit, has_mosi)
+            .enable(bus::BusFeature::Receive, has_miso || has_mosi)
+            .enable(bus::BusFeature::FullDuplex, has_mosi && has_miso)
+            .enable(bus::BusFeature::MosiSharedRx, has_mosi && !has_miso)
+            .build();
+    }
 
-    // Attach to a caller-owned, already initialized host. Before external
-    // spi_bus_initialize(), the caller must claim the matching controller with
-    // SPI.claimController(requireController(index)) and pass the returned index
-    // as claimed_controller. The caller retains both the host and claim: detach
-    // with release(), then call spi_bus_free(), and only then return the claim
-    // with SPI.releaseClaimedController().
-    error::error_t attach(::spi_host_device_t host, int8_t claimed_controller);
     ::spi_host_device_t nativeHost() const
     {
         return _host;
@@ -211,7 +192,24 @@ public:
         return _device;
     }
 
+protected:
+    bus::CloseOutcome closeBackend(void) override
+    {
+        return teardownBackend();
+    }
+    result_t<void> beginOperationBackend(bus::OperationContext<spi::MasterAccessConfig>& context) override;
+    result_t<void> endOperationBackend(bus::OperationContext<spi::MasterAccessConfig>& context) override;
+    result_t<void> transferBackend(bus::OperationContext<spi::MasterAccessConfig>& context,
+                                   const spi::TransferDesc& desc, data::Source* src, size_t tx_len, data::Sink* dst,
+                                   size_t rx_len) override;
+    result_t<bus::TransferTotals> waitTransferBackend(bus::OperationContext<spi::MasterAccessConfig>& context) override;
+    bool transferBusyBackend(bus::OperationContext<spi::MasterAccessConfig>& context) override;
+
 private:
+    bus::CloseOutcome teardownBackend(void);
+    result_t<void> initBackend(const IBusConfig& config, ::spi_host_device_t host);
+    friend spi::IBus* makeHardwareBackendForSPI(const bus::LocalResourceContext&, const spi::LogicalBusConfig&, int8_t);
+    result_t<void> resetForInitialization(void);
     static void workerEntry(void* arg);
     void workerLoop(void);
     void waitInFlight(void);
@@ -254,11 +252,11 @@ private:
     bool _worker_half_duplex        = false;
 };
 
-// Facade backend selection: spi::Bus::init(BusConfig_espidf) -> Bus_espidf.
-template <>
-struct BackendFor<BusConfig_espidf> {
-    using type = Bus_espidf;
-};
+inline result_t<std::unique_ptr<IBus>> makePortableBackend_espidf(const bus::LocalResourceContext& resources,
+                                                                  const IBusConfig& config)
+{
+    return bus::makePortableBackend<IBus, Bus_espidf, IBusConfig>(resources, config);
+}
 
 // hardware backend factory. Builds a Bus_espidf for a logical
 // request, binding the leased controller index to an ESP-IDF SPI host. The pool
@@ -267,7 +265,8 @@ struct BackendFor<BusConfig_espidf> {
 // variant-agnostic. SPI1_HOST (flash) is deliberately not in the pool, so index
 // 0 is SPI2_HOST. M5HALCore wires this into spi::BusView when this variant
 // provides hardware SPI (M5HAL_DETAIL_SPI_HAS_HARDWARE_BACKEND_ below).
-inline spi::IBus* makeHardwareBackendForSPI(const spi::LogicalBusConfig& logical, int8_t controller)
+inline spi::IBus* makeHardwareBackendForSPI(const bus::LocalResourceContext& resources,
+                                            const spi::LogicalBusConfig& logical, int8_t controller)
 {
     ::spi_host_device_t host;
     if (!detail_espidf_spi::hostForController(controller, host)) {
@@ -277,12 +276,12 @@ inline spi::IBus* makeHardwareBackendForSPI(const spi::LogicalBusConfig& logical
     if (backend == nullptr) {
         return nullptr;
     }
-    BusConfig_espidf cfg;
+    backend->bindLocalResources(resources);
+    IBusConfig cfg;
     cfg.pin_clk  = logical.pin_clk;
     cfg.pin_mosi = logical.pin_mosi;
     cfg.pin_miso = logical.pin_miso;
-    cfg.host     = host;
-    auto r       = backend->init(cfg);
+    auto r       = backend->initBackend(cfg, host);
     if (!r.has_value()) {
         delete backend;
         return nullptr;
@@ -293,6 +292,14 @@ inline spi::IBus* makeHardwareBackendForSPI(const spi::LogicalBusConfig& logical
 // Tells M5HALCore that this build has a poolable hardware SPI backend, so the
 // SPI BusView is wired with the hardware factory + controller pool.
 #define M5HAL_DETAIL_SPI_HAS_HARDWARE_BACKEND_ 1
+
+template <class Policy>
+struct NativeProvider_espidf {
+    static result_t<std::shared_ptr<IBus>> acquire(bus::IHalBackend&, const IBusConfig&, Policy)
+    {
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
+};
 
 }  // namespace m5::hal::v2::spi
 

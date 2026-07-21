@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "usb_jtag.hpp"
+#include "error.hpp"
 
 #if defined(ESP_PLATFORM) && defined(CONFIG_SOC_USB_SERIAL_JTAG_SUPPORTED)
 
@@ -7,42 +8,66 @@ namespace m5::hal::v2::uart {
 
 result_t<void> Bus_espidf_usb_jtag::init()
 {
+    return initWithBufferSizes(kRxDriverBufferSize, kTxDriverBufferSize, /*attach_existing=*/false);
+}
+
+result_t<void> Bus_espidf_usb_jtag::initWithBufferSizes(uint32_t rx_buffer_size, uint32_t tx_buffer_size,
+                                                        bool attach_existing)
+{
+    if (!initializationAllowed(false)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+
     if (_installed) {
-        (void)release();
+        auto closed = teardownBackend();
+        if (closed.disposition != bus::CloseDisposition::Success) {
+            return m5::stl::make_unexpected(closed.error_code);
+        }
     }
 
     usb_serial_jtag_driver_config_t native_cfg = {};
-    native_cfg.rx_buffer_size                  = kRxDriverBufferSize;
-    native_cfg.tx_buffer_size                  = kTxDriverBufferSize;
+    native_cfg.rx_buffer_size                  = rx_buffer_size;
+    native_cfg.tx_buffer_size                  = tx_buffer_size;
 
-    const auto err    = usb_serial_jtag_driver_install(&native_cfg);
-    const auto mapped = mapEspErr(err);
-    if (error::isError(mapped)) {
-        return m5::stl::make_unexpected(mapped);
+    const auto err = usb_serial_jtag_driver_install(&native_cfg);
+    if (err == ESP_OK) {
+        _driver_owned = true;
+    } else if (err == ESP_ERR_INVALID_STATE && attach_existing) {
+        _driver_owned = false;
+    } else {
+        return m5::stl::make_unexpected(impl_espidf::mapEspErr(err));
     }
 
-    _config.rx_buffer_size = kRxDriverBufferSize;
-    _config.tx_buffer_size = kTxDriverBufferSize;
+    _config.rx_buffer_size = rx_buffer_size;
+    _config.tx_buffer_size = tx_buffer_size;
     _installed             = true;
     clearRxCache();
+    auto initialized = markInitializationSucceeded(false);
+    if (!initialized) {
+        (void)teardownBackend();
+        return initialized;
+    }
     return {};
 }
 
-result_t<void> Bus_espidf_usb_jtag::release()
+bus::CloseOutcome Bus_espidf_usb_jtag::teardownBackend(void)
 {
     if (!_installed) {
-        return {};
+        return bus::CloseOutcome::success();
     }
-    // Transactional release (matches uart.inl / i2c gen4): clear _installed
-    // only after the ESP-IDF uninstall succeeds. On failure keep _installed
-    // set so the dtor / a retry can uninstall the driver.
-    const auto mapped = mapEspErr(usb_serial_jtag_driver_uninstall());
-    if (error::isError(mapped)) {
-        return m5::stl::make_unexpected(mapped);
+    // Transactional teardown (matches uart.inl / i2c gen4): clear _installed
+    // only after an owned ESP-IDF driver uninstalls successfully. An attached
+    // console driver remains caller-owned and is only detached here.
+    if (_driver_owned) {
+        const auto mapped = impl_espidf::mapEspErr(usb_serial_jtag_driver_uninstall());
+        if (error::isError(mapped)) {
+            return bus::CloseOutcome::noMutation(mapped);
+        }
     }
-    _installed = false;
+    _installed    = false;
+    _driver_owned = false;
     clearRxCache();
-    return {};
+    return bus::CloseOutcome::success();
 }
 
 result_t<size_t> Bus_espidf_usb_jtag::rawWrite(const uint8_t* data, size_t len, uint32_t timeout_ms)
@@ -83,23 +108,6 @@ result_t<size_t> Bus_espidf_usb_jtag::rawReadableBytes()
     }
     pumpRxCache();
     return _rx_count;
-}
-
-error::error_t Bus_espidf_usb_jtag::mapEspErr(esp_err_t err)
-{
-    switch (err) {
-        case ESP_OK:
-            return error::error_t::OK;
-        case ESP_ERR_INVALID_ARG:
-        case ESP_ERR_INVALID_STATE:
-            return error::error_t::INVALID_ARGUMENT;
-        case ESP_ERR_TIMEOUT:
-            return error::error_t::TIMEOUT_ERROR;
-        case ESP_ERR_NO_MEM:
-            return error::error_t::OUT_OF_RESOURCE;
-        default:
-            return error::error_t::IO_ERROR;
-    }
 }
 
 void Bus_espidf_usb_jtag::clearRxCache()

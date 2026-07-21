@@ -77,12 +77,8 @@ struct TransferDesc : public bus::ITransferDesc {
 
 個別 byte 指定 (例: register address を little-endian で送りたい、 型で表現できないビット列、 等の用途)。 template 1-引数 ctor と用途を分ける。
 
-### 将来の拡張候補
-
-- `bool use_restart_override` — `cfg.use_restart` の per-call override
-- `bool last_byte_nack` — read 末尾の NACK 制御
-
-これらは必要が見えた時点で追加する (先回り追加なし)。
+descriptor field は、複数backendで意味を固定できる具体的要求とtestが揃ったものだけを追加する。
+特定backendの実装都合を先回りして共通契約へ持ち込まない。
 
 ## spi::TransferDesc
 

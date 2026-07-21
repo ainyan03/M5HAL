@@ -3,10 +3,13 @@
 #define M5_HAL_VARIANTS_FRAMEWORKS_ARDUINO_HAL_SPI_SPI_INL
 
 #include "spi.hpp"
+#include "../../../../../hal/v2/resource_domain.hpp"
 
 #include <M5Utility.hpp>
 
 #include <cstddef>
+#include <cstdint>
+#include <new>
 
 #if defined(ARDUINO)
 
@@ -14,6 +17,40 @@ namespace m5::hal::v2::spi {
 
 namespace {
 namespace impl_arduino {
+
+constexpr uint16_t kNativeProvider = 0x0201;
+
+struct PendingNativeToken {
+    bus::FixedNativeInterner<bus::NativeIdentity, bus::BusRegistry::kCapacity>* interner = nullptr;
+    bus::NativeToken token{};
+
+    ~PendingNativeToken()
+    {
+        if (interner != nullptr && token.valid()) {
+            (void)interner->release(token);
+        }
+    }
+
+    void dismiss()
+    {
+        interner = nullptr;
+        token    = {};
+    }
+};
+
+bus::BindingDescriptor makeNativeBinding(const IBusConfig& cfg, bus::NativeToken token)
+{
+    bus::BindingDescriptor binding;
+    binding.provider    = kNativeProvider;
+    binding.ownership   = bus::Ownership::Borrowed;
+    binding.native_kind = bus::NativeBindingKind::Native;
+    binding.native      = token;
+    binding.config_primary =
+        static_cast<uint16_t>(cfg.pin_clk) | (static_cast<uint32_t>(static_cast<uint16_t>(cfg.pin_mosi)) << 16u);
+    binding.config_secondary =
+        static_cast<uint16_t>(cfg.pin_miso) | (static_cast<uint32_t>(static_cast<uint16_t>(cfg.pin_dc)) << 16u);
+    return binding;
+}
 
 // Return type deduced: MSBFIRST/LSBFIRST are plain int constants on
 // arduino-esp32 but a `BitOrder` enum on arduino-pico (RP2040) — SPISettings'
@@ -172,34 +209,51 @@ result_t<void> transferChunk(::SPIClass& spi, data::ConstDataSpan tx_span, data:
 }  // namespace impl_arduino
 }  // namespace
 
-error::error_t Bus_arduino::attach(::SPIClass& spi)
+result_t<void> Bus_arduino::adoptBorrowedNative(
+    ::SPIClass& spi, const IBusConfig& config,
+    bus::FixedNativeInterner<bus::NativeIdentity, bus::BusRegistry::kCapacity>& interner, bus::NativeToken token)
 {
-    if (_spi) {
-        (void)release();
+    if (!token.valid()) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
-    _spi      = &spi;
-    _owns_spi = false;
-    return error::error_t::OK;
+    if (!initializationAllowed(false)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    auto reset = teardown();
+    if (!reset.has_value()) {
+        return reset;
+    }
+    _config          = config;
+    _spi             = &spi;
+    _owns_spi        = false;
+    auto initialized = markInitializationSucceeded(false);
+    if (!initialized.has_value()) {
+        _spi = nullptr;
+        return initialized;
+    }
+    _native_interner = &interner;
+    _native_token    = token;
+    return {};
 }
 
-result_t<void> Bus_arduino::init(const BusConfig_arduino& config)
+result_t<void> Bus_arduino::init(const IBusConfig& config)
 {
 #if !defined(ESP_PLATFORM)
     // Portable SPIClass only guarantees begin() with the board's default bus
-    // pins. A typed Arduino config explicitly selects this backend, so do not
-    // silently substitute software or ignore a requested wiring assignment.
-    // Callers that need arbitrary pins can use the logical acquire path, whose
-    // allocation policy selects the software backend when no hardware factory
-    // is available.
+    // pins. Do not silently ignore a requested wiring assignment.
     if (config.pin_clk >= 0 || config.pin_miso >= 0 || config.pin_mosi >= 0) {
-        return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
     }
 #endif
-    _config = config;
-    if (_spi) {
-        (void)release();
+    if (!initializationAllowed(false)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
     }
-    auto* spi = config.spi != nullptr ? config.spi : &SPI;
+    auto reset = teardown();
+    if (!reset.has_value()) {
+        return reset;
+    }
+    _config   = config;
+    auto* spi = &SPI;
 
 #if defined(ESP_PLATFORM)
     // arduino-esp32 SPIClass::begin(sck, miso, mosi, ss) is an Espressif
@@ -222,17 +276,41 @@ result_t<void> Bus_arduino::init(const BusConfig_arduino& config)
         impl_arduino::setPinOutput(_config.pin_dc, true);
     }
 
-    auto err = attach(*spi);
-    if (error::isError(err)) {
-        spi->end();
-        return m5::stl::make_unexpected(err);
+    _spi             = spi;
+    _owns_spi        = true;
+    auto initialized = markInitializationSucceeded(false);
+    if (!initialized.has_value()) {
+        (void)teardown();
+        return initialized;
     }
-    _owns_spi = true;
     return {};
 }
 
-result_t<void> Bus_arduino::release(void)
+result_t<void> Bus_arduino::init(const IBusConfig& config, native::Borrowed<::SPIClass> policy)
 {
+    if (!initializationAllowed(false)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    auto reset = teardown();
+    if (!reset.has_value()) {
+        return reset;
+    }
+    _config   = config;
+    _spi      = &policy.resource();
+    _owns_spi = false;
+    return markInitializationSucceeded(false);
+}
+
+result_t<void> Bus_arduino::teardown(void)
+{
+    if (_native_interner != nullptr && _native_token.valid()) {
+        auto released = _native_interner->release(_native_token);
+        if (!released.has_value()) {
+            return released;
+        }
+    }
+    _native_interner = nullptr;
+    _native_token    = {};
     if (_spi && _owns_spi) {
         _spi->end();
     }
@@ -241,9 +319,81 @@ result_t<void> Bus_arduino::release(void)
     return {};
 }
 
-result_t<void> Bus_arduino::beginTransaction(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg)
+bus::CloseOutcome Bus_arduino::closeBackend(void)
 {
-    (void)owner;
+    auto closed = teardown();
+    if (!closed.has_value()) {
+        return bus::CloseOutcome::noMutation(closed.error());
+    }
+    return bus::CloseOutcome::success();
+}
+
+result_t<std::shared_ptr<IBus>> NativeProvider_arduino<native::Borrowed<::SPIClass>>::acquire(
+    bus::IHalBackend& backend, const IBusConfig& cfg, native::Borrowed<::SPIClass> policy)
+{
+    const auto* domain = backend.localResourceDomain();
+    if (domain == nullptr) {
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
+
+    const uint64_t address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&policy.resource()));
+    auto identity          = bus::NativeIdentity::make(bus::NativeIdentityKind::ObjectAddress, {address});
+    if (!identity.has_value()) {
+        return m5::stl::make_unexpected(identity.error());
+    }
+    auto& interner = domain->nativeInterner();
+    auto token     = interner.intern(identity.value());
+    if (!token.has_value()) {
+        return m5::stl::make_unexpected(token.error());
+    }
+    impl_arduino::PendingNativeToken pending{&interner, token.value()};
+    auto key = bus::ResourceKey::makeToken(types::bus_kind_t::SPI, bus::ResourceTag::Native, token.value(),
+                                           static_cast<uint32_t>(bus::NativeIdentityKind::ObjectAddress));
+    if (!key.has_value()) {
+        return m5::stl::make_unexpected(key.error());
+    }
+    const auto binding = impl_arduino::makeNativeBinding(cfg, token.value());
+    auto acquired      = backend.busRegistry().acquireOrFind(
+        key.value(), binding,
+        [&cfg](const std::shared_ptr<bus::IBus>& existing) -> result_t<void> {
+            if (!BusTraits::configCompatible(static_cast<const IBusConfig&>(existing->getConfig()), cfg)) {
+                return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+            }
+            return {};
+        },
+        [&]() -> result_t<std::shared_ptr<bus::IBus>> {
+            std::unique_ptr<Bus_arduino> concrete{new (std::nothrow) Bus_arduino()};
+            if (!concrete) {
+                return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+            }
+            concrete->bindLocalResources(backend.localResources());
+            auto adopted = concrete->adoptBorrowedNative(policy.resource(), cfg, interner, token.value());
+            if (!adopted.has_value()) {
+                return m5::stl::make_unexpected(adopted.error());
+            }
+            pending.dismiss();
+
+            std::shared_ptr<Bus> facade{new (std::nothrow) Bus()};
+            if (!facade) {
+                return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+            }
+            facade->bindLocalResources(backend.localResources());
+            std::unique_ptr<IBus> selected{concrete.release()};
+            auto installed = facade->adoptPortableBackend(std::move(selected), cfg);
+            if (!installed.has_value()) {
+                return m5::stl::make_unexpected(installed.error());
+            }
+            return std::shared_ptr<bus::IBus>{std::move(facade)};
+        });
+    if (!acquired.has_value()) {
+        return m5::stl::make_unexpected(acquired.error());
+    }
+    return std::static_pointer_cast<IBus>(acquired.value());
+}
+
+result_t<void> Bus_arduino::beginOperationBackend(bus::OperationContext<spi::MasterAccessConfig>& context)
+{
+    const auto& cfg = context.config;
     if (_spi == nullptr || cfg.freq == 0) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
@@ -255,9 +405,9 @@ result_t<void> Bus_arduino::beginTransaction(bus::IAccessor* owner, const spi::M
     return {};
 }
 
-result_t<void> Bus_arduino::endTransaction(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg)
+result_t<void> Bus_arduino::endOperationBackend(bus::OperationContext<spi::MasterAccessConfig>& context)
 {
-    (void)owner;
+    const auto& cfg = context.config;
     impl_arduino::setPinLevel(cfg.pin_cs, true);
     if (_spi != nullptr) {
         _spi->endTransaction();
@@ -265,11 +415,11 @@ result_t<void> Bus_arduino::endTransaction(bus::IAccessor* owner, const spi::Mas
     return {};
 }
 
-result_t<void> Bus_arduino::transfer(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg,
-                                     const spi::TransferDesc& desc, data::Source* src, size_t tx_len, data::Sink* dst,
-                                     size_t rx_len)
+result_t<void> Bus_arduino::transferBackend(bus::OperationContext<spi::MasterAccessConfig>& context,
+                                            const spi::TransferDesc& desc, data::Source* src, size_t tx_len,
+                                            data::Sink* dst, size_t rx_len)
 {
-    (void)owner;
+    const auto& cfg = context.config;
     _transfer_totals.clear();
     // This variant drives a single-lane MOSI/MISO pair through SPIClass.
     // Multi-lane modes (dual/quad/octal) are physically unimplemented:
@@ -289,14 +439,17 @@ result_t<void> Bus_arduino::transfer(bus::IAccessor* owner, const spi::MasterAcc
                       mode == spi_data_mode_t::HalfDuplexWithDcBit;
         if (multi_lane ||
             (half_duplex && src != nullptr && tx_len > 0 && !src->eof() && dst != nullptr && rx_len > 0)) {
-            return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
+            return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
         }
     }
     if (_spi == nullptr || desc.command_bytes > 4 || desc.address_bytes > 4) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
-    if (rx_len > 0 && _config.pin_miso < 0) {
-        return m5::stl::make_unexpected(half_duplex ? error::error_t::NOT_IMPLEMENTED : error::error_t::INVALID_STATE);
+    if (rx_len > 0 && !supportsReceive()) {
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
+    if (src != nullptr && tx_len > 0 && !src->eof() && !supportsTransmit()) {
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
     }
 
     // Per-device D/C override: a non-negative accessor pin_dc beats the
@@ -389,10 +542,9 @@ result_t<void> Bus_arduino::transfer(bus::IAccessor* owner, const spi::MasterAcc
     return {};
 }
 
-result_t<bus::TransferTotals> Bus_arduino::waitTransfer(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg)
+result_t<bus::TransferTotals> Bus_arduino::waitTransferBackend(bus::OperationContext<spi::MasterAccessConfig>& context)
 {
-    (void)owner;
-    (void)cfg;
+    (void)context;
     auto totals = _transfer_totals;
     _transfer_totals.clear();
     return totals;

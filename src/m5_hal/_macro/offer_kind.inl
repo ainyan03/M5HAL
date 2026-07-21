@@ -6,7 +6,7 @@
 // instead of repeating the namespace plumbing. What CANNOT move here
 // stays in offer_all.inl — the kind-specific marker macros
 // (M5HAL_V2_SELECTED_VARIANT_<KIND>) and their #elif chains, because
-// #define / #ifdef cannot compute macro names ([026]).
+// #define / #ifdef cannot compute macro names.
 //
 // Inputs (set by offer_all.inl, all consumed/undeffed here):
 //   M5HAL_OFFER_KIND_NS_         — kind namespace leaf (e.g. i2c)
@@ -19,22 +19,19 @@
 //                                  kind still injected via `using namespace`
 //                                  (free functions + Mutex, see runtime.md)
 //   M5HAL_OFFER_KIND_FACADE_     — defined: the unsuffixed `Bus` is a runtime
-// facade class in the kind header,
-//                                  so only the winner `BusConfig` alias is
-//                                  emitted (emitting `using Bus` would redefine
-//                                  the facade). Set for all facade-backed
+// facade class in the kind header, so the winner binds only its portable
+// factory and NativeProvider (emitting `using Bus` would redefine the
+// facade). Set for all facade-backed
 //                                  kinds (i2c / spi / i2s / uart).
 // Plus the current _offer.hpp's M5HAL_VARIANT_CURRENT_ALIAS_ (the variant
-// short name, doubling as the `_<variant>` type suffix) and
+// short name, used as the provider-symbol suffix) and
 // M5HAL_VARIANT_CURRENT_BASE_NS_ (used by the runtime injection only).
 //
-// Winner binding (D17): variants define their concrete types directly in
-// m5::hal::v2::<kind> as `Bus_<variant>` / `BusConfig_<variant>` (gpio:
-// `Port_<variant>` / `GPIO_<variant>` / `get*GPIO_<variant>`), and the
-// first variant to offer a kind wins the unsuffixed name through the
-// type aliases emitted here. `i2c::Bus` is therefore one alias hop away
-// from its concrete `i2c::Bus_arduino`, every variant stays addressable
-// by its suffixed name, and multiple variants coexist in one namespace.
+// Winner binding contract: facade bus variants define `Bus_<variant>`,
+// `makePortableBackend_<variant>`, and `NativeProvider_<variant>` directly in
+// m5::hal::v2::<kind>. The first eligible variant binds those provider seams;
+// public `Bus` and portable `BusConfig` remain kind-level types. GPIO and the
+// non-facade legacy path continue to use the aliases emitted below.
 
 #ifdef M5HAL_OFFER_KIND_EMIT_FLAT_
 #undef M5HAL_OFFER_KIND_EMIT_FLAT_
@@ -61,9 +58,26 @@ namespace m5 { namespace hal { namespace v2 { namespace M5HAL_OFFER_KIND_NS_ {
         return M5HAL_OFFER_PASTE_(getGPIO_, M5HAL_VARIANT_CURRENT_ALIAS_)();
     }
 #elif defined(M5HAL_OFFER_KIND_FACADE_)
-    // facade kind (i2c): `Bus` is a runtime facade class defined in the kind
-    // header, so only the winner's `BusConfig` alias is emitted here.
-    using BusConfig = M5HAL_OFFER_PASTE_(BusConfig_, M5HAL_VARIANT_CURRENT_ALIAS_);
+    // Facade kinds expose one portable BusConfig from the kind header.
+    // The winner selects a provider, never a configuration type.
+    template <class Policy>
+    struct NativeProvider : M5HAL_OFFER_PASTE_(NativeProvider_, M5HAL_VARIANT_CURRENT_ALIAS_)<Policy> {};
+
+    inline result_t<std::unique_ptr<IBus>> makeSelectedPortableBackend(
+        const bus::LocalResourceContext& resources, const IBusConfig& config)
+    {
+        return M5HAL_OFFER_PASTE_(makePortableBackend_, M5HAL_VARIANT_CURRENT_ALIAS_)(resources, config);
+    }
+    inline result_t<void> Bus::init(const IBusConfig& config)
+    {
+        const auto& resources = bus::defaultLocalResources();
+        auto backend = makeSelectedPortableBackend(resources, config);
+        if (!backend.has_value()) {
+            return m5::stl::make_unexpected(backend.error());
+        }
+        bindLocalResources(resources);
+        return adoptPortableBackend(std::move(backend.value()), config);
+    }
 #else
     using Bus       = M5HAL_OFFER_PASTE_(Bus_, M5HAL_VARIANT_CURRENT_ALIAS_);
     using BusConfig = M5HAL_OFFER_PASTE_(BusConfig_, M5HAL_VARIANT_CURRENT_ALIAS_);

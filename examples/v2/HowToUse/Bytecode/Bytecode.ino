@@ -250,14 +250,12 @@ void setup()
 
     // Tag-typed pins: either order is correct (no swapped-pin accidents).
     m5hal::i2c::BusConfig i2c_cfg{m5hal::i2c::Scl{PIN_I2C_SCL}, m5hal::i2c::Sda{PIN_I2C_SDA}};
-    i2c_cfg.wire = &Wire;
     if (auto r = i2c_bus.init(i2c_cfg); !r.has_value()) {
         printError("i2c bus init", r.error());
         return;
     }
 
     m5hal::spi::BusConfig spi_cfg;
-    spi_cfg.spi      = &SPI;
     spi_cfg.pin_clk  = PIN_SPI_CLK;
     spi_cfg.pin_mosi = PIN_SPI_MOSI;
     spi_cfg.pin_miso = PIN_SPI_MISO;

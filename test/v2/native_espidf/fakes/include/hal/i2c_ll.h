@@ -4,10 +4,9 @@
 // Fake mirror of ESP-IDF's hal/i2c_ll.h -- the host harness's I2C device
 // model. Two groups of functions:
 //
-//   * Init-only / config LL calls (bus clock, pin timing, FIFO thresholds,
-//     ...): no-ops. The espidf slave backend's init() calls these to
-//     configure real hardware; the fake device model has no register file
-//     to configure, so there is nothing meaningful for them to do.
+//   * Init-only / config LL calls (pin timing, FIFO thresholds, ...): no-ops.
+//     Clock enables/disables are the exception: they append to a deterministic
+//     trace so init/close ownership and ordering can be asserted.
 //   * State-machine LL calls (interrupt mask, RX/TX FIFO, slave direction,
 //     stretch cause): operate on the `i2c_dev_t` fake device model (see
 //     soc/i2c_struct.h). These are the ONLY functions a test's assertions
@@ -31,6 +30,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 // ---- interrupt-mask bit assignments (harness-internal; only need to be
 // self-consistent with the product code's unqualified use of these names) --
@@ -52,6 +52,24 @@
 
 namespace m5hal_hostharness {
 
+enum class I2cClockEvent : uint8_t {
+    BusEnable,
+    ControllerEnable,
+    ControllerDisable,
+    BusDisable,
+};
+
+inline std::vector<I2cClockEvent>& i2cClockTrace()
+{
+    static std::vector<I2cClockEvent> trace;
+    return trace;
+}
+
+inline void resetI2cClockTrace()
+{
+    i2cClockTrace().clear();
+}
+
 inline i2c_dev_t& i2cDeviceFor(i2c_port_t)
 {
     static i2c_dev_t device;
@@ -62,15 +80,19 @@ inline i2c_dev_t& i2cDeviceFor(i2c_port_t)
 
 #define I2C_LL_GET_HW(port) (&::m5hal_hostharness::i2cDeviceFor(port))
 
-// ---- init-only / config: no-ops ------------------------------------------
-inline void i2c_ll_enable_bus_clock(i2c_port_t, bool)
+// ---- init-only / config --------------------------------------------------
+inline void i2c_ll_enable_bus_clock(i2c_port_t, bool enable)
 {
+    m5hal_hostharness::i2cClockTrace().push_back(enable ? m5hal_hostharness::I2cClockEvent::BusEnable
+                                                        : m5hal_hostharness::I2cClockEvent::BusDisable);
 }
 inline void i2c_ll_reset_register(i2c_port_t)
 {
 }
-inline void i2c_ll_enable_controller_clock(i2c_dev_t*, bool)
+inline void i2c_ll_enable_controller_clock(i2c_dev_t*, bool enable)
 {
+    m5hal_hostharness::i2cClockTrace().push_back(enable ? m5hal_hostharness::I2cClockEvent::ControllerEnable
+                                                        : m5hal_hostharness::I2cClockEvent::ControllerDisable);
 }
 inline void i2c_ll_set_source_clk(i2c_dev_t*, i2c_clock_source_t)
 {
@@ -81,8 +103,10 @@ inline void i2c_ll_master_rx_full_ack_level(i2c_dev_t*, int)
 inline void i2c_ll_slave_enable_auto_start(i2c_dev_t*, bool)
 {
 }
-inline void i2c_ll_set_slave_addr(i2c_dev_t*, uint16_t, bool)
+inline void i2c_ll_set_slave_addr(i2c_dev_t* hw, uint16_t address, bool address_10bit)
 {
+    hw->pending_slave_address       = address;
+    hw->pending_slave_address_10bit = address_10bit;
 }
 inline void i2c_ll_set_tout(i2c_dev_t*, uint32_t)
 {
@@ -108,8 +132,11 @@ inline void i2c_ll_slave_enable_scl_stretch(i2c_dev_t*, bool)
 inline void i2c_ll_slave_set_stretch_protect_num(i2c_dev_t*, uint32_t)
 {
 }
-inline void i2c_ll_update(i2c_dev_t*)
+inline void i2c_ll_update(i2c_dev_t* hw)
 {
+    hw->slave_address       = hw->pending_slave_address;
+    hw->slave_address_10bit = hw->pending_slave_address_10bit;
+    ++hw->update_count;
 }
 
 // ---- state-machine LL calls: the fake device model -----------------------
@@ -178,6 +205,10 @@ inline void i2c_ll_write_txfifo(i2c_dev_t* hw, const uint8_t* src, uint32_t len)
 inline int i2c_ll_slave_get_read_write_status(i2c_dev_t* hw)
 {
     return hw->slave_rw;
+}
+inline bool i2c_ll_is_bus_busy(i2c_dev_t* hw)
+{
+    return hw->bus_busy;
 }
 inline void i2c_ll_slave_get_stretch_cause(i2c_dev_t* hw, i2c_slave_stretch_cause_t* out)
 {

@@ -35,10 +35,10 @@ public:
     // because the services on this wire (software I2C master/slave) have no
     // intra-call spins — see the ServiceContext field notes.
     // The bound runner must be driven EXCLUSIVELY through this harness (no
-    // auto-run, no concurrent runOnce callers): pump() consumes the
-    // accumulated delta whether or not the pass ran, so a try-lock back-off
-    // would silently drop that elapsed (runOnce's bool means "progressed",
-    // not "ran" — the two are indistinguishable here).
+    // auto-run, no concurrent runOnce callers). pump() intentionally discards
+    // the result under that precondition; a BUSY error would mean the harness
+    // contract was violated, and consuming the accumulated delta after such
+    // a failed pass would silently drop elapsed time.
     void advance(service::fast_tick_t delta)
     {
         _now_v += delta;
@@ -243,7 +243,7 @@ private:
 };
 
 // RAII registration of a `VirtualI2CGPIO` into a caller-supplied
-// `GPIOGroup` slot, so a master's `BusConfig_software` can name its SCL/SDA
+// `GPIOGroup` slot, so a master's portable `BusConfig` can name its SCL/SDA
 // as plain `gpio_number_t` pins. Takes a plain `GPIOGroup&` (not the `Hal`
 // facade) so the same harness works from a native gtest with no facade
 // singleton in play.
@@ -328,7 +328,11 @@ private:
         cfg.address     = address;
         cfg.timeout_ms  = 0;
         cfg.tx_underrun = tx_underrun;
-        auto r          = _bus.init(lines, cfg);
+        // SlaveEndpoint is the legacy wire-frame-window test helper. New
+        // queue-driven endpoints leave this false and accept wire traffic only
+        // between SlaveAccessor::beginAccess()/endAccess().
+        cfg.legacy_wire_frame_window = true;
+        auto r                       = _bus.init(lines, cfg);
         assert(r.has_value() && "SlaveEndpoint: init failed");
         (void)r;
     }

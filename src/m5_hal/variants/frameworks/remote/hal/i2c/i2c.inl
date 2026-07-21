@@ -10,7 +10,7 @@
 
 namespace m5::hal::v2::i2c {
 
-result_t<void> Bus_remote::init(const BusConfig_remote& config)
+result_t<void> Bus_remote::init(const IBusConfig& config)
 {
     bus::BusLifecycle::Operation operation{*_lifecycle};
     if (!operation) {
@@ -23,10 +23,12 @@ result_t<void> Bus_remote::init(const BusConfig_remote& config)
     return {};
 }
 
-result_t<void> Bus_remote::transfer(bus::IAccessor* owner, const i2c::MasterAccessConfig& cfg,
-                                    const i2c::TransferDesc& desc, data::Source* src, size_t tx_len, data::Sink* dst,
-                                    size_t rx_len)
+result_t<void> Bus_remote::transferBackend(bus::OperationContext<i2c::MasterAccessConfig>& context,
+                                           const i2c::TransferDesc& desc, data::Source* src, size_t tx_len,
+                                           data::Sink* dst, size_t rx_len)
 {
+    auto* owner     = &bus::OperationSlot::contextOwner(context);
+    const auto& cfg = context.config;
     bus::BusLifecycle::Operation operation{*_lifecycle};
     if (!operation) {
         return m5::stl::make_unexpected(operation.error());
@@ -46,21 +48,20 @@ result_t<void> Bus_remote::transfer(bus::IAccessor* owner, const i2c::MasterAcce
 
     uint8_t cfg_buf[bytecode::kI2CConfigSize];
     auto cfg_bytes = remote::detail::encodeRemoteConfig(cfg_buf, cfg);
-    uint8_t meta_buf[1 + i2c::TransferDesc::PREFIX_CAPACITY];
-    size_t meta_len = encodeI2cMeta(meta_buf, cfg, desc);
-
-    auto r = remote::remoteTransferWire(_session, types::bus_kind_t::I2C, _bus_id, cfg_bytes, {meta_buf, meta_len}, src,
-                                        tx_len, dst, rx_len, kTransferTimeoutMs, &_config_cache);
+    auto r         = remote::remoteAtomicTransferWire(_session, _bus_id, cfg_bytes, desc, src, tx_len, dst, rx_len,
+                                                      kTransferTimeoutMs, &_config_cache);
     if (!r.has_value()) {
         return m5::stl::make_unexpected(r.error());
     }
-    _last_totals = bus::TransferTotals{tx_len, rx_len};
+    _last_totals = r.value();
     _has_totals  = true;
     return {};
 }
 
-result_t<bus::TransferTotals> Bus_remote::waitTransfer(bus::IAccessor* owner, const i2c::MasterAccessConfig& cfg)
+result_t<bus::TransferTotals> Bus_remote::waitTransferBackend(bus::OperationContext<i2c::MasterAccessConfig>& context)
 {
+    auto* owner     = &bus::OperationSlot::contextOwner(context);
+    const auto& cfg = context.config;
     bus::BusLifecycle::Operation operation{*_lifecycle};
     if (!operation) {
         return m5::stl::make_unexpected(operation.error());
@@ -73,8 +74,9 @@ result_t<bus::TransferTotals> Bus_remote::waitTransfer(bus::IAccessor* owner, co
     return out;
 }
 
-bool Bus_remote::transferBusy(bus::IAccessor* owner)
+bool Bus_remote::transferBusyBackend(bus::OperationContext<i2c::MasterAccessConfig>& context)
 {
+    auto* owner = &bus::OperationSlot::contextOwner(context);
     bus::BusLifecycle::Operation operation{*_lifecycle, 0};
     if (!operation) {
         return false;

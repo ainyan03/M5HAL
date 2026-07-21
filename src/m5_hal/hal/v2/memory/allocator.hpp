@@ -22,17 +22,46 @@ M5HAL_INLINE_V2 namespace v2
         PersistentSlow,
     };
 
+    struct FallbackOps {
+        using malloc_fn_t  = void* (*)(size_t, usage_t);
+        using realloc_fn_t = void* (*)(void*, size_t, size_t, usage_t);
+        using free_fn_t    = void (*)(void*);
+
+        constexpr FallbackOps() = default;
+        constexpr FallbackOps(malloc_fn_t malloc, free_fn_t free) : malloc_fn{malloc}, free_fn{free}
+        {
+        }
+        constexpr FallbackOps(malloc_fn_t malloc, realloc_fn_t realloc, free_fn_t free)
+            : malloc_fn{malloc}, realloc_fn{realloc}, free_fn{free}
+        {
+        }
+
+        constexpr bool valid() const
+        {
+            const bool standard = malloc_fn == nullptr && realloc_fn == nullptr && free_fn == nullptr;
+            const bool custom   = malloc_fn != nullptr && free_fn != nullptr;
+            return standard || custom;
+        }
+
+        malloc_fn_t malloc_fn   = nullptr;
+        realloc_fn_t realloc_fn = nullptr;
+        free_fn_t free_fn       = nullptr;
+    };
+
     class Allocator {
     public:
-        using malloc_fn_t = void* (*)(size_t, usage_t);
+        using malloc_fn_t = FallbackOps::malloc_fn_t;
         /// Fallback reallocator hook.
         ///
         /// `preserve_size` is the number of bytes the caller wants to keep
         /// from `ptr`, not necessarily the backend allocation capacity.
         /// Implementations may use it as the copy bound when they cannot grow
         /// in place.
-        using realloc_fn_t = void* (*)(void*, size_t, size_t, usage_t);
-        using free_fn_t    = void (*)(void*);
+        using realloc_fn_t = FallbackOps::realloc_fn_t;
+        using free_fn_t    = FallbackOps::free_fn_t;
+
+        Allocator();
+        explicit Allocator(FallbackOps fallback);
 
         /// Allocates a buffer.
         ///
@@ -61,31 +90,15 @@ M5HAL_INLINE_V2 namespace v2
         /// Deallocates a buffer returned by this allocator.
         void deallocate(void* ptr);
 
-        /// Sets fallback allocation and free hooks.
-        ///
-        /// Fallback reallocation uses malloc-copy-free when no realloc hook is
-        /// registered.
-        void setFallback(malloc_fn_t malloc_fn, free_fn_t free_fn)
-        {
-            _malloc_fn  = malloc_fn;
-            _realloc_fn = nullptr;
-            _free_fn    = free_fn;
-        }
-
-        /// Sets fallback allocation, reallocation, and free hooks.
-        ///
-        /// Call this during initialization only; concurrent updates while
-        /// allocation APIs are running are not synchronized.
-        void setFallback(malloc_fn_t malloc_fn, realloc_fn_t realloc_fn, free_fn_t free_fn)
-        {
-            _malloc_fn  = malloc_fn;
-            _realloc_fn = realloc_fn;
-            _free_fn    = free_fn;
-        }
-
         size_t usedBlocks() const;
         size_t largestFreeRun() const;
         size_t tempReleaseCount() const;
+
+        /// Returns whether `ptr` is the start of a live temp-pool allocation.
+        ///
+        /// This distinguishes pool storage from fallback allocations without
+        /// inferring ownership from shared pool usage counters.
+        bool isTempPoolAllocation(const void* ptr) const;
 
         static constexpr size_t tempBlockSize()
         {
@@ -110,9 +123,7 @@ M5HAL_INLINE_V2 namespace v2
         detail::FixedBlockPool<M5HAL_CONFIG_MEMORY_TEMP_BLOCK_SIZE_BYTES, M5HAL_CONFIG_MEMORY_TEMP_BLOCK_COUNT>
             _temp_pool;
         std::atomic<size_t> _temp_release_count{0};
-        malloc_fn_t _malloc_fn   = nullptr;
-        realloc_fn_t _realloc_fn = nullptr;
-        free_fn_t _free_fn       = nullptr;
+        const FallbackOps _fallback;
     };
 
     class TempBuffer {

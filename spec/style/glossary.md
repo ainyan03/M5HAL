@@ -2,39 +2,37 @@
 
 > **読者**: メンテナ向け（ビルド・運用・規約）。
 
-公開コードコメント (Doxygen + `//`) を英訳する際の用語の固定。 同じ日本語概念が複数の英語訳で書かれてブレることを防ぐためのリファレンス。
-
-スコープ:
-
-- 本ファイルは **コード内コメントで使う訳語の指針**。 v2 識別子は英語コメントと整合する命名に統一済 (`bus_kind_t` / `getBusKind` / `BusKind` 等)。 新規ファイル / 改変箇所は本 glossary に揃えて書く
-- 仕様文書 (`spec/`) はバイリンガル運用 (日本語が正本) を継続。 本ファイルは「コードコメント英訳時に揺れないため」 の用途
-- 規約全体は [coding_style.md](coding_style.md) §コメント
+公開コードコメント(Doxygen + `//`)で使う日本語概念と推奨英語表記の検索表。
+記述規約は[coding_style.md](coding_style.md) §コメントを参照する。
 
 ## バス通信 (bus communication)
 
 | 日本語 / 概念 | 英語 (推奨) | 備考 |
 |---|---|---|
 | 通信バス | bus | コード上 `Bus` |
-| バスインターンレジストリ | bus registry | `M5_Hal` が全 kind の bus を配線 (identity) で intern する weak registry。寿命は返された strong owner が決める ([design/bus_accessor.md](../design/bus_accessor.md)) |
+| 資源ドメイン | resource domain | local registry / GPIO / Services / Memoryをco-ownするidentity namespace。`M5_Hal`はdefault domain入口 |
+| バスインターンレジストリ | bus registry | 各ResourceDomainが全kindのbusをexact `ResourceKey`でinternするweak registry。寿命は返されたstrong ownerが決める ([design/bus_accessor.md](../design/bus_accessor.md)) |
 | 共有取得 | shared acquisition / acquire | `M5_Hal.<kind>.acquire(cfg)` が所有権を持つ共有ハンドル (`shared_ptr<IBus>`) を返す。直接構築はエスケープ |
 | 共同所有 | co-own | `shared_ptr` からアクセサを構築するとアクセサがバスの生存を共有保持する (`Accessor dev{handle, cfg}`) |
-| 明示解放 | explicit release / consuming close | `result_t<void> release(std::shared_ptr<IBus>& bus)`。exact instance + sole owner のときだけ成功し、caller の handle を消費する |
-| 自然解放 | natural release / final-holder destruction | 最後の strong owner が消えたときの bus dtor 起点の解放 |
+| 明示終了 | explicit consuming close | `result_t<void> close(std::shared_ptr<IBus>& bus)`。exact instance + sole owner のときだけ成功し、caller の handle を消費する |
+| 自然終了 | natural close / final-holder destruction | 最後の strong owner が消えたときの bus dtor 起点の終了 |
+| portable取得 | portable acquisition | 共通`BusConfig`を`acquire(cfg)`へ渡す。provider選択はbuildのwinner bindingが行い、config型では選ばない |
+| native所有方針 | native ownership policy | 対応providerだけが受理する`native::borrowed(resource)` / `native::managed(resource)`。bus取得用の`attach` / `open`は公開しない |
 | 隔離済み墓標 | quarantined tombstone | 外部解放を確認できず、identity / remote bus ID の再利用を止める registry 状態 |
 | バス種別 | bus kind | v2 では識別子も `bus_kind_t` / `BusKind` / `getBusKind()` で統一済 (旧 `bus_type_t` 等は v0 のみ) |
 | 通信相手 / アクセス対象 | accessor | コード上 `Accessor`、 固有名詞扱い |
 | 通信本体 (atomic I/O) | transfer | 動詞・名詞共通 |
 | 1 回の transfer に付随するメタ情報 | per-call transfer metadata | `TransferDesc` の説明 |
 | 接頭バイト列 | prefix bytes | I2C/SPI の register address 等 |
-| 排他制御 | mutual exclusion / locking | `Bus::lock` / `Bus::unlock` |
+| 排他制御 | mutual exclusion / locking | Accessor内部の`acquireAccessLock` / `releaseAccessLock` |
 | 同時に 1 owner のみ保有可能 | exclusive | "exclusive ownership" |
-| トランザクション (SPI CS assert 区間) | transaction | SPI 専用、 `begin/endTransaction` |
-| アクセス期間 | access window | `begin/endAccess` 間。 "scope" でも可だが C++ scope と紛らわしい |
-| 入れ子の access | nested access | `Accessor::beginAccess` を再帰的に呼ぶ場合 |
-| depth counter による吸収 | absorbed via depth counter | nested access の自然な扱い |
+| wire frame (SPI CS assert区間 / I2C START〜STOP) | wire frame | protocol境界。Accessor lifecycle名とは分離する |
+| Access | Access / access scope | `beginAccess`〜`endAccess`。排他・設定・backend開始終了を含む |
+| 入れ子の Access | nested Access | 禁止。二重`beginAccess`は`INVALID_STATE` |
+| active Accessの借用 | borrow the active Access | sugarは二重beginせず既存Accessへ参加する |
 | 再 lock / 二重 lock | re-lock / re-acquire | |
 | アクセス権限の所有者 | lock owner | コード上 `_lock_owner` |
-| タイムアウト (lock 取得待ち) | acquisition timeout | lock 系 API の `timeout_ms` 引数 (省略 = `types::TIMEOUT_FOREVER` = 無限待ち、 0 = 即時 try-lock) |
+| タイムアウト (lock取得待ち) | acquisition timeout | `beginAccess(timeout_ms)`の予算 (省略 = `TIMEOUT_FOREVER`、0 = 即時try) |
 | runtime 設備 (time / mutex) | runtime kind | `m5::hal::v2::runtime` ([design/runtime.md](../design/runtime.md))。 bus 構造を持たない設備 kind |
 | 非再帰 (mutex) | non-recursive | 保有タスク自身の再 lock も timeout まで待って失敗 |
 | セッションゲート | session gate / operation gate | 1 `RemoteSession` の complete RPC を直列化する canonical mutex。bus/channel → session の順で取得 |
@@ -56,7 +54,7 @@
 | 書き込み量と reserve の対称性 | transactional reserve / commit pair | |
 | 契約違反 | contract violation | undefined behavior in release |
 | 復帰可能エラー | recoverable error | returned via `expected<T, E>` |
-| stream 通信 | streaming transport | UART 等の将来用途 |
+| stream 通信 | streaming transport | UART / remote等 |
 
 ## エラー / 契約 (error / contract)
 
@@ -88,11 +86,11 @@
 | SFINAE 制約 | SFINAE constraint | |
 | unsigned integral 型 | unsigned integral type | register sugar の引数制約 |
 
-### 不採用の理由 (rejected alternatives)
-
-- `view` は不採用 — `std::string_view` を連想させる (accessor はデータの view ではなくバス上の操作主体。`shared_ptr` から構築すると対象バスを co-own してその生存を担保する)
-- `session` は不採用 — ネットワーキングの session を連想させる (排他期間は access window と呼ぶ)
-- transfer の動詞形は `issue a transfer` / `perform a transfer` の 2 形を許容する
+| 避ける表記 | 推奨表記 | 備考 |
+|---|---|---|
+| view (Accessorの意味) | accessor | data viewではなくbus上の操作主体 |
+| session (Accessの意味) | Access / access scope | network sessionと区別する |
+| execute a transfer | issue / perform a transfer | transferの動詞形 |
 
 ## GPIO
 
@@ -122,6 +120,15 @@
 | capability 申告 | capability declaration | `_offer.hpp` |
 | re-include 前提 | re-includable | `*.inl` の意 |
 
+`capability`は対象を省略すると混同しやすいため、次の修飾を付ける。
+
+| 概念 | 推奨表記 | 対象 |
+|---|---|---|
+| variant offer | variant offer / build-time offer | build時にkind実装を提供するか (`_offer.hpp`) |
+| allocation capability | allocation capability | local controller resolver用の`backend_caps_t` |
+| connection capability | remote connection capability | Helloで広告するGPIO、BusCreate、静的Bus一覧 (`remote::Capabilities`) |
+| Bus instance capability | Bus instance capability / capability snapshot | 取得済みBusのoperationとlimit (`bus::BusCapabilities`) |
+
 ## v0 / v2 共存
 
 | 日本語 / 概念 | 英語 (推奨) | 備考 |
@@ -130,7 +137,3 @@
 | inline namespace 切替 | inline namespace switch | 利用者設定は`M5HAL_V0_INLINE` / `M5HAL_V2_INLINE`。展開用の`M5HAL_INLINE_V0` / `M5HAL_INLINE_V2`は内部macro |
 | 上書き (override) | override | C++ override と意味同じ |
 | 下位互換 | backward compatibility | v0 API の継続提供 |
-
-## コメント規約 (`@brief` 書き出し / 避ける表現)
-
-詳細は [coding_style.md](coding_style.md) §コメント を参照。

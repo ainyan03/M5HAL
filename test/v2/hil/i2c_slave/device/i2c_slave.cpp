@@ -18,9 +18,8 @@
 // platform (espressif32@6.12.0 = IDF 4.4) does not ship. Built framework=espidf,
 // like the raw-LL bench firmware whose recipe this backend distilled.
 //
-// Pair with a verification MASTER: a companion ESP-IDF I2C master (kept as a
-// bench firmware in the project's private experiments tree, not published)
-// flashed onto a Core2 (classic ESP32, SDA=32/SCL=33). The master sweeps the
+// Pair with a public verification master under this fixture, flashed onto a
+// Core2 (classic ESP32, SDA=32/SCL=33). The master sweeps the
 // register file in three modes -- WTR (write-then-read, repeated-START, one
 // transaction), SPLIT (register write, STOP, then a separate read) and WTEST
 // (multi-byte write then read-back) -- at 100/400/800 kHz, n=1..64, and prints
@@ -43,15 +42,6 @@
 
 #include <esp_log.h>
 
-#if defined(M5HAL_TEST_SLAVE_REINIT_DEEP)
-#include <soc/soc_caps.h>
-#if !defined(SOC_RCC_IS_INDEPENDENT) || !SOC_RCC_IS_INDEPENDENT
-#error \
-    "M5HAL_TEST_SLAVE_REINIT_DEEP is an RCC-independent-SoC-only diag knob (C6/H2); RCC-shared SoCs need PERIPH_RCC_ATOMIC(), which this knob does not implement"
-#endif
-#include <hal/i2c_ll.h>
-#endif
-
 namespace m5hal = m5::hal::v2;
 
 namespace {
@@ -64,8 +54,8 @@ namespace {
 #ifndef M5HAL_HIL_I2C_PIN_SCL
 #define M5HAL_HIL_I2C_PIN_SCL 1
 #endif
-constexpr int PIN_SDA         = M5HAL_HIL_I2C_PIN_SDA;
-constexpr int PIN_SCL         = M5HAL_HIL_I2C_PIN_SCL;
+constexpr int PIN_SDA = M5HAL_HIL_I2C_PIN_SDA;
+constexpr int PIN_SCL = M5HAL_HIL_I2C_PIN_SCL;
 // Slave address defaults to 0x42 (the single-slave rigs); a multi-slave shared
 // bus gives each board its own address via build_flags
 // (e.g. -DM5HAL_HIL_I2C_SLAVE_ADDR=0x43).
@@ -73,7 +63,7 @@ constexpr int PIN_SCL         = M5HAL_HIL_I2C_PIN_SCL;
 #define M5HAL_HIL_I2C_SLAVE_ADDR 0x42
 #endif
 constexpr uint8_t SLAVE_ADDR  = M5HAL_HIL_I2C_SLAVE_ADDR;  // matches the verification master
-constexpr uint8_t COUNTER_REG = 0xFF;  // reads return a live, incrementing value
+constexpr uint8_t COUNTER_REG = 0xFF;                      // reads return a live, incrementing value
 
 m5hal::i2c::SlaveBus_espidf slave_bus;
 
@@ -125,9 +115,11 @@ extern "C" void app_main(void)
     initRegFile();
 
     m5hal::i2c::SlaveBusConfig cfg;
-    cfg.pin_sda = PIN_SDA;
-    cfg.pin_scl = PIN_SCL;
-    cfg.address = SLAVE_ADDR;
+    // This register-map fixture still uses the legacy wire-frame-window API.
+    cfg.legacy_wire_frame_window = true;
+    cfg.pin_sda                  = PIN_SDA;
+    cfg.pin_scl                  = PIN_SCL;
+    cfg.address                  = SLAVE_ADDR;
 // stretch = hold the master while the accessor composes the reply. Chips
 // without stretch-cause support (classic ESP32) reject TxUnderrun::Stretch at
 // init(), so those fall back to Fill. On those chips the accessor binds its
@@ -187,50 +179,21 @@ extern "C" void app_main(void)
 #endif
 #if defined(M5HAL_TEST_SLAVE_REINIT_AT_MS)
         // Diag knob (opt-in): once uptime crosses M5HAL_TEST_SLAVE_REINIT_AT_MS,
-        // release() + init() the slave bus exactly once, without touching
-        // reg_file / read_counter / acc. This isolates whether a SW-only
-        // reinit of the M5HAL slave backend, on its own, clears a wedged H2
-        // (i.e. does the wedge live in backend/driver state that release()+
-        // init() resets, or does it survive a SW reinit and need a HW reset).
+        // close() + init() the slave bus exactly once, without touching
+        // reg_file / read_counter / acc. close() includes the backend's
+        // symmetric controller/bus clock teardown; init() re-enables and
+        // resets the peripheral.
         // Never define this for ordinary acceptance runs.
         if (!reinit_done && m5hal::runtime::millis() > M5HAL_TEST_SLAVE_REINIT_AT_MS) {
             reinit_done = true;
             ESP_LOGI("i2c_slave", "diag reinit: begin (t=%lu ms)",
                      static_cast<unsigned long>(m5hal::runtime::millis()));
-            auto release_result = slave_bus.release();
-            if (release_result.has_value()) {
-                ESP_LOGI("i2c_slave", "diag reinit: release() ok");
+            auto close_result = slave_bus.close();
+            if (close_result.has_value()) {
+                ESP_LOGI("i2c_slave", "diag reinit: close() ok");
             } else {
-                ESP_LOGE("i2c_slave", "diag reinit: release() failed (err=%d)",
-                         static_cast<int>(release_result.error()));
+                ESP_LOGE("i2c_slave", "diag reinit: close() failed (err=%d)", static_cast<int>(close_result.error()));
             }
-#if defined(M5HAL_TEST_SLAVE_REINIT_DEEP)
-            // Diag knob (opt-in, requires M5HAL_TEST_SLAVE_REINIT_AT_MS): between
-            // release() and init(), cycle the I2C peripheral's clock gates --
-            // controller clock off, then bus clock off -- before letting init()
-            // turn both back on (init() itself does bus-clock-on + reset_register
-            // + controller-clock-on, see slave.inl). This isolates whether a
-            // wedge that survives a plain SW reinit (release()+init() alone,
-            // i.e. reset_register without a clock-gate cycle) is actually
-            // cleared once the clock domain itself is dropped and re-raised --
-            // i.e. does the wedged state live in clock-gated retained register
-            // state that reset_register alone does not touch.
-            {
-                ::i2c_dev_t* hw = I2C_LL_GET_HW(I2C_NUM_0);
-                // No `::` prefix on the i2c_ll_* calls below: on some SoCs these
-                // are function-like macros, and prefixing a macro expansion with
-                // `::` breaks (same caveat as slave.inl's init()).
-                i2c_ll_enable_controller_clock(hw, false);
-                // Bus clock off must come after the controller clock off: once
-                // the bus clock is gated, the peripheral's registers (including
-                // the controller clock enable bit itself) are no longer
-                // accessible, so gating it first would leave the controller
-                // clock call moot.
-                i2c_ll_enable_bus_clock(I2C_NUM_0, false);
-                m5hal::runtime::delayMs(10);
-                ESP_LOGI("i2c_slave", "diag reinit: deep clock-gate cycle done");
-            }
-#endif
             auto reinit_result = slave_bus.init(cfg);
             if (reinit_result.has_value()) {
                 ESP_LOGI("i2c_slave", "diag reinit: init() ok");

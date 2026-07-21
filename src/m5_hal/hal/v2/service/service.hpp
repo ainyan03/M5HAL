@@ -36,7 +36,7 @@
 // foreign cycle counters. Measured on dual-core ESP32 against a
 // SAME-pinned runner: software bit-bang reads show no regression, and
 // a consumer that busy-polls transferBusy() from the runner's core no
-// longer starves the transfer until endTransaction(). Pin with a core
+// longer starves the transfer until its completion wait. Pin with a core
 // id (or types::TASK_CORE_SAME) when the runner must share the
 // consumer's clock domain, e.g. under M5HAL_CONFIG_SERVICE_ASSUME_PINNED.
 #ifndef M5HAL_CONFIG_SERVICE_AUTORUN_CORE
@@ -279,7 +279,20 @@ M5HAL_INLINE_V2 namespace v2
         ServiceRunner(const ServiceRunner&)            = delete;
         ServiceRunner& operator=(const ServiceRunner&) = delete;
 
-        bool add(IService& service);
+        // Register a polling target. Success means the service was actually
+        // admitted to the table (not merely queued). While auto-run owns the
+        // table, add() waits for the runner task to apply the request so a
+        // duplicate and a full table remain exact errors in every mode.
+        // Duplicate -> INVALID_STATE; table capacity exhaustion ->
+        // OUT_OF_RESOURCE. Active external add() calls remain serialized by
+        // the control mutex while awaiting acknowledgment, so pending-add
+        // capacity is an implementation invariant, not a public failure mode.
+        // On embedded targets the first add also starts the
+        // auto-run task; a start failure is returned exactly and this add is
+        // rolled back. Because active add() waits for the runner, callers must
+        // not hold a lock that any currently registered serviceImpl() may
+        // need; doing so can prevent the runner from reaching the next flush.
+        [[nodiscard]] result_t<void> add(IService& service);
 
         // remove() is SYNCHRONOUS: once it returns, the removed service's
         // serviceImpl() is guaranteed not to be called again, so the caller
@@ -294,39 +307,39 @@ M5HAL_INLINE_V2 namespace v2
         //    the in-flight poll before the removal is observed -> deadlock).
         //  - Concurrent add() and remove() of the SAME service from different
         //    threads is undefined.
-        //  - Never wait (directly or via another task) for remove()/clear()
-        //    to complete from inside a serviceImpl() -> circular wait.
-        bool remove(IService& service);
+        //  - remove(absent) is an idempotent success: its synchronous
+        //    postcondition already holds.
+        [[nodiscard]] result_t<void> remove(IService& service);
 
         // clear() is SYNCHRONOUS like remove(): if auto-run is active it
         // stops (joins) the runner task, drains pending, and empties the
         // table; the runner stays stopped and the next add() restarts it.
-        // The remove() contract above applies to clear() as well. Not
-        // supported from inside a serviceImpl() (it would join its own task).
-        void clear();
+        // The remove() contract above applies to clear() as well. From inside
+        // serviceImpl() it returns INVALID_STATE without changing
+        // pending/table/clock state (joining the current writer would deadlock).
+        [[nodiscard]] result_t<void> clear();
 
         // Concurrent runOnce callers are serialized through the control
         // mutex with a TRY-lock: a contender -- or any caller while auto-run
-        // owns the table -- returns false without polling. Do not call
-        // runOnce from inside a service() poll (it try-locks the same mutex
-        // and returns false).
+        // owns the table -- returns BUSY without polling. A successful result
+        // carries whether the pass made Progress/Done. Calling from inside a
+        // service poll also returns BUSY before attempting a recursive lock.
         // Services may add/remove (including themselves) during the pass;
         // remove() compensates the cursor, and a service added mid-pass is
         // polled in the same pass (it lands on the not-yet-visited tail).
         static ServicePoll run(IService& service, const ServiceContext& ctx);
 
         // Explicit-context pass (tests / simulation): ctx.elapsed advances
-        // the runner's virtual timeline; the default-clock stream is not
-        // touched. Do not interleave with default-clock driving (runOnce()
-        // or auto-run) on the same runner: the first default-clock pass
-        // after mixing gap-drops (elapsed = 0) and time continues on the
-        // real clock — state does not corrupt, but timing guarantees are
-        // void.
-        bool runOnce(const ServiceContext& ctx);
+        // the runner's virtual timeline and invalidates the default-clock
+        // stream, so the next default-clock pass gap-drops (elapsed = 0).
+        // Do not interleave with default-clock driving (runOnce() or auto-run)
+        // on the same runner: state does not corrupt, but timing guarantees
+        // after mixing are void.
+        result_t<bool> runOnce(const ServiceContext& ctx);
 
         // Default-clock pass: measures elapsed on the runner's own
         // (prev, domain) stream with fastTick()/fastTickDomain().
-        bool runOnce();
+        result_t<bool> runOnce();
 
         // Approximate: reads the table count with relaxed ordering and does
         // not reflect additions/removals still queued in the pending slots
@@ -335,14 +348,25 @@ M5HAL_INLINE_V2 namespace v2
         size_t size() const;
         size_t capacity() const;
 
-        bool startAutoRun();
+        // Already-running/already-stopped calls are idempotent successes.
+        // start propagates runtime::Task's exact error. start from a manual
+        // service callback and stop from any service callback return
+        // INVALID_STATE without changing runner state.
+        result_t<void> startAutoRun();
 
-        void stopAutoRun();
+        result_t<void> stopAutoRun();
 
         bool autoRunActive() const;
 
     private:
-        static constexpr size_t kMaxPending = 4;
+        static constexpr size_t kMaxPendingRemoves = 4;
+
+        enum class PendingAddOutcome : uint8_t {
+            Pending,
+            Success,
+            InvalidState,
+            OutOfResource,
+        };
 
         // Idle-wait backstop for the auto-run task. The runner normally
         // wakes through _wake (notified by add/remove/stop); this timeout
@@ -355,7 +379,7 @@ M5HAL_INLINE_V2 namespace v2
 
         size_t findInTable(const IService* service) const;
 
-        void applyAdd(IService* service);
+        result_t<void> applyAdd(IService* service);
 
         void applyRemove(IService* service);
 
@@ -375,7 +399,7 @@ M5HAL_INLINE_V2 namespace v2
         // the mutex is non-recursive, so the start/stop bodies cannot re-take
         // it. The public startAutoRun()/stopAutoRun() take _control and defer
         // here.
-        bool startAutoRunLocked();
+        result_t<void> startAutoRunLocked();
         void stopAutoRunLocked();
 
         // True when the calling thread is the one currently authoritative for
@@ -385,6 +409,12 @@ M5HAL_INLINE_V2 namespace v2
         // _control: a control thread may hold it while joining that very task
         // (clear/stopAutoRun), and a self-wait would deadlock.
         bool isCurrentWriter() const;
+
+        result_t<void> unlockControl();
+        bool controlBroken() const
+        {
+            return _control_broken.load(std::memory_order_acquire);
+        }
 
         // CAS a queued add of `service` back out of the pending-add slots.
         // Removing a service must also cancel a still-unconsumed add of it so
@@ -417,8 +447,15 @@ M5HAL_INLINE_V2 namespace v2
         std::atomic<size_t> _count{0};
         size_t _iter_index = kMaxServices;
         std::atomic<bool> _has_pending{false};
-        std::atomic<IService*> _pending_add[kMaxPending]    = {};
-        std::atomic<IService*> _pending_remove[kMaxPending] = {};
+        // External add() retains _control through acknowledgment, hence only
+        // one pending add can exist. The mutex prevents a new caller from
+        // reusing the outcome after the runner clears the pointer but before
+        // the current caller observes that outcome.
+        std::atomic<IService*> _pending_add{nullptr};
+        std::atomic<PendingAddOutcome> _pending_add_outcome{PendingAddOutcome::Pending};
+        // remove() releases _control before waiting, so independent callers
+        // may occupy several removal slots concurrently.
+        std::atomic<IService*> _pending_remove[kMaxPendingRemoves] = {};
         runtime::Task _auto_task;
         std::atomic<bool> _auto_stop{false};
         std::atomic<bool> _auto_running{false};
@@ -433,9 +470,17 @@ M5HAL_INLINE_V2 namespace v2
         // (missed-notification telemetry, reported through M5HAL_DIAG).
         // Written only by the runner task.
         uint32_t _idle_wake_timeouts = 0;
+        // Counts non-timeout Event backend failures across the startup barrier
+        // and idle loop. The runner backs off and retries instead of silently
+        // treating them as timeout or exiting while _auto_running remains
+        // published.
+        uint32_t _wake_errors = 0;
         // Serializes the control plane (add/remove/clear/start/stop/runOnce);
         // the poll hot path (runOnceInternal / serviceImpl) never takes it.
         runtime::Mutex _control;
+        // Set without taking _control when its unlock reports failure. Once
+        // set, no public command may treat the table as safely reusable.
+        std::atomic<bool> _control_broken{false};
         // Identity of the thread currently running runOnceInternal (the table
         // owner), or null between passes. Written only by that thread; read by
         // control threads for the self-call check. See isCurrentWriter().

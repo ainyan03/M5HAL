@@ -15,15 +15,56 @@
 
 #include <time.h>
 
+#if defined(M5HAL_TEST_POSIX_MUTEX_FAULTS) || defined(M5HAL_TEST_POSIX_EVENT_FAULTS)
+#include <atomic>
+#endif
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <new>
+#include <system_error>
 #include <thread>
 
+#include "../../../../../hal/v2/error.hpp"
+#include "../../../detail/thread_create_error.hpp"
+
 namespace m5::variants::frameworks::posix::hal::v2::runtime {
+
+#if defined(M5HAL_TEST_POSIX_MUTEX_FAULTS) && defined(__cpp_exceptions)
+namespace detail {
+inline std::atomic<bool> mutex_lock_system_error_once{false};
+inline std::atomic<bool> mutex_unlock_error_once{false};
+
+inline void failNextMutexLockWithSystemError(void)
+{
+    mutex_lock_system_error_once.store(true, std::memory_order_release);
+}
+
+inline void failNextMutexUnlockWithIoError(void)
+{
+    mutex_unlock_error_once.store(true, std::memory_order_release);
+}
+}  // namespace detail
+#endif
+
+#if defined(M5HAL_TEST_POSIX_EVENT_FAULTS) && defined(__cpp_exceptions)
+namespace detail {
+inline std::atomic<bool> event_wait_system_error_once{false};
+
+inline void failNextEventWaitWithSystemError(void)
+{
+    event_wait_system_error_once.store(true, std::memory_order_release);
+}
+
+inline bool eventWaitSystemErrorPending(void)
+{
+    return event_wait_system_error_once.load(std::memory_order_acquire);
+}
+}  // namespace detail
+#endif
 
 inline uint32_t millis(void)
 {
@@ -75,12 +116,9 @@ inline void* currentTaskId(void)
   @brief std::timed_mutex satisfying the runtime::Mutex contract.
 
   `lock(types::TIMEOUT_FOREVER)` switches to a plain blocking lock().
-  Non-recursive: a re-lock from the holding thread waits until the
-  timeout and fails (with TIMEOUT_FOREVER it deadlocks). The C++
-  standard leaves an owner's try_lock(_for) undefined, but both
-  deployed implementations resolve it as a plain timeout (libstdc++
-  via pthread_mutex_timedlock on a NORMAL mutex, libc++ via its own
-  mutex + condvar), which is what the contract specifies.
+  Non-recursive: attempting to lock again from the owning thread violates
+  the runtime contract (the C++ standard makes that use of timed_mutex
+  undefined). Backend failures reported as system_error are IO_ERROR.
  */
 class Mutex {
 public:
@@ -88,20 +126,45 @@ public:
     Mutex(const Mutex&)            = delete;
     Mutex& operator=(const Mutex&) = delete;
 
-    bool lock(uint32_t timeout_ms)
+    ::m5::hal::v2::result_t<void> lock(uint32_t timeout_ms)
     {
-        if (timeout_ms == 0) {
-            return _mutex.try_lock();
+#if defined(__cpp_exceptions)
+        try {
+#if defined(M5HAL_TEST_POSIX_MUTEX_FAULTS)
+            if (detail::mutex_lock_system_error_once.exchange(false, std::memory_order_acq_rel)) {
+                throw std::system_error{std::make_error_code(std::errc::io_error)};
+            }
+#endif
+#endif
+            if (timeout_ms == 0) {
+                if (!_mutex.try_lock()) {
+                    return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+                }
+                return {};
+            }
+            if (timeout_ms == 0xFFFFFFFFu) {  // types::TIMEOUT_FOREVER
+                _mutex.lock();
+                return {};
+            }
+            if (!_mutex.try_lock_for(std::chrono::milliseconds{timeout_ms})) {
+                return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+            }
+            return {};
+#if defined(__cpp_exceptions)
+        } catch (const std::system_error&) {
+            return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::IO_ERROR);
         }
-        if (timeout_ms == 0xFFFFFFFFu) {  // types::TIMEOUT_FOREVER
-            _mutex.lock();
-            return true;
-        }
-        return _mutex.try_lock_for(std::chrono::milliseconds{timeout_ms});
+#endif
     }
-    void unlock(void)
+    ::m5::hal::v2::result_t<void> unlock(void)
     {
         _mutex.unlock();
+#if defined(M5HAL_TEST_POSIX_MUTEX_FAULTS) && defined(__cpp_exceptions)
+        if (detail::mutex_unlock_error_once.exchange(false, std::memory_order_acq_rel)) {
+            return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::IO_ERROR);
+        }
+#endif
+        return {};
     }
 
 private:
@@ -127,26 +190,39 @@ public:
     Event(const Event&)            = delete;
     Event& operator=(const Event&) = delete;
 
-    bool wait(uint32_t timeout_ms)
+    ::m5::hal::v2::result_t<void> wait(uint32_t timeout_ms)
     {
-        std::unique_lock<std::mutex> lock{_mutex};
-        if (timeout_ms == 0) {  // non-blocking check
-            if (!_signaled) {
-                return false;
+#if defined(__cpp_exceptions)
+        try {
+#if defined(M5HAL_TEST_POSIX_EVENT_FAULTS)
+            if (detail::event_wait_system_error_once.exchange(false, std::memory_order_acq_rel)) {
+                throw std::system_error{std::make_error_code(std::errc::io_error)};
+            }
+#endif
+#endif
+            std::unique_lock<std::mutex> lock{_mutex};
+            if (timeout_ms == 0) {  // non-blocking check
+                if (!_signaled) {
+                    return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+                }
+                _signaled = false;
+                return {};
+            }
+            if (timeout_ms == 0xFFFFFFFFu) {  // types::TIMEOUT_FOREVER
+                _cv.wait(lock, [this] { return _signaled; });
+                _signaled = false;
+                return {};
+            }
+            if (!_cv.wait_for(lock, std::chrono::milliseconds{timeout_ms}, [this] { return _signaled; })) {
+                return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::TIMEOUT_ERROR);
             }
             _signaled = false;
-            return true;
+            return {};
+#if defined(__cpp_exceptions)
+        } catch (const std::system_error&) {
+            return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::IO_ERROR);
         }
-        if (timeout_ms == 0xFFFFFFFFu) {  // types::TIMEOUT_FOREVER
-            _cv.wait(lock, [this] { return _signaled; });
-            _signaled = false;
-            return true;
-        }
-        if (!_cv.wait_for(lock, std::chrono::milliseconds{timeout_ms}, [this] { return _signaled; })) {
-            return false;
-        }
-        _signaled = false;
-        return true;
+#endif
     }
     void notify(void)
     {
@@ -181,18 +257,33 @@ public:
     Task(const Task&)            = delete;
     Task& operator=(const Task&) = delete;
 
-    bool start(entry_fn_t fn, void* arg, const char* name = nullptr, size_t stack_size = 4096, int priority = 1,
-               int core = -1 /* types::TASK_CORE_ANY; placement ignored by this backend */)
+    ::m5::hal::v2::result_t<void> start(entry_fn_t fn, void* arg, const char* name = nullptr, size_t stack_size = 4096,
+                                        int priority = 1,
+                                        int core     = -1 /* types::TASK_CORE_ANY; placement ignored by this backend */)
     {
         (void)name;
         (void)stack_size;
         (void)priority;
         (void)core;
-        if (joinable() || fn == nullptr) {
-            return false;
+        if (fn == nullptr) {
+            return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::INVALID_ARGUMENT);
         }
-        _thread = std::thread{fn, arg};
-        return true;
+        if (joinable()) {
+            return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::INVALID_STATE);
+        }
+#if !defined(__cpp_exceptions)
+        (void)arg;
+        return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::UNSUPPORTED);
+#else
+        try {
+            _thread = std::thread{fn, arg};
+        } catch (const std::bad_alloc&) {
+            return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::OUT_OF_RESOURCE);
+        } catch (const std::system_error& e) {
+            return ::m5::stl::make_unexpected(::m5::variants::frameworks::detail::mapThreadCreateError(e.code()));
+        }
+#endif
+        return {};
     }
 
     void join(void)

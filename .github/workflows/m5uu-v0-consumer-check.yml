@@ -1,0 +1,59 @@
+name: M5UnitUnified v0 Consumer Check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout M5HAL
+        uses: actions/checkout@v6
+        with:
+          path: M5HAL
+
+      - name: Read consumer pins
+        id: pins
+        working-directory: M5HAL
+        run: |
+          source test/pio_m5uu_v0_consumer/pins.env
+          echo "m5utility=$M5UTILITY_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "m5unitunified=$M5UNITUNIFIED_COMMIT" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout pinned M5Utility
+        uses: actions/checkout@v6
+        with:
+          repository: m5stack/M5Utility
+          ref: ${{ steps.pins.outputs.m5utility }}
+          path: M5Utility
+
+      - name: Checkout pinned M5UnitUnified
+        uses: actions/checkout@v6
+        with:
+          repository: m5stack/M5UnitUnified
+          ref: ${{ steps.pins.outputs.m5unitunified }}
+          path: M5UnitUnified
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v5
+        continue-on-error: true
+        with:
+          path: ~/.platformio
+          key: ${{ runner.os }}-m5uu-v0-${{ hashFiles('M5HAL/test/pio_m5uu_v0_consumer/**') }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Install PlatformIO
+        run: pip3 install platformio==6.1.19
+
+      - name: Build pinned M5UnitUnified against M5HAL v0
+        working-directory: M5HAL
+        run: bash test/pio_m5uu_v0_consumer/check.sh

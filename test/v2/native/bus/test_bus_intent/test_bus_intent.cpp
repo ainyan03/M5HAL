@@ -21,55 +21,6 @@
 // software-I2C tests, so the fakes here perform no I/O and keep the resolver
 // test independent of GPIO pin resolution.
 
-// Test-local config + backend for the TYPED acquire<CfgT> path (an explicit
-// backend choice). The BackendFor specialization lets `BusView::acquire(cfg)`
-// build it through `Bus::init<CfgT>`; such a bus is NOT intent-managed, so
-// commitBuses() must leave it on this backend.
-namespace m5::hal::v2::i2c {
-struct TypedFakeConfig : public IBusConfig {
-    using IBusConfig::IBusConfig;
-};
-class TypedFakeBackend : public IBus {
-public:
-    m5::hal::v2::result_t<void> init(const TypedFakeConfig& cfg)
-    {
-        _config = cfg;
-        return {};
-    }
-    // backendKind() keeps the base default (Software).
-};
-template <>
-struct BackendFor<TypedFakeConfig> {
-    using type = TypedFakeBackend;
-};
-
-// Typed (unmanaged) HARDWARE backend pinned to controller 0: commitBuses()
-// must reserve its controller so a managed bus is not assigned the same one.
-struct TypedFakeHwConfig : public IBusConfig {
-    using IBusConfig::IBusConfig;
-};
-class TypedFakeHwBackend : public IBus {
-public:
-    m5::hal::v2::result_t<void> init(const TypedFakeHwConfig& cfg)
-    {
-        _config = cfg;
-        return {};
-    }
-    m5::hal::v2::types::backend_kind_t backendKind(void) const override
-    {
-        return m5::hal::v2::types::backend_kind_t::Hardware;
-    }
-    int8_t controllerId(void) const override
-    {
-        return 0;
-    }
-};
-template <>
-struct BackendFor<TypedFakeHwConfig> {
-    using type = TypedFakeHwBackend;
-};
-}  // namespace m5::hal::v2::i2c
-
 namespace {
 namespace v2 = m5::hal::v2;
 
@@ -102,11 +53,13 @@ private:
 // Factories injected into the test BusView. The hardware factory plays the role
 // espidf fills in a real build; the software factory plays the always-present
 // bit-bang fallback. Neither touches GPIO (this test is about allocation).
-v2::i2c::IBus* fakeSwFactory(const v2::i2c::LogicalBusConfig& /*logical*/)
+v2::i2c::IBus* fakeSwFactory(const v2::bus::LocalResourceContext& /*resources*/,
+                             const v2::i2c::LogicalBusConfig& /*logical*/)
 {
     return new (std::nothrow) FakeBackend(v2::types::backend_kind_t::Software, -1);
 }
-v2::i2c::IBus* fakeHwFactory(const v2::i2c::LogicalBusConfig& /*logical*/, int8_t controller)
+v2::i2c::IBus* fakeHwFactory(const v2::bus::LocalResourceContext& /*resources*/,
+                             const v2::i2c::LogicalBusConfig& /*logical*/, int8_t controller)
 {
     return new (std::nothrow) FakeBackend(v2::types::backend_kind_t::Hardware, controller);
 }
@@ -145,22 +98,6 @@ struct I2cIntentHarness {
     }
 };
 
-v2::i2c::TypedFakeConfig makeTypedFakeConfig(void)
-{
-    v2::i2c::TypedFakeConfig typed;
-    typed.pin_scl = 33;
-    typed.pin_sda = 32;
-    return typed;
-}
-
-v2::i2c::TypedFakeHwConfig makeTypedFakeHwConfig(void)
-{
-    v2::i2c::TypedFakeHwConfig pinned_cfg;
-    pinned_cfg.pin_scl = 10;
-    pinned_cfg.pin_sda = 11;
-    return pinned_cfg;
-}
-
 }  // namespace
 
 TEST(I2cBusIntent, ThreeBusAllocationThenHatPromotion)
@@ -186,18 +123,6 @@ TEST(I2cBusIntent, RequireControllerClaimsSpecificController)
 {
     I2cIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
     v2::test::bus_contract::expectRequireControllerClaimsSpecificController(h.view, &reqByIndex);
-}
-
-TEST(I2cBusIntent, TypedAcquireIsNotManagedByCommit)
-{
-    I2cIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
-    v2::test::bus_contract::expectTypedAcquireIsNotManagedByCommit(h.view, &reqByIndex, &makeTypedFakeConfig);
-}
-
-TEST(I2cBusIntent, TypedReacquireThroughLogicalBecomesManaged)
-{
-    I2cIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
-    v2::test::bus_contract::expectTypedReacquireThroughLogicalBecomesManaged(h.view, &reqByIndex, &makeTypedFakeConfig);
 }
 
 TEST(I2cBusIntent, ConcurrentLogicalRetagAndCommitAreSerialized)
@@ -272,7 +197,8 @@ bool blockSnapshotEligibility(const v2::i2c::LogicalBusConfig& /*logical*/, int8
     return true;
 }
 
-v2::i2c::IBus* captureSnapshotHwFactory(const v2::i2c::LogicalBusConfig& logical, int8_t controller)
+v2::i2c::IBus* captureSnapshotHwFactory(const v2::bus::LocalResourceContext& /*resources*/,
+                                        const v2::i2c::LogicalBusConfig& logical, int8_t controller)
 {
     g_snapshot_overlap->factory_forbid.store(logical.intent.forbid, std::memory_order_relaxed);
     return new (std::nothrow) FakeBackend(v2::types::backend_kind_t::Hardware, controller);
@@ -317,13 +243,6 @@ TEST(I2cBusIntent, RetagAfterSnapshotDoesNotChangeInFlightCommit)
     ASSERT_TRUE(committed.has_value()) << "err=" << v2::error::toString(committed.error());
     EXPECT_EQ(bus.value()->backendKind(), kSw);
     g_snapshot_overlap = nullptr;
-}
-
-TEST(I2cBusIntent, UnmanagedHardwareBusReservesItsController)
-{
-    I2cIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
-    v2::test::bus_contract::expectUnmanagedHardwareBusReservesItsController(h.view, &reqByIndex,
-                                                                            &makeTypedFakeHwConfig);
 }
 
 // --- New capability-model behaviours (Phase A) -------------------------------
@@ -515,6 +434,24 @@ public:
     explicit FakeManagedBus(v2::types::AllocationIntent intent, int wiring = 0) : _intent{intent}, _wiring{wiring}
     {
     }
+    ~FakeManagedBus() override
+    {
+        if (_registry != nullptr && _registry->beginAbandon(_token, _key, this)) {
+            _registry->finishAbandon(_token, _key, this, true);
+        }
+    }
+    bool bindRegistryRegistration(v2::bus::BusRegistry& registry, const v2::bus::ResourceKey& key, uint16_t slot,
+                                  uint32_t generation) override
+    {
+        _registry = &registry;
+        _key      = key;
+        _token    = {slot, 0, generation};
+        return _token.valid();
+    }
+    const v2::bus::ResourceKey* registryResourceKey(void) const override
+    {
+        return &_key;
+    }
     int wiring(void) const
     {
         return _wiring;
@@ -578,6 +515,9 @@ private:
     int8_t _controller                       = -1;
     uint32_t _generation                     = 0;
     bool _fail_next_swap_backend_after_apply = false;
+    v2::bus::BusRegistry* _registry          = nullptr;
+    v2::bus::ResourceKey _key;
+    v2::bus::RegistryEntryToken _token;
 };
 
 // A kind with NO software placeholder and NON-equivalent controllers: only
@@ -603,33 +543,23 @@ public:
     {
         return static_cast<FakeManagedBus&>(bus);
     }
-    v2::bus::IBus* makePlaceholder(v2::bus::IManagedBus&, const v2::types::AllocationIntent&) const override
-    {
-        return nullptr;  // software-less: a demoted bus becomes pending
-    }
-    v2::bus::IBus* makeHardware(v2::bus::IManagedBus&, const v2::types::AllocationIntent&,
-                                int8_t controller) const override
-    {
-        return new (std::nothrow) FakeCoreHwBackend(controller);
-    }
     // Fake commit*: this stub has no real facade lock, so it just builds + swaps
     // (the production AllocationKind builds under the lock via swapBackendWith).
     // The fake bus's swapBackend/swapPending still record the result, so the
     // allocation-logic assertions (and failNextSwapBackendAfterApply) are intact.
-    v2::result_t<void> commitPlaceholder(v2::bus::IManagedBus& mb, const v2::types::AllocationIntent& intent,
+    v2::result_t<void> commitPlaceholder(v2::bus::IManagedBus& mb, const v2::types::AllocationIntent&,
                                          uint32_t timeout_ms) const override
     {
-        v2::bus::IBus* raw = makePlaceholder(mb, intent);
-        return raw ? mb.swapBackend(std::unique_ptr<v2::bus::IBus>(raw), timeout_ms) : mb.swapPending(timeout_ms);
+        return mb.swapPending(timeout_ms);
     }
-    v2::result_t<void> commitHardware(v2::bus::IManagedBus& mb, const v2::types::AllocationIntent& intent,
-                                      int8_t controller, uint32_t timeout_ms) const override
+    v2::result_t<void> commitHardware(v2::bus::IManagedBus& mb, const v2::types::AllocationIntent&, int8_t controller,
+                                      uint32_t timeout_ms) const override
     {
-        v2::bus::IBus* raw = makeHardware(mb, intent, controller);
-        if (raw == nullptr) {
+        std::unique_ptr<v2::bus::IBus> backend{new (std::nothrow) FakeCoreHwBackend(controller)};
+        if (!backend) {
             return m5::stl::make_unexpected(v2::error::error_t::OUT_OF_RESOURCE);
         }
-        return mb.swapBackend(std::unique_ptr<v2::bus::IBus>(raw), timeout_ms);
+        return mb.swapBackend(std::move(backend), timeout_ms);
     }
     bool uniformControllers(void) const override
     {
@@ -647,14 +577,12 @@ private:
 FakeManagedBus* internFake(v2::bus::BusRegistry& reg, std::shared_ptr<v2::bus::IBus>& hold,
                            v2::types::gpio_number_t pin, v2::types::AllocationIntent intent, int wiring = 0)
 {
-    v2::bus::IdentityKey id;
-    id.pins[0] = pin;
-    id.pins[1] = static_cast<v2::types::gpio_number_t>(pin + 100);
-    auto r     = reg.acquireOrFind(
-        v2::types::bus_kind_t::I2S, id, [&intent, wiring]() -> v2::result_t<std::shared_ptr<v2::bus::IBus>> {
-            return std::shared_ptr<v2::bus::IBus>(new (std::nothrow) FakeManagedBus(intent, wiring));
-        });
-    hold = r.value();
+    auto id = v2::bus::ResourceKey::fromPins(v2::types::bus_kind_t::I2S,
+                                             {pin, static_cast<v2::types::gpio_number_t>(pin + 100)});
+    auto r  = reg.acquireOrFind(id, [&intent, wiring]() -> v2::result_t<std::shared_ptr<v2::bus::IBus>> {
+        return std::shared_ptr<v2::bus::IBus>(new (std::nothrow) FakeManagedBus(intent, wiring));
+    });
+    hold    = r.value();
     return static_cast<FakeManagedBus*>(hold.get());
 }
 
@@ -783,29 +711,19 @@ public:
     {
         return static_cast<FakeManagedBus&>(bus);
     }
-    v2::bus::IBus* makePlaceholder(v2::bus::IManagedBus&, const v2::types::AllocationIntent&) const override
-    {
-        return nullptr;  // software-less: a demoted bus becomes pending
-    }
-    v2::bus::IBus* makeHardware(v2::bus::IManagedBus&, const v2::types::AllocationIntent&,
-                                int8_t controller) const override
-    {
-        return new (std::nothrow) FakeCoreHwBackend(controller);
-    }
-    v2::result_t<void> commitPlaceholder(v2::bus::IManagedBus& mb, const v2::types::AllocationIntent& intent,
+    v2::result_t<void> commitPlaceholder(v2::bus::IManagedBus& mb, const v2::types::AllocationIntent&,
                                          uint32_t timeout_ms) const override
     {
-        v2::bus::IBus* raw = makePlaceholder(mb, intent);
-        return raw ? mb.swapBackend(std::unique_ptr<v2::bus::IBus>(raw), timeout_ms) : mb.swapPending(timeout_ms);
+        return mb.swapPending(timeout_ms);
     }
-    v2::result_t<void> commitHardware(v2::bus::IManagedBus& mb, const v2::types::AllocationIntent& intent,
-                                      int8_t controller, uint32_t timeout_ms) const override
+    v2::result_t<void> commitHardware(v2::bus::IManagedBus& mb, const v2::types::AllocationIntent&, int8_t controller,
+                                      uint32_t timeout_ms) const override
     {
-        v2::bus::IBus* raw = makeHardware(mb, intent, controller);
-        if (raw == nullptr) {
+        std::unique_ptr<v2::bus::IBus> backend{new (std::nothrow) FakeCoreHwBackend(controller)};
+        if (!backend) {
             return m5::stl::make_unexpected(v2::error::error_t::OUT_OF_RESOURCE);
         }
-        return mb.swapBackend(std::unique_ptr<v2::bus::IBus>(raw), timeout_ms);
+        return mb.swapBackend(std::move(backend), timeout_ms);
     }
     bool uniformControllers(void) const override
     {
@@ -1007,7 +925,7 @@ TEST(AllocationCoreSeam, PinDomainRequireControllerRejectsWrongWiring)
 
     // requireCtrl(2) is tier 0 (named controller, no fallback): caps pass
     // (controller 2 offers LOW_POWER and is named, so the opt-in bypass
-    // applies), but the wiring does not match the fixed pin domain -- D8
+    // applies), but the wiring does not match the fixed pin domain -- this
     // says this is a configuration error (INVALID_ARGUMENT), not a resource
     // shortage (OUT_OF_RESOURCE).
     std::shared_ptr<v2::bus::IBus> hold;
@@ -1091,7 +1009,7 @@ constexpr v2::types::gpio_number_t kLpFixedSda = 8;
 v2::result_t<void> fakeCompleteLogicalFixedPin(v2::i2c::LogicalBusConfig& cfg)
 {
     if ((cfg.intent.require & v2::i2c::caps::LOW_POWER) == 0) {
-        // Only requireLowPower() triggers auto-fill (D4): preferLowPower()
+        // Only requireLowPower() triggers auto-fill: preferLowPower()
         // may still fall back to HP at commit time, after this identity is
         // already fixed.
         return {};
@@ -1213,7 +1131,7 @@ TEST(I2cBusIntent, ClaimControllerHonorsCapabilityPreference)
     EXPECT_EQ(fallback.value(), 0);
 }
 
-// --- Backend hot-swap order + rollback (release-before-make) ----------------
+// --- Backend hot-swap order + rollback (close-before-make) ------------------
 // Exercises the REAL LocalKindAdapter<Traits>::commitPlaceholder /
 // commitHardware (managed_facade.hpp's swapBackendWith rollback overload),
 // unlike the AllocationCoreSeam fakes above (FakeSwlessKind / FakeOptInKind
@@ -1226,7 +1144,7 @@ TEST(I2cBusIntent, ClaimControllerHonorsCapabilityPreference)
 // assertion in one test can never leave a dangling pointer for the next.
 namespace {
 
-// A fake backend that records "make"/"release" events (tagged by kind and
+// A fake backend that records "make"/"close" events (tagged by kind and
 // controller) into a shared log and performs no real I/O.
 class OrderedFakeBackend : public v2::i2c::IBus {
 public:
@@ -1245,12 +1163,14 @@ public:
     {
         return _kind == v2::types::backend_kind_t::Hardware ? _controller : static_cast<int8_t>(-1);
     }
-    v2::result_t<void> release(void) override
+
+protected:
+    v2::bus::CloseOutcome closeBackend(void) override
     {
         if (_log != nullptr) {
-            _log->push_back(_tag("release"));
+            _log->push_back(_tag("close"));
         }
-        return {};
+        return v2::bus::CloseOutcome::success();
     }
 
 private:
@@ -1286,7 +1206,7 @@ struct ScopedFakeState {
     ScopedFakeState& operator=(const ScopedFakeState&) = delete;
 };
 
-v2::i2c::IBus* orderedSwFactory(const v2::i2c::LogicalBusConfig&)
+v2::i2c::IBus* orderedSwFactory(const v2::bus::LocalResourceContext& /*resources*/, const v2::i2c::LogicalBusConfig&)
 {
     if (g_state->fail_next_sw) {
         g_state->fail_next_sw = false;
@@ -1294,7 +1214,8 @@ v2::i2c::IBus* orderedSwFactory(const v2::i2c::LogicalBusConfig&)
     }
     return new (std::nothrow) OrderedFakeBackend(&g_state->log, v2::types::backend_kind_t::Software, -1);
 }
-v2::i2c::IBus* orderedHwFactory(const v2::i2c::LogicalBusConfig&, int8_t controller)
+v2::i2c::IBus* orderedHwFactory(const v2::bus::LocalResourceContext& /*resources*/, const v2::i2c::LogicalBusConfig&,
+                                int8_t controller)
 {
     if (g_state->fail_next_hw) {
         g_state->fail_next_hw = false;
@@ -1305,7 +1226,7 @@ v2::i2c::IBus* orderedHwFactory(const v2::i2c::LogicalBusConfig&, int8_t control
 
 }  // namespace
 
-TEST(I2cBusIntentSwapRollback, DemoteReleasesOldHardwareBeforeBuildingPlaceholder)
+TEST(I2cBusIntentSwapRollback, DemoteClosesOldHardwareBeforeBuildingPlaceholder)
 {
     // guard is declared before h so its dtor (clearing g_state) runs AFTER
     // h's dtor -- g_state stays valid for every backend h creates/destroys.
@@ -1333,8 +1254,8 @@ TEST(I2cBusIntentSwapRollback, DemoteReleasesOldHardwareBeforeBuildingPlaceholde
     EXPECT_EQ(a.value()->backendKind(), kSw);
 
     ASSERT_GE(guard.state.log.size(), 2u);
-    EXPECT_EQ(guard.state.log[0], "release:hw0");  // A's old hardware released FIRST
-    EXPECT_EQ(guard.state.log[1], "make:sw");      // ... then the placeholder is built
+    EXPECT_EQ(guard.state.log[0], "close:hw0");  // A's old hardware closes FIRST
+    EXPECT_EQ(guard.state.log[1], "make:sw");    // ... then the placeholder is built
 }
 
 TEST(I2cBusIntentSwapRollback, DemoteFailureRollsBackToSameHardwareController)

@@ -156,15 +156,16 @@ constexpr uint8_t pull_down  = 0b1000;
 #undef ADC
 enum class BusKind : uint8_t {
     Unknown = 0,
-    I2C,
-    SPI,
-    I2S,
-    UART,
+    I2C     = 1,
+    SPI     = 2,
+    I2S     = 3,
+    UART    = 4,
 
-    PWM,
-    GPIO,
-    ADC,
-    DAC,
+    PWM  = 5,
+    GPIO = 6,
+    ADC  = 7,
+    DAC  = 8,
+    PDM  = 9,
 };
 using bus_kind_t = BusKind;
 

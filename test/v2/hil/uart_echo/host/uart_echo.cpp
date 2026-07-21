@@ -48,10 +48,9 @@ protected:
             << "no echo from " << port << " — is the uart_echo device firmware flashed at this baud?";
     }
 
-    // Concrete POSIX backend (not the runtime facade uart::Bus): the host opens
-    // a serial port via the backend-specific open()/nativeHandle() that the
-    // facade does not expose (follow-up). The Tx/RxAccessors
-    // below still bind to it as a uart::IBus.
+    // Concrete POSIX backend (not the runtime facade uart::Bus): the host
+    // initializes a managed native path and then uses nativeHandle() for modem
+    // control. The Tx/RxAccessors below still bind to it as a uart::IBus.
     uart::Bus_posix bus_;
     uint32_t baud_ = 115200;
 };

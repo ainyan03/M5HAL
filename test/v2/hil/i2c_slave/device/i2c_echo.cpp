@@ -88,6 +88,10 @@ extern "C" void app_main(void)
     cfg.tx_fill_byte       = 0xFF;
     cfg.stretch_timeout_ms = 100;
     cfg.timeout_ms         = 1000;
+    // This fixture intentionally exercises the legacy wire-frame-window
+    // accessor. Queued beginAccess()/endAccess() lifecycle is the default for
+    // new code, so legacy wire acceptance must be an explicit opt-in.
+    cfg.legacy_wire_frame_window = true;
 
     auto init_result = slave_bus.init(cfg);
     if (!init_result.has_value()) {

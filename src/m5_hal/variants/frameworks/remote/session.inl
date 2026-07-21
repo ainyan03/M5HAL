@@ -3,6 +3,7 @@
 #define M5_HAL_VARIANTS_FRAMEWORKS_REMOTE_SESSION_INL_
 
 #include "session.hpp"
+#include "detail_helpers.hpp"
 
 #include "../../../hal/v2/remote/wire_drain.hpp"
 
@@ -20,8 +21,10 @@ RemoteSession::RemoteSession(data::MuxFrameEncoder& enc, data::MuxFrameDecoder& 
       _wire_tx{&wire_tx},
       _session_handle{std::make_shared<RemoteSessionHandle>()}
 {
-    if (_session_handle) {
+    if (_session_handle && _session_handle->valid()) {
         _session_handle->bind(*this);
+    } else {
+        _session_handle.reset();
     }
     _dec->setFrameHandler(frameHandlerThunk, this);
     _dec->setStaleDataObserver(staleDataThunk, this);
@@ -30,7 +33,7 @@ RemoteSession::RemoteSession(data::MuxFrameEncoder& enc, data::MuxFrameDecoder& 
 RemoteSession::~RemoteSession()
 {
     if (_session_handle) {
-        _session_handle->close();
+        (void)_session_handle->close();
     }
 }
 
@@ -191,22 +194,7 @@ result_t<void> RemoteSession::checkResponse()
     // A response must carry a terminal Report (ReportComplete/ReportError). An
     // empty payload or a script that never reports is a protocol violation, not
     // success — matches detail::decodeResponseStatus's contract.
-    if (resp.size == 0) {
-        return m5::stl::make_unexpected(error::error_t::PROTOCOL_ERROR);
-    }
-    bytecode::BytecodeRunner runner{memory::defaultAllocator()};
-    runner.setReceiveOnly(true);
-    auto run = runner.run(resp);
-    if (!run.has_value()) {
-        return m5::stl::make_unexpected(run.error());
-    }
-    if (!runner.statusReported()) {
-        return m5::stl::make_unexpected(error::error_t::PROTOCOL_ERROR);
-    }
-    if (error::isError(runner.reportedStatus())) {
-        return m5::stl::make_unexpected(runner.reportedStatus());
-    }
-    return {};
+    return detail::decodeResponseStatus(resp);
 }
 
 uint8_t RemoteSession::allocateStreamId()
@@ -258,7 +246,10 @@ void RemoteSession::clearAllQuarantine()
 
 result_t<void> RemoteSession::pumpWire()
 {
-    drainTx();
+    auto drained = drainTx();
+    if (!drained.has_value()) {
+        return m5::stl::make_unexpected(drained.error());
+    }
     auto decoded = _dec->pump(*_wire_rx);
     if (!decoded.has_value()) {
         return m5::stl::make_unexpected(decoded.error());
@@ -274,13 +265,16 @@ result_t<void> RemoteSession::flushTx()
     if (!encoded.has_value()) {
         return m5::stl::make_unexpected(encoded.error());
     }
-    drainTx();
+    auto drained = drainTx();
+    if (!drained.has_value()) {
+        return m5::stl::make_unexpected(drained.error());
+    }
     return {};
 }
 
-void RemoteSession::drainTx()
+result_t<remote::detail::DrainProgress> RemoteSession::drainTx()
 {
-    detail::drainToSink(_enc->output(), *_wire_tx);
+    return remote::detail::drainToSink(_enc->output(), *_wire_tx);
 }
 
 void RemoteSession::sendCreditIfChanged()

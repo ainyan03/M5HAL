@@ -73,11 +73,38 @@ M5HAL_INLINE_V2 namespace v2
 #if defined(M5HAL_V2_SELECTED_VARIANT_I2S) && !defined(M5HAL_DETAIL_VARIANT_SELECTED_I2S_)
 #error "M5HAL_V2_SELECTED_VARIANT_I2S is a read-only output and must not be predefined"
 #endif
+#if defined(M5HAL_V2_SELECTED_VARIANT_PDM) && !defined(M5HAL_DETAIL_VARIANT_SELECTED_PDM_)
+#error "M5HAL_V2_SELECTED_VARIANT_PDM is a read-only output and must not be predefined"
+#endif
 #if defined(M5HAL_V2_SELECTED_VARIANT_UART) && !defined(M5HAL_DETAIL_VARIANT_SELECTED_UART_)
 #error "M5HAL_V2_SELECTED_VARIANT_UART is a read-only output and must not be predefined"
 #endif
 
-// runtime kind (time + mutex): resolved EARLY, before any bus header —
+// Validate selectors as C++ integer constant expressions as well as in the
+// preprocessor scan. In a #if expression an undefined identifier becomes 0,
+// which would otherwise turn a misspelled named ID into the NONE default.
+static_assert(M5HAL_CONFIG_VARIANT_RUNTIME == M5HAL_CONFIG_VARIANT_RUNTIME,
+              "M5HAL_CONFIG_VARIANT_RUNTIME must expand to a defined integer constant expression");
+static_assert(M5HAL_CONFIG_VARIANT_RUNTIME_MUTEX == M5HAL_CONFIG_VARIANT_RUNTIME_MUTEX,
+              "M5HAL_CONFIG_VARIANT_RUNTIME_MUTEX must expand to a defined integer constant expression");
+static_assert(M5HAL_CONFIG_VARIANT_RUNTIME_TASK == M5HAL_CONFIG_VARIANT_RUNTIME_TASK,
+              "M5HAL_CONFIG_VARIANT_RUNTIME_TASK must expand to a defined integer constant expression");
+static_assert(M5HAL_CONFIG_VARIANT_RUNTIME_EVENT == M5HAL_CONFIG_VARIANT_RUNTIME_EVENT,
+              "M5HAL_CONFIG_VARIANT_RUNTIME_EVENT must expand to a defined integer constant expression");
+static_assert(M5HAL_CONFIG_VARIANT_GPIO == M5HAL_CONFIG_VARIANT_GPIO,
+              "M5HAL_CONFIG_VARIANT_GPIO must expand to a defined integer constant expression");
+static_assert(M5HAL_CONFIG_VARIANT_I2C == M5HAL_CONFIG_VARIANT_I2C,
+              "M5HAL_CONFIG_VARIANT_I2C must expand to a defined integer constant expression");
+static_assert(M5HAL_CONFIG_VARIANT_SPI == M5HAL_CONFIG_VARIANT_SPI,
+              "M5HAL_CONFIG_VARIANT_SPI must expand to a defined integer constant expression");
+static_assert(M5HAL_CONFIG_VARIANT_I2S == M5HAL_CONFIG_VARIANT_I2S,
+              "M5HAL_CONFIG_VARIANT_I2S must expand to a defined integer constant expression");
+static_assert(M5HAL_CONFIG_VARIANT_PDM == M5HAL_CONFIG_VARIANT_PDM,
+              "M5HAL_CONFIG_VARIANT_PDM must expand to a defined integer constant expression");
+static_assert(M5HAL_CONFIG_VARIANT_UART == M5HAL_CONFIG_VARIANT_UART,
+              "M5HAL_CONFIG_VARIANT_UART must expand to a defined integer constant expression");
+
+// runtime kinds (time + mutex + task + event): resolved EARLY, before any bus header —
 // bus::IBus embeds runtime::Mutex by value, so the winning variant must
 // be known here. The header below runs its own runtime-only scan pass
 // (same dispatch block in offer_all.inl, other kinds masked); the main
@@ -86,10 +113,13 @@ M5HAL_INLINE_V2 namespace v2
 
 #include "./m5_hal/hal/v2/i2c/i2c.hpp"
 #include "./m5_hal/hal/v2/i2c/slave.hpp"
+#include "./m5_hal/hal/v2/i2c/slave_frame.hpp"
+#include "./m5_hal/hal/v2/i2c/slave_accessor.hpp"
 #include "./m5_hal/hal/v2/spi/spi.hpp"
 #include "./m5_hal/hal/v2/spi/slave.hpp"
 #include "./m5_hal/hal/v2/uart/uart.hpp"
 #include "./m5_hal/hal/v2/i2s/i2s.hpp"
+#include "./m5_hal/hal/v2/pdm/pdm.hpp"
 
 #include "./m5_hal/hal/v2/bus/bus.hpp"
 #include "./m5_hal/hal/v2/gpio/gpio.hpp"
@@ -105,6 +135,8 @@ M5HAL_INLINE_V2 namespace v2
 #include "./m5_hal/hal/v2/data/block.hpp"
 #include "./m5_hal/hal/v2/data/mux.hpp"
 #include "./m5_hal/hal/v2/frame/frame.hpp"
+#include "./m5_hal/hal/v2/slave/event.hpp"
+#include "./m5_hal/hal/v2/slave/queue.hpp"
 #include "./m5_hal/hal/v2/bytecode/bytecode.hpp"
 #include "./m5_hal/hal/v2/remote/remote.hpp"
 #include "./m5_hal/hal/v2/remote/server.hpp"
@@ -146,10 +178,10 @@ M5HAL_INLINE_V2 namespace v2
 #include "./m5_hal/variants/frameworks/posix/hal.hpp"
 #endif
 
-// Remote framework variant: proxy buses (I2C/SPI/UART/I2S) that forward to a
+// Remote framework variant: proxy buses (I2C/SPI/UART/I2S/PDM) that forward to a
 // peer MCU over RemoteSession. Opt-in via M5HAL_CONFIG_REMOTE_VARIANT. The
-// umbrella defines the Bus_remote / BusConfig_remote types the offer scan below
-// binds as winner aliases, so it must precede that scan.
+// umbrella contributes the remote provider used by the selection scan below,
+// so it must precede that scan.
 #if M5HAL_FRAMEWORK_HAS_REMOTE
 #include "./m5_hal/variants/frameworks/remote/hal.hpp"
 #endif
@@ -170,11 +202,13 @@ M5HAL_INLINE_V2 namespace v2
 // espidf framework -> posix framework -> remote framework -> software
 // framework -> stub fallback.
 // Each pass includes the variant's _offer.hpp followed by
-// offer_all.inl, which on the first hit per kind binds the winner's
+// offer_all.inl, which on the first eligible hit per kind binds the winner's
 // suffixed types (`Bus_<variant>` etc., defined directly in
 // m5::hal::v2::<kind>) to the unsuffixed names (`using Bus =
 // Bus_<variant>;`) and undefs the M5HAL_VARIANT_CURRENT_*_ macros.
 // Non-winning variants stay addressable by their suffixed names.
+// Eligibility is every offer when M5HAL_CONFIG_VARIANT_<KIND> is NONE,
+// otherwise only the offer whose stable variant id matches that input.
 
 #include "./m5_hal/variants/frameworks/stub/hal.hpp"
 
@@ -217,7 +251,7 @@ M5HAL_INLINE_V2 namespace v2
 //    a peer MCU via RemoteSession). Opt-in via
 //    M5HAL_CONFIG_REMOTE_VARIANT=1 build flag.
 //    Scanned after posix so posix wins UART (the host serial transport), while
-//    remote wins I2C / SPI / I2S / UART (the tunnelled bus kinds) on host builds
+//    remote wins I2C / SPI / I2S / PDM (the tunnelled bus kinds) on host builds
 //    where no higher-priority variant offers them.
 #if M5HAL_FRAMEWORK_HAS_REMOTE
 #include "./m5_hal/variants/frameworks/remote/_offer.hpp"
@@ -241,6 +275,24 @@ M5HAL_INLINE_V2 namespace v2
 // default on purpose: bus::IBus depends on the type existing, so the
 // early scan in hal/v2/runtime/runtime.hpp #errors instead when no
 // variant offers it (the stub fallback always does).
+#if M5HAL_CONFIG_VARIANT_GPIO != M5HAL_V2_VARIANT_ID_NONE && !defined(M5HAL_DETAIL_VARIANT_SELECTED_GPIO_)
+#error "M5HAL_CONFIG_VARIANT_GPIO selects an unavailable variant or one that does not offer GPIO"
+#endif
+#if M5HAL_CONFIG_VARIANT_I2C != M5HAL_V2_VARIANT_ID_NONE && !defined(M5HAL_DETAIL_VARIANT_SELECTED_I2C_)
+#error "M5HAL_CONFIG_VARIANT_I2C selects an unavailable variant or one that does not offer I2C"
+#endif
+#if M5HAL_CONFIG_VARIANT_SPI != M5HAL_V2_VARIANT_ID_NONE && !defined(M5HAL_DETAIL_VARIANT_SELECTED_SPI_)
+#error "M5HAL_CONFIG_VARIANT_SPI selects an unavailable variant or one that does not offer SPI"
+#endif
+#if M5HAL_CONFIG_VARIANT_I2S != M5HAL_V2_VARIANT_ID_NONE && !defined(M5HAL_DETAIL_VARIANT_SELECTED_I2S_)
+#error "M5HAL_CONFIG_VARIANT_I2S selects an unavailable variant or one that does not offer I2S"
+#endif
+#if M5HAL_CONFIG_VARIANT_PDM != M5HAL_V2_VARIANT_ID_NONE && !defined(M5HAL_DETAIL_VARIANT_SELECTED_PDM_)
+#error "M5HAL_CONFIG_VARIANT_PDM selects an unavailable variant or one that does not offer PDM"
+#endif
+#if M5HAL_CONFIG_VARIANT_UART != M5HAL_V2_VARIANT_ID_NONE && !defined(M5HAL_DETAIL_VARIANT_SELECTED_UART_)
+#error "M5HAL_CONFIG_VARIANT_UART selects an unavailable variant or one that does not offer UART"
+#endif
 #ifndef M5HAL_DETAIL_VARIANT_SELECTED_GPIO_
 #define M5HAL_DETAIL_VARIANT_SELECTED_GPIO_ 1
 #define M5HAL_V2_SELECTED_VARIANT_GPIO      M5HAL_V2_VARIANT_ID_NONE
@@ -256,6 +308,10 @@ M5HAL_INLINE_V2 namespace v2
 #ifndef M5HAL_DETAIL_VARIANT_SELECTED_I2S_
 #define M5HAL_DETAIL_VARIANT_SELECTED_I2S_ 1
 #define M5HAL_V2_SELECTED_VARIANT_I2S      M5HAL_V2_VARIANT_ID_NONE
+#endif
+#ifndef M5HAL_DETAIL_VARIANT_SELECTED_PDM_
+#define M5HAL_DETAIL_VARIANT_SELECTED_PDM_ 1
+#define M5HAL_V2_SELECTED_VARIANT_PDM      M5HAL_V2_VARIANT_ID_NONE
 #endif
 #ifndef M5HAL_DETAIL_VARIANT_SELECTED_UART_
 #define M5HAL_DETAIL_VARIANT_SELECTED_UART_ 1

@@ -7,10 +7,13 @@
 #if M5HAL_FRAMEWORK_HAS_POSIX && M5HAL_CONFIG_POSIX_UART
 
 #include <algorithm>
+#include <cstdlib>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <new>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <termios.h>
@@ -23,6 +26,7 @@
 #endif
 
 #include "../../../../../hal/v2/diag.hpp"
+#include "../../../../../hal/v2/resource_domain.hpp"
 
 namespace m5::hal::v2::uart {
 
@@ -160,15 +164,141 @@ error::error_t posixIOError()
     return error::error_t::IO_ERROR;
 }
 
-// RAII unlock for a runtime::Mutex critical section (mirrors the pattern in
-// service.inl's ControlUnlock) so an early return can never leak the lock.
-struct MutexUnlock {
-    runtime::Mutex* m;
-    ~MutexUnlock()
+constexpr uint16_t kNativeProvider = 0x0501;
+
+bool portableConfigValid(const IBusConfig& cfg)
+{
+    return cfg.pin_tx == -1 && cfg.pin_rx == -1 && cfg.pin_rts == -1 && cfg.pin_cts == -1 &&
+           cfg.rx_buffer_size <= UINT32_MAX && cfg.tx_buffer_size <= UINT32_MAX;
+}
+
+bus::BindingDescriptor makeBinding(const IBusConfig& cfg, bus::Ownership ownership, bus::NativeToken token,
+                                   const NativeOptions& options)
+{
+    bus::BindingDescriptor binding;
+    binding.provider         = kNativeProvider;
+    binding.ownership        = ownership;
+    binding.native_kind      = bus::NativeBindingKind::Native;
+    binding.native           = token;
+    binding.config_primary   = static_cast<uint32_t>(cfg.rx_buffer_size);
+    binding.config_secondary = static_cast<uint32_t>(cfg.tx_buffer_size);
+    binding.native_options   = static_cast<uint32_t>(options.tx_coalesce_bytes);
+    return binding;
+}
+
+result_t<bus::NativeIdentity> identityForFd(int fd)
+{
+    struct stat st {};
+    if (fd < 0 || ::fstat(fd, &st) != 0) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+    return bus::NativeIdentity::make(
+        bus::NativeIdentityKind::PosixDevice,
+        {static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino), static_cast<uint64_t>(st.st_rdev)});
+}
+
+int duplicateFd(int fd)
+{
+#ifdef F_DUPFD_CLOEXEC
+    int duplicate = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (duplicate >= 0 || errno != EINVAL) {
+        return duplicate;
+    }
+#endif
+    return ::dup(fd);
+}
+
+struct PendingNative {
+    int fd                                                                               = -1;
+    bus::FixedNativeInterner<bus::NativeIdentity, bus::BusRegistry::kCapacity>* interner = nullptr;
+    bus::NativeToken token{};
+
+    ~PendingNative()
     {
-        m->unlock();
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        if (interner != nullptr && token.valid()) {
+            (void)interner->release(token);
+        }
+    }
+
+    void dismiss()
+    {
+        fd       = -1;
+        interner = nullptr;
+        token    = {};
     }
 };
+
+result_t<std::shared_ptr<IBus>> acquireBoundFd(bus::IHalBackend& hal_backend, const IBusConfig& cfg, int owned_fd,
+                                               bus::Ownership ownership, const NativeOptions& options)
+{
+    PendingNative pending;
+    pending.fd = owned_fd;
+    if (!portableConfigValid(cfg) || options.tx_coalesce_bytes > NativeOptions::kMaxTxCoalesceBytes) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+    const auto* domain = hal_backend.localResourceDomain();
+    if (domain == nullptr) {
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
+    auto identity = identityForFd(owned_fd);
+    if (!identity.has_value()) {
+        return m5::stl::make_unexpected(identity.error());
+    }
+    auto& interner = domain->nativeInterner();
+    auto token     = interner.intern(identity.value());
+    if (!token.has_value()) {
+        return m5::stl::make_unexpected(token.error());
+    }
+    pending.interner = &interner;
+    pending.token    = token.value();
+
+    auto key = bus::ResourceKey::makeToken(types::bus_kind_t::UART, bus::ResourceTag::Native, token.value(),
+                                           static_cast<uint32_t>(bus::NativeIdentityKind::PosixDevice));
+    if (!key.has_value()) {
+        return m5::stl::make_unexpected(key.error());
+    }
+    const auto binding = makeBinding(cfg, ownership, token.value(), options);
+    auto acquired      = hal_backend.busRegistry().acquireOrFind(
+        key.value(), binding,
+        [&cfg](const std::shared_ptr<bus::IBus>& existing) -> result_t<void> {
+            if (!BusTraits::configCompatible(static_cast<const IBusConfig&>(existing->getConfig()), cfg)) {
+                return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+            }
+            return {};
+        },
+        [&]() -> result_t<std::shared_ptr<bus::IBus>> {
+            std::unique_ptr<Bus_posix> concrete{new (std::nothrow) Bus_posix()};
+            if (!concrete) {
+                return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+            }
+            concrete->bindLocalResources(hal_backend.localResources());
+            auto adopted_native =
+                concrete->adoptOwnedNative(pending.fd, cfg, options.tx_coalesce_bytes, interner, token.value());
+            if (!adopted_native.has_value()) {
+                return m5::stl::make_unexpected(adopted_native.error());
+            }
+            pending.dismiss();
+
+            std::shared_ptr<Bus> facade{new (std::nothrow) Bus()};
+            if (!facade) {
+                return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+            }
+            facade->bindLocalResources(hal_backend.localResources());
+            std::unique_ptr<IBus> backend{concrete.release()};
+            auto adopted = facade->adoptPortableBackend(std::move(backend), cfg);
+            if (!adopted.has_value()) {
+                return m5::stl::make_unexpected(adopted.error());
+            }
+            return std::shared_ptr<bus::IBus>{std::move(facade)};
+        });
+    if (!acquired.has_value()) {
+        return m5::stl::make_unexpected(acquired.error());
+    }
+    return std::static_pointer_cast<IBus>(acquired.value());
+}
 
 }  // namespace impl_posix
 }  // namespace
@@ -183,142 +313,249 @@ bool Bus_posix::baudToSpeed(uint32_t baud, uint32_t& out_speed)
     return true;
 }
 
-result_t<void> Bus_posix::init(const BusConfig_posix& config)
+Bus_posix::~Bus_posix()
 {
-    char* device_path = nullptr;
-    if (config.device_path != nullptr) {
-        const size_t len = ::strlen(config.device_path);
-        device_path      = new (std::nothrow) char[len + 1];
-        if (device_path == nullptr) {
-            return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
-        }
-        ::memcpy(device_path, config.device_path, len + 1);
-    }
-
-    auto released = release();  // release() takes its own _state_mutex critical section
-    if (!released.has_value()) {
-        delete[] device_path;
-        return m5::stl::make_unexpected(released.error());
-    }
-    _config      = config;
-    _device_path = device_path;  // termios open is lazy (first write/read)
-    _tx_coalesce = config.tx_coalesce_bytes;
-    return {};
+    (void)teardownBackend();
 }
 
-result_t<void> Bus_posix::release(void)
+result_t<void> Bus_posix::init(const IBusConfig& config)
 {
-    if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
-        return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
-    }
-    impl_posix::MutexUnlock state_unlock{&_state_mutex};
+    (void)config;
+    return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+}
 
+result_t<void> Bus_posix::initOwnedDirect(int fd, const IBusConfig& config, const NativeOptions& options)
+{
+    if (fd < 0 || options.tx_coalesce_bytes > kCoalesceCapacity) {
+        if (fd >= 0) {
+            (void)::close(fd);
+        }
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+    auto reset = resetForInitialization();
+    if (!reset.has_value()) {
+        (void)::close(fd);
+        return reset;
+    }
+    _config      = config;
+    _fd          = fd;
+    _owns_fd     = true;
+    _begun       = false;
+    _tx_coalesce = options.tx_coalesce_bytes;
+
+    uart::AccessConfig access_config;
+    auto applied = applyConfig(nullptr, Channel::None, access_config);
+    if (!applied.has_value()) {
+        (void)resetForInitialization();
+        return applied;
+    }
+    auto initialized = markInitializationSucceeded(false);
+    if (!initialized.has_value()) {
+        (void)resetForInitialization();
+    }
+    return initialized;
+}
+
+result_t<void> Bus_posix::init(const IBusConfig& config, native::Borrowed<NativeFd> policy)
+{
+    return initOwnedDirect(impl_posix::duplicateFd(policy.resource().value), config, NativeOptions{});
+}
+
+result_t<void> Bus_posix::init(const IBusConfig& config, native::Managed<NativePath> policy)
+{
+    auto arguments = std::move(policy).arguments();
+    return init(config, native::managed(std::get<0>(arguments), NativeOptions{}));
+}
+
+result_t<void> Bus_posix::init(const IBusConfig& config, native::Managed<NativePath, NativeOptions> policy)
+{
+    auto arguments          = std::move(policy).arguments();
+    const NativePath path   = std::get<0>(arguments);
+    const NativeOptions opt = std::get<1>(arguments);
+    if (path.value.empty()) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+    const int fd = ::open(path.value.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (fd < 0) {
+        return m5::stl::make_unexpected(impl_posix::posixIOError());
+    }
+    return initOwnedDirect(fd, config, opt);
+}
+
+bus::CloseOutcome Bus_posix::closeBackend(void)
+{
+    return teardownBackend();
+}
+
+bus::CloseOutcome Bus_posix::teardownBackend(void)
+{
+    auto locked = _state_mutex.lock(types::TIMEOUT_FOREVER);
+    if (!locked.has_value()) {
+        return bus::CloseOutcome::noMutation(locked.error());
+    }
+    runtime::ScopedUnlock state_unlock{_state_mutex};
+
+    bool mutated = false;
+    if (_original_termios_valid && _fd >= 0) {
+        if (::tcsetattr(_fd, TCSANOW, &_original_termios) != 0) {
+            return bus::CloseOutcome::noMutation(impl_posix::posixIOError());
+        }
+        _original_termios_valid = false;
+        mutated                 = true;
+    }
     if (_owns_fd && _fd >= 0) {
-        ::close(_fd);
+        if (::close(_fd) != 0) {
+            // POSIX leaves descriptor state unspecified for some close
+            // failures (notably EINTR). Never retry close on a number the OS
+            // may already have reused; retain the remaining token for retry.
+            _fd      = -1;
+            _owns_fd = false;
+            _begun   = false;
+            _co_used = 0;
+            return bus::CloseOutcome::partialOrUnknown(impl_posix::posixIOError());
+        }
+        mutated = true;
+    } else if (_fd >= 0) {
+        // A legacy attached descriptor remains caller-owned, but detaching it
+        // is still a teardown step before a native token can be released.
+        mutated = true;
     }
     _fd      = -1;
     _owns_fd = false;
     _begun   = false;
-    delete[] _device_path;
-    _device_path = nullptr;
-    // Preserve the init-time coalescing policy across attach(fd), as before.
-    // attach() deliberately calls release() before adopting the descriptor.
     _co_used = 0;
+    if (_native_interner != nullptr && _native_token.valid()) {
+        auto token_released = _native_interner->release(_native_token);
+        if (!token_released.has_value()) {
+            if (mutated) {
+                return bus::CloseOutcome::partialOrUnknown(token_released.error());
+            }
+            return bus::CloseOutcome::noMutation(token_released.error());
+        }
+        mutated = true;
+    }
+    _native_interner = nullptr;
+    _native_token    = {};
+    // Preserve the init-time coalescing policy across attach(fd), as before.
+    return bus::CloseOutcome::success();
+}
+
+result_t<void> Bus_posix::resetForInitialization(void)
+{
+    auto outcome = teardownBackend();
+    if (outcome.disposition == bus::CloseDisposition::Success) {
+        return {};
+    }
+    if (outcome.disposition == bus::CloseDisposition::PartialOrUnknown) {
+        quarantineLifecycleAfterPartialTeardown();
+    }
+    return m5::stl::make_unexpected(outcome.error_code);
+}
+
+result_t<void> Bus_posix::adoptOwnedNative(
+    int fd, const IBusConfig& config, size_t tx_coalesce_bytes,
+    bus::FixedNativeInterner<bus::NativeIdentity, bus::BusRegistry::kCapacity>& interner, bus::NativeToken token)
+{
+    if (fd < 0 || !token.valid() || tx_coalesce_bytes > kCoalesceCapacity) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+    auto reset = resetForInitialization();
+    if (!reset.has_value()) {
+        return reset;
+    }
+    _fd              = fd;
+    _owns_fd         = true;
+    _begun           = false;
+    _config          = config;
+    _tx_coalesce     = tx_coalesce_bytes;
+    _native_interner = &interner;
+    _native_token    = token;
     return {};
+}
+
+result_t<std::shared_ptr<IBus>> NativeProvider_posix<native::Borrowed<NativeFd>>::acquire(
+    bus::IHalBackend& backend, const IBusConfig& cfg, native::Borrowed<NativeFd> policy)
+{
+    if (backend.localResourceDomain() == nullptr) {
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
+    const int duplicate = impl_posix::duplicateFd(policy.resource().value);
+    if (duplicate < 0) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+    return impl_posix::acquireBoundFd(backend, cfg, duplicate, bus::Ownership::Borrowed, NativeOptions{});
+}
+
+result_t<std::shared_ptr<IBus>> NativeProvider_posix<native::Managed<NativePath>>::acquire(
+    bus::IHalBackend& backend, const IBusConfig& cfg, native::Managed<NativePath> policy)
+{
+    auto arguments = std::move(policy).arguments();
+    return NativeProvider_posix<native::Managed<NativePath, NativeOptions>>::acquire(
+        backend, cfg, native::managed(std::get<0>(arguments), NativeOptions{}));
+}
+
+result_t<std::shared_ptr<IBus>> NativeProvider_posix<native::Managed<NativePath, NativeOptions>>::acquire(
+    bus::IHalBackend& backend, const IBusConfig& cfg, native::Managed<NativePath, NativeOptions> policy)
+{
+    if (backend.localResourceDomain() == nullptr) {
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
+    auto arguments          = std::move(policy).arguments();
+    const NativePath path   = std::get<0>(arguments);
+    const NativeOptions opt = std::get<1>(arguments);
+    if (path.value.empty()) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+    char canonical[PATH_MAX];
+    if (::realpath(path.value.c_str(), canonical) == nullptr) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+    const int fd = ::open(canonical, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (fd < 0) {
+        return m5::stl::make_unexpected(impl_posix::posixIOError());
+    }
+    return impl_posix::acquireBoundFd(backend, cfg, fd, bus::Ownership::Managed, opt);
 }
 
 uint32_t Bus_posix::reconfigSkips()
 {
-    if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
+    if (!_state_mutex.lock(types::TIMEOUT_FOREVER).has_value()) {
         return 0;
     }
-    impl_posix::MutexUnlock state_unlock{&_state_mutex};
+    runtime::ScopedUnlock state_unlock{_state_mutex};
     return _reconfig_skips;
 }
 
-error::error_t Bus_posix::open(const char* device_path, uint32_t baud)
+result_t<void> Bus_posix::beginOperationBackend(bus::OperationContext<uart::AccessConfig>& context)
 {
-    (void)release();
-    if (device_path == nullptr) {
-        return error::error_t::INVALID_ARGUMENT;
-    }
-    int fd = ::open(device_path, O_RDWR | O_NOCTTY | O_NONBLOCK);
-    if (fd < 0) {
-        return impl_posix::posixIOError();
-    }
-
-    if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
-        ::close(fd);
-        return error::error_t::TIMEOUT_ERROR;
-    }
-    {
-        impl_posix::MutexUnlock state_unlock{&_state_mutex};
-        _fd      = fd;
-        _owns_fd = true;
-        _begun   = false;
-    }
-
-    uart::AccessConfig cfg;
-    cfg.baud_rate = baud;
-    // First apply on this fd: owner/entered are unused on that path (see
-    // applyConfig), so a null owner and Channel::None are safe here.
-    auto applied = applyConfig(nullptr, Channel::None, cfg);
-    if (!applied.has_value()) {
-        (void)release();
-        return applied.error();
-    }
-    return error::error_t::OK;
+    const Channel entered = context.runtime.mode == bus::OperationMode::Tx ? Channel::Tx : Channel::Rx;
+    return applyConfig(operationOwner(context), entered, context.config,
+                       bus::remainingTimeout(context.runtime, runtime::millis()));
 }
 
-error::error_t Bus_posix::attach(int fd)
+result_t<void> Bus_posix::endOperationBackend(bus::OperationContext<uart::AccessConfig>& context)
 {
-    (void)release();
-    if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
-        return error::error_t::TIMEOUT_ERROR;
+    if (context.runtime.mode != bus::OperationMode::Tx) {
+        return {};
     }
-    {
-        impl_posix::MutexUnlock state_unlock{&_state_mutex};
-        _fd      = fd;
-        _owns_fd = false;  // caller keeps ownership of the descriptor
-        _begun   = false;
-    }
-
-    // Configure the line to raw immediately (symmetric with open()), so a peer
-    // that writes before our first read sees a raw — not canonical — slave and
-    // the bytes are delivered rather than line-buffered. The real per-access
-    // baud/format is re-applied on the first write/read if it differs.
-    uart::AccessConfig cfg;
-    auto applied = applyConfig(nullptr, Channel::None, cfg);  // first apply: no gate needed (see above)
-    if (!applied.has_value()) {
-        return applied.error();
-    }
-    return error::error_t::OK;
+    return flushCoalesced(bus::remainingTimeout(context.runtime, runtime::millis()));
 }
 
-result_t<void> Bus_posix::applyConfig(bus::IAccessor* owner, Channel entered, const uart::AccessConfig& cfg)
+result_t<void> Bus_posix::applyConfig(bus::IAccessor* owner, Channel entered, const uart::AccessConfig& cfg,
+                                      uint32_t timeout_ms)
 {
     if (cfg.baud_rate == 0 || cfg.data_bits != 8 || (cfg.stop_bits != 1 && cfg.stop_bits != 2)) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
 
-    if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
-        return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+    auto locked = _state_mutex.lock(timeout_ms);
+    if (!locked.has_value()) {
+        return m5::stl::make_unexpected(locked.error());
     }
-    impl_posix::MutexUnlock state_unlock{&_state_mutex};
+    runtime::ScopedUnlock state_unlock{_state_mutex};
 
-    // Lazily open the configured device when no fd has been adopted yet.
-    // Part of the first apply below (no reconfigure gate needed for it).
     if (_fd < 0) {
-        if (_device_path == nullptr) {
-            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
-        int fd = ::open(_device_path, O_RDWR | O_NOCTTY | O_NONBLOCK);
-        if (fd < 0) {
-            return m5::stl::make_unexpected(impl_posix::posixIOError());
-        }
-        _fd      = fd;
-        _owns_fd = true;
-        _begun   = false;
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
     }
 
     if (!_begun) {
@@ -333,7 +570,7 @@ result_t<void> Bus_posix::applyConfig(bus::IAccessor* owner, Channel entered, co
     if (owner == nullptr) {
         // A reconfigure without an accessor identity cannot prove quiescence.
         ++_reconfig_skips;
-        M5HAL_DIAG("uart reconfig skipped: no accessor identity (skips=%u)", static_cast<unsigned>(_reconfig_skips));
+        M5HAL_DIAG("uart reconfig rejected: no accessor identity (skips=%u)", static_cast<unsigned>(_reconfig_skips));
         return {};
     }
 
@@ -344,8 +581,8 @@ result_t<void> Bus_posix::applyConfig(bus::IAccessor* owner, Channel entered, co
     auto grant = ibus.tryAcquireOppositeChannel(owner, entered);
     if (!grant.granted) {
         ++_reconfig_skips;
-        M5HAL_DIAG("uart reconfig skipped: opposite channel busy (skips=%u)", static_cast<unsigned>(_reconfig_skips));
-        return {};  // keep serving the currently applied config
+        M5HAL_DIAG("uart reconfig rejected: opposite channel busy (skips=%u)", static_cast<unsigned>(_reconfig_skips));
+        return m5::stl::make_unexpected(error::error_t::BUSY);
     }
     auto applied = applyConfigLocked(cfg);
     ibus.releaseOppositeChannel(owner, grant);
@@ -367,6 +604,10 @@ result_t<void> Bus_posix::applyConfigLocked(const uart::AccessConfig& cfg)
     struct termios tio;
     if (::tcgetattr(_fd, &tio) != 0) {
         return m5::stl::make_unexpected(impl_posix::posixIOError());
+    }
+    if (!_original_termios_valid) {
+        _original_termios       = tio;
+        _original_termios_valid = true;
     }
     ::cfmakeraw(&tio);
     // A rate without a B* constant (macOS high baud) gets a placeholder here; the
@@ -476,19 +717,18 @@ result_t<void> Bus_posix::flushCoalescedLocked(uint32_t timeout_ms)
 
 result_t<void> Bus_posix::flushCoalesced(uint32_t timeout_ms)
 {
-    if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
-        return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+    auto locked = _state_mutex.lock(timeout_ms);
+    if (!locked.has_value()) {
+        return m5::stl::make_unexpected(locked.error());
     }
-    impl_posix::MutexUnlock state_unlock{&_state_mutex};
+    runtime::ScopedUnlock state_unlock{_state_mutex};
     return flushCoalescedLocked(timeout_ms);
 }
 
-result_t<size_t> Bus_posix::write(bus::IAccessor* owner, const uart::AccessConfig& cfg, data::Source* src, size_t len)
+result_t<size_t> Bus_posix::writeBackend(bus::OperationContext<uart::AccessConfig>& context, data::Source* src,
+                                         size_t len)
 {
-    auto applied = applyConfig(owner, Channel::Tx, cfg);
-    if (!applied.has_value()) {
-        return m5::stl::make_unexpected(applied.error());
-    }
+    const auto& cfg  = context.config;
     const size_t cap = _tx_coalesce == 0 ? 0 : std::min(_tx_coalesce, kCoalesceCapacity);
     size_t done      = 0;
     while (src != nullptr && !src->eof() && done < len) {
@@ -518,10 +758,11 @@ result_t<size_t> Bus_posix::write(bus::IAccessor* owner, const uart::AccessConfi
             // Coalesce-buffer append (B12): capacity check + optional flush +
             // memcpy + size update must be one atomic step against a
             // concurrent RX-side flushCoalesced() call.
-            if (!_state_mutex.lock(types::TIMEOUT_FOREVER)) {
-                return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+            auto locked = _state_mutex.lock(types::TIMEOUT_FOREVER);
+            if (!locked.has_value()) {
+                return m5::stl::make_unexpected(locked.error());
             }
-            impl_posix::MutexUnlock state_unlock{&_state_mutex};
+            runtime::ScopedUnlock state_unlock{_state_mutex};
             if (_co_used + span.value().size > cap) {
                 auto f = flushCoalescedLocked(cfg.write_timeout_ms);
                 if (!f.has_value()) {
@@ -579,30 +820,24 @@ result_t<size_t> Bus_posix::rawReadableBytes()
     return static_cast<size_t>(avail);
 }
 
-result_t<size_t> Bus_posix::read(bus::IAccessor* owner, const uart::AccessConfig& cfg, data::Sink* dst, size_t len)
+result_t<size_t> Bus_posix::readBackend(bus::OperationContext<uart::AccessConfig>& context, data::Sink* dst, size_t len)
 {
-    auto applied = applyConfig(owner, Channel::Rx, cfg);
-    if (!applied.has_value()) {
-        return m5::stl::make_unexpected(applied.error());
-    }
-    auto flushed = flushCoalesced(cfg.write_timeout_ms);
+    const auto& cfg = context.config;
+    auto flushed    = flushCoalesced(cfg.write_timeout_ms);
     if (!flushed.has_value()) {
         return m5::stl::make_unexpected(flushed.error());
     }
-    return Bus_streaming::read(owner, cfg, dst, len);
+    return Bus_streaming::readBackend(context, dst, len);
 }
 
-result_t<size_t> Bus_posix::readableBytes(bus::IAccessor* owner, const uart::AccessConfig& cfg)
+result_t<size_t> Bus_posix::readableBytesBackend(bus::OperationContext<uart::AccessConfig>& context)
 {
-    auto applied = applyConfig(owner, Channel::Rx, cfg);
-    if (!applied.has_value()) {
-        return m5::stl::make_unexpected(applied.error());
-    }
-    auto flushed = flushCoalesced(cfg.write_timeout_ms);
+    const auto& cfg = context.config;
+    auto flushed    = flushCoalesced(cfg.write_timeout_ms);
     if (!flushed.has_value()) {
         return m5::stl::make_unexpected(flushed.error());
     }
-    return Bus_streaming::readableBytes(owner, cfg);
+    return Bus_streaming::readableBytesBackend(context);
 }
 
 }  // namespace m5::hal::v2::uart

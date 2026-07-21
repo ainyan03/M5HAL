@@ -21,10 +21,35 @@ void delayCycle(uint32_t count)
 
 m5::stl::expected<I2CBus*, m5::hal::error::error_t> getBus(const I2CBusConfig& config)
 {
-    // @TODO ソフトウェアSPIの複数のインスタンスを管理できるようにすること。
-    static SoftwareI2CBus bus;
-    bus.init(config);
-    return &bus;
+    // Fixed-slot registry keyed by the pin pair: distinct pin pairs get
+    // distinct bus instances instead of aliasing one shared static, and a
+    // failed init() propagates instead of handing back a half-configured bus.
+    static constexpr size_t kMaxBuses = 4;
+    static SoftwareI2CBus buses[kMaxBuses];
+    static const interface::gpio::Pin* key_scl[kMaxBuses];
+    static const interface::gpio::Pin* key_sda[kMaxBuses];
+    static bool used[kMaxBuses];
+
+    for (size_t i = 0; i < kMaxBuses; ++i) {
+        // I2CBusConfig carries only the pin pair, so a key match means the
+        // already-initialized instance is fully equivalent: no re-init.
+        if (used[i] && key_scl[i] == config.pin_scl && key_sda[i] == config.pin_sda) {
+            return &buses[i];
+        }
+    }
+    for (size_t i = 0; i < kMaxBuses; ++i) {
+        if (!used[i]) {
+            const auto err = buses[i].init(config);
+            if (err != error::error_t::OK) {
+                return m5::stl::make_unexpected(err);
+            }
+            key_scl[i] = config.pin_scl;
+            key_sda[i] = config.pin_sda;
+            used[i]    = true;
+            return &buses[i];
+        }
+    }
+    return m5::stl::make_unexpected(m5::hal::error::error_t::OUT_OF_RESOURCE);
 }
 
 error::error_t SoftwareI2CBus::init(const BusConfig& config)

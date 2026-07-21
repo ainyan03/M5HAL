@@ -19,10 +19,11 @@ if(COMMAND idf_component_register)
     # The espidf variant public headers expose driver types for attach/native
     # handles, so the driver component dependencies must be public.
     #
-    # The esp_driver_* components (gpio / i2c / spi / uart) were all split out
+    # The esp_driver_* components (gpio / i2c / spi / uart / i2s) were all split out
     # of the monolithic 'driver' component in the IDF v5.3 "driver as
     # components" refactor. On v5.2 and earlier the headers we use
-    # (driver/gpio.h, driver/i2c_master.h, driver/spi_master.h, driver/uart.h)
+    # (driver/gpio.h, driver/i2c_master.h, driver/spi_master.h, driver/uart.h,
+    # driver/i2s_std.h, driver/i2s_pdm.h)
     # all live in 'driver'. Note the new i2c_master API shipped in v5.2 but
     # inside 'driver'; the standalone esp_driver_i2c component only exists from
     # v5.3 — requiring it on v5.2 fails to resolve (verified via the idf-matrix
@@ -32,12 +33,14 @@ if(COMMAND idf_component_register)
         set(m5hal_gpio_req esp_driver_gpio)
         set(m5hal_spi_req esp_driver_spi)
         set(m5hal_uart_req esp_driver_uart)
+        set(m5hal_i2s_req esp_driver_i2s)
         set(m5hal_i2c_req esp_driver_i2c driver)
     else()
         set(m5hal_gpio_req driver)
         set(m5hal_i2c_req driver)
         set(m5hal_spi_req driver)
         set(m5hal_uart_req driver)
+        set(m5hal_i2s_req driver)
     endif()
 
     # Arduino as an IDF component: when the arduino-esp32 core is part of the
@@ -98,7 +101,7 @@ if(COMMAND idf_component_register)
     idf_component_register(
         SRCS "src/M5HAL_v0.cpp" "src/M5HAL_v2.cpp"
         INCLUDE_DIRS "src"
-        REQUIRES M5Utility esp_timer ${m5hal_gpio_req} ${m5hal_i2c_req} ${m5hal_spi_req} ${m5hal_uart_req} ${m5hal_arduino_req} ${m5hal_tinyusb_req} ${m5hal_usb_jtag_req}
+        REQUIRES M5Utility esp_timer ${m5hal_gpio_req} ${m5hal_i2c_req} ${m5hal_spi_req} ${m5hal_uart_req} ${m5hal_i2s_req} ${m5hal_arduino_req} ${m5hal_tinyusb_req} ${m5hal_usb_jtag_req}
     )
 else()
     # PlatformIO espidf standalone build path.

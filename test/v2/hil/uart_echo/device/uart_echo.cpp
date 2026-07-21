@@ -31,7 +31,7 @@ constexpr int PIN_UART_RX = 3;  // UART0 RX (USB bridge) on classic ESP32
 #endif
 constexpr uint32_t BAUD = M5HAL_HIL_UART_ECHO_BAUD_RATE;
 
-m5hal::uart::Bus uart_bus;  // flat-injected = arduino UART variant on this build
+m5hal::uart::Bus_arduino uart_bus;
 m5hal::uart::AccessConfig uart_cfg;
 
 }  // namespace
@@ -48,12 +48,11 @@ void setup()
     // UART variant honors IBusConfig.{rx,tx}_buffer_size (applied before its
     // lazy begin()), so no direct Serial.setRxBufferSize() is needed.
     m5hal::uart::BusConfig bus_cfg;
-    bus_cfg.setSerial(Serial);
     bus_cfg.pin_tx         = PIN_UART_TX;
     bus_cfg.pin_rx         = PIN_UART_RX;
     bus_cfg.rx_buffer_size = 2048;
     bus_cfg.tx_buffer_size = 2048;
-    (void)uart_bus.init(bus_cfg);
+    (void)uart_bus.init(bus_cfg, m5hal::native::borrowed(Serial));
 
     uart_cfg.baud_rate             = BAUD;
     uart_cfg.first_byte_timeout_ms = 2;

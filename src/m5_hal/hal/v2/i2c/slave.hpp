@@ -9,7 +9,10 @@
 #include "../error.hpp"
 #include "../runtime/runtime.hpp"
 #include "../service/service.hpp"
+#include "../slave/event.hpp"
+#include "../slave/queue.hpp"
 #include "../types.hpp"
+#include "slave_frame.hpp"
 
 #include <M5Utility.hpp>
 
@@ -19,6 +22,8 @@
 #include <string.h>
 
 namespace m5::hal::v2::i2c {
+
+class SlaveAccessor;
 
 enum class TxUnderrun : uint8_t { Fill, Stretch };
 
@@ -82,6 +87,12 @@ struct SlaveBusConfig : public bus::IBusConfig {
     TxUnderrun tx_underrun       = TxUnderrun::Fill;
     uint8_t tx_fill_byte         = 0xFF;
     uint32_t stretch_timeout_ms  = 100;
+    // Source-migration and wire-acceptance fence. false (default) reserves
+    // address acceptance for SlaveAccessor::beginAccess(); true explicitly
+    // selects the legacy wire-frame window API, which accepts immediately
+    // after init(). Backends that remain legacy-only reject false before they
+    // can start acknowledging the configured address.
+    bool legacy_wire_frame_window = false;
     // Hardware controller index this slave should occupy, e.g. the value
     // returned by `bus::BusView::claimController` on the I2C BusView. -1
     // (default) means "the backend's own default port" -- outside the
@@ -90,6 +101,15 @@ struct SlaveBusConfig : public bus::IBusConfig {
     int8_t controller = -1;
 
     constexpr SlaveBusConfig(void) : bus::IBusConfig{types::bus_kind_t::I2C}
+    {
+    }
+};
+
+struct SlaveAccessConfig : public bus::IAccessConfig {
+    slave::QueueMode tx_mode = slave::QueueMode::Byte;
+    slave::QueueMode rx_mode = slave::QueueMode::Byte;
+
+    constexpr SlaveAccessConfig() : bus::IAccessConfig{types::bus_kind_t::I2C}
     {
     }
 };
@@ -110,14 +130,58 @@ struct ISlaveBus : public bus::IBus {
         return _config;
     }
 
-    virtual result_t<void> init(const SlaveBusConfig &cfg)                                                       = 0;
-    virtual result_t<void> beginTransaction(bus::IAccessor *owner, uint32_t timeout_ms = types::TIMEOUT_FOREVER) = 0;
-    virtual result_t<void> endTransaction(bus::IAccessor *owner)                                                 = 0;
-    virtual result_t<size_t> read(bus::IAccessor *owner, data::DataSpan dst)                                     = 0;
-    virtual result_t<size_t> write(bus::IAccessor *owner, data::ConstDataSpan src)                               = 0;
-    virtual result_t<size_t> readableBytes(bus::IAccessor *owner)                                                = 0;
-    virtual result_t<bool> transactionComplete(bus::IAccessor *owner)                                            = 0;
-    virtual service::IService *service()                                                                         = 0;
+    virtual result_t<void> init(const SlaveBusConfig &cfg) = 0;
+    // Attempt to open one already-observed transaction without waiting. Returns
+    // TIMEOUT_ERROR when none is currently openable; SlaveStreamAccessor owns
+    // the public timeout/retry contract around this backend seam.
+    virtual result_t<void> tryOpenWireFrame(bus::IAccessor *owner)                 = 0;
+    virtual result_t<void> closeWireFrame(bus::IAccessor *owner)                   = 0;
+    virtual result_t<size_t> read(bus::IAccessor *owner, data::DataSpan dst)       = 0;
+    virtual result_t<size_t> write(bus::IAccessor *owner, data::ConstDataSpan src) = 0;
+    virtual result_t<size_t> readableBytes(bus::IAccessor *owner)                  = 0;
+    virtual result_t<bool> wireFrameComplete(bus::IAccessor *owner)                = 0;
+    virtual service::IService *service()                                           = 0;
+
+    // Queue-driven slave lifecycle. These non-virtual entries validate the
+    // accessor-owned Context capability before dispatching to provider hooks.
+    result_t<void> beginOperation(bus::OperationContext<SlaveAccessConfig> &context)
+    {
+        auto registered = _operation_slot.registerContext(context, this, _lock_owner);
+        if (!registered.has_value()) {
+            return registered;
+        }
+        auto begun = beginOperationBackend(context);
+        if (!begun.has_value()) {
+            _operation_slot.invalidate(context);
+        }
+        return begun;
+    }
+    result_t<void> endOperation(bus::OperationContext<SlaveAccessConfig> &context)
+    {
+        if (!_operation_slot.valid(context, this, _lock_owner)) {
+            if (_operation_slot.registered(context, this)) {
+                if (_operation_slot.restoreRegisteredRuntime(context, this, _lock_owner)) {
+                    (void)endOperationBackend(context);
+                }
+                _operation_slot.invalidate(context);
+            }
+            return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+        }
+        // The backend owns worker/ISR quiescence. Invalidate only after it has
+        // returned, including its failure paths, so no retained Context can be
+        // mistaken for live authority after Access cleanup releases the lock.
+        auto ended = endOperationBackend(context);
+        _operation_slot.invalidate(context);
+        return ended;
+    }
+
+    // Internal queue-progress wake. SlaveAccessor calls this after a successful
+    // TX enqueue or RX dequeue so an event-driven backend can resume without a
+    // polling dependency. Backends without a worker keep the no-op default.
+    virtual void notifyOperationActivity(bus::IAccessor *owner)
+    {
+        (void)owner;
+    }
 
     // Block the calling consumer until the backend has activity for `owner`'s open
     // transaction (RX bytes became readable, the transaction completed, or TX reply
@@ -132,7 +196,7 @@ struct ISlaveBus : public bus::IBus {
     // Returns `true` when the backend confirmed an activity wake before the timeout,
     // `false` when the wait elapsed with no confirmed signal. The poll fallback cannot
     // observe a wake reason, so it always reports `false`; either way the caller must
-    // re-check state (readableBytes / transactionComplete) -- the bool is an advisory
+    // re-check state (readableBytes / wireFrameComplete) -- the bool is an advisory
     // hint, not a substitute for that check.
     virtual result_t<bool> waitForActivity(bus::IAccessor *owner, uint32_t timeout_ms)
     {
@@ -158,6 +222,8 @@ struct ISlaveBus : public bus::IBus {
     // (pointer_received / write_offset / tx_offset) and re-composes the TX
     // prefill; `binding->pointer` itself is left as the caller set it (bind does
     // not clobber an already-persisted wire pointer).
+    // A backend also returns false without touching `binding` or hardware when
+    // a mutually exclusive queued Access is active.
     virtual bool bindIsrRegMap(IsrRegMapBinding *binding)
     {
         (void)binding;
@@ -174,7 +240,24 @@ struct ISlaveBus : public bus::IBus {
     }
 
 protected:
+    virtual result_t<void> beginOperationBackend(bus::OperationContext<SlaveAccessConfig> &context)
+    {
+        (void)context;
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
+    virtual result_t<void> endOperationBackend(bus::OperationContext<SlaveAccessConfig> &context)
+    {
+        (void)context;
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
+
+    bus::IAccessor &operationOwner(bus::OperationContext<SlaveAccessConfig> &context)
+    {
+        return bus::OperationSlot::contextOwner(context);
+    }
+
     SlaveBusConfig _config;
+    bus::OperationSlot _operation_slot;
 };
 
 class SlaveStreamAccessor : public bus::IAccessor, public data::StreamReader, public data::StreamWriter {
@@ -192,9 +275,9 @@ public:
         return static_cast<ISlaveBus &>(bus::IAccessor::getBus());
     }
 
-    result_t<void> beginTransaction(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+    result_t<void> openWireFrame(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
 
-    result_t<void> endTransaction(void);
+    result_t<void> closeWireFrame(void);
 
     result_t<size_t> read(data::DataSpan dst) override;
 
@@ -207,8 +290,8 @@ public:
     // the transaction open until it completes: the backend streams the reply out
     // of the open transaction across the read (refilling the TX FIFO under clock
     // stretch), so ending early would discard the reply mid-read. Poll this after
-    // write() before endTransaction(). A pure write reports complete on its STOP.
-    result_t<bool> transactionComplete(void);
+    // write() before closeWireFrame(). A pure write reports complete on its STOP.
+    result_t<bool> wireFrameComplete(void);
 
     // Park until the backend signals activity (RX/TX/STOP) for this accessor, or the
     // timeout elapses -- the event-driven replacement for a fixed poll delay in a
@@ -219,7 +302,7 @@ public:
     //
     // Returns `true` on a confirmed activity wake, `false` on timeout (and always
     // `false` on the poll fallback); `INVALID_ARGUMENT` when this accessor is not
-    // bound. The bool is advisory -- re-check readableBytes / transactionComplete
+    // bound. The bool is advisory -- re-check readableBytes / wireFrameComplete
     // regardless (a custom serve loop uses it only to tell "woke early" from "timed
     // out", e.g. to decide whether to keep waiting).
     result_t<bool> waitForActivity(uint32_t timeout_ms)
@@ -399,7 +482,7 @@ public:
     // Returns OK once the transaction is served and closed. A hard (unexpected)
     // error from any backend poll stops the exchange early but still closes the
     // transaction, and is returned -- the happy path is unchanged, but a real
-    // failure (owner mismatch, bus released) is no longer reported as success. A
+    // failure (owner mismatch, bus closed) is no longer reported as success. A
     // short read (0 bytes, the normal stream short-read) is not an error.
     //
     // A finite `timeout_ms` bounds BOTH the wait for a transaction to start AND
@@ -424,7 +507,7 @@ public:
     // blocks for a tick-driven ServiceRunner loop (where serve()'s blocking
     // poll cannot be used) and the seam exercised by the native unit tests.
 
-    // Begin a fresh transaction window: the next ingested byte becomes the
+    // Begin a fresh wire-frame exchange: the next ingested byte becomes the
     // register pointer. The pointer value itself persists from the prior
     // transaction (SPLIT relies on this).
     void beginExchange(void);
@@ -491,27 +574,27 @@ private:
     bool _isr_bound = false;
 };
 
-class ScopedSlaveTransaction {
+class ScopedWireFrame {
 public:
-    explicit ScopedSlaveTransaction(SlaveStreamAccessor &accessor, uint32_t timeout_ms = types::TIMEOUT_FOREVER)
+    explicit ScopedWireFrame(SlaveStreamAccessor &accessor, uint32_t timeout_ms = types::TIMEOUT_FOREVER)
         : _accessor{&accessor}
     {
-        auto r = _accessor->beginTransaction(timeout_ms);
+        auto r = _accessor->openWireFrame(timeout_ms);
         if (!r.has_value()) {
             _error    = r.error();
             _accessor = nullptr;
         }
     }
-    ~ScopedSlaveTransaction()
+    ~ScopedWireFrame()
     {
         if (_accessor != nullptr) {
-            (void)_accessor->endTransaction();
+            (void)_accessor->closeWireFrame();
         }
     }
-    ScopedSlaveTransaction(const ScopedSlaveTransaction &)            = delete;
-    ScopedSlaveTransaction &operator=(const ScopedSlaveTransaction &) = delete;
-    ScopedSlaveTransaction(ScopedSlaveTransaction &&)                 = delete;
-    ScopedSlaveTransaction &operator=(ScopedSlaveTransaction &&)      = delete;
+    ScopedWireFrame(const ScopedWireFrame &)            = delete;
+    ScopedWireFrame &operator=(const ScopedWireFrame &) = delete;
+    ScopedWireFrame(ScopedWireFrame &&)                 = delete;
+    ScopedWireFrame &operator=(ScopedWireFrame &&)      = delete;
 
     bool has_error(void) const
     {
@@ -588,17 +671,34 @@ public:
 
     SlaveBus_software() = default;
 
+    result_t<void> close(void)
+    {
+        return bus::IBus::close();
+    }
+
     result_t<void> init(SlaveLineDriver &lines, const SlaveBusConfig &config);
 
     result_t<void> init(const SlaveBusConfig &cfg) override;
 
-    result_t<void> release(void) override;
+    bus::BusCapabilities capabilities(void) const override
+    {
+        auto builder = bus::detail::BusCapabilitiesBuilder{bus::IBus::capabilities()};
+        if (_config.legacy_wire_frame_window) {
+            builder.enable(bus::BusFeature::SlaveLegacyWireFrame);
+        } else {
+            builder.enable(bus::BusFeature::SlaveByteTx)
+                .enable(bus::BusFeature::SlaveByteRx)
+                .enable(bus::BusFeature::SlaveFrameRx)
+                .enable(bus::BusFeature::ClockStretch, _config.tx_underrun == TxUnderrun::Stretch);
+        }
+        return builder.build();
+    }
 
     service::IService *service() override;
 
-    result_t<void> beginTransaction(bus::IAccessor *owner, uint32_t timeout_ms = 0) override;
+    result_t<void> tryOpenWireFrame(bus::IAccessor *owner) override;
 
-    result_t<void> endTransaction(bus::IAccessor *owner) override;
+    result_t<void> closeWireFrame(bus::IAccessor *owner) override;
 
     result_t<size_t> read(bus::IAccessor *owner, data::DataSpan dst) override;
 
@@ -606,7 +706,7 @@ public:
 
     result_t<size_t> readableBytes(bus::IAccessor *owner) override;
 
-    result_t<bool> transactionComplete(bus::IAccessor *owner) override;
+    result_t<bool> wireFrameComplete(bus::IAccessor *owner) override;
 
     void setMaxAckedWriteBytes(size_t count);
 
@@ -627,7 +727,14 @@ public:
 
     service::ServicePoll serviceImpl(const service::ServiceContext &ctx) override;
 
+protected:
+    bus::CloseOutcome closeBackend(void) override;
+    result_t<void> beginOperationBackend(bus::OperationContext<SlaveAccessConfig> &context) override;
+    result_t<void> endOperationBackend(bus::OperationContext<SlaveAccessConfig> &context) override;
+
 private:
+    result_t<void> teardownBackend(void);
+
     enum class State : uint8_t { Idle, Receive, AckSetup, Ack, Transmit, ReadMasterAck, WaitTx, Ignore };
 
     struct Transaction {
@@ -669,6 +776,22 @@ private:
 
     uint8_t nextTxByte();
 
+    bool queuedAccepting() const;
+
+    bool beginQueuedFrame();
+
+    void beginQueuedSegment(I2cFrameDirection direction);
+
+    void finishQueuedSegment();
+
+    void finishQueuedFrame(slave::FrameFlags flags, error::error_t frame_error);
+
+    void storeQueuedReceivedByte(uint8_t value);
+
+    void completeQueuedTransmitByte();
+
+    void publishQueuedEvent(slave::SlaveEvent events);
+
     void driveTxBit();
 
     void beginStretch(service::fast_tick_t now_tick);
@@ -703,6 +826,28 @@ private:
     service::fast_tick_t _stretch_start       = 0;
     service::fast_tick_t _stretch_budget      = 0;
     service::fast_tick_t _svc_now             = 0;  // private virtual clock (ctx.elapsed accumulation)
+    runtime::Mutex _queued_mutex;
+    SlaveAccessor *_queued_accessor                           = nullptr;
+    bus::OperationContext<SlaveAccessConfig> *_queued_context = nullptr;
+    I2cObservedFrameReservation _queued_frame{};
+    bool _queued_lifecycle_used                 = false;
+    bool _queued_active                         = false;
+    bool _queued_closing                        = false;
+    bool _queued_frame_active                   = false;
+    bool _queued_frame_dropping                 = false;
+    bool _queued_segment_active                 = false;
+    bool _queued_segment_details                = true;
+    bool _queued_tx_from_queue                  = false;
+    bool _queued_tx_fill_selected               = false;
+    bool _queued_frame_underrun                 = false;
+    I2cFrameDirection _queued_segment_direction = I2cFrameDirection::Write;
+    uint32_t _queued_frame_id                   = 0;
+    uint32_t _queued_frame_wire_bytes           = 0;
+    uint32_t _queued_frame_write_bytes          = 0;
+    uint32_t _queued_frame_dropped_bytes        = 0;
+    uint32_t _queued_segment_offset             = 0;
+    uint32_t _queued_segment_length             = 0;
+    uint32_t _queued_segment_ordinal            = 0;
 };
 
 }  // namespace m5::hal::v2::i2c

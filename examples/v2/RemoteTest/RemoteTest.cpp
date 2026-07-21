@@ -16,6 +16,7 @@
 #if !defined(ARDUINO)
 
 #include <M5HAL_v2.hpp>
+#include <m5_hal/variants/frameworks/remote/detail_helpers.hpp>
 #include <m5_hal/variants/frameworks/posix/hal/remote/wire_dump.hpp>
 
 #include <new>
@@ -52,6 +53,7 @@ struct MuxHostEndpoint {
     uint8_t proto_ver  = 0;
     uint8_t caps_flags = 0;
     uint8_t bus_count  = 0;
+    m5hal::remote::Capabilities capabilities;
 
     // M5HAL_WIRE_DUMP capture taps, one pair per transport. Pass-through when
     // the env var is unset.
@@ -99,14 +101,11 @@ struct MuxHostEndpoint {
     // Connect over a serial device. `port` is a tty path.
     bool connectSerial(const char* port)
     {
-        is_tcp = false;
-        m5hal::uart::BusConfig_posix bus_cfg;
-        bus_cfg.tx_coalesce_bytes = 4096;
-        (void)bus.init(bus_cfg);
-
-        auto err = bus.open(port, uart_cfg.baud_rate);
-        if (err != m5hal::error::error_t::OK) {
-            ::fprintf(stderr, "open %s failed: %d\n", port, static_cast<int>(err));
+        is_tcp           = false;
+        auto initialized = bus.init(m5hal::uart::BusConfig{}, m5hal::native::managed(m5hal::uart::NativePath{port},
+                                                                                     m5hal::uart::NativeOptions{4096}));
+        if (!initialized.has_value()) {
+            ::fprintf(stderr, "open %s failed: %d\n", port, static_cast<int>(initialized.error()));
             return false;
         }
 
@@ -160,12 +159,12 @@ struct MuxHostEndpoint {
         session = &sess;
     }
 
-    void release()
+    void close()
     {
         if (is_tcp) {
             (void)tcp_stream.close();
         } else {
-            (void)bus.release();
+            (void)bus.close();
         }
     }
 };
@@ -190,7 +189,7 @@ bool autoDiscover(MuxHostEndpoint& host, char* found_path, size_t cap)
             ::snprintf(found_path, cap, "%s", ports[i].path);
             return true;
         }
-        (void)host.bus.release();
+        (void)host.bus.close();
     }
     return false;
 }
@@ -482,14 +481,25 @@ void testSpiTransfer(MuxHostEndpoint& host, size_t frame_size)
     m5hal::spi::Bus_remote bus{*host.session, kSpiBusId};
     m5hal::spi::MasterAccessConfig cfg;
     m5hal::spi::TransferDesc desc;
+    m5hal::spi::MasterAccessor accessor{bus, cfg};
     m5hal::data::MemorySource src{tx_buf, frame_size};
     m5hal::data::MemorySink dst{rx_buf, frame_size};
 
-    auto t0      = m5::utility::millis();
-    auto r       = bus.transfer(nullptr, cfg, desc, &src, frame_size, &dst, frame_size);
+    auto t0    = m5::utility::millis();
+    auto begun = accessor.beginAccess();
+    if (!begun.has_value()) {
+        ::printf("  transfer begin failed: %d\n", static_cast<int>(begun.error()));
+        return;
+    }
+    auto r       = accessor.transfer(desc, &src, frame_size, &dst, frame_size);
+    auto ended   = accessor.endAccess();
     auto elapsed = static_cast<uint32_t>(m5::utility::millis()) - static_cast<uint32_t>(t0);
     if (!r.has_value()) {
         ::printf("  transfer failed: %d\n", static_cast<int>(r.error()));
+        return;
+    }
+    if (!ended.has_value()) {
+        ::printf("  transfer cleanup failed: %d\n", static_cast<int>(ended.error()));
         return;
     }
     double kbps = elapsed > 0 ? (static_cast<double>(frame_size) * 8.0 / elapsed) : 0.0;
@@ -753,7 +763,7 @@ bool testReset(MuxHostEndpoint& host, const char* port_buf, bool wait)
         return false;  // caller should exit
     }
     ::printf("  Waiting for reboot...\n");
-    host.release();
+    host.close();
     bool reconnected = false;
     for (int attempt = 0; attempt < 30; ++attempt) {
         ::usleep(500 * 1000);
@@ -768,7 +778,7 @@ bool testReset(MuxHostEndpoint& host, const char* port_buf, bool wait)
             reconnected = true;
             break;
         }
-        host.release();
+        host.close();
     }
     ::printf("  Reconnect Hello %s\n", reconnected ? "OK" : "FAILED");
     return reconnected;
@@ -814,14 +824,20 @@ void testSpiRepeat(MuxHostEndpoint& host, size_t xfer_size, size_t max_rounds)
     m5hal::spi::Bus_remote bus{*host.session, kSpiBusId};
     m5hal::spi::MasterAccessConfig cfg;
     m5hal::spi::TransferDesc desc;
+    m5hal::spi::MasterAccessor accessor{bus, cfg};
 
     size_t ok = 0;
     auto t0   = m5::utility::millis();
     for (size_t round = 0; round < max_rounds; ++round) {
         m5hal::data::MemorySource src{tx_buf, xfer_size};
         m5hal::data::MemorySink dst{rx_buf, xfer_size};
-        auto r = bus.transfer(nullptr, cfg, desc, &src, xfer_size, &dst, xfer_size);
-        if (r.has_value()) {
+        auto begun = accessor.beginAccess();
+        if (!begun.has_value()) {
+            continue;
+        }
+        auto r     = accessor.transfer(desc, &src, xfer_size, &dst, xfer_size);
+        auto ended = accessor.endAccess();
+        if (r.has_value() && ended.has_value()) {
             ++ok;
         }
     }
@@ -833,10 +849,27 @@ void printCaps(MuxHostEndpoint& host)
 {
     ::printf("\n--- Capabilities ---\n");
     ::printf("  remote proto v%u\n", static_cast<unsigned>(host.proto_ver));
-    ::printf("  flags: 0x%02X (%s%s%s)\n", static_cast<unsigned>(host.caps_flags),
+    ::printf("  flags: 0x%02X (%s%s%s%s%s)\n", static_cast<unsigned>(host.caps_flags),
              (host.caps_flags & 0x01) ? "has_gpio" : "", ((host.caps_flags & 0x03) == 0x03) ? " | " : "",
-             (host.caps_flags & 0x02) ? "supports_bus_create" : "");
+             (host.caps_flags & 0x02) ? "supports_bus_create" : "",
+             (host.caps_flags & m5hal::remote::kHelloFlagBusCapabilities) ? " | " : "",
+             (host.caps_flags & m5hal::remote::kHelloFlagBusCapabilities) ? "bus_capabilities" : "");
     ::printf("  bus_count: %u\n", static_cast<unsigned>(host.bus_count));
+    for (size_t i = 0; i < host.capabilities.bus_count; ++i) {
+        const auto& entry = host.capabilities.buses[i];
+        const auto& caps  = entry.capabilities;
+        ::printf("  bus[%zu]: kind=%u id=%u generation=%u tx=%s rx=%s hardware=%s", i,
+                 static_cast<unsigned>(entry.kind), static_cast<unsigned>(entry.bus_id),
+                 static_cast<unsigned>(caps.generation()),
+                 caps.supports(m5hal::bus::BusFeature::Transmit) ? "yes" : "no",
+                 caps.supports(m5hal::bus::BusFeature::Receive) ? "yes" : "no",
+                 caps.supports(m5hal::bus::BusFeature::HardwareBackend) ? "yes" : "no");
+        const auto frequency = caps.limit(m5hal::bus::BusLimit::MaxFrequencyHz);
+        if (frequency.has_value()) {
+            ::printf(" max_hz=%u", static_cast<unsigned>(frequency.value()));
+        }
+        ::printf("\n");
+    }
 }
 
 void printUsage(const char* prog)
@@ -1030,16 +1063,15 @@ int main(int argc, char** argv)
         }
     }
     {
-        auto caps = host.session->lastResponse();
-        if (caps.size >= 1) {
-            host.proto_ver = caps.data[0];
+        auto decoded = m5hal::remote::detail::decodeHelloCaps(host.session->lastResponse());
+        if (!decoded.has_value()) {
+            ::fprintf(stderr, "invalid hello capabilities: %d\n", static_cast<int>(decoded.error()));
+            return 1;
         }
-        if (caps.size >= 2) {
-            host.caps_flags = caps.data[1];
-        }
-        if (caps.size >= 3) {
-            host.bus_count = caps.data[2];
-        }
+        host.capabilities = decoded.value();
+        host.proto_ver    = host.capabilities.proto_ver;
+        host.caps_flags   = host.session->lastResponse().size >= 2 ? host.session->lastResponse().data[1] : 0;
+        host.bus_count    = static_cast<uint8_t>(host.capabilities.bus_count);
     }
     ::printf("remote proto v%u, flags 0x%02X, %u bus(es)\n", static_cast<unsigned>(host.proto_ver),
              static_cast<unsigned>(host.caps_flags), static_cast<unsigned>(host.bus_count));

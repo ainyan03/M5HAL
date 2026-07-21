@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 
 #include "M5HAL_v2.hpp"
+
+#include <limits>
 #include "m5_hal/hal/v2/data/ring.inl"
 #include "m5_hal/hal/v2/data/stream.inl"
 #include "m5_hal/hal/v2/data/mux.inl"
@@ -25,6 +27,7 @@
 #endif
 #include "m5_hal/variants/frameworks/remote/hal/i2c/i2c.inl"
 #include "m5_hal/variants/frameworks/remote/hal/i2s/i2s.inl"
+#include "m5_hal/variants/frameworks/remote/hal/pdm/pdm.inl"
 #include "m5_hal/variants/frameworks/remote/hal/spi/spi.inl"
 #include "m5_hal/variants/frameworks/remote/hal/uart/uart.inl"
 #include "m5_hal/variants/frameworks/remote/hal/gpio/gpio.inl"
@@ -37,6 +40,7 @@
 #include "m5_hal/hal/v2/uart/bus_console.inl"
 #include "m5_hal/hal/v2/uart/uart.inl"
 #include "m5_hal/hal/v2/i2s/i2s.inl"
+#include "m5_hal/hal/v2/pdm/pdm.inl"
 
 #define M5HAL_STATIC_MACRO_PATH_IMPL M5HAL_STATIC_MACRO_CONCAT(M5HAL_V2_DETECTED_PLATFORM_VARIANT_PATH, hal.inl)
 
@@ -132,14 +136,118 @@ namespace m5 {
 namespace hal {
 M5HAL_INLINE_V2 namespace v2
 {
-    namespace {
-    bus::LocalBackend* s_local_backend = nullptr;
-
-    bus::LocalBackend* localBackendForConnect()
+    namespace remote {
+    uint64_t nextRemoteSessionGeneration(void)
     {
-        (void)getM5_Hal();
-        return s_local_backend;
+        static runtime::Mutex mutex;
+        static uint64_t next = 0;
+        if (!mutex.lock(types::TIMEOUT_FOREVER)) {
+            return 0;
+        }
+        const uint64_t result = next == std::numeric_limits<uint64_t>::max() ? 0 : ++next;
+        (void)mutex.unlock();
+        return result;
     }
+    }  // namespace remote
+
+    namespace bus {
+    const LocalResourceContext& defaultLocalResources(void)
+    {
+        static const LocalResourceContext resources = getM5_Hal().resourceDomain().localResources();
+        return resources;
+    }
+    }  // namespace bus
+
+    namespace detail {
+    struct LocalConnectionState {
+        bus::LocalBackend backend;
+        bus::LocalKindAdapter<i2c::BusTraits> i2c_adapter;
+        bus::LocalKindAdapter<spi::BusTraits> spi_adapter;
+#if M5HAL_V2_SELECTED_VARIANT_I2C != M5HAL_V2_VARIANT_ID_NONE
+        bus::LocalPortableProvider<i2c::BusTraits> i2c_portable{&i2c::makeSelectedPortableBackend};
+#endif
+#if M5HAL_V2_SELECTED_VARIANT_SPI != M5HAL_V2_VARIANT_ID_NONE
+        bus::LocalPortableProvider<spi::BusTraits> spi_portable{&spi::makeSelectedPortableBackend};
+#endif
+#if M5HAL_V2_SELECTED_VARIANT_UART != M5HAL_V2_VARIANT_ID_NONE
+        bus::LocalPortableProvider<uart::BusTraits> uart_portable{&uart::makeSelectedPortableBackend};
+#endif
+#if M5HAL_V2_SELECTED_VARIANT_I2S != M5HAL_V2_VARIANT_ID_NONE
+        bus::LocalPortableProvider<i2s::BusTraits> i2s_portable{&i2s::makeSelectedPortableBackend};
+#endif
+#if M5HAL_V2_SELECTED_VARIANT_PDM != M5HAL_V2_VARIANT_ID_NONE
+        bus::LocalPortableProvider<pdm::BusTraits> pdm_portable{&pdm::makeSelectedPortableBackend};
+#endif
+
+#if defined(M5HAL_DETAIL_I2C_HAS_HARDWARE_BACKEND_) && defined(M5HAL_DETAIL_SPI_HAS_HARDWARE_BACKEND_)
+        explicit LocalConnectionState(const ResourceDomain& domain)
+            : backend{domain},
+              i2c_adapter{backend.busRegistry(),           &i2c::makeSoftwareBackendForI2C,
+                          &i2c::makeHardwareBackendForI2C, i2c::hardwareControllerCountForI2C(),
+                          i2c::controllerTopologyForI2C(), backend.localResources()},
+              spi_adapter
+        {
+            backend.busRegistry(), &spi::makeSoftwareBackendForSPI, &spi::makeHardwareBackendForSPI,
+                spi::hardwareControllerCountForSPI(), {}, backend.localResources()
+        }
+#elif defined(M5HAL_DETAIL_I2C_HAS_HARDWARE_BACKEND_)
+        explicit LocalConnectionState(const ResourceDomain& domain)
+            : backend{domain},
+              i2c_adapter{backend.busRegistry(),           &i2c::makeSoftwareBackendForI2C,
+                          &i2c::makeHardwareBackendForI2C, i2c::hardwareControllerCountForI2C(),
+                          i2c::controllerTopologyForI2C(), backend.localResources()},
+              spi_adapter
+        {
+            backend.busRegistry(), &spi::makeSoftwareBackendForSPI, nullptr, 0, {}, backend.localResources()
+        }
+#elif defined(M5HAL_DETAIL_SPI_HAS_HARDWARE_BACKEND_)
+        explicit LocalConnectionState(const ResourceDomain& domain)
+            : backend{domain},
+              i2c_adapter{backend.busRegistry(),   &i2c::makeSoftwareBackendForI2C, nullptr, 0, {},
+                          backend.localResources()},
+              spi_adapter
+        {
+            backend.busRegistry(), &spi::makeSoftwareBackendForSPI, &spi::makeHardwareBackendForSPI,
+                spi::hardwareControllerCountForSPI(), {}, backend.localResources()
+        }
+#else
+        explicit LocalConnectionState(const ResourceDomain& domain)
+            : backend{domain},
+              i2c_adapter{backend.busRegistry(),   &i2c::makeSoftwareBackendForI2C, nullptr, 0, {},
+                          backend.localResources()},
+              spi_adapter{backend.busRegistry(),   &spi::makeSoftwareBackendForSPI, nullptr, 0, {},
+                          backend.localResources()}
+#endif
+        {
+            backend.registerKind(i2c_adapter);
+            backend.registerKind(spi_adapter);
+#if M5HAL_V2_SELECTED_VARIANT_I2C != M5HAL_V2_VARIANT_ID_NONE
+            backend.registerPortableProvider(i2c_portable);
+#endif
+#if M5HAL_V2_SELECTED_VARIANT_SPI != M5HAL_V2_VARIANT_ID_NONE
+            backend.registerPortableProvider(spi_portable);
+#endif
+#if M5HAL_V2_SELECTED_VARIANT_UART != M5HAL_V2_VARIANT_ID_NONE
+            backend.registerPortableProvider(uart_portable);
+#endif
+#if M5HAL_V2_SELECTED_VARIANT_I2S != M5HAL_V2_VARIANT_ID_NONE
+            backend.registerPortableProvider(i2s_portable);
+#endif
+#if M5HAL_V2_SELECTED_VARIANT_PDM != M5HAL_V2_VARIANT_ID_NONE
+            backend.registerPortableProvider(pdm_portable);
+#endif
+        }
+
+        void bindLifetime(const std::shared_ptr<LocalConnectionState>& self)
+        {
+            backend.bindLifetime(self);
+            i2c_adapter.bindLifetime(self);
+            spi_adapter.bindLifetime(self);
+        }
+    };
+    }  // namespace detail
+
+    namespace {
 
     bool isLocalEndpoint(const char* endpoint)
     {
@@ -152,8 +260,10 @@ M5HAL_INLINE_V2 namespace v2
     Hal::~Hal()
     {
         setBackendAll(nullptr);
-        Gpio.clearWatchers();
         if (_connection != nullptr && _connection->service() != nullptr) {
+            // Destruction cannot report teardown status. Normal connection
+            // replacement propagates the exact remove() result before it
+            // releases the service owner.
             (void)Services.remove(*_connection->service());
         }
         if (_has_remote_gpio) {
@@ -162,6 +272,7 @@ M5HAL_INLINE_V2 namespace v2
         }
         delete _connection;
         _connection = nullptr;
+        _local_connection.reset();
         // Avoid recursive destruction through RemoteGpioOwner::next after a
         // long-running process has reconnected many times.
         while (_retired_remote_gpios != nullptr) {
@@ -195,37 +306,95 @@ M5HAL_INLINE_V2 namespace v2
     result_t<void> Hal::connect(const char* endpoint, const remote::DeviceConfig& cfg)
     {
         if (isLocalEndpoint(endpoint)) {
-            auto* local = localBackendForConnect();
-            if (local == nullptr) {
-                return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
-            }
-            if (_connection == nullptr && _backend == local) {
-                if (!Gpio.hasGPIO(0)) {
-                    (void)Gpio.addGPIO(gpio::getGPIO(), 0);
+            auto ensure_local_gpio = [&]() -> result_t<void> {
+                if (Gpio.hasGPIO(0)) {
+                    return {};
+                }
+                auto added = Gpio.addGPIO(gpio::getGPIO(), 0);
+                if (!added.has_value()) {
+                    return m5::stl::make_unexpected(added.error());
                 }
                 return {};
+            };
+            if (!_local_connection) {
+                auto& state = *_domain._state;
+                auto locked = state.local_connection_mutex.lock(types::TIMEOUT_FOREVER);
+                if (!locked.has_value()) {
+                    return m5::stl::make_unexpected(locked.error());
+                }
+                auto shared = std::static_pointer_cast<detail::LocalConnectionState>(state.local_connection.lock());
+                if (!shared) {
+                    shared = std::shared_ptr<detail::LocalConnectionState>{new (std::nothrow)
+                                                                               detail::LocalConnectionState(_domain)};
+                    if (shared) {
+                        shared->bindLifetime(shared);
+                        state.local_connection = shared;
+                    }
+                }
+                auto unlocked = state.local_connection_mutex.unlock();
+                if (!unlocked.has_value()) {
+                    return m5::stl::make_unexpected(unlocked.error());
+                }
+                if (!shared) {
+                    return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+                }
+                _local_connection = std::move(shared);
             }
+            auto* local = &_local_connection->backend;
+            if (_connection == nullptr && _backend == local) {
+                return ensure_local_gpio();
+            }
+
+            const bool restore_remote_gpio = _has_remote_gpio;
+            const auto remote_gpio_slot    = _remote_gpio_slot;
+            const bool had_local_gpio      = Gpio.hasGPIO(0);
+            const auto* remote_gpio = restore_remote_gpio && _connection != nullptr ? _connection->gpio() : nullptr;
             if (_has_remote_gpio) {
                 (void)Gpio.removeGPIO(_remote_gpio_slot);
                 _has_remote_gpio = false;
             }
+            auto local_gpio = ensure_local_gpio();
+            if (!local_gpio.has_value()) {
+                if (restore_remote_gpio) {
+                    auto restored = Gpio.addGPIO(remote_gpio, remote_gpio_slot);
+                    if (restored.has_value()) {
+                        _remote_gpio_slot = remote_gpio_slot;
+                        _has_remote_gpio  = true;
+                    }
+                }
+                return m5::stl::make_unexpected(local_gpio.error());
+            }
             if (_connection != nullptr && _connection->service() != nullptr) {
-                (void)Services.remove(*_connection->service());
+                auto removed = Services.remove(*_connection->service());
+                if (!removed.has_value()) {
+                    if (!had_local_gpio) {
+                        auto removed_local = Gpio.removeGPIO(0);
+                        if (!removed_local.has_value()) {
+                            return m5::stl::make_unexpected(removed_local.error());
+                        }
+                    }
+                    if (restore_remote_gpio) {
+                        auto restored = Gpio.addGPIO(remote_gpio, remote_gpio_slot);
+                        if (!restored.has_value()) {
+                            return m5::stl::make_unexpected(restored.error());
+                        }
+                        _remote_gpio_slot = remote_gpio_slot;
+                        _has_remote_gpio  = true;
+                    }
+                    return m5::stl::make_unexpected(removed.error());
+                }
             }
             auto* old_connection = _connection;
             if (old_connection != nullptr) {
                 auto old_handle = old_connection->sessionHandle();
                 if (old_handle) {
-                    old_handle->close();
+                    (void)old_handle->close();
                 }
                 retireRemoteGPIO();
             }
             _connection = nullptr;
             setBackendAll(local);
             delete old_connection;
-            if (!Gpio.hasGPIO(0)) {
-                (void)Gpio.addGPIO(gpio::getGPIO(), 0);
-            }
             return {};
         }
 
@@ -260,48 +429,14 @@ M5HAL_INLINE_V2 namespace v2
     }
 #endif
 
-    // The I2C and SPI local adapters are initialized here (not via in-class
-    // initializers) because this is the only TU where the winner-binding scan
-    // has run, so the variant-supplied backend factories are visible. _backend
-    // is constructed first (declaration order); adapters share its registry.
-    // _hal is last: it takes &_backend and its BusViews delegate through it.
-    // The two hardware-backend guards are independent, so the init list is
-    // spelled out per combination below.
-#if defined(M5HAL_DETAIL_I2C_HAS_HARDWARE_BACKEND_) && defined(M5HAL_DETAIL_SPI_HAS_HARDWARE_BACKEND_)
     M5HALCore::M5HALCore()
-        : _i2c_adapter{_backend.busRegistry(), &i2c::makeSoftwareBackendForI2C, &i2c::makeHardwareBackendForI2C,
-                       i2c::hardwareControllerCountForI2C(), i2c::controllerTopologyForI2C()},
-          _spi_adapter{_backend.busRegistry(), &spi::makeSoftwareBackendForSPI, &spi::makeHardwareBackendForSPI,
-                       spi::hardwareControllerCountForSPI()},
-          _hal{&_backend}
-#elif defined(M5HAL_DETAIL_I2C_HAS_HARDWARE_BACKEND_)
-    M5HALCore::M5HALCore()
-        : _i2c_adapter{_backend.busRegistry(), &i2c::makeSoftwareBackendForI2C, &i2c::makeHardwareBackendForI2C,
-                       i2c::hardwareControllerCountForI2C(), i2c::controllerTopologyForI2C()},
-          _spi_adapter{_backend.busRegistry(), &spi::makeSoftwareBackendForSPI},
-          _hal{&_backend}
-#elif defined(M5HAL_DETAIL_SPI_HAS_HARDWARE_BACKEND_)
-    M5HALCore::M5HALCore()
-        : _i2c_adapter{_backend.busRegistry(), &i2c::makeSoftwareBackendForI2C},
-          _spi_adapter{_backend.busRegistry(), &spi::makeSoftwareBackendForSPI, &spi::makeHardwareBackendForSPI,
-                       spi::hardwareControllerCountForSPI()},
-          _hal{&_backend}
-#else
-    M5HALCore::M5HALCore()
-        : _i2c_adapter{_backend.busRegistry(), &i2c::makeSoftwareBackendForI2C},
-          _spi_adapter{_backend.busRegistry(), &spi::makeSoftwareBackendForSPI},
-          _hal{&_backend}
+#if defined(ESP_PLATFORM)
+        : _hal{ResourceDomain{memory::FallbackOps{&m5halEspidfMalloc, &m5halEspidfRealloc, &m5halEspidfFree}}}
 #endif
     {
-        s_local_backend = &_backend;
-        _backend.registerKind(_i2c_adapter);
-        _backend.registerKind(_spi_adapter);
-#if defined(ESP_PLATFORM)
-        _hal.Memory.setFallback(&m5halEspidfMalloc, &m5halEspidfRealloc, &m5halEspidfFree);
-#endif
-        auto r = _hal.Gpio.addGPIO(gpio::getGPIO(), 0);
-        assert(r.has_value() && "M5HALCore::ctor: slot 0 (MCU GPIO) registration failed");
-        (void)r;
+        auto initialized = _hal.init();
+        assert(initialized.has_value() && "M5HALCore::ctor: default local domain initialization failed");
+        (void)initialized;
     }
 
     Hal& M5_Hal = getM5_Hal();

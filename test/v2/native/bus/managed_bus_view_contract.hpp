@@ -97,61 +97,6 @@ void expectRequireControllerClaimsSpecificController(View& view, MakeReq make_re
     EXPECT_EQ(a.value()->controllerId(), 1);
 }
 
-template <class View, class MakeReq, class MakeTypedConfig>
-void expectTypedAcquireIsNotManagedByCommit(View& view, MakeReq make_req, MakeTypedConfig make_typed_config)
-{
-    auto managed_bus = view.acquire(make_req(0, kManagedRequire));
-    auto typed_bus   = view.acquire(make_typed_config());
-    ASSERT_TRUE(managed_bus.has_value());
-    ASSERT_TRUE(typed_bus.has_value());
-
-    ASSERT_TRUE(view.commitBuses().has_value());
-    EXPECT_EQ(managed_bus.value()->backendKind(), kManagedHw);
-    EXPECT_EQ(typed_bus.value()->backendKind(), kManagedSw);
-    EXPECT_EQ(typed_bus.value()->backendGeneration(), 0u);
-    EXPECT_EQ(view.hardwareInUse(), 1u);
-}
-
-template <class View, class MakeReq, class MakeTypedConfig>
-void expectTypedReacquireThroughLogicalBecomesManaged(View& view, MakeReq make_req,
-                                                      MakeTypedConfig make_typed_config)
-{
-    auto typed_bus = view.acquire(make_typed_config());
-    ASSERT_TRUE(typed_bus.has_value());
-    ASSERT_TRUE(typed_bus.value());
-    EXPECT_EQ(typed_bus.value()->backendKind(), kManagedSw);
-    EXPECT_EQ(typed_bus.value()->backendGeneration(), 0u);
-
-    // Identity is wiring-only. A logical acquire of the same typed-created
-    // facade must return that facade and retag it as intent-managed.
-    auto logical_bus = view.acquire(make_req(1, kManagedRequire));
-    ASSERT_TRUE(logical_bus.has_value());
-    EXPECT_EQ(logical_bus.value().get(), typed_bus.value().get());
-
-    ASSERT_TRUE(view.commitBuses().has_value());
-    EXPECT_EQ(typed_bus.value()->backendKind(), kManagedHw);
-    EXPECT_EQ(typed_bus.value()->controllerId(), 0);
-    EXPECT_EQ(typed_bus.value()->backendGeneration(), 1u);
-    EXPECT_EQ(view.hardwareInUse(), 1u);
-}
-
-template <class View, class MakeReq, class MakeTypedHwConfig>
-void expectUnmanagedHardwareBusReservesItsController(View& view, MakeReq make_req, MakeTypedHwConfig make_hw_config)
-{
-    auto pinned  = view.acquire(make_hw_config());
-    auto req_bus = view.acquire(make_req(0, kManagedRequire));
-    ASSERT_TRUE(pinned.has_value());
-    ASSERT_TRUE(req_bus.has_value());
-
-    ASSERT_TRUE(view.commitBuses().has_value());
-    EXPECT_EQ(req_bus.value()->backendKind(), kManagedHw);
-    EXPECT_EQ(req_bus.value()->controllerId(), 1);
-    EXPECT_EQ(pinned.value()->backendKind(), kManagedHw);
-    EXPECT_EQ(pinned.value()->controllerId(), 0);
-    EXPECT_EQ(pinned.value()->backendGeneration(), 0u);
-    EXPECT_EQ(view.hardwareInUse(), 2u);
-}
-
 template <class View, class MakeReq>
 void expectSoftwareForbidKeepsHardwareOff(View& view, MakeReq make_req)
 {
@@ -199,7 +144,7 @@ void expectRequireAndForbidConflictIsInvalid(View& view, MakeReq make_req)
     bad.forbid  = types::backend_caps::HARDWARE;
     EXPECT_FALSE(bad.valid());
 
-    // D3/F5: an invalid intent is rejected up front at BusView acquire, not
+    // An invalid intent is rejected up front at BusView acquire, not
     // deferred to commitBuses -- so the bus is never interned and no controller
     // is leased.
     auto a = view.acquire(make_req(0, bad));
@@ -211,7 +156,7 @@ void expectRequireAndForbidConflictIsInvalid(View& view, MakeReq make_req)
 template <class View, class MakeReq>
 void expectNegativeSpecificControllerIsInvalid(View& view, MakeReq make_req)
 {
-    // D3/F6: Require/Prefer with a negative controller_id is an impossible
+    // Require/Prefer with a negative controller_id is an impossible
     // request, not "any controller". valid() rejects it and acquire fails up
     // front instead of silently relaxing it to a generic hardware request.
     types::AllocationIntent req_bad;

@@ -7,7 +7,7 @@
 // its fidelity limits, and how to extend it to another peripheral.
 //
 // Each TEST drives the backend the same way real hardware would: an
-// accessor (beginTransaction / read / write / endTransaction, the same
+// accessor (openWireFrame / read / write / closeWireFrame, the same
 // public API an application uses) on one side, and hand-scripted fake ISR
 // events (via fireIsr(), which pokes the fake i2c_dev_t model and then
 // synchronously invokes the captured ISR handler) standing in for the wire
@@ -33,7 +33,9 @@
 #include <soc/i2c_struct.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <vector>
 
@@ -41,12 +43,178 @@ namespace {
 
 using m5::hal::v2::data::ConstDataSpan;
 using m5::hal::v2::data::DataSpan;
+using m5::hal::v2::i2c::SlaveAccessConfig;
+using m5::hal::v2::i2c::SlaveAccessor;
 using m5::hal::v2::i2c::SlaveBus_espidf;
 using m5::hal::v2::i2c::SlaveBusConfig;
 using m5::hal::v2::i2c::SlaveStreamAccessor;
 
+void unusedTaskEntry(void*)
+{
+}
+
+TEST(FreeRtosRuntimeMutex, ReportsTimeoutAndInvalidUnlock)
+{
+    namespace runtime = ::m5::hal::v2::runtime;
+    using error_t     = ::m5::hal::v2::error::error_t;
+
+    runtime::Mutex mutex;
+    auto locked = mutex.lock(0);
+    ASSERT_TRUE(locked.has_value()) << "err=" << ::m5::hal::v2::error::toString(locked.error());
+
+    auto contended = mutex.lock(0);
+    ASSERT_FALSE(contended.has_value());
+    EXPECT_EQ(contended.error(), error_t::TIMEOUT_ERROR);
+
+    auto unlocked = mutex.unlock();
+    ASSERT_TRUE(unlocked.has_value()) << "err=" << ::m5::hal::v2::error::toString(unlocked.error());
+
+    auto invalid = mutex.unlock();
+    ASSERT_FALSE(invalid.has_value());
+    EXPECT_EQ(invalid.error(), error_t::INVALID_STATE);
+}
+
+TEST(FreeRtosRuntimeMutex, PreservesTimeoutBudgetAtSemaphoreSeam)
+{
+    namespace runtime = ::m5::hal::v2::runtime;
+
+    runtime::Mutex mutex;
+
+    auto locked = mutex.lock(0);
+    ASSERT_TRUE(locked.has_value());
+    EXPECT_EQ(m5hal_fake_last_semaphore_take_ticks, 0u);
+    ASSERT_TRUE(mutex.unlock().has_value());
+
+    locked = mutex.lock(17);
+    ASSERT_TRUE(locked.has_value());
+    // 17 ms at 100 Hz is 1.7 ticks. The expected literal is deliberately
+    // independent of the production conversion helper under test.
+    EXPECT_EQ(m5hal_fake_last_semaphore_take_ticks, 2u);
+    ASSERT_TRUE(mutex.unlock().has_value());
+
+    locked = mutex.lock(::m5::hal::v2::types::TIMEOUT_FOREVER);
+    ASSERT_TRUE(locked.has_value());
+    EXPECT_EQ(m5hal_fake_last_semaphore_take_ticks, portMAX_DELAY);
+    ASSERT_TRUE(mutex.unlock().has_value());
+}
+
+TEST(FreeRtosRuntimeEvent, LatchesMergesAndPreservesTimeoutBudget)
+{
+    namespace runtime = ::m5::hal::v2::runtime;
+    using error_t     = ::m5::hal::v2::error::error_t;
+
+    runtime::Event event;
+    event.notify();
+    event.notify();  // xSemaphoreGive() returns pdFALSE: a successful merge, not an error.
+    auto consumed = event.wait(0);
+    ASSERT_TRUE(consumed.has_value()) << "err=" << ::m5::hal::v2::error::toString(consumed.error());
+    EXPECT_EQ(m5hal_fake_last_semaphore_take_ticks, 0u);
+
+    auto empty = event.wait(17);
+    ASSERT_FALSE(empty.has_value());
+    EXPECT_EQ(empty.error(), error_t::TIMEOUT_ERROR);
+    EXPECT_EQ(m5hal_fake_last_semaphore_take_ticks, 2u);
+
+    event.notify();
+    auto forever = event.wait(::m5::hal::v2::types::TIMEOUT_FOREVER);
+    ASSERT_TRUE(forever.has_value()) << "err=" << ::m5::hal::v2::error::toString(forever.error());
+    EXPECT_EQ(m5hal_fake_last_semaphore_take_ticks, portMAX_DELAY);
+}
+
+TEST(FreeRtosRuntimeTask, StartMapsArgumentStateAndCreateFailures)
+{
+    namespace runtime = ::m5::hal::v2::runtime;
+    using error_t     = ::m5::hal::v2::error::error_t;
+
+    runtime::Task task;
+
+    auto null_entry = task.start(nullptr, nullptr);
+    ASSERT_FALSE(null_entry.has_value());
+    EXPECT_EQ(null_entry.error(), error_t::INVALID_ARGUMENT);
+
+    auto zero_stack = task.start(&unusedTaskEntry, nullptr, nullptr, 0);
+    ASSERT_FALSE(zero_stack.has_value());
+    EXPECT_EQ(zero_stack.error(), error_t::INVALID_ARGUMENT);
+
+    if constexpr (sizeof(size_t) > sizeof(uint32_t)) {
+        const auto oversized = static_cast<size_t>(std::numeric_limits<uint32_t>::max()) + 1u;
+        auto bad_stack       = task.start(&unusedTaskEntry, nullptr, nullptr, oversized);
+        ASSERT_FALSE(bad_stack.has_value());
+        EXPECT_EQ(bad_stack.error(), error_t::INVALID_ARGUMENT);
+    }
+
+    auto negative_priority = task.start(&unusedTaskEntry, nullptr, nullptr, 4096, -1);
+    ASSERT_FALSE(negative_priority.has_value());
+    EXPECT_EQ(negative_priority.error(), error_t::INVALID_ARGUMENT);
+
+    auto bad_priority = task.start(&unusedTaskEntry, nullptr, nullptr, 4096, configMAX_PRIORITIES);
+    ASSERT_FALSE(bad_priority.has_value());
+    EXPECT_EQ(bad_priority.error(), error_t::INVALID_ARGUMENT);
+
+    auto bad_core = task.start(&unusedTaskEntry, nullptr, nullptr, 4096, 1, portNUM_PROCESSORS);
+    ASSERT_FALSE(bad_core.has_value());
+    EXPECT_EQ(bad_core.error(), error_t::INVALID_ARGUMENT);
+
+    auto low_core = task.start(&unusedTaskEntry, nullptr, nullptr, 4096, 1, ::m5::hal::v2::types::TASK_CORE_SAME - 1);
+    ASSERT_FALSE(low_core.has_value());
+    EXPECT_EQ(low_core.error(), error_t::INVALID_ARGUMENT);
+
+    m5hal_hostharness::failNextPinnedTaskCreate();
+    auto exhausted = task.start(&unusedTaskEntry, nullptr);
+    ASSERT_FALSE(exhausted.has_value());
+    EXPECT_EQ(exhausted.error(), error_t::OUT_OF_RESOURCE);
+    EXPECT_FALSE(task.joinable());
+
+    m5hal_hostharness::runNextPinnedTaskSynchronously();
+    auto started = task.start(&unusedTaskEntry, nullptr);
+    ASSERT_TRUE(started.has_value());
+    EXPECT_TRUE(task.joinable());
+
+    auto invalid_while_joinable = task.start(nullptr, nullptr);
+    ASSERT_FALSE(invalid_while_joinable.has_value());
+    EXPECT_EQ(invalid_while_joinable.error(), error_t::INVALID_ARGUMENT);
+
+    auto duplicate = task.start(&unusedTaskEntry, nullptr);
+    ASSERT_FALSE(duplicate.has_value());
+    EXPECT_EQ(duplicate.error(), error_t::INVALID_STATE);
+
+    task.join();
+    EXPECT_FALSE(task.joinable());
+}
+
+class IdleRunnerService final : public ::m5::hal::v2::service::IService {
+    ::m5::hal::v2::service::ServicePoll serviceImpl(const ::m5::hal::v2::service::ServiceContext&) override
+    {
+        return ::m5::hal::v2::service::ServiceResult::Idle;
+    }
+};
+
+TEST(FreeRtosServiceRunner, ImplicitTaskFailureIsExactAndRollsBackRegistration)
+{
+    using error_t = ::m5::hal::v2::error::error_t;
+
+    ::m5::hal::v2::service::ServiceRunner runner;
+    IdleRunnerService service;
+
+    m5hal_hostharness::failNextPinnedTaskCreate();
+    auto added = runner.add(service);
+    ASSERT_FALSE(added.has_value());
+    EXPECT_EQ(added.error(), error_t::OUT_OF_RESOURCE);
+    EXPECT_EQ(runner.size(), size_t{0});
+    EXPECT_FALSE(runner.autoRunActive());
+
+    // Rollback must leave the service reusable rather than as a hidden
+    // duplicate. The next add reaches Task::start again and reports that
+    // second launch attempt's exact failure.
+    m5hal_hostharness::failNextPinnedTaskCreate();
+    auto retried = runner.add(service);
+    ASSERT_FALSE(retried.has_value());
+    EXPECT_EQ(retried.error(), error_t::OUT_OF_RESOURCE);
+    EXPECT_EQ(runner.size(), size_t{0});
+}
+
 // Every scenario fires the ISR before the accessor opens, so the transaction
-// the accessor wants is ALWAYS already allocated -- beginTransaction can use
+// the accessor wants is ALWAYS already allocated -- openWireFrame can use
 // a single non-blocking attempt (timeout 0). This is deliberate CI hygiene,
 // not an optimization: the default TIMEOUT_FOREVER retry loop turns a
 // regression that stops producing openable transactions into a test-process
@@ -60,6 +228,13 @@ SlaveBusConfig makeConfig()
     cfg.pin_scl = 1;
     cfg.pin_sda = 2;
     cfg.address = 0x42;
+    return cfg;
+}
+
+SlaveBusConfig makeLegacyConfig()
+{
+    auto cfg                     = makeConfig();
+    cfg.legacy_wire_frame_window = true;
     return cfg;
 }
 
@@ -109,7 +284,7 @@ void fireIsr(uint32_t pending_bits, bool is_read,
 }
 
 // Owns a fresh SlaveBus_espidf + bound accessor, inited against the fake
-// device model. RAII teardown (~SlaveBus_espidf calls release()) frees the
+// device model. RAII teardown (~SlaveBus_espidf calls teardownBackend()) frees the
 // captured ISR handle and resets the fake model's interrupt mask, so the
 // next Harness's init() sees a clean baseline.
 struct Harness {
@@ -118,14 +293,188 @@ struct Harness {
 
     Harness()
     {
-        auto r = bus.init(makeConfig());
+        auto r = bus.init(makeLegacyConfig());
         if (!r.has_value()) {
             ADD_FAILURE() << "bus.init failed: err=" << m5::hal::v2::error::toString(r.error());
         }
     }
 };
 
+SlaveAccessConfig byteQueueConfig()
+{
+    SlaveAccessConfig config;
+    config.tx_mode = m5::hal::v2::slave::QueueMode::Byte;
+    config.rx_mode = m5::hal::v2::slave::QueueMode::Byte;
+    return config;
+}
+
+struct QueueHarness {
+    SlaveBus_espidf bus;
+    m5::hal::v2::slave::StaticSlaveQueueStorage<128, 128, 1, 1> queues;
+    m5::hal::v2::i2c::StaticI2cSegmentStorage<1> segments;
+    SlaveAccessor acc{bus, queues.tx(), queues.rx(), segments.storage(), byteQueueConfig()};
+
+    QueueHarness()
+    {
+        auto r = bus.init(makeConfig());
+        if (!r.has_value()) ADD_FAILURE() << "bus.init failed: " << m5::hal::v2::error::toString(r.error());
+    }
+};
+
 }  // namespace
+
+TEST(EspidfI2cSlaveQueuedHostHarness, ByteLifecycleRxAndEnd)
+{
+    QueueHarness h;
+    auto begun = h.acc.beginAccess(100);
+    ASSERT_TRUE(begun.has_value()) << m5::hal::v2::error::toString(begun.error());
+    const uint8_t wire[] = {0x11, 0x22, 0x33};
+    primeRxFifo(wire);
+    fireIsr(I2C_RXFIFO_WM_INT_ENA_M, false);
+
+    uint8_t received[sizeof(wire)]{};
+    auto read = h.acc.read({received, sizeof(received)});
+    ASSERT_TRUE(read.has_value());
+    EXPECT_EQ(*read, sizeof(wire));
+    EXPECT_TRUE(std::equal(std::begin(wire), std::end(wire), received));
+    EXPECT_TRUE(h.acc.endAccess(100).has_value());
+    EXPECT_FALSE(h.acc.inAccess());
+}
+
+TEST(EspidfI2cSlaveQueuedHostHarness, StuckWorkerEndDeletesTaskDetachesAndKeepsBackendBroken)
+{
+    QueueHarness h;
+    const uint32_t deleted_before = m5hal_hostharness::deletedTaskCount();
+    ASSERT_TRUE(h.acc.beginAccess(100).has_value());
+    h.bus.testHoldQueuedWorkerSession();
+    auto ended = h.acc.endAccess(0);
+    ASSERT_FALSE(ended.has_value());
+    EXPECT_EQ(ended.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+    EXPECT_TRUE(h.bus.testQueuedEndpointsDetached());
+    EXPECT_FALSE(h.bus.testQueuedProducerTaskPresent());
+    EXPECT_EQ(m5hal_hostharness::deletedTaskCount(), deleted_before + 1);
+    EXPECT_FALSE(h.acc.beginAccess(0).has_value());
+    h.bus.testReleaseHeldQueuedWorkerSession();
+    ASSERT_TRUE(h.bus.close().has_value());
+    ASSERT_TRUE(h.bus.init(makeConfig()).has_value());
+    ASSERT_TRUE(h.acc.beginAccess(100).has_value());
+    ASSERT_TRUE(h.acc.endAccess(100).has_value());
+}
+
+TEST(EspidfI2cSlaveQueuedHostHarness, BeginRollbackStopsStuckWorkerAndDetaches)
+{
+    QueueHarness h;
+    const uint32_t deleted_before = m5hal_hostharness::deletedTaskCount();
+    h.bus.testFailNextQueuedBeginWithHeldWorker();
+    auto begun = h.acc.beginAccess(100);
+    ASSERT_FALSE(begun.has_value());
+    EXPECT_EQ(begun.error(), m5::hal::v2::error::error_t::INVALID_STATE);
+    EXPECT_TRUE(h.bus.testQueuedEndpointsDetached());
+    EXPECT_FALSE(h.bus.testQueuedProducerTaskPresent());
+    EXPECT_EQ(m5hal_hostharness::deletedTaskCount(), deleted_before + 1);
+    h.bus.testReleaseHeldQueuedWorkerSession();
+}
+
+TEST(EspidfI2cSlaveQueuedHostHarness, TxLoadDoesNotPopUntilStopAndSuffixIsRetained)
+{
+    QueueHarness h;
+    const uint8_t reply[] = {0xA0, 0xA1, 0xA2, 0xA3};
+    ASSERT_TRUE(h.acc.write({reply, sizeof(reply)}).has_value());
+    auto begun = h.acc.beginAccess(100);
+    ASSERT_TRUE(begun.has_value()) << m5::hal::v2::error::toString(begun.error());
+
+    fireIsr(I2C_SLAVE_STRETCH_INT_ENA_M, true, I2C_SLAVE_STRETCH_CAUSE_ADDRESS_MATCH);
+    EXPECT_EQ(h.acc.writable(), 128u - sizeof(reply));
+    ASSERT_GE(fakeHw().txfifo_count, sizeof(reply));
+    // Two bytes reached the master and the next byte moved into the shifter
+    // before the early NACK. FIFO occupancy alone cannot confirm that third byte.
+    fakeHw().txfifo_count = i2c_dev_t::kFifoLen - 3;
+    fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, true);
+    EXPECT_EQ(h.acc.writable(), 126u);
+    EXPECT_NE(fakeHw().int_ena & I2C_SLAVE_STRETCH_INT_ENA_M, 0u);
+
+    fireIsr(I2C_SLAVE_STRETCH_INT_ENA_M, true, I2C_SLAVE_STRETCH_CAUSE_ADDRESS_MATCH);
+    EXPECT_FALSE(fakeHw().stretch_active);
+    ASSERT_GE(fakeHw().txfifo_count, 2u);
+    EXPECT_EQ(fakeHw().txfifo[0], 0xA2);
+    EXPECT_EQ(fakeHw().txfifo[1], 0xA3);
+    fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, true);
+    EXPECT_TRUE(h.acc.endAccess(100).has_value());
+}
+
+TEST(EspidfI2cSlaveQueuedHostHarness, EndAccessDrainsResidualHardwareRx)
+{
+    QueueHarness h;
+    EXPECT_EQ(fakeHw().slave_address, 0x3FFu);
+    EXPECT_TRUE(fakeHw().slave_address_10bit);
+    EXPECT_EQ(fakeHw().int_ena & I2C_LL_INTR_MASK, 0u);
+    const unsigned updates_before_begin = fakeHw().update_count;
+    auto begun                          = h.acc.beginAccess(100);
+    ASSERT_TRUE(begun.has_value()) << m5::hal::v2::error::toString(begun.error());
+    EXPECT_GT(fakeHw().update_count, updates_before_begin);
+    EXPECT_EQ(fakeHw().slave_address, makeConfig().address);
+    EXPECT_FALSE(fakeHw().slave_address_10bit);
+
+    const uint8_t wire[] = {0x31, 0x32, 0x33};
+    primeRxFifo(wire);
+    const unsigned updates_before_end = fakeHw().update_count;
+    ASSERT_TRUE(h.acc.endAccess(100).has_value());
+    EXPECT_GT(fakeHw().update_count, updates_before_end);
+    EXPECT_EQ(fakeHw().slave_address, 0x3FFu);
+    EXPECT_TRUE(fakeHw().slave_address_10bit);
+
+    uint8_t received[sizeof(wire)]{};
+    auto read = h.acc.read({received, sizeof(received)});
+    ASSERT_TRUE(read.has_value());
+    EXPECT_EQ(*read, sizeof(wire));
+    EXPECT_TRUE(std::equal(std::begin(wire), std::end(wire), received));
+}
+
+TEST(EspidfI2cSlaveQueuedHostHarness, EndAccessHardStopsBusyWireAndKeepsBackendBroken)
+{
+    QueueHarness h;
+    ASSERT_TRUE(h.acc.beginAccess(100).has_value());
+    fakeHw().bus_busy = true;
+
+    auto ended = h.acc.endAccess(0);
+    ASSERT_FALSE(ended.has_value());
+    EXPECT_EQ(ended.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+    EXPECT_FALSE(h.acc.inAccess());
+    EXPECT_FALSE(h.acc.beginAccess(0).has_value());
+
+    // Keep the process-wide fake sane for the next test's fresh init.
+    fakeHw().bus_busy = false;
+}
+
+TEST(EspidfI2cSlaveQueuedHostHarness, StopTailWithoutBridgeSpaceIsAccountedAndBreaksAcceptance)
+{
+    QueueHarness h;
+    ASSERT_TRUE(h.acc.beginAccess(100).has_value());
+    std::array<uint8_t, i2c_dev_t::kFifoLen> batch{};
+    std::iota(batch.begin(), batch.end(), uint8_t{0});
+
+    // Four batches fill the caller RX queue. Four more remain staged in the
+    // fixed ISR bridge because the worker cannot replay them yet.
+    for (size_t i = 0; i < 8; ++i) {
+        primeRxFifo(batch);
+        fireIsr(I2C_RXFIFO_WM_INT_ENA_M, false);
+    }
+    EXPECT_EQ(h.acc.readable(), 128u);
+
+    // The STOP tail has nowhere safe to live. It must be explicitly dropped,
+    // accounted, and fence subsequent address matches instead of leaking into
+    // the next transaction.
+    primeRxFifo(batch);
+    fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, false);
+    EXPECT_EQ(fakeHw().rxfifo_count, 0u);
+    EXPECT_EQ(fakeHw().slave_address, 0x3FFu);
+    EXPECT_TRUE(fakeHw().slave_address_10bit);
+    EXPECT_GE(h.acc.rxStatus().dropped_bytes, batch.size());
+
+    auto ended = h.acc.endAccess(100);
+    EXPECT_FALSE(ended.has_value());
+    EXPECT_FALSE(h.acc.beginAccess(0).has_value());
+}
 
 // ---------------------------------------------------------------------------
 // Baseline: the harness can drive a plain write and a plain read at all,
@@ -159,7 +508,7 @@ TEST(EspidfI2cSlaveHostHarness, BasicWriteTransactionIsFullyReadable)
     primeRxFifo(written);
     fireIsr(I2C_RXFIFO_WM_INT_ENA_M, /*is_read=*/false);
 
-    ASSERT_TRUE(h.acc.beginTransaction(kBeginNonBlocking).has_value());
+    ASSERT_TRUE(h.acc.openWireFrame(kBeginNonBlocking).has_value());
     uint8_t rx[sizeof(written)] = {};
     auto read                   = h.acc.read(DataSpan{rx, sizeof(rx)});
     ASSERT_TRUE(read.has_value()) << m5::hal::v2::error::toString(read.error());
@@ -167,10 +516,10 @@ TEST(EspidfI2cSlaveHostHarness, BasicWriteTransactionIsFullyReadable)
     EXPECT_TRUE(std::equal(std::begin(written), std::end(written), rx));
 
     fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, /*is_read=*/false);  // STOP
-    auto complete = h.acc.transactionComplete();
+    auto complete = h.acc.wireFrameComplete();
     ASSERT_TRUE(complete.has_value());
     EXPECT_TRUE(*complete);
-    EXPECT_TRUE(h.acc.endTransaction().has_value());
+    EXPECT_TRUE(h.acc.closeWireFrame().has_value());
     EXPECT_EQ(h.bus.rxOverflowCount(), 0u);
 }
 
@@ -181,7 +530,7 @@ TEST(EspidfI2cSlaveHostHarness, BasicReadTransactionServesComposedReply)
     // Pure read: address-match stretch with no prior write phase.
     fireIsr(I2C_SLAVE_STRETCH_INT_ENA_M, /*is_read=*/true, I2C_SLAVE_STRETCH_CAUSE_ADDRESS_MATCH);
 
-    ASSERT_TRUE(h.acc.beginTransaction(kBeginNonBlocking).has_value());
+    ASSERT_TRUE(h.acc.openWireFrame(kBeginNonBlocking).has_value());
     const uint8_t reply[] = {0xCA, 0xFE};
     auto write            = h.acc.write(ConstDataSpan{reply, sizeof(reply)});
     ASSERT_TRUE(write.has_value()) << m5::hal::v2::error::toString(write.error());
@@ -195,10 +544,10 @@ TEST(EspidfI2cSlaveHostHarness, BasicReadTransactionServesComposedReply)
     EXPECT_FALSE(fakeHw().stretch_active);
 
     fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, /*is_read=*/true);  // STOP
-    EXPECT_TRUE(h.acc.endTransaction().has_value());
+    EXPECT_TRUE(h.acc.closeWireFrame().has_value());
 }
 
-TEST(EspidfI2cSlaveHostHarness, EndTransactionReleasesRxFullHold)
+TEST(EspidfI2cSlaveHostHarness, CloseWireFrameReleasesRxFullHold)
 {
     Harness h;
 
@@ -207,7 +556,7 @@ TEST(EspidfI2cSlaveHostHarness, EndTransactionReleasesRxFullHold)
     primeRxFifo(fill);
     fireIsr(I2C_RXFIFO_WM_INT_ENA_M, /*is_read=*/false);
 
-    ASSERT_TRUE(h.acc.beginTransaction(kBeginNonBlocking).has_value());
+    ASSERT_TRUE(h.acc.openWireFrame(kBeginNonBlocking).has_value());
 
     primeRxFifo(std::vector<uint8_t>{0xA5});
     fireIsr(I2C_SLAVE_STRETCH_INT_ENA_M, /*is_read=*/false, I2C_SLAVE_STRETCH_CAUSE_RX_FULL);
@@ -216,7 +565,7 @@ TEST(EspidfI2cSlaveHostHarness, EndTransactionReleasesRxFullHold)
     EXPECT_EQ(fakeHw().int_ena & (I2C_SLAVE_STRETCH_INT_ENA_M | I2C_RXFIFO_WM_INT_ENA_M), 0u)
         << "rx_full hold masks the level sources until the held transaction is drained or discarded";
 
-    auto ended = h.acc.endTransaction();
+    auto ended = h.acc.closeWireFrame();
     ASSERT_TRUE(ended.has_value()) << m5::hal::v2::error::toString(ended.error());
 
     EXPECT_FALSE(fakeHw().stretch_active);
@@ -242,7 +591,7 @@ TEST(EspidfI2cSlaveHostHarness, RxFullHoldSurvivesReadAddressMatchUntilRxIsDrain
     primeRxFifo(backlog);
     fireIsr(I2C_RXFIFO_WM_INT_ENA_M, /*is_read=*/false);
 
-    ASSERT_TRUE(h.acc.beginTransaction(kBeginNonBlocking).has_value());
+    ASSERT_TRUE(h.acc.openWireFrame(kBeginNonBlocking).has_value());
     auto readable = h.acc.readableBytes();
     ASSERT_TRUE(readable.has_value()) << m5::hal::v2::error::toString(readable.error());
     ASSERT_EQ(*readable, backlog.size());
@@ -277,28 +626,57 @@ TEST(EspidfI2cSlaveHostHarness, RxFullHoldSurvivesReadAddressMatchUntilRxIsDrain
     EXPECT_TRUE(std::equal(std::begin(reply), std::end(reply), fakeHw().txfifo));
     EXPECT_FALSE(fakeHw().stretch_active);
 
-    EXPECT_TRUE(h.acc.endTransaction().has_value());
+    EXPECT_TRUE(h.acc.closeWireFrame().has_value());
 }
 
-TEST(EspidfI2cSlaveHostHarness, ReleaseTimeoutReturnsErrorAndInitDoesNotReenter)
+TEST(EspidfI2cSlaveHostHarness, ForcedCloseCompletesCleanupAndAllowsReinit)
 {
+    using m5hal_hostharness::I2cClockEvent;
+    m5hal_hostharness::resetI2cClockTrace();
+
     SlaveBus_espidf bus;
     auto init = bus.init(makeConfig());
     ASSERT_TRUE(init.has_value()) << m5::hal::v2::error::toString(init.error());
+    EXPECT_EQ(m5hal_hostharness::i2cClockTrace(),
+              (std::vector<I2cClockEvent>{I2cClockEvent::BusEnable, I2cClockEvent::ControllerEnable}));
 
-    auto released = bus.release();
-    ASSERT_FALSE(released.has_value());
-    EXPECT_EQ(released.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+    auto closed = bus.close();
+    ASSERT_TRUE(closed.has_value());
+    EXPECT_EQ(m5hal_hostharness::i2cClockTrace(),
+              (std::vector<I2cClockEvent>{I2cClockEvent::BusEnable, I2cClockEvent::ControllerEnable,
+                                          I2cClockEvent::ControllerDisable, I2cClockEvent::BusDisable}));
 
     auto reinit = bus.init(makeConfig());
-    ASSERT_FALSE(reinit.has_value());
-    EXPECT_EQ(reinit.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+    ASSERT_TRUE(reinit.has_value());
+    EXPECT_EQ(m5hal_hostharness::i2cClockTrace(),
+              (std::vector<I2cClockEvent>{I2cClockEvent::BusEnable, I2cClockEvent::ControllerEnable,
+                                          I2cClockEvent::ControllerDisable, I2cClockEvent::BusDisable,
+                                          I2cClockEvent::BusEnable, I2cClockEvent::ControllerEnable}));
+}
+
+TEST(EspidfI2cSlaveHostHarness, SuccessfulCloseDisablesClocksInReverseOrder)
+{
+    using m5hal_hostharness::I2cClockEvent;
+    m5hal_hostharness::resetI2cClockTrace();
+
+    SlaveBus_espidf bus;
+    auto init = bus.init(makeConfig());
+    ASSERT_TRUE(init.has_value()) << m5::hal::v2::error::toString(init.error());
+    EXPECT_EQ(m5hal_hostharness::i2cClockTrace(),
+              (std::vector<I2cClockEvent>{I2cClockEvent::BusEnable, I2cClockEvent::ControllerEnable}));
+
+    m5hal_hostharness::runCreatedTaskOnNextDelay();
+    auto closed = bus.close();
+    ASSERT_TRUE(closed.has_value()) << m5::hal::v2::error::toString(closed.error());
+    EXPECT_EQ(m5hal_hostharness::i2cClockTrace(),
+              (std::vector<I2cClockEvent>{I2cClockEvent::BusEnable, I2cClockEvent::ControllerEnable,
+                                          I2cClockEvent::ControllerDisable, I2cClockEvent::BusDisable}));
 }
 
 // ---------------------------------------------------------------------------
 // cc133e89: a reply composed while servicing a WRITE transaction must not
 // leak onto the wire if a zero-gap READ address-match beats the accessor's
-// endTransaction() of that write. Regresses the `_open == _current`
+// closeWireFrame() of that write. Regresses the `_open == _current`
 // stale-reply guard in snapshotResponseLocked() / write()'s release path.
 // ---------------------------------------------------------------------------
 
@@ -312,7 +690,7 @@ TEST(EspidfI2cSlaveHostHarness, Cc133e89StaleComposedReplyDoesNotLeakIntoFollowi
     // exposed the race), then STOPs.
     primeRxFifo(std::vector<uint8_t>{0x10});
     fireIsr(I2C_RXFIFO_WM_INT_ENA_M, /*is_read=*/false);
-    ASSERT_TRUE(h.acc.beginTransaction(kBeginNonBlocking).has_value());
+    ASSERT_TRUE(h.acc.openWireFrame(kBeginNonBlocking).has_value());
     uint8_t rx_byte = 0;
     ASSERT_TRUE(h.acc.read(DataSpan{&rx_byte, 1}).has_value());
     EXPECT_EQ(rx_byte, 0x10);
@@ -332,7 +710,7 @@ TEST(EspidfI2cSlaveHostHarness, Cc133e89StaleComposedReplyDoesNotLeakIntoFollowi
 
     // serve()'s loop for the (stale, not-yet-closed) write transaction
     // writes again -- e.g. streaming more reply bytes before it has
-    // observed transactionComplete() and called endTransaction(). This is
+    // observed wireFrameComplete() and called closeWireFrame(). This is
     // the EXACT call cc133e89's fix guards: `_open` (the write transaction)
     // is no longer the wire's transaction (`_current` is now the new read's
     // allocation), so this must NOT release the new read's stretch with the
@@ -346,11 +724,11 @@ TEST(EspidfI2cSlaveHostHarness, Cc133e89StaleComposedReplyDoesNotLeakIntoFollowi
     EXPECT_EQ(fakeHw().txfifo_count, 0u) << "write() onto the stale transaction must not release the new read's hold";
     EXPECT_TRUE(fakeHw().stretch_active) << "the new read's stretch must stay held pending a fresh compose";
 
-    ASSERT_TRUE(h.acc.endTransaction().has_value());
+    ASSERT_TRUE(h.acc.closeWireFrame().has_value());
 
     // The accessor opens the transaction the ISR allocated for the new read
     // and composes a fresh reply; this one DOES release the hold.
-    ASSERT_TRUE(h.acc.beginTransaction(kBeginNonBlocking).has_value());
+    ASSERT_TRUE(h.acc.openWireFrame(kBeginNonBlocking).has_value());
     const uint8_t fresh_reply[] = {0xBE, 0xEF, 0x01};
     auto fresh                  = h.acc.write(ConstDataSpan{fresh_reply, sizeof(fresh_reply)});
     ASSERT_TRUE(fresh.has_value()) << m5::hal::v2::error::toString(fresh.error());
@@ -361,7 +739,7 @@ TEST(EspidfI2cSlaveHostHarness, Cc133e89StaleComposedReplyDoesNotLeakIntoFollowi
     EXPECT_FALSE(fakeHw().stretch_active);
 
     fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, /*is_read=*/true);  // STOP
-    EXPECT_TRUE(h.acc.endTransaction().has_value());
+    EXPECT_TRUE(h.acc.closeWireFrame().has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -391,7 +769,7 @@ TEST(EspidfI2cSlaveHostHarness, A999a5faStopTailSpillsIntoReserveWithoutOverflow
     primeRxFifo(tail_batch);
     fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, /*is_read=*/false);
 
-    ASSERT_TRUE(h.acc.beginTransaction(kBeginNonBlocking).has_value());
+    ASSERT_TRUE(h.acc.openWireFrame(kBeginNonBlocking).has_value());
     std::vector<uint8_t> all(first_batch.size() + tail_batch.size());
     auto read = h.acc.read(DataSpan{all.data(), all.size()});
     ASSERT_TRUE(read.has_value()) << m5::hal::v2::error::toString(read.error());
@@ -402,7 +780,70 @@ TEST(EspidfI2cSlaveHostHarness, A999a5faStopTailSpillsIntoReserveWithoutOverflow
     EXPECT_EQ(all, expected);
     EXPECT_EQ(h.bus.rxOverflowCount(), 0u);
 
-    EXPECT_TRUE(h.acc.endTransaction().has_value());
+    EXPECT_TRUE(h.acc.closeWireFrame().has_value());
+}
+
+// ---------------------------------------------------------------------------
+// When all transaction slots are occupied, allocating the next wire
+// transaction recycles the oldest non-open slot. Any unread RX backlog in that
+// slot is genuinely lost and must therefore contribute its byte count to
+// rxOverflowCount(). A zero-RX transaction must contribute nothing.
+//
+// A partially read transaction cannot be an eviction victim through the public
+// API: read() requires openWireFrame(), which makes it `_open`, and the
+// allocator explicitly excludes `_open`; closeWireFrame() discards/frees it.
+// Thus the host harness can exercise the all-unread and zero-unread boundaries,
+// while the production subtraction remains defensive against rx_read > rx_size.
+// ---------------------------------------------------------------------------
+
+TEST(EspidfI2cSlaveHostHarness, TransactionSlotEvictionCountsAllUnreadRxBytes)
+{
+    Harness h;
+
+    const std::vector<uint8_t> oldest = {0x10, 0x20, 0x30, 0x40, 0x50};
+    primeRxFifo(oldest);
+    fireIsr(I2C_RXFIFO_WM_INT_ENA_M, /*is_read=*/false);
+    fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, /*is_read=*/false);  // STOP
+
+    // Fill the remaining slots with completed, unread write transactions.
+    for (size_t i = 1; i < SlaveBus_espidf::kMaxTransactions; ++i) {
+        primeRxFifo(std::vector<uint8_t>{static_cast<uint8_t>(0x80 + i)});
+        fireIsr(I2C_RXFIFO_WM_INT_ENA_M, /*is_read=*/false);
+        fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, /*is_read=*/false);  // STOP
+    }
+    ASSERT_EQ(h.bus.rxOverflowCount(), 0u);
+
+    // Allocating transaction kMaxTransactions + 1 recycles the oldest slot.
+    primeRxFifo(std::vector<uint8_t>{0xEE});
+    fireIsr(I2C_RXFIFO_WM_INT_ENA_M, /*is_read=*/false);
+    EXPECT_EQ(h.bus.rxOverflowCount(), oldest.size());
+}
+
+TEST(EspidfI2cSlaveHostHarness, TransactionSlotEvictionWithZeroUnreadRxAddsNothing)
+{
+    Harness h;
+
+    // A completed pure-read transaction occupies the oldest slot with rx_size=0.
+    fireIsr(I2C_SLAVE_STRETCH_INT_ENA_M, /*is_read=*/true, I2C_SLAVE_STRETCH_CAUSE_ADDRESS_MATCH);
+    fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, /*is_read=*/true);  // STOP
+
+    // Fill the other slots with one unread byte each.
+    for (size_t i = 1; i < SlaveBus_espidf::kMaxTransactions; ++i) {
+        primeRxFifo(std::vector<uint8_t>{static_cast<uint8_t>(0x90 + i)});
+        fireIsr(I2C_RXFIFO_WM_INT_ENA_M, /*is_read=*/false);
+        fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, /*is_read=*/false);  // STOP
+    }
+
+    // First recycle drops the zero-RX slot; the byte counter must stay unchanged.
+    primeRxFifo(std::vector<uint8_t>{0xE0});
+    fireIsr(I2C_RXFIFO_WM_INT_ENA_M, /*is_read=*/false);
+    EXPECT_EQ(h.bus.rxOverflowCount(), 0u);
+    fireIsr(I2C_TRANS_COMPLETE_INT_ENA_M, /*is_read=*/false);  // STOP
+
+    // The next recycle drops the one-byte transaction that is now oldest.
+    primeRxFifo(std::vector<uint8_t>{0xE1});
+    fireIsr(I2C_RXFIFO_WM_INT_ENA_M, /*is_read=*/false);
+    EXPECT_EQ(h.bus.rxOverflowCount(), 1u);
 }
 
 // ---------------------------------------------------------------------------
@@ -438,7 +879,7 @@ TEST(EspidfI2cSlaveHostHarness, SplitWriteThenReadAllocatesFreshTransactionOnMer
     // one pending RX byte.
     primeRxFifo(std::vector<uint8_t>{0x07});
     fireIsr(I2C_SLAVE_STRETCH_INT_ENA_M, /*is_read=*/false, I2C_SLAVE_STRETCH_CAUSE_ADDRESS_MATCH);
-    ASSERT_TRUE(h.acc.beginTransaction(kBeginNonBlocking).has_value());
+    ASSERT_TRUE(h.acc.openWireFrame(kBeginNonBlocking).has_value());
     uint8_t reg_ptr = 0;
     ASSERT_TRUE(h.acc.read(DataSpan{&reg_ptr, 1}).has_value());
     EXPECT_EQ(reg_ptr, 0x07);
@@ -459,22 +900,22 @@ TEST(EspidfI2cSlaveHostHarness, SplitWriteThenReadAllocatesFreshTransactionOnMer
     }
 
     // The write transaction is now complete on the wire; the accessor still
-    // holds it open (it has not called endTransaction() yet).
-    auto complete = h.acc.transactionComplete();
+    // holds it open (it has not called closeWireFrame() yet).
+    auto complete = h.acc.wireFrameComplete();
     ASSERT_TRUE(complete.has_value());
     EXPECT_TRUE(*complete);
-    ASSERT_TRUE(h.acc.endTransaction().has_value());
+    ASSERT_TRUE(h.acc.closeWireFrame().has_value());
 
     // Opening the next transaction must reach the NEW slot the merged
     // pass's STRETCH branch allocated -- readableBytes()==0 (a pure read
     // never received rx bytes) proves it is not the write transaction's
     // slot, which had 1 unread byte's worth of history.
-    ASSERT_TRUE(h.acc.beginTransaction(kBeginNonBlocking).has_value());
+    ASSERT_TRUE(h.acc.openWireFrame(kBeginNonBlocking).has_value());
     auto readable = h.acc.readableBytes();
     ASSERT_TRUE(readable.has_value());
     EXPECT_EQ(*readable, 0u) << "must not reuse the completed write transaction's slot";
 
-    EXPECT_TRUE(h.acc.endTransaction().has_value());
+    EXPECT_TRUE(h.acc.closeWireFrame().has_value());
 }
 
 int main(int argc, char** argv)

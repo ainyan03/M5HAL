@@ -1,6 +1,6 @@
 # stability — API 安定度と変更不可の範囲
 
-> **読者**: 利用者・メンテナ・移植者。
+> **読者**: 利用者向け。
 
 M5HAL の各 API がどこまで変わりうるかを宣言する。 **段は spec 文書ごとに付く** (`design/*.md` 1 本 =
 1 段)。 名前空間やディレクトリの階層とは無関係で、 段は属性である。
@@ -14,15 +14,20 @@ M5HAL の各 API がどこまで変わりうるかを宣言する。 **段は sp
 | `stable` | **契約は変更不可**。 非互換変更を行わない |
 
 > **`unstable` の意味**: **API 契約の形がまだ確定していない**ことを表す。 実装の品質・動作の
-> 安定性とは**無関係**である。 実装が完成し実機受入済みであっても `unstable` でありうる。
+> 安定性とは**無関係**である。backendが提供され検証対象になっていても`unstable`でありうる。
 
 **既定は `unstable`。** 段の宣言が無い spec 文書は `unstable` とみなす。 `stable` は**明示的な
 宣言行為**であり、 黙って約束が発生することはない。
 
+## 文書分割
+
+独立して変更不可範囲を説明・検証・昇格でき、利用者にも別の互換性面として理解できる場合は、specを
+自然な文書へ分割してよい。型・関数ごとのstability台帳や、個別symbolだけを昇格するための細分化は行わない。
+一つの文書内でsymbolごとに異なる段を付けず、必要なら互換性面として自然に分割する。
+
 ## 昇格
 
-段は API ごとに独立して昇格する。 `1.1.0` で `spi` が `stable`、 `1.2.0` で `i2c` が `stable`、
-という進み方を正とする。 降格は行わない。
+段はspec文書ごとに独立して昇格し、降格は行わない。
 
 | 遷移 | ゲート |
 |---|---|
@@ -36,14 +41,13 @@ semver イベントではなく信頼の毀損にあたるため、 昇格は慎
 
 ## 現在の段
 
-| 段 | spec 文書 |
+この台帳を各design文書の段の正本とする。新しいdesign文書も明示的に追加する。
+
+| 段 | spec文書 |
 |---|---|
 | `experimental` | [design/frame.md](design/frame.md) / [design/bytecode.md](design/bytecode.md) / [design/remote.md](design/remote.md) |
-| `unstable` | [design/bus_accessor.md](design/bus_accessor.md) / [design/configuration.md](design/configuration.md) / [design/data_io.md](design/data_io.md) / [design/errors.md](design/errors.md) / [design/gpio.md](design/gpio.md) / [design/i2c.md](design/i2c.md) / [design/i2c_slave.md](design/i2c_slave.md) / [design/i2s.md](design/i2s.md) / [design/memory.md](design/memory.md) / [design/runtime.md](design/runtime.md) / [design/service.md](design/service.md) / [design/spi.md](design/spi.md) / [design/transfer_desc.md](design/transfer_desc.md) / [design/uart.md](design/uart.md) / [design/v0_v2_coexistence.md](design/v0_v2_coexistence.md) / [design/variants.md](design/variants.md) |
-| `stable` | (なし) |
-
-`stable` が空なのは出発点であるためで、 方針ではない。 昇格ゲートを満たした API から順に
-`1.x` の各リリースで宣言する。
+| `unstable` | [design/bus_accessor.md](design/bus_accessor.md) / [design/bus_capabilities.md](design/bus_capabilities.md) / [design/configuration.md](design/configuration.md) / [design/data_io.md](design/data_io.md) / [design/errors.md](design/errors.md) / [design/gpio.md](design/gpio.md) / [design/i2c.md](design/i2c.md) / [design/i2c_slave.md](design/i2c_slave.md) / [design/i2s.md](design/i2s.md) / [design/memory.md](design/memory.md) / [design/pdm.md](design/pdm.md) / [design/runtime.md](design/runtime.md) / [design/service.md](design/service.md) / [design/slave_queue.md](design/slave_queue.md) / [design/spi.md](design/spi.md) / [design/transfer_desc.md](design/transfer_desc.md) / [design/uart.md](design/uart.md) / [design/v0_v2_coexistence.md](design/v0_v2_coexistence.md) / [design/variants.md](design/variants.md) |
+| `stable` | （なし） |
 
 ## 段と独立に変更不可であるもの
 
@@ -59,5 +63,5 @@ semver イベントではなく信頼の毀損にあたるため、 昇格は慎
 ## 関連
 
 - 版数と世代の呼称 → [goals.md](goals.md) §呼称と版数
-- 2.0.0 への昇格条件 → [goals.md](goals.md) §成功条件 / 2.0.0 ゲート
+- 2.x の互換性契約 → [goals.md](goals.md) §2.x の互換性契約
 - 検証レーン → [verification.md](verification.md)

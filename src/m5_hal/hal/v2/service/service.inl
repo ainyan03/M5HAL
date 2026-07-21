@@ -180,28 +180,45 @@ ServicePoll IService::service(const ServiceContext& ctx)
 
 ServiceRunner::~ServiceRunner()
 {
-    stopAutoRun();
+    auto stopped = stopAutoRun();
+    if (!stopped.has_value() && _auto_running.load(std::memory_order_acquire)) {
+        // Destruction cannot return the control error, but it must not let a
+        // runner task retain `this` after the object lifetime ends.
+        _auto_stop.store(true, std::memory_order_release);
+        _wake.notify();
+        _auto_task.join();
+        _auto_running.store(false, std::memory_order_release);
+    }
 }
 
-bool ServiceRunner::add(IService& service)
+result_t<void> ServiceRunner::unlockControl()
 {
+    auto unlocked = _control.unlock();
+    if (!unlocked.has_value()) {
+        _control_broken.store(true, std::memory_order_release);
+    }
+    return unlocked;
+}
+
+result_t<void> ServiceRunner::add(IService& service)
+{
+    if (controlBroken()) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
     if (isCurrentWriter()) {
         // Self-add from inside a serviceImpl on the table-owning task: the
         // owner is the sole writer (R1), so apply directly. Must not take
         // _control (see isCurrentWriter()).
-        if (findInTable(&service) != kMaxServices || _count.load(std::memory_order_relaxed) >= kMaxServices) {
-            return false;
-        }
-        applyAdd(&service);
-        return true;
+        return applyAdd(&service);
     }
-    (void)_control.lock(types::TIMEOUT_FOREVER);
-    bool result;
+    auto control_locked = _control.lock(types::TIMEOUT_FOREVER);
+    if (!control_locked.has_value()) {
+        return m5::stl::make_unexpected(control_locked.error());
+    }
+    result_t<void> result;
     if (!_auto_running.load(std::memory_order_acquire)) {
-        if (findInTable(&service) != kMaxServices || _count.load(std::memory_order_relaxed) >= kMaxServices) {
-            result = false;
-        } else {
-            applyAdd(&service);
+        result = applyAdd(&service);
+        if (result) {
             // Implicit auto-run start is an EMBEDDED-framework usability
             // affordance only. posix has a working auto-run backend
             // (startAutoRun() works), but must never start it implicitly:
@@ -212,39 +229,63 @@ bool ServiceRunner::add(IService& service)
             // 行わない"). On bare-Arduino targets with only the stub Task
             // (allowlisted non-ESP Arduino cores), the backend cannot run — skip the attempt
             // instead of ignoring its failure.
-#if defined(ESP_PLATFORM) || (defined(ARDUINO) && M5HAL_SERVICE_AUTORUN_TASK_SUPPORTED_)
-            (void)startAutoRunLocked();
+#if defined(ESP_PLATFORM) || (defined(ARDUINO) && M5HAL_SERVICE_AUTORUN_TASK_SUPPORTED_) || \
+    defined(M5HAL_TEST_SERVICE_IMPLICIT_AUTORUN)
+            auto started = startAutoRunLocked();
+            if (!started) {
+                applyRemove(&service);
+                result = m5::stl::make_unexpected(started.error());
+            }
 #endif
-            result = true;
         }
     } else {
-        result = false;
-        for (size_t i = 0; i < kMaxPending; ++i) {
-            IService* expected = nullptr;
-            if (_pending_add[i].compare_exchange_strong(expected, &service, std::memory_order_relaxed,
-                                                        std::memory_order_relaxed)) {
-                _has_pending.store(true, std::memory_order_release);
-                // Wake the runner out of its idle wait: state first, then
-                // notify, both before _control is released. The CAS winner
-                // is the one caller that must notify (a duplicate add that
-                // finds the service already queued may skip it — the
-                // winner's notify is still latched or already consumed).
-                _wake.notify();
-                result = true;
-                break;
-            }
-            if (expected == &service) {
-                result = true;
-                break;
+        // _control remains held until acknowledgment, so no other external
+        // add() can own or reuse this slot. Callback add/remove runs on the
+        // sole table writer and may complete/cancel it without taking
+        // _control.
+        _pending_add_outcome.store(PendingAddOutcome::Pending, std::memory_order_relaxed);
+        _pending_add.store(&service, std::memory_order_release);
+        _has_pending.store(true, std::memory_order_release);
+        _wake.notify();
+        uint32_t attempt = 0;
+        while (_pending_add.load(std::memory_order_acquire) == &service) {
+            if (attempt < 8) {
+                ++attempt;
+                runtime::yield();
+            } else {
+                runtime::delayMs(1);
             }
         }
+        switch (_pending_add_outcome.load(std::memory_order_relaxed)) {
+            case PendingAddOutcome::Success:
+                result = result_t<void>{};
+                break;
+            case PendingAddOutcome::InvalidState:
+                result = m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+                break;
+            case PendingAddOutcome::OutOfResource:
+                result = m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+                break;
+            case PendingAddOutcome::Pending:
+                // Pointer consumption release-publishes the outcome first;
+                // observing Pending here would violate the slot protocol, not
+                // indicate exhaustion of a public capacity.
+                result = m5::stl::make_unexpected(error::error_t::UNKNOWN_ERROR);
+                break;
+        }
     }
-    _control.unlock();
+    auto unlocked = unlockControl();
+    if (result.has_value() && !unlocked.has_value()) {
+        return m5::stl::make_unexpected(unlocked.error());
+    }
     return result;
 }
 
-bool ServiceRunner::remove(IService& service)
+result_t<void> ServiceRunner::remove(IService& service)
 {
+    if (controlBroken()) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
     if (isCurrentWriter()) {
         // Self-remove: a service removing itself or a sibling from inside its
         // own serviceImpl() on the table-owning task. Apply directly -- the
@@ -254,17 +295,19 @@ bool ServiceRunner::remove(IService& service)
         // resurrected.
         cancelPendingAdd(&service);
         applyRemove(&service);
-        return true;
+        return {};
     }
-    (void)_control.lock(types::TIMEOUT_FOREVER);
+    auto control_locked = _control.lock(types::TIMEOUT_FOREVER);
+    if (!control_locked.has_value()) {
+        return m5::stl::make_unexpected(control_locked.error());
+    }
     if (!_auto_running.load(std::memory_order_acquire)) {
         // Table is still (no runner task): apply directly under _control.
         const bool present = findInTable(&service) != kMaxServices;
         if (present) {
             applyRemove(&service);
         }
-        _control.unlock();
-        return present;
+        return unlockControl();
     }
     // Auto-run owns the table: cancel a queued add of the target, then queue
     // the removal and wait for the runner task to consume it.
@@ -284,9 +327,9 @@ bool ServiceRunner::remove(IService& service)
             runtime::delayMs(1);
         }
     };
-    size_t slot = kMaxPending;
+    size_t slot = kMaxPendingRemoves;
     for (;;) {
-        for (size_t i = 0; i < kMaxPending; ++i) {
+        for (size_t i = 0; i < kMaxPendingRemoves; ++i) {
             IService* expected = nullptr;
             if (_pending_remove[i].compare_exchange_strong(expected, &service, std::memory_order_relaxed,
                                                            std::memory_order_relaxed)) {
@@ -298,7 +341,7 @@ bool ServiceRunner::remove(IService& service)
                 break;
             }
         }
-        if (slot != kMaxPending) {
+        if (slot != kMaxPendingRemoves) {
             break;
         }
         // All slots belong to other in-flight removals. Returning false here
@@ -307,17 +350,22 @@ bool ServiceRunner::remove(IService& service)
         // (teardown callers delete right after remove()). Instead, release
         // _control so the runner task can flush the queue, give it CPU, and
         // retry.
-        _control.unlock();
+        auto released = unlockControl();
+        if (!released.has_value()) {
+            return m5::stl::make_unexpected(released.error());
+        }
         wait_step();
-        (void)_control.lock(types::TIMEOUT_FOREVER);
+        control_locked = _control.lock(types::TIMEOUT_FOREVER);
+        if (!control_locked.has_value()) {
+            return m5::stl::make_unexpected(control_locked.error());
+        }
         if (!_auto_running.load(std::memory_order_acquire)) {
             // The runner stopped while we backed off: direct path.
             const bool present = findInTable(&service) != kMaxServices;
             if (present) {
                 applyRemove(&service);
             }
-            _control.unlock();
-            return present;
+            return unlockControl();
         }
     }
     _has_pending.store(true, std::memory_order_release);
@@ -325,7 +373,10 @@ bool ServiceRunner::remove(IService& service)
     // instead of sleeping out its idle wait (the caller's own polling below
     // still ticks, but the runner-side latency is gone).
     _wake.notify();
-    _control.unlock();
+    auto released = unlockControl();
+    if (!released.has_value()) {
+        return m5::stl::make_unexpected(released.error());
+    }
 
     // Wait until the runner task's flushPending() consumes our slot.
     // flushPending() runs at the HEAD of every pass, before any poll, and
@@ -340,11 +391,14 @@ bool ServiceRunner::remove(IService& service)
     // remove() docs). Slot consumption is therefore a sufficient signal.
     for (;;) {
         if (_pending_remove[slot].load(std::memory_order_acquire) != &service) {
-            return true;  // consumed: removal observed by the runner task
+            return {};  // consumed: removal observed by the runner task
         }
         if (!_auto_running.load(std::memory_order_acquire)) {
             // The runner task appears to have stopped; finish under _control.
-            (void)_control.lock(types::TIMEOUT_FOREVER);
+            control_locked = _control.lock(types::TIMEOUT_FOREVER);
+            if (!control_locked.has_value()) {
+                return m5::stl::make_unexpected(control_locked.error());
+            }
             if (!_auto_running.load(std::memory_order_acquire)) {
                 // Confirmed stopped -- no task can start while we hold _control
                 // (startAutoRunLocked needs it) -- so the table is ours: drain
@@ -353,27 +407,39 @@ bool ServiceRunner::remove(IService& service)
                 if (cur == &service) {
                     applyRemove(&service);
                 }
-                _control.unlock();
-                return true;
+                return unlockControl();
             }
-            _control.unlock();  // a new runner task started; resume waiting
+            auto resumed = unlockControl();  // a new runner task started; resume waiting
+            if (!resumed.has_value()) {
+                return m5::stl::make_unexpected(resumed.error());
+            }
         }
         wait_step();
     }
 }
 
-void ServiceRunner::clear()
+result_t<void> ServiceRunner::clear()
 {
-    (void)_control.lock(types::TIMEOUT_FOREVER);
+    if (controlBroken()) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    if (isCurrentWriter()) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    auto control_locked = _control.lock(types::TIMEOUT_FOREVER);
+    if (!control_locked.has_value()) {
+        return m5::stl::make_unexpected(control_locked.error());
+    }
     if (_auto_running.load(std::memory_order_acquire)) {
         // Stop (join) the runner task so the table is still. It stays stopped;
         // the next add() restarts it. (Draining into pending is not always
-        // possible: kMaxPending < kMaxServices. clear() is a low-frequency
+        // possible: kMaxPendingRemoves < kMaxServices. clear() is a low-frequency
         // teardown path, so paying the task re-create cost is acceptable.)
         stopAutoRunLocked();
     }
-    for (size_t i = 0; i < kMaxPending; ++i) {
-        _pending_add[i].store(nullptr, std::memory_order_relaxed);
+    _pending_add.store(nullptr, std::memory_order_relaxed);
+    _pending_add_outcome.store(PendingAddOutcome::Pending, std::memory_order_relaxed);
+    for (size_t i = 0; i < kMaxPendingRemoves; ++i) {
         _pending_remove[i].store(nullptr, std::memory_order_relaxed);
     }
     _has_pending.store(false, std::memory_order_relaxed);
@@ -389,7 +455,7 @@ void ServiceRunner::clear()
     // teardown. _virtual_now deliberately keeps its value: applyAdd
     // re-baselines _last_polled against it, so any origin is valid.
     _stream = TickStream{};
-    _control.unlock();
+    return unlockControl();
 }
 
 ServicePoll ServiceRunner::run(IService& service, const ServiceContext& ctx)
@@ -397,56 +463,100 @@ ServicePoll ServiceRunner::run(IService& service, const ServiceContext& ctx)
     return service.service(ctx);
 }
 
-bool ServiceRunner::runOnce(const ServiceContext& ctx)
+result_t<bool> ServiceRunner::runOnce(const ServiceContext& ctx)
 {
+    if (controlBroken()) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    if (isCurrentWriter()) {
+        return m5::stl::make_unexpected(error::error_t::BUSY);
+    }
     // Try-lock: a contender (another runOnce, or an add/remove/clear in
     // flight) backs off without polling, implementing the serialization the
     // header promises. Auto-run drives the table on its own task, so a caller
     // must also back off while it is active.
-    if (!_control.lock(0)) {
-        return false;
+    auto control_locked = _control.lock(0);
+    if (!control_locked.has_value()) {
+        const auto mapped =
+            control_locked.error() == error::error_t::TIMEOUT_ERROR ? error::error_t::BUSY : control_locked.error();
+        return m5::stl::make_unexpected(mapped);
     }
     // RAII so a serviceImpl() exception (host builds) cannot leak the lock.
     struct ControlUnlock {
-        runtime::Mutex* m;
+        ServiceRunner* runner;
+        bool active = true;
         ~ControlUnlock()
         {
-            m->unlock();
+            if (active) {
+                (void)runner->unlockControl();
+            }
         }
-    } unlock_guard{&_control};
+        result_t<void> release()
+        {
+            active = false;
+            return runner->unlockControl();
+        }
+    } unlock_guard{this};
     if (_auto_running.load(std::memory_order_acquire)) {
-        return false;
+        return m5::stl::make_unexpected(error::error_t::BUSY);
     }
     // Explicit-context pass: the caller vouches for elapsed. Invalidate
     // the default-clock stream so the next default pass gap-drops
     // (elapsed=0) as the mixing contract promises — its previous reading
     // predates this pass, and counting the real time across it would
     // double-count on top of the explicit elapsed supplied here.
-    _stream = TickStream{};
-    return runOnceInternal(ctx.elapsed, ctx.local_tick, /*refresh_local_each_poll=*/false);
+    _stream       = TickStream{};
+    auto result   = runOnceInternal(ctx.elapsed, ctx.local_tick, /*refresh_local_each_poll=*/false);
+    auto unlocked = unlock_guard.release();
+    if (!unlocked.has_value()) {
+        return m5::stl::make_unexpected(unlocked.error());
+    }
+    return result;
 }
 
-bool ServiceRunner::runOnce()
+result_t<bool> ServiceRunner::runOnce()
 {
-    if (!_control.lock(0)) {
-        return false;
+    if (controlBroken()) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    if (isCurrentWriter()) {
+        return m5::stl::make_unexpected(error::error_t::BUSY);
+    }
+    auto control_locked = _control.lock(0);
+    if (!control_locked.has_value()) {
+        const auto mapped =
+            control_locked.error() == error::error_t::TIMEOUT_ERROR ? error::error_t::BUSY : control_locked.error();
+        return m5::stl::make_unexpected(mapped);
     }
     struct ControlUnlock {
-        runtime::Mutex* m;
+        ServiceRunner* runner;
+        bool active = true;
         ~ControlUnlock()
         {
-            m->unlock();
+            if (active) {
+                (void)runner->unlockControl();
+            }
         }
-    } unlock_guard{&_control};
+        result_t<void> release()
+        {
+            active = false;
+            return runner->unlockControl();
+        }
+    } unlock_guard{this};
     if (_auto_running.load(std::memory_order_acquire)) {
-        return false;
+        return m5::stl::make_unexpected(error::error_t::BUSY);
     }
     // Step the stream only HERE, after the pass is committed (lock held,
     // no auto-run): stepping before the back-off checks would advance
     // `prev` on a pass that never runs and permanently drop that interval,
     // and would race the auto-run task's own step.
     const TickSample s = sampleTickWithDomain();
-    return runOnceInternal(_stream.step(s.tick, s.domain), s.tick, /*refresh_local_each_poll=*/true);
+    auto result        = runOnceInternal(_stream.step(s.tick, s.domain), s.tick, /*refresh_local_each_poll=*/true);
+    auto unlocked      = unlock_guard.release();
+    if (!unlocked.has_value()) {
+        return m5::stl::make_unexpected(unlocked.error());
+    }
+    return result;
 }
 
 size_t ServiceRunner::size() const
@@ -459,25 +569,41 @@ size_t ServiceRunner::capacity() const
     return kMaxServices;
 }
 
-bool ServiceRunner::startAutoRun()
+result_t<void> ServiceRunner::startAutoRun()
 {
-    (void)_control.lock(types::TIMEOUT_FOREVER);
-    const bool result = startAutoRunLocked();
-    _control.unlock();
+    if (controlBroken()) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    if (isCurrentWriter()) {
+        if (_auto_running.load(std::memory_order_acquire)) {
+            return {};
+        }
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    auto control_locked = _control.lock(types::TIMEOUT_FOREVER);
+    if (!control_locked.has_value()) {
+        return m5::stl::make_unexpected(control_locked.error());
+    }
+    auto result   = startAutoRunLocked();
+    auto unlocked = unlockControl();
+    if (result.has_value() && !unlocked.has_value()) {
+        return m5::stl::make_unexpected(unlocked.error());
+    }
     return result;
 }
 
-bool ServiceRunner::startAutoRunLocked()
+result_t<void> ServiceRunner::startAutoRunLocked()
 {
 #if defined(ESP_PLATFORM) || M5HAL_SERVICE_AUTORUN_TASK_SUPPORTED_
     if (_auto_running.load(std::memory_order_acquire)) {
-        return true;
+        return {};
     }
     _auto_stop.store(false, std::memory_order_release);
-    if (!_auto_task.start(&ServiceRunner::autoRunEntry, this, "m5hal-svc", 4096, 1,
-                          M5HAL_CONFIG_SERVICE_AUTORUN_CORE)) {
+    auto started =
+        _auto_task.start(&ServiceRunner::autoRunEntry, this, "m5hal-svc", 4096, 1, M5HAL_CONFIG_SERVICE_AUTORUN_CORE);
+    if (!started) {
         _auto_stop.store(true, std::memory_order_release);
-        return false;
+        return m5::stl::make_unexpected(started.error());
     }
     // Publish AFTER the task exists. Every table-affecting path reads
     // _auto_running under _control (held here), so ordering against them is
@@ -487,19 +613,34 @@ bool ServiceRunner::startAutoRunLocked()
     // not-yet-created (or failed) runner as alive and wait on it -- and a
     // higher-priority waiter spinning on that belief can starve this thread
     // out of ever reaching the create/revert, wedging both. Start -> flag
-    // removes that window; the runner task itself never writes the flag.
+    // removes that window. autoRunEntry() waits on _wake until this publish,
+    // so even a newly created higher-priority task cannot poll a service while
+    // callbacks would still observe the runner as inactive.
     _auto_running.store(true, std::memory_order_release);
-    return true;
+    _wake.notify();
+    return {};
 #else
-    return false;
+    return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
 #endif
 }
 
-void ServiceRunner::stopAutoRun()
+result_t<void> ServiceRunner::stopAutoRun()
 {
-    (void)_control.lock(types::TIMEOUT_FOREVER);
+    if (controlBroken()) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    if (isCurrentWriter()) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    auto control_locked = _control.lock(types::TIMEOUT_FOREVER);
+    if (!control_locked.has_value()) {
+        return m5::stl::make_unexpected(control_locked.error());
+    }
+    if (!_auto_running.load(std::memory_order_acquire)) {
+        return unlockControl();
+    }
     stopAutoRunLocked();
-    _control.unlock();
+    return unlockControl();
 }
 
 void ServiceRunner::stopAutoRunLocked()
@@ -523,11 +664,14 @@ bool ServiceRunner::autoRunActive() const
 
 void ServiceRunner::flushPending()
 {
-    if (!_has_pending.load(std::memory_order_acquire)) {
+    // Consume only the notification generation that this scan owns. A
+    // producer publishing after the exchange leaves true behind for the next
+    // pass; a load followed by store(false) could erase that newer publish
+    // and strand a synchronous add/remove waiter indefinitely.
+    if (!_has_pending.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
-    _has_pending.store(false, std::memory_order_relaxed);
-    for (size_t i = 0; i < kMaxPending; ++i) {
+    for (size_t i = 0; i < kMaxPendingRemoves; ++i) {
         // acq_rel: the release side lets a remove() waiter (spinning on this
         // slot with an acquire load) observe consumption. applyRemove() runs
         // immediately after, before the poll loop below, so the removal is in
@@ -537,11 +681,15 @@ void ServiceRunner::flushPending()
             applyRemove(s);
         }
     }
-    for (size_t i = 0; i < kMaxPending; ++i) {
-        IService* s = _pending_add[i].exchange(nullptr, std::memory_order_relaxed);
-        if (s != nullptr) {
-            applyAdd(s);
-        }
+    IService* s = _pending_add.load(std::memory_order_relaxed);
+    if (s != nullptr) {
+        auto added = applyAdd(s);
+        _pending_add_outcome.store(
+            added ? PendingAddOutcome::Success
+                  : (added.error() == error::error_t::INVALID_STATE ? PendingAddOutcome::InvalidState
+                                                                    : PendingAddOutcome::OutOfResource),
+            std::memory_order_relaxed);
+        _pending_add.store(nullptr, std::memory_order_release);
     }
 }
 
@@ -556,12 +704,12 @@ size_t ServiceRunner::findInTable(const IService* service) const
     return kMaxServices;
 }
 
-void ServiceRunner::applyAdd(IService* service)
+result_t<void> ServiceRunner::applyAdd(IService* service)
 {
     const size_t n = _count.load(std::memory_order_relaxed);
     for (size_t i = 0; i < n; ++i) {
         if (_services[i] == service) {
-            return;
+            return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
         }
     }
     if (n < kMaxServices) {
@@ -573,7 +721,9 @@ void ServiceRunner::applyAdd(IService* service)
         // _virtual_now safe -- any starting value works as a baseline.
         _last_polled[n] = _virtual_now;
         _count.store(n + 1, std::memory_order_relaxed);
+        return {};
     }
+    return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
 }
 
 void ServiceRunner::applyRemove(IService* service)
@@ -605,7 +755,24 @@ void ServiceRunner::applyRemove(IService* service)
 
 void ServiceRunner::autoRunEntry(void* arg)
 {
-    static_cast<ServiceRunner*>(arg)->autoRunLoop();
+    auto* runner = static_cast<ServiceRunner*>(arg);
+    // Task creation may schedule this entry before Task::start() returns to
+    // startAutoRunLocked(). Block until the creator publishes _auto_running;
+    // otherwise the first callback could see an existing auto-run task as
+    // inactive. The predicate loop tolerates a stale latched wake from an
+    // earlier stop/restart cycle.
+    while (!runner->_auto_running.load(std::memory_order_acquire)) {
+        if (runner->_auto_stop.load(std::memory_order_acquire)) {
+            return;
+        }
+        auto waited = runner->_wake.wait(kIdleWakeTimeoutMs);
+        if (!waited.has_value() && waited.error() != error::error_t::TIMEOUT_ERROR) {
+            ++runner->_wake_errors;
+            M5HAL_DIAG("startup wake error #%u: %s", runner->_wake_errors, error::toString(waited.error()));
+            runtime::delayMs(1);
+        }
+    }
+    runner->autoRunLoop();
 }
 
 bool ServiceRunner::isCurrentWriter() const
@@ -616,10 +783,11 @@ bool ServiceRunner::isCurrentWriter() const
 
 void ServiceRunner::cancelPendingAdd(IService* service)
 {
-    for (size_t i = 0; i < kMaxPending; ++i) {
+    if (_pending_add.load(std::memory_order_relaxed) == service) {
         IService* expected = service;
-        (void)_pending_add[i].compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel,
-                                                      std::memory_order_relaxed);
+        _pending_add_outcome.store(PendingAddOutcome::InvalidState, std::memory_order_relaxed);
+        (void)_pending_add.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel,
+                                                   std::memory_order_relaxed);
     }
 }
 
@@ -694,9 +862,16 @@ void ServiceRunner::autoRunLoop()
             // immediately instead of being lost. The timeout is only a
             // liveness backstop — waking through it means a notification
             // was missed, so count those for diagnosis.
-            if (!_wake.wait(kIdleWakeTimeoutMs)) {
-                ++_idle_wake_timeouts;
-                M5HAL_DIAG("idle wake timeout #%u", _idle_wake_timeouts);
+            auto waited = _wake.wait(kIdleWakeTimeoutMs);
+            if (!waited.has_value()) {
+                if (waited.error() == error::error_t::TIMEOUT_ERROR) {
+                    ++_idle_wake_timeouts;
+                    M5HAL_DIAG("idle wake timeout #%u", _idle_wake_timeouts);
+                } else {
+                    ++_wake_errors;
+                    M5HAL_DIAG("idle wake error #%u: %s", _wake_errors, error::toString(waited.error()));
+                    runtime::delayMs(1);
+                }
             }
         } else {
             runtime::yield();

@@ -3,8 +3,13 @@
 #define M5_HAL_VARIANTS_FRAMEWORKS_POSIX_HAL_UART_UART_HPP
 
 #include "../../../../../hal/v2/bus/bus.hpp"
+#include "../../../../../hal/v2/bus/hal_backend.hpp"
+#include "../../../../../hal/v2/bus/portable_factory.hpp"
 #include "../../../../../hal/v2/uart/bus_streaming.hpp"
 #include "../../../../../hal/v2/uart/uart.hpp"
+
+#include <string>
+#include <termios.h>
 
 // Host POSIX UART variant: a real serial port driven through termios. It
 // is offered (and flat-injected as the host UART) only on a POSIX host
@@ -17,51 +22,67 @@
 
 namespace m5::hal::v2::uart {
 
-// Variant-specific bus config: a host serial device path
-// (e.g. "/dev/ttyUSB0", "/dev/tty.usbserial-XXXX") instead of MCU pins.
-// Mirrors the arduino variant carrying a `HardwareSerial*`.
-// Deliberately does NOT inherit the tag-pin constructors (Tx / Rx):
-// this variant never reads the pin fields, so a one-line pin
-// construction would only look complete while leaving `device_path`
-// unset.
-struct BusConfig_posix : public uart::IBusConfig {
-    const char* device_path = nullptr;
+/*! @brief Caller-owned POSIX descriptor selected for a native UART binding. */
+struct NativeFd {
+    int value = -1;
 
-    /*! Coalesce writes in user space and flush them in batches of up to this
-        many bytes (0 = write through immediately, the default). Each write()
-        syscall on a USB serial device costs a USB scheduling round trip, so
-        burst-heavy protocols (e.g. the remote bus stream writes, ~250 B per
-        frame) gain substantial throughput from batching. Any read path
-        (read / readableBytes) flushes pending bytes first, so a write-then-
-        await-reply pattern can never deadlock on buffered output. */
-    size_t tx_coalesce_bytes = 0;
-
-    constexpr BusConfig_posix(void) : uart::IBusConfig{}
+    constexpr explicit NativeFd(int fd) : value{fd}
     {
     }
 };
 
+/*! @brief Existing POSIX device path from which a managed UART is opened. */
+struct NativePath {
+    std::string value;
+
+    explicit NativePath(const char* path) : value{path != nullptr ? path : ""}
+    {
+    }
+    explicit NativePath(std::string path) : value{std::move(path)}
+    {
+    }
+};
+
+/*! @brief POSIX-provider creation options (not part of portable BusConfig). */
+struct NativeOptions {
+    static constexpr size_t kMaxTxCoalesceBytes = 4096;
+    size_t tx_coalesce_bytes                    = 0;
+};
+
 class Bus_posix : public uart::Bus_streaming {
 public:
-    ~Bus_posix() override
+    ~Bus_posix() override;
+
+    result_t<void> close(void)
     {
-        (void)release();
+        return uart::IBus::close();
     }
 
-    result_t<void> init(const BusConfig_posix& config);
-    result_t<void> release(void) override;
+    result_t<void> init(const IBusConfig& config);
+    result_t<void> init(const IBusConfig& config, native::Borrowed<NativeFd> policy);
+    result_t<void> init(const IBusConfig& config, native::Managed<NativePath> policy);
+    result_t<void> init(const IBusConfig& config, native::Managed<NativePath, NativeOptions> policy);
+
+    types::backend_kind_t backendKind(void) const override
+    {
+        return types::backend_kind_t::Hardware;
+    }
+
+protected:
+    result_t<void> beginOperationBackend(bus::OperationContext<uart::AccessConfig>& context) override;
+    result_t<void> endOperationBackend(bus::OperationContext<uart::AccessConfig>& context) override;
 
     // Override write for coalescing optimisation; read uses Bus_streaming::read.
-    result_t<size_t> write(bus::IAccessor* owner, const uart::AccessConfig& cfg, data::Source* src,
-                           size_t len) override;
-    result_t<size_t> read(bus::IAccessor* owner, const uart::AccessConfig& cfg, data::Sink* dst, size_t len) override;
-    result_t<size_t> readableBytes(bus::IAccessor* owner, const uart::AccessConfig& cfg) override;
+    result_t<size_t> writeBackend(bus::OperationContext<uart::AccessConfig>& context, data::Source* src,
+                                  size_t len) override;
+    result_t<size_t> readBackend(bus::OperationContext<uart::AccessConfig>& context, data::Sink* dst,
+                                 size_t len) override;
+    result_t<size_t> readableBytesBackend(bus::OperationContext<uart::AccessConfig>& context) override;
 
-    // Open the named device (owning the fd), or adopt a caller-owned fd
-    // (e.g. one end of an openpty() pair). Both leave termios setup to the
-    // first write/read via the per-access AccessConfig.
-    error::error_t open(const char* device_path, uint32_t baud = 115200);
-    error::error_t attach(int fd);
+public:
+    result_t<void> adoptOwnedNative(
+        int fd, const IBusConfig& config, size_t tx_coalesce_bytes,
+        bus::FixedNativeInterner<bus::NativeIdentity, bus::BusRegistry::kCapacity>& interner, bus::NativeToken token);
     int nativeHandle() const
     {
         return _fd;
@@ -77,17 +98,22 @@ public:
     uint32_t reconfigSkips();
 
 protected:
+    bus::CloseOutcome closeBackend(void) override;
     result_t<size_t> rawWrite(const uint8_t* data, size_t len, uint32_t timeout_ms) override;
     result_t<size_t> rawRead(uint8_t* buf, size_t len, uint32_t timeout_ms) override;
     result_t<size_t> rawReadableBytes() override;
 
 private:
+    bus::CloseOutcome teardownBackend(void);
+    result_t<void> resetForInitialization(void);
+    result_t<void> initOwnedDirect(int fd, const IBusConfig& config, const NativeOptions& options);
     // Reconfiguration quiescence gate (spec/design/uart.md): `owner`/`entered`
     // identify the calling accessor and the channel it already holds so a
     // config change different from `_applied_cfg` can be gated through
     // `uart::IBus::tryAcquireOppositeChannel`. The first apply on a fresh fd
     // (`!_begun`) — including the lazy open above — skips the gate.
-    result_t<void> applyConfig(bus::IAccessor* owner, Channel entered, const uart::AccessConfig& cfg);
+    result_t<void> applyConfig(bus::IAccessor* owner, Channel entered, const uart::AccessConfig& cfg,
+                               uint32_t timeout_ms = types::TIMEOUT_FOREVER);
     // Actual termios apply; assumes `_state_mutex` is already held.
     result_t<void> applyConfigLocked(const uart::AccessConfig& cfg);
     // Drain the coalescing buffer (no-op when empty / coalescing disabled).
@@ -96,13 +122,14 @@ private:
     result_t<void> flushCoalesced(uint32_t timeout_ms);
     result_t<void> flushCoalescedLocked(uint32_t timeout_ms);
 
-    static constexpr size_t kCoalesceCapacity = 4096;
+    static constexpr size_t kCoalesceCapacity = NativeOptions::kMaxTxCoalesceBytes;
 
-    char* _device_path  = nullptr;
-    size_t _tx_coalesce = 0;  // from BusConfig_posix::tx_coalesce_bytes (the base _config slices)
-    int _fd             = -1;
-    bool _owns_fd       = false;
-    bool _begun         = false;
+    size_t _tx_coalesce          = 0;
+    int _fd                      = -1;
+    bool _owns_fd                = false;
+    bool _begun                  = false;
+    bool _original_termios_valid = false;
+    struct termios _original_termios {};
     uart::AccessConfig _applied_cfg;
     size_t _co_used = 0;
     uint8_t _co_buf[kCoalesceCapacity];
@@ -111,13 +138,40 @@ private:
     // TX/RX access (B12: the coalescing buffer is written by write() and
     // drained by read()/readableBytes(), i.e. from either channel).
     runtime::Mutex _state_mutex;
-    uint32_t _reconfig_skips = 0;  // skipped reconfigures (opposite channel busy); read via reconfigSkips()
+    uint32_t _reconfig_skips = 0;  // rejected reconfigures (opposite channel busy); read via reconfigSkips()
+    // `IBus::_local_resources.lifetime` co-owns the DomainState containing
+    // this interner until after Bus_posix destruction.
+    bus::FixedNativeInterner<bus::NativeIdentity, bus::BusRegistry::kCapacity>* _native_interner = nullptr;
+    bus::NativeToken _native_token{};
 };
 
-// Facade backend selection: uart::Bus::init(BusConfig_posix) -> Bus_posix.
+inline result_t<std::unique_ptr<IBus>> makePortableBackend_posix(const bus::LocalResourceContext&, const IBusConfig&)
+{
+    return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+}
+
+template <class Policy>
+struct NativeProvider_posix {
+    static result_t<std::shared_ptr<IBus>> acquire(bus::IHalBackend&, const IBusConfig&, Policy)
+    {
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
+};
+
 template <>
-struct BackendFor<BusConfig_posix> {
-    using type = Bus_posix;
+struct NativeProvider_posix<native::Borrowed<NativeFd>> {
+    static result_t<std::shared_ptr<IBus>> acquire(bus::IHalBackend&, const IBusConfig&, native::Borrowed<NativeFd>);
+};
+
+template <>
+struct NativeProvider_posix<native::Managed<NativePath>> {
+    static result_t<std::shared_ptr<IBus>> acquire(bus::IHalBackend&, const IBusConfig&, native::Managed<NativePath>);
+};
+
+template <>
+struct NativeProvider_posix<native::Managed<NativePath, NativeOptions>> {
+    static result_t<std::shared_ptr<IBus>> acquire(bus::IHalBackend&, const IBusConfig&,
+                                                   native::Managed<NativePath, NativeOptions>);
 };
 
 }  // namespace m5::hal::v2::uart

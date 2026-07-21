@@ -7,6 +7,9 @@
 #include "../error.hpp"
 #include "../runtime/runtime.hpp"
 #include "../types.hpp"
+#include "capabilities.hpp"
+#include "native_policy.hpp"
+#include "operation.hpp"
 
 #include <M5Utility.hpp>
 
@@ -14,15 +17,67 @@
 #include <memory>
 #include <utility>
 
+namespace m5::hal::v2::gpio {
+class GPIOGroup;
+}
+namespace m5::hal::v2::service {
+class ServiceRunner;
+}
+namespace m5::hal::v2::memory {
+class Allocator;
+}
+
 /*!
   @namespace m5::hal::v2::bus
   @brief IBus / IAccessor abstractions shared by every kind (I2C, SPI, ...).
  */
 namespace m5::hal::v2::bus {
 
+class BusRegistry;
+struct IHalBackend;
+struct ResourceKey;
+
+/*! @brief Dependencies captured once when a local Bus is created. */
+struct LocalResourceContext {
+    gpio::GPIOGroup* gpio            = nullptr;
+    service::ServiceRunner* services = nullptr;
+    memory::Allocator* memory        = nullptr;
+    std::shared_ptr<void> lifetime;
+
+    bool valid(void) const
+    {
+        return gpio != nullptr && services != nullptr && memory != nullptr && lifetime != nullptr;
+    }
+};
+
+/*! @brief Compatibility/bootstrap resources used only by directly built local buses. */
+const LocalResourceContext& defaultLocalResources(void);
+
 struct IBus;
 struct IAccessConfig;
 struct IAccessor;
+
+/*! @brief How much backend state a failed close may have changed. */
+enum class CloseDisposition : uint8_t { Success, NoMutation, PartialOrUnknown };
+
+/*! @brief Internal close result used to decide registry rollback vs quarantine. */
+struct CloseOutcome {
+    CloseDisposition disposition = CloseDisposition::Success;
+    error::error_t error_code    = error::error_t::OK;
+
+    static CloseOutcome success(void)
+    {
+        return {};
+    }
+    static CloseOutcome noMutation(error::error_t e)
+    {
+        return {CloseDisposition::NoMutation, e};
+    }
+    static CloseOutcome partialOrUnknown(error::error_t e)
+    {
+        return {CloseDisposition::PartialOrUnknown, e};
+    }
+};
 
 /*!
   @brief Shared operation/close gate for a bus whose external identity may
@@ -43,20 +98,29 @@ public:
     class Operation {
     public:
         explicit Operation(BusLifecycle& lifecycle, uint32_t timeout_ms = types::TIMEOUT_FOREVER)
-            : _lifecycle{&lifecycle}, _locked{lifecycle._mutex.lock(timeout_ms)}
+            : _lifecycle{&lifecycle}
         {
+            const auto locked = lifecycle._mutex.lock(timeout_ms);
+            _locked           = locked.has_value();
             if (!_locked) {
-                _error = error::error_t::TIMEOUT_ERROR;
+                _error = locked.error();
             } else if (lifecycle._state.load(std::memory_order_acquire) != State::Open) {
-                _error = error::error_t::CLOSED;
-                lifecycle._mutex.unlock();
-                _locked = false;
+                _error        = error::error_t::CLOSED;
+                auto unlocked = lifecycle._mutex.unlock();
+                _locked       = false;
+                if (!unlocked.has_value()) {
+                    lifecycle.quarantineWithoutLock();
+                    _error = unlocked.error();
+                }
             }
         }
         ~Operation()
         {
             if (_locked) {
-                _lifecycle->_mutex.unlock();
+                auto unlocked = _lifecycle->_mutex.unlock();
+                if (!unlocked.has_value()) {
+                    _lifecycle->quarantineWithoutLock();
+                }
             }
         }
         Operation(const Operation&)            = delete;
@@ -79,15 +143,23 @@ public:
 
     class Close {
     public:
-        explicit Close(BusLifecycle& lifecycle, uint32_t timeout_ms = types::TIMEOUT_FOREVER)
-            : _lifecycle{&lifecycle}, _locked{lifecycle._mutex.lock(timeout_ms)}
+        explicit Close(BusLifecycle& lifecycle, uint32_t timeout_ms = types::TIMEOUT_FOREVER) : _lifecycle{&lifecycle}
         {
+            const auto locked = lifecycle._mutex.lock(timeout_ms);
+            _locked           = locked.has_value();
+            _error            = locked.has_value() ? error::error_t::OK : locked.error();
             if (_locked) {
                 if (lifecycle._state.load(std::memory_order_acquire) == State::Open) {
                     lifecycle._state.store(State::Releasing, std::memory_order_release);
                 } else {
-                    lifecycle._mutex.unlock();
-                    _locked = false;
+                    auto unlocked = lifecycle._mutex.unlock();
+                    _locked       = false;
+                    if (!unlocked.has_value()) {
+                        lifecycle.quarantineWithoutLock();
+                        _error = unlocked.error();
+                    } else {
+                        _error = error::error_t::BUSY;
+                    }
                 }
             }
         }
@@ -96,7 +168,10 @@ public:
             if (_locked) {
                 // An unfinished close is a failed close.
                 _lifecycle->_state.store(State::Open, std::memory_order_release);
-                _lifecycle->_mutex.unlock();
+                auto unlocked = _lifecycle->_mutex.unlock();
+                if (!unlocked.has_value()) {
+                    _lifecycle->quarantineWithoutLock();
+                }
             }
         }
         Close(const Close&)            = delete;
@@ -108,32 +183,39 @@ public:
         }
         error::error_t error() const
         {
-            return _locked ? error::error_t::OK : error::error_t::BUSY;
+            return _locked ? error::error_t::OK
+                           : (_error == error::error_t::TIMEOUT_ERROR ? error::error_t::BUSY : _error);
         }
-        void rollback()
+        result_t<void> rollback()
         {
-            finish(State::Open);
+            return finish(State::Open);
         }
-        void commit()
+        result_t<void> commit()
         {
-            finish(State::Closed);
+            return finish(State::Closed);
         }
-        void quarantine()
+        result_t<void> quarantine()
         {
-            finish(State::Quarantined);
+            return finish(State::Quarantined);
         }
 
     private:
-        void finish(State state)
+        result_t<void> finish(State state)
         {
             if (_locked) {
                 _lifecycle->_state.store(state, std::memory_order_release);
-                _lifecycle->_mutex.unlock();
-                _locked = false;
+                _locked       = false;
+                auto unlocked = _lifecycle->_mutex.unlock();
+                if (!unlocked.has_value()) {
+                    _lifecycle->quarantineWithoutLock();
+                }
+                return unlocked;
             }
+            return {};
         }
         BusLifecycle* _lifecycle = nullptr;
         bool _locked             = false;
+        error::error_t _error    = error::error_t::OK;
     };
 
     State state() const
@@ -191,32 +273,6 @@ struct ITransferDesc {};
 
 //-------------------------------------------------------------------------
 /*!
-  @brief Cumulative byte counts for one bus transaction.
-
-  `tx` counts bytes consumed from caller-provided Source/write buffers.
-  `rx` counts bytes committed into caller-provided Sink/read buffers.
-  Descriptor-generated wire bytes (I2C prefix, SPI command/address/dummy,
-  implicit dummy TX, etc.) are intentionally excluded.
- */
-struct TransferTotals {
-    size_t tx = 0;
-    size_t rx = 0;
-
-    void clear(void)
-    {
-        tx = 0;
-        rx = 0;
-    }
-
-    void add(const TransferTotals& other)
-    {
-        tx += other.tx;
-        rx += other.rx;
-    }
-};
-
-//-------------------------------------------------------------------------
-/*!
   @brief Abstract base for accessor-side (per-target) configuration.
 
   The kind-tag convention matches `IBusConfig`: a non-virtual getter
@@ -239,10 +295,11 @@ protected:
 /*!
   @brief Abstract base for a per-target accessor.
 
-  An `IAccessor` is the owner identity for an access window, holds a
-  pointer to its `IBus`, and exposes lifecycle hooks. Actual I/O is
-  defined by kind-specific derivations (`i2c::MasterAccessor`,
-  `spi::MasterAccessor`, ...).
+  An `IAccessor` is the owner identity for an access, holds a pointer to
+  its `IBus`, and provides the shared implementation used by kind-specific
+  lifecycle APIs. Actual `beginAccess` / `endAccess` and I/O are defined by
+  concrete derivations (`i2c::MasterAccessor`, `spi::MasterAccessor`, ...),
+  because their typed OperationContext and backend hooks differ.
 
   An accessor may be constructed UNBOUND (no bus yet) and bound later
   through the derivation's kind-typed `bind()` — the
@@ -296,31 +353,7 @@ struct IAccessor {
     IBus& getBus(void) const;
     const IBusConfig& getBusConfig(void) const;
 
-    /*!
-      @brief Open an access window on the underlying bus.
-
-      Internally calls `_bus.lock(this, timeout_ms)` (with a paired
-      `_bus.unlock(this)` from `endAccess`). The depth counter
-      `_access_depth` collapses nested calls (e.g. an outer
-      `ScopedAccess` plus an inner sugar method) into a single lock.
-
-      @param timeout_ms Bus-lock acquisition timeout, in milliseconds;
-                       0 = immediate try-lock, `types::TIMEOUT_FOREVER`
-                       (the default) = wait until acquired (semantics:
-                       `IBus::lock`). Prefer an explicit budget you can
-                       handle on expiry; the infinite default is the
-                       sugar for call sites where handling a timeout is
-                       more trouble than it is worth.
-      @return Empty success, or `TIMEOUT_ERROR` when the bus stayed
-              held by another owner for the whole (finite) timeout.
-     */
-    m5::hal::v2::result_t<void> beginAccess(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
-    /*!
-      @brief Close one nesting level of the access window; release the
-             bus lock on the outermost call.
-     */
-    m5::hal::v2::result_t<void> endAccess(void);
-    /*! @brief Return whether the accessor currently holds an access window. */
+    /*! @brief Return whether the concrete accessor currently owns an operation. */
     bool inAccess(void) const;
 
     /*!
@@ -360,8 +393,34 @@ protected:
      */
     void _bindBus(IBus& bus);
 
+    template <class Config>
+    OperationContext<Config> makeOperationContext(const Config& config)
+    {
+        return OperationContext<Config>{*this, config};
+    }
+
+    template <class Context, class BeginHook>
+    result_t<void> _beginOperationAccess(Context& context, uint32_t timeout_ms, OperationMode mode,
+                                         BeginHook&& begin_hook);
+
+    template <class Context, class LockHook, class UnlockHook, class BeginHook>
+    result_t<void> _beginOperationAccess(Context& context, uint32_t timeout_ms, OperationMode mode,
+                                         LockHook&& lock_hook, UnlockHook&& unlock_hook, BeginHook&& begin_hook);
+
+    template <class Context, class EndHook>
+    result_t<void> _endOperationAccess(Context& context, uint32_t timeout_ms, EndHook&& end_hook);
+
+    template <class Context, class EndHook, class UnlockHook>
+    result_t<void> _endOperationAccess(Context& context, uint32_t timeout_ms, EndHook&& end_hook,
+                                       UnlockHook&& unlock_hook);
+
+    bool _inOperationAccess() const
+    {
+        return _operation_active;
+    }
+
     IBus* _bus             = nullptr;
-    uint32_t _access_depth = 0;
+    bool _operation_active = false;
     // Empty unless the accessor co-owns its bus (constructed from a
     // shared_ptr). Pins the bus lifetime; `_bus` aliases `_owner.get()`.
     std::shared_ptr<IBus> _owner{};
@@ -392,62 +451,31 @@ public:
     {
         return {};
     }
+    void bindLocalResources(const LocalResourceContext& resources)
+    {
+        _local_resources = resources;
+    }
+    const LocalResourceContext& localResourceContext(void) const
+    {
+        return localResources();
+    }
+    virtual bool bindRegistryRegistration(BusRegistry&, const ResourceKey&, uint16_t, uint32_t)
+    {
+        return false;
+    }
+    virtual const ResourceKey* registryResourceKey(void) const
+    {
+        return nullptr;
+    }
     types::bus_kind_t getBusKind(void) const;
 
     // IBus initialization is intentionally NOT part of this abstract
-    // interface. Initialization inherently needs variant-specific data
-    // (a TwoWire*, a port number, a device path, ...), so a kind-generic
-    // `init` cannot exist; each concrete bus declares its own
-    // non-virtual `init(const <Variant>IBusConfig&)` taking exactly the
-    // config type it can act on (variants without extra fields take the
-    // abstract kind config). The former base virtual only enabled
-    // passing a sibling config, which the mandatory downcast turned
-    // into UB. Return type matches the other public APIs
-    // (`lock` / `unlock` / `transfer` / ...), so callers use
-    // `if (auto r = bus.init(cfg); !r) ...` uniformly.
-
-    /*! @brief Release any resources acquired by the concrete bus's `init`. */
-    virtual result_t<void> release(void);
-
-    /*!
-      @brief Acquire mutual exclusion on the bus for an owner.
-
-      Backed by the always-embedded `runtime::Mutex`: the call
-      WAITS for the current holder up to `timeout_ms` and fails with
-      `TIMEOUT_ERROR` when the mutex could not be taken; `timeout_ms`
-      of 0 is an immediate try-lock and `types::TIMEOUT_FOREVER` (the
-      default) blocks until acquired. Non-recursive — `IBus::lock` is
-      invoked at most once per access window (nesting is absorbed by
-      the depth counter in `IAccessor::beginAccess`), and a re-lock from
-      the holding task (same owner or another accessor) also waits
-      until the timeout and fails — with TIMEOUT_FOREVER that is a
-      deadlock (fail-loud: the task watchdog fires). Task context only;
-      never call from an ISR. Timeout granularity follows the
-      runtime variant (one FreeRTOS tick — 10 ms by default — on the
-      embedded targets).
-
-      `owner` must be a valid `IAccessor*`; `nullptr` returns
-      `INVALID_ARGUMENT`. The `_lock_owner` bookkeeping happens with
-      the mutex held on both lock and unlock.
-
-      @param owner       Locking accessor; required.
-      @param timeout_ms  Acquisition timeout in milliseconds; 0 tries
-                         once and returns immediately,
-                         `types::TIMEOUT_FOREVER` waits indefinitely.
-      @retval TIMEOUT_ERROR     The bus was still held after timeout_ms.
-      @retval INVALID_ARGUMENT  `owner` is null.
-     */
-    virtual result_t<void> lock(IAccessor* owner, uint32_t timeout_ms = types::TIMEOUT_FOREVER);
-
-    /*!
-      @brief Release the bus lock.
-
-      `owner` must match the accessor that took the lock; a mismatch or
-      an unlock without a preceding lock returns `INVALID_ARGUMENT`
-      without touching the mutex. Must be called from the task that
-      locked (a FreeRTOS mutex requirement).
-     */
-    virtual result_t<void> unlock(IAccessor* owner);
+    // interface. Each kind has one portable config, while a concrete provider
+    // may additionally accept native::borrowed/managed policy arguments.
+    // Those overloads cannot be represented by one kind-generic virtual init;
+    // direct concrete/facade buses therefore declare non-virtual init methods.
+    // The result_t return matches other fallible public commands, so callers
+    // use `if (auto r = bus.init(cfg); !r) ...` uniformly.
 
     // Backend query API. These describe HOW the bus is
     // currently driven, so a holder can react to a hot-swap (e.g. a
@@ -492,34 +520,202 @@ public:
      */
     virtual uint32_t backendGeneration(void) const;
 
+    /*!
+      @brief Allocation-free snapshot of this exact Bus instance generation.
+
+      The returned value is independent of the Bus lifetime. A facade backend
+      swap affects only later snapshots; previously returned values do not
+      change.
+     */
+    virtual BusCapabilities capabilities(void) const;
+
 protected:
-    runtime::Mutex _mutex;             // always embedded; backs lock()/unlock()
+    /*! @brief Close a directly owned bus and release its backend resources. */
+    [[nodiscard]] result_t<void> close(void);
+
+    /*!
+      @brief Provider teardown hook with mutation classification.
+
+      Providers that own resources override this hook. The default succeeds
+      for resource-free proxies and test doubles.
+     */
+    virtual CloseOutcome closeBackend(void);
+
+    /*!
+      @brief Internal direct-init lifecycle gate.
+
+      A successfully closed directly constructed facade may be initialized
+      again. Registry-bound facades are final once closed, and a facade whose
+      teardown is in progress or quarantined cannot be reinitialized.
+     */
+    bool initializationAllowed(bool registry_bound) const;
+    result_t<void> markInitializationSucceeded(bool registry_bound);
+    static CloseOutcome closeOwnedBackend(IBus& backend)
+    {
+        return backend.closeWithOutcome();
+    }
+    void quarantineLifecycleAfterPartialTeardown(void)
+    {
+        _close_state.store(CloseState::Quarantined, std::memory_order_release);
+    }
+    bool accessLifecycleOpen(void) const
+    {
+        return _close_state.load(std::memory_order_acquire) == CloseState::Open;
+    }
+    virtual result_t<void> tryAcquireCloseBarrier(void);
+    virtual result_t<void> releaseCloseBarrier(void);
+
+    const LocalResourceContext& localResources(void) const
+    {
+        return _local_resources.valid() ? _local_resources : defaultLocalResources();
+    }
+
+private:
+    friend class BusRegistry;
+    friend struct IHalBackend;
+    void markRegistryBound(void)
+    {
+        _registry_bound.store(true, std::memory_order_release);
+    }
+    CloseOutcome closeWithOutcome(void);
+    LocalResourceContext _local_resources;
+    // Use a natural-width atomic.  Xtensa LX106 does not provide the byte CAS
+    // helper (`__atomic_compare_exchange_1`) in its default Arduino link, while
+    // close arbitration requires compare_exchange to remain lock-free and
+    // allocation-free on every supported target.
+    enum class CloseState : uint32_t { Open, Closing, Quarantined, Closed };
+    std::atomic<CloseState> _close_state{CloseState::Open};
+    std::atomic<bool> _registry_bound{false};
+
+protected:
+    /*!
+      @brief Internal lock seam used by concrete Accessor lifecycles.
+
+      This is deliberately not a public low-level access API. Concrete
+      Accessors establish typed operation context before acquiring it and
+      always pair it with `releaseAccessLock` during rollback or close.
+     */
+    virtual result_t<void> acquireAccessLock(IAccessor& owner, uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+    virtual result_t<void> releaseAccessLock(IAccessor& owner);
+
+    bool accessBroken() const
+    {
+        return _access_broken.load(std::memory_order_acquire);
+    }
+    void markAccessBroken()
+    {
+        _access_broken.store(true, std::memory_order_release);
+    }
+
+    runtime::Mutex _mutex;             // always embedded; backs the Access lock
     IAccessor* _lock_owner = nullptr;  // nullptr = not currently locked
+
+private:
+    friend struct IAccessor;
+    std::atomic<bool> _access_broken{false};
 };
+
+template <class Context, class BeginHook>
+result_t<void> IAccessor::_beginOperationAccess(Context& context, uint32_t timeout_ms, OperationMode mode,
+                                                BeginHook&& begin_hook)
+{
+    return _beginOperationAccess(
+        context, timeout_ms, mode, [&](uint32_t remaining_ms) { return _bus->acquireAccessLock(*this, remaining_ms); },
+        [&] { return _bus->releaseAccessLock(*this); }, std::forward<BeginHook>(begin_hook));
+}
+
+template <class Context, class LockHook, class UnlockHook, class BeginHook>
+result_t<void> IAccessor::_beginOperationAccess(Context& context, uint32_t timeout_ms, OperationMode mode,
+                                                LockHook&& lock_hook, UnlockHook&& unlock_hook, BeginHook&& begin_hook)
+{
+    if (_operation_active) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    M5HAL_ASSERT(_bus != nullptr, "accessor is not bound to a bus (bind() it first)");
+    if (_bus == nullptr) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+    }
+    context.runtime.begin(runtime::millis(), timeout_ms, mode);
+    if (_bus->accessBroken()) {
+        context.runtime.state |= OperationStateFlags::Broken;
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+
+    auto locked = lock_hook(remainingTimeout(context.runtime, runtime::millis()));
+    if (!locked.has_value()) {
+        return locked;
+    }
+    if (_bus->accessBroken()) {
+        auto unlocked = unlock_hook();
+        context.runtime.state |= OperationStateFlags::Broken;
+        if (!unlocked.has_value()) {
+            _bus->markAccessBroken();
+        }
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    auto begun = begin_hook(context);
+    if (!begun.has_value()) {
+        auto unlocked = unlock_hook();
+        if (!unlocked.has_value()) {
+            context.runtime.state |= OperationStateFlags::Broken;
+            _bus->markAccessBroken();
+        }
+        return begun;
+    }
+    context.runtime.state |= OperationStateFlags::BackendStarted;
+    _operation_active = true;
+    return {};
+}
+
+template <class Context, class EndHook>
+result_t<void> IAccessor::_endOperationAccess(Context& context, uint32_t timeout_ms, EndHook&& end_hook)
+{
+    return _endOperationAccess(context, timeout_ms, std::forward<EndHook>(end_hook),
+                               [&] { return _bus->releaseAccessLock(*this); });
+}
+
+template <class Context, class EndHook, class UnlockHook>
+result_t<void> IAccessor::_endOperationAccess(Context& context, uint32_t timeout_ms, EndHook&& end_hook,
+                                              UnlockHook&& unlock_hook)
+{
+    if (!_operation_active) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    context.runtime.beginClose(runtime::millis(), timeout_ms);
+    auto ended        = end_hook(context);
+    _operation_active = false;
+    auto unlocked     = unlock_hook();
+    if (!unlocked.has_value()) {
+        context.runtime.state |= OperationStateFlags::Broken;
+        _bus->markAccessBroken();
+    }
+    if (!ended.has_value()) {
+        return ended;
+    }
+    return unlocked;
+}
 
 //-------------------------------------------------------------------------
 /*!
   @brief RAII helper that wraps an accessor's `beginAccess` / `endAccess`.
 
-  Templated on the accessor type so the accessor's OWN `beginAccess` is called
-  by static dispatch. For UART / I2S split accessors that is the TX-only or
-  RX-only `beginAccess`, NOT the base `IAccessor::beginAccess` (which is
-  non-virtual and would otherwise be sliced to the combined-channel lock,
-  blocking the opposite channel and risking self-deadlock). Use CTAD:
+  Templated on the concrete accessor type so its own `beginAccess` / `endAccess`
+  lifecycle is called by static dispatch. `IAccessor` intentionally has no
+  type-erased lifecycle because it cannot carry a bus-kind `OperationContext`.
+  Use CTAD:
   `ScopedAccess guard{tx_accessor};` deduces the accessor type. Master /
   single-channel accessors deduce to themselves and behave exactly as before.
 
-  Nested with sugar methods that also call `beginAccess`, the depth
-  counter folds the layers naturally. Both move and copy are deleted
-  because the scope is not meant to outlive its lexical block. A
-  lock-acquisition failure is observed via `has_error()` / `error()`.
+  Sugar methods borrow an already-active Access instead of opening a nested
+  one. Both move and copy are deleted because the scope is not meant to
+  outlive its lexical block. An acquisition failure is observed via
+  `has_error()` / `error()`.
 
   Polarity: success = `scope.ok()` (== `!scope.has_error()`). There is
   deliberately no `operator bool` - "truthy scope = acquired" and
   "truthy = has error" are both plausible readings, so the check must
   spell the polarity out; `ok()` makes the positive check explicit.
-  `error()` is `OK` exactly when `has_error()` is false. The same
-  applies to `ScopedLock` below.
+  `error()` is `OK` exactly when `has_error()` is false.
  */
 template <class Accessor>
 class ScopedAccess {
@@ -543,9 +739,22 @@ public:
     ScopedAccess(ScopedAccess&&)                 = delete;
     ScopedAccess& operator=(ScopedAccess&&)      = delete;
 
+    result_t<void> finish(uint32_t timeout_ms = 1000)
+    {
+        if (_accessor == nullptr) {
+            return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+        }
+        auto ended = endWithTimeout(*_accessor, timeout_ms, 0);
+        _accessor  = nullptr;
+        if (!ended.has_value()) {
+            _error = ended.error();
+        }
+        return ended;
+    }
+
     bool has_error(void) const
     {
-        return _accessor == nullptr;
+        return error::isError(_error);
     }
     /*! @brief Success view: `true` when the scope acquired (== `!has_error()`). */
     bool ok(void) const
@@ -558,34 +767,19 @@ public:
     }
 
 private:
+    template <class T>
+    static auto endWithTimeout(T& accessor, uint32_t timeout_ms, int) -> decltype(accessor.endAccess(timeout_ms))
+    {
+        return accessor.endAccess(timeout_ms);
+    }
+
+    template <class T>
+    static result_t<void> endWithTimeout(T& accessor, uint32_t, long)
+    {
+        return accessor.endAccess();
+    }
+
     Accessor* _accessor                = nullptr;
-    m5::hal::v2::error::error_t _error = m5::hal::v2::error::error_t::OK;
-};
-
-/*!
-  @brief RAII helper that wraps `IBus::lock` / `IBus::unlock`.
-
-  For low-level callers who want to make several
-  `bus.transfer(&accessor, ...)` calls atomic. Move and copy are
-  deleted; failure is observed via `has_error()` / `error()`.
- */
-class ScopedLock {
-public:
-    ScopedLock(IBus& bus, IAccessor* owner, uint32_t timeout_ms = types::TIMEOUT_FOREVER);
-    ~ScopedLock();
-    ScopedLock(const ScopedLock&)            = delete;
-    ScopedLock& operator=(const ScopedLock&) = delete;
-    ScopedLock(ScopedLock&&)                 = delete;
-    ScopedLock& operator=(ScopedLock&&)      = delete;
-
-    bool has_error(void) const;
-    /*! @brief Success view: `true` when the scope acquired (== `!has_error()`). */
-    bool ok(void) const;
-    m5::hal::v2::error::error_t error(void) const;
-
-private:
-    IBus* _bus                         = nullptr;
-    IAccessor* _owner                  = nullptr;
     m5::hal::v2::error::error_t _error = m5::hal::v2::error::error_t::OK;
 };
 
@@ -616,7 +810,7 @@ private:
     package names its slots with constants); the HAL only provides the
     table.
   - **Lifetime rule**: registered buses should have static storage
-    duration; call `removeBus` before destroying or `release()`-ing a
+    duration; call `removeBus` before destroying or `close()`-ing a
     registered bus. The registry never deletes.
   - Registration is a startup-time operation; afterwards the table is
     treated as read-only (no locking), like `GPIOGroup`.

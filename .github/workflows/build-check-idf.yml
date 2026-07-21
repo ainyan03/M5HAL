@@ -22,10 +22,8 @@
 #
 # Modeled on the LovyanGFX / M5GFX / M5Unified `IDFBuild.yml` pattern, using the
 # official image directly as the job container (no manual esp-idf clone). The
-# tiny consumer project (test/idf_component_build) registers M5HAL + the sibling
-# M5Utility checkout as components (IDF_COMPONENT_MANAGER=0 -> hermetic, no
-# network deps) and compiles the shared v2 API surface (test/v2/build_check),
-# which references PinBackup / ScopedPinBackup.
+# tiny consumer project registers M5HAL + the sibling M5Utility checkout as
+# components and compiles the canonical examples/v2/BuildTest API fixture.
 name: build-check-idf
 
 on:

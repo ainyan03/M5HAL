@@ -8,6 +8,8 @@
 
 #include <M5Utility.hpp>
 
+#include <cstring>
+
 namespace m5::hal::v2::remote {
 
 result_t<void> RemoteServerHandler::handler(void* ctx, frame::Kind kind, uint8_t seq, data::ConstDataSpan payload,
@@ -27,7 +29,11 @@ result_t<void> RemoteServerHandler::handler(void* ctx, frame::Kind kind, uint8_t
             // Response and simply not restarting is within contract (already
             // the case for posix hosts, which have never called esp_restart
             // here either; RP2040/SAMD51 now share that same behavior).
-            enc.writeFrame(frame::Kind::Response, seq, {});
+            if (!enc.writeFrame(frame::Kind::Response, seq, {})) {
+                // Fire-and-forget (see above): the host never reads this
+                // Response, so a saturated encoder only costs a breadcrumb.
+                M5HAL_DIAG("control response dropped, encoder full seq=%u", static_cast<unsigned>(seq));
+            }
 #if defined(ESP_PLATFORM)
             // ESPIDF and arduino-esp32 both resolve to ESP_PLATFORM here;
             // other Arduino cores (RP2040 / SAMD51) have no FreeRTOS/esp_restart
@@ -39,7 +45,10 @@ result_t<void> RemoteServerHandler::handler(void* ctx, frame::Kind kind, uint8_t
             return {};
 
         case frame::Kind::Ping:
-            enc.writeFrame(frame::Kind::Pong, seq, {});
+            if (!enc.writeFrame(frame::Kind::Pong, seq, {})) {
+                M5HAL_DIAG("pong dropped, encoder full seq=%u", static_cast<unsigned>(seq));
+                return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
+            }
             return {};
 
         case frame::Kind::HelloReq: {
@@ -57,13 +66,15 @@ result_t<void> RemoteServerHandler::handler(void* ctx, frame::Kind kind, uint8_t
             // HelloResp: [proto_ver][flags][n]([bus_kind][bus_id])*n [gpio_port][gpio_pin:u16]?
             // (spec/design/remote.md §hello). n mirrors the server's statically
             // registered bus capabilities; the host decodes with decodeHelloCaps.
-            uint8_t hello_body[3 + Capabilities::kMaxEntries * 2 + 3];
-            uint8_t flags = h->hello_flags;
+            uint8_t hello_body[frame::kMaxPayload];
+            // The structured extension flag is owned by the encoder below; do not
+            // let an application advertise it without the corresponding body.
+            uint8_t flags = static_cast<uint8_t>(h->hello_flags & ~kHelloFlagBusCapabilities);
             if (h->pool != nullptr) {
-                flags |= 0x02u;
+                flags |= kHelloFlagBusCreate;
             }
             if (h->gpio != nullptr) {
-                flags |= 0x01u;
+                flags |= kHelloFlagGpio;
             }
             hello_body[0] = kProtocolVersion;
             hello_body[1] = flags;
@@ -75,9 +86,9 @@ result_t<void> RemoteServerHandler::handler(void* ctx, frame::Kind kind, uint8_t
             hello_body[2]    = static_cast<uint8_t>(cap_count);
             size_t hello_len = 3;
             for (size_t i = 0; i < cap_count; ++i) {
-                const Capabilities::BusEntry& entry = h->server->capabilityAt(i);
-                hello_body[hello_len]               = static_cast<uint8_t>(entry.kind);
-                hello_body[hello_len + 1]           = entry.bus_id;
+                const auto entry          = h->server->capabilityAt(i);
+                hello_body[hello_len]     = static_cast<uint8_t>(entry.kind);
+                hello_body[hello_len + 1] = entry.bus_id;
                 hello_len += 2;
             }
             if (h->gpio != nullptr) {
@@ -87,7 +98,47 @@ result_t<void> RemoteServerHandler::handler(void* ctx, frame::Kind kind, uint8_t
                 hello_body[hello_len + 2] = static_cast<uint8_t>((pin_cnt >> 8) & 0xFFu);
                 hello_len += 3;
             }
-            enc.writeFrame(frame::Kind::HelloResp, seq, {hello_body, hello_len});
+
+            // Optional v1 extension envelope. Old hosts ignore this tail; a
+            // new host uses the flag and TLV lengths instead of guessing from
+            // otherwise-unmarked trailing bytes.
+            const size_t extension_start = hello_len;
+            if (cap_count != 0 && hello_len + 5 <= sizeof(hello_body)) {
+                const size_t envelope_len_pos = hello_len++;
+                hello_body[hello_len++]       = kHelloExtensionBusCapabilities;
+                const size_t tlv_len_pos      = hello_len++;
+                hello_body[hello_len++]       = static_cast<uint8_t>(cap_count);
+                bool encoded_all              = true;
+                for (size_t i = 0; i < cap_count; ++i) {
+                    const auto entry = h->server->capabilityAt(i);
+                    uint8_t record[detail::kBusCapabilitiesWireMaxKnownRecordSize];
+                    auto encoded = detail::encodeBusCapabilitiesWire(entry.capabilities, {record, sizeof(record)});
+                    if (!encoded.has_value() || encoded.value() > 255 ||
+                        hello_len + 3 + encoded.value() > sizeof(hello_body)) {
+                        encoded_all = false;
+                        break;
+                    }
+                    hello_body[hello_len++] = static_cast<uint8_t>(entry.kind);
+                    hello_body[hello_len++] = entry.bus_id;
+                    hello_body[hello_len++] = static_cast<uint8_t>(encoded.value());
+                    ::memcpy(hello_body + hello_len, record, encoded.value());
+                    hello_len += encoded.value();
+                }
+                const size_t tlv_len      = hello_len - tlv_len_pos - 1;
+                const size_t envelope_len = hello_len - envelope_len_pos - 1;
+                if (!encoded_all || tlv_len > 255 || envelope_len > 255) {
+                    hello_len = extension_start;
+                } else {
+                    hello_body[tlv_len_pos]      = static_cast<uint8_t>(tlv_len);
+                    hello_body[envelope_len_pos] = static_cast<uint8_t>(envelope_len);
+                    flags |= kHelloFlagBusCapabilities;
+                    hello_body[1] = flags;
+                }
+            }
+            if (!enc.writeFrame(frame::Kind::HelloResp, seq, {hello_body, hello_len})) {
+                M5HAL_DIAG("hello response dropped, encoder full seq=%u", static_cast<unsigned>(seq));
+                return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
+            }
             return {};
         }
 
@@ -636,7 +687,12 @@ result_t<void> RemoteServerHandler::writeError(data::MuxFrameEncoder& enc, uint8
 {
     int8_t err = static_cast<int8_t>(code);
     M5HAL_DIAG("protocol error seq=%u code=%d", static_cast<unsigned>(seq), static_cast<int>(code));
-    enc.writeFrame(frame::Kind::Control, seq, {reinterpret_cast<const uint8_t*>(&err), 1});
+    if (!enc.writeFrame(frame::Kind::Control, seq, {reinterpret_cast<const uint8_t*>(&err), 1})) {
+        // Without this breadcrumb an encoder-full drop here is
+        // indistinguishable from an ordinary client timeout.
+        M5HAL_DIAG("error report dropped, encoder full seq=%u", static_cast<unsigned>(seq));
+        return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
+    }
     return {};
 }
 

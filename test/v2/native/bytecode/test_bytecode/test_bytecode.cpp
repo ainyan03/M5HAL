@@ -83,13 +83,18 @@ public:
     {
         return {};
     }
-    result_t<void> release(void) override
+
+protected:
+    bus::CloseOutcome closeBackend(void) override
     {
-        return {};
+        return bus::CloseOutcome::success();
     }
-    result_t<void> transfer(bus::IAccessor*, const i2c::MasterAccessConfig& cfg, const i2c::TransferDesc& desc,
-                            data::Source* tx, size_t, data::Sink* rx, size_t) override
+
+    result_t<void> transferBackend(bus::OperationContext<i2c::MasterAccessConfig>& context,
+                                   const i2c::TransferDesc& desc, data::Source* tx, size_t, data::Sink* rx,
+                                   size_t) override
     {
+        const auto& cfg = context.config;
         ++transfer_count;
         last_addr = cfg.i2c_addr;
         last_freq = cfg.freq;
@@ -103,7 +108,7 @@ public:
         last_totals.rx = *drained - last_totals.tx;
         return {};
     }
-    result_t<bus::TransferTotals> waitTransfer(bus::IAccessor*, const i2c::MasterAccessConfig&) override
+    result_t<bus::TransferTotals> waitTransferBackend(bus::OperationContext<i2c::MasterAccessConfig>&) override
     {
         auto totals = last_totals;
         last_totals.clear();
@@ -113,6 +118,7 @@ public:
         return totals;
     }
 
+public:
     size_t transfer_count     = 0;
     uint16_t last_addr        = 0;
     uint32_t last_freq        = 0;
@@ -129,17 +135,33 @@ public:
     {
         return {};
     }
-    result_t<void> release(void) override
+
+protected:
+    bus::CloseOutcome closeBackend(void) override
     {
+        return bus::CloseOutcome::success();
+    }
+
+    result_t<void> beginOperationBackend(bus::OperationContext<spi::MasterAccessConfig>&) override
+    {
+        ++begin_count;
+        operation_active = true;
         return {};
     }
-    result_t<void> transfer(bus::IAccessor*, const spi::MasterAccessConfig&, const spi::TransferDesc& desc,
-                            data::Source* tx, size_t, data::Sink* rx, size_t) override
+    result_t<void> endOperationBackend(bus::OperationContext<spi::MasterAccessConfig>&) override
+    {
+        ++end_count;
+        operation_active = false;
+        return {};
+    }
+    result_t<void> transferBackend(bus::OperationContext<spi::MasterAccessConfig>&, const spi::TransferDesc& desc,
+                                   data::Source* tx, size_t, data::Sink* rx, size_t) override
     {
         ++transfer_count;
-        last_desc      = desc;
-        auto tx_before = tx_bytes.size();
-        auto drained   = drainAndFeed(tx, rx, tx_bytes, rx_script);
+        transfer_saw_active = operation_active;
+        last_desc           = desc;
+        auto tx_before      = tx_bytes.size();
+        auto drained        = drainAndFeed(tx, rx, tx_bytes, rx_script);
         if (!drained.has_value()) {
             return m5::stl::make_unexpected(drained.error());
         }
@@ -147,14 +169,19 @@ public:
         last_totals.rx = *drained - last_totals.tx;
         return {};
     }
-    result_t<bus::TransferTotals> waitTransfer(bus::IAccessor*, const spi::MasterAccessConfig&) override
+    result_t<bus::TransferTotals> waitTransferBackend(bus::OperationContext<spi::MasterAccessConfig>&) override
     {
         auto totals = last_totals;
         last_totals.clear();
         return totals;
     }
 
-    size_t transfer_count = 0;
+public:
+    size_t transfer_count    = 0;
+    size_t begin_count       = 0;
+    size_t end_count         = 0;
+    bool operation_active    = false;
+    bool transfer_saw_active = false;
     spi::TransferDesc last_desc{};
     std::vector<uint8_t> tx_bytes;
     std::vector<uint8_t> rx_script;
@@ -163,7 +190,7 @@ public:
 
 class CaptureUartBus : public uart::IBus {
 public:
-    result_t<size_t> write(bus::IAccessor*, const uart::AccessConfig&, data::Source* tx, size_t len) override
+    result_t<size_t> writeBackend(bus::OperationContext<uart::AccessConfig>&, data::Source* tx, size_t len) override
     {
         const size_t limit = std::min(len, max_write_per_call);
         size_t done        = 0;
@@ -185,14 +212,14 @@ public:
         }
         return done;
     }
-    result_t<size_t> read(bus::IAccessor*, const uart::AccessConfig&, data::Sink* rx, size_t len) override
+    result_t<size_t> readBackend(bus::OperationContext<uart::AccessConfig>&, data::Sink* rx, size_t len) override
     {
         std::vector<uint8_t> ignored;
         std::vector<uint8_t> chunk{rx_script.begin(),
                                    rx_script.begin() + static_cast<ptrdiff_t>(std::min(len, rx_script.size()))};
         return drainAndFeed(nullptr, rx, ignored, chunk);
     }
-    result_t<size_t> readableBytes(bus::IAccessor*, const uart::AccessConfig&) override
+    result_t<size_t> readableBytesBackend(bus::OperationContext<uart::AccessConfig>&) override
     {
         return rx_script.size();
     }
@@ -291,17 +318,21 @@ void countDelay(uint32_t ms)
     g_delay_total += ms;
 }
 
+void ignoreDelay(uint32_t)
+{
+}
+
 // ============================================================================
 // LenVar
 // ============================================================================
 
 TEST(BytecodeLenVar, RoundtripAcrossBoundaries)
 {
-    const size_t values[] = {0, 1, 0xFC, 0xFD, 0x1234, 0xFFFF, 0x10000, 0xABCDEF};
-    for (size_t v : values) {
+    const uint32_t values[] = {0, 1, 0xFC, 0xFD, 0x1234, 0xFFFF, 0x10000, 0xABCDEF};
+    for (uint32_t v : values) {
         uint8_t buf[5] = {};
-        const size_t n = bytecode::encodeLenVar(buf, v);
-        EXPECT_EQ(n, bytecode::lenVarSize(v)) << v;
+        const size_t n = bytecode::detail::encodeLenVar(buf, v);
+        EXPECT_EQ(n, bytecode::detail::lenVarSize(v)) << v;
         auto decoded = bytecode::decodeLenVar({buf, n});
         EXPECT_TRUE(decoded.valid) << v;
         EXPECT_EQ(decoded.consumed, n) << v;
@@ -312,7 +343,7 @@ TEST(BytecodeLenVar, RoundtripAcrossBoundaries)
 TEST(BytecodeLenVar, ShortInputAndReservedMarker)
 {
     uint8_t wide[5] = {};
-    (void)bytecode::encodeLenVar(wide, 0x1234);  // 3-byte form
+    (void)bytecode::detail::encodeLenVar(wide, 0x1234);  // 3-byte form
     auto partial = bytecode::decodeLenVar({wide, 2});
     EXPECT_TRUE(partial.valid);
     EXPECT_EQ(partial.consumed, 0u);  // needs more bytes
@@ -320,6 +351,36 @@ TEST(BytecodeLenVar, ShortInputAndReservedMarker)
     const uint8_t reserved[] = {0xFF};
     auto bad                 = bytecode::decodeLenVar({reserved, 1});
     EXPECT_FALSE(bad.valid);
+}
+
+TEST(BytecodeReceiveProperty, SeededInputsAreDeterministicWithoutActuation)
+{
+    uint32_t state = 0xB17EC0DEu;
+    auto next      = [&state]() {
+        state = state * 1103515245u + 12345u;
+        return state;
+    };
+    std::array<uint8_t, 128> script{};
+    bytecode::BytecodeRunner runner;
+    runner.setDelayFn(&ignoreDelay);
+
+    for (size_t iteration = 0; iteration < 512; ++iteration) {
+        const size_t size = next() % (script.size() + 1u);
+        for (size_t i = 0; i < size; ++i) {
+            script[i] = static_cast<uint8_t>(next());
+        }
+
+        const auto first       = runner.run({script.data(), size});
+        const size_t first_at  = runner.lastOffset();
+        const auto second      = runner.run({script.data(), size});
+        const size_t second_at = runner.lastOffset();
+        EXPECT_EQ(first.has_value(), second.has_value()) << iteration;
+        if (!first.has_value() && !second.has_value()) {
+            EXPECT_EQ(first.error(), second.error()) << iteration;
+        }
+        EXPECT_EQ(first_at, second_at) << iteration;
+        EXPECT_LE(second_at, size) << iteration;
+    }
 }
 
 // ============================================================================
@@ -470,6 +531,66 @@ TEST(BytecodeRunner, SPITransferCarriesDescriptor)
     EXPECT_EQ(rig.runner.storedData(2).size, 1u);
 }
 
+TEST(BytecodeRunner, SPIExplicitWireScopeBorrowsOnePhysicalAccess)
+{
+    Rig rig;
+    rig.spi_bus.rx_script = {0xA5};
+    spi::TransferDesc desc;
+
+    uint8_t buf[96] = {};
+    data::MemorySink sink{data::DataSpan{buf, sizeof(buf)}};
+    bytecode::BytecodeEncoder enc{sink};
+    ASSERT_TRUE(enc.busBeginTransaction(types::bus_kind_t::SPI, 0).has_value());
+    ASSERT_TRUE(enc.transfer(0, desc, data::ConstDataSpan{}, 1, 3).has_value());
+    ASSERT_TRUE(enc.busEndTransaction(types::bus_kind_t::SPI, 0).has_value());
+    ASSERT_TRUE(enc.end().has_value());
+
+    ASSERT_TRUE(rig.runner.run(data::ConstDataSpan{buf, sizeof(buf)}).has_value());
+    EXPECT_EQ(rig.spi_bus.begin_count, 1u);
+    EXPECT_EQ(rig.spi_bus.end_count, 1u);
+    EXPECT_EQ(rig.spi_bus.transfer_count, 1u);
+    EXPECT_TRUE(rig.spi_bus.transfer_saw_active);
+    EXPECT_FALSE(rig.spi_bus.operation_active);
+    EXPECT_EQ(rig.runner.storedData(3).size, 1u);
+    EXPECT_EQ(static_cast<uint8_t>(bytecode::OpCode::BusBeginTransaction), 0xB4u);
+    EXPECT_EQ(static_cast<uint8_t>(bytecode::OpCode::BusEndTransaction), 0xB5u);
+}
+
+TEST(BytecodeRunner, SPILegacyNestedWireDepthIsAbsorbedByAdapter)
+{
+    Rig rig;
+    uint8_t buf[96] = {};
+    data::MemorySink sink{data::DataSpan{buf, sizeof(buf)}};
+    bytecode::BytecodeEncoder enc{sink};
+    ASSERT_TRUE(enc.busBeginTransaction(types::bus_kind_t::SPI, 0).has_value());
+    ASSERT_TRUE(enc.busBeginTransaction(types::bus_kind_t::SPI, 0).has_value());
+    ASSERT_TRUE(enc.busEndTransaction(types::bus_kind_t::SPI, 0).has_value());
+    ASSERT_TRUE(enc.busEndTransaction(types::bus_kind_t::SPI, 0).has_value());
+    ASSERT_TRUE(enc.end().has_value());
+
+    ASSERT_TRUE(rig.runner.run(data::ConstDataSpan{buf, sizeof(buf)}).has_value());
+    EXPECT_EQ(rig.spi_bus.begin_count, 1u);
+    EXPECT_EQ(rig.spi_bus.end_count, 1u);
+    EXPECT_FALSE(rig.spi_bus.operation_active);
+}
+
+TEST(BytecodeRunner, SPIUnregisterClosesAnOpenLegacyWireScope)
+{
+    Rig rig;
+    uint8_t buf[32] = {};
+    data::MemorySink sink{data::DataSpan{buf, sizeof(buf)}};
+    bytecode::BytecodeEncoder enc{sink};
+    ASSERT_TRUE(enc.busBeginTransaction(types::bus_kind_t::SPI, 0).has_value());
+    ASSERT_TRUE(enc.end().has_value());
+    ASSERT_TRUE(rig.runner.run(data::ConstDataSpan{buf, sizeof(buf)}).has_value());
+    ASSERT_TRUE(rig.spi_bus.operation_active);
+
+    rig.runner.unregisterSPI(0);
+    EXPECT_EQ(rig.spi_bus.end_count, 1u);
+    EXPECT_FALSE(rig.spi_bus.operation_active);
+    EXPECT_FALSE(rig.runner.hasBinding(types::bus_kind_t::SPI, 0));
+}
+
 TEST(BytecodeRunner, UARTTransferTracksActualReadCount)
 {
     Rig rig;
@@ -599,6 +720,65 @@ TEST(BytecodeRunner, StoreSlotsOverwriteAndExhaust)
     EXPECT_EQ(result.error(), error_t::OUT_OF_RESOURCE);
 }
 
+TEST(BytecodeRunner, BusCreateRollsBackWhenCapabilityStoreCannotBeAllocatedAndPrioritizesReleaseFailure)
+{
+    CaptureI2cBus bus;
+    i2c::MasterAccessor accessor{bus, i2c::MasterAccessConfig{}};
+    bytecode::BytecodeRunner runner;
+    struct Handler {
+        bytecode::BytecodeRunner* runner;
+        i2c::MasterAccessor* accessor;
+        size_t creates    = 0;
+        size_t releases   = 0;
+        bool fail_release = false;
+
+        static result_t<void> call(void* ctx, bool create, types::bus_kind_t kind, uint8_t bus_id, data::ConstDataSpan)
+        {
+            auto& self = *static_cast<Handler*>(ctx);
+            if (kind != types::bus_kind_t::I2C) {
+                return m5::stl::make_unexpected(error_t::UNSUPPORTED);
+            }
+            if (create) {
+                ++self.creates;
+                return self.runner->registerI2C(bus_id, *self.accessor);
+            }
+            ++self.releases;
+            if (self.fail_release) {
+                return m5::stl::make_unexpected(error_t::IO_ERROR);
+            }
+            self.runner->unregisterI2C(bus_id);
+            return {};
+        }
+    } handler{&runner, &accessor};
+    runner.setBusCreateHandler(&Handler::call, &handler);
+
+    uint8_t buf[256] = {};
+    data::MemorySink sink{data::DataSpan{buf, sizeof(buf)}};
+    bytecode::BytecodeEncoder enc{sink};
+    const uint8_t value = 0xA5;
+    for (uint8_t id = 0; id < 8; ++id) {
+        ASSERT_TRUE(enc.storeData(id, {&value, 1}).has_value());
+    }
+    ASSERT_TRUE(enc.busCreate(types::bus_kind_t::I2C, 1, 9, {}).has_value());
+    ASSERT_TRUE(enc.end().has_value());
+
+    auto result = runner.run({buf, sink.written()});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), error_t::OUT_OF_RESOURCE);
+    EXPECT_EQ(handler.creates, 1u);
+    EXPECT_EQ(handler.releases, 1u);
+    EXPECT_FALSE(runner.hasBinding(types::bus_kind_t::I2C, 1));
+
+    handler.fail_release = true;
+    result               = runner.run({buf, sink.written()});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), error_t::IO_ERROR);
+    EXPECT_EQ(handler.creates, 2u);
+    EXPECT_EQ(handler.releases, 2u);
+    EXPECT_TRUE(runner.hasBinding(types::bus_kind_t::I2C, 1));
+    runner.unregisterI2C(1);
+}
+
 // ============================================================================
 // Forward compatibility / diagnostics
 // ============================================================================
@@ -644,6 +824,7 @@ TEST(BytecodeRunner, HostileLenVarDoesNotWrap)
     EXPECT_EQ(rejected.error(), error_t::PROTOCOL_ERROR);
 }
 
+#if defined(NDEBUG)
 TEST(BytecodeEncoder, RejectsPayloadSizeOverflowBeforeReserve)
 {
     uint8_t buf[32] = {};
@@ -692,6 +873,22 @@ TEST(BytecodeEncoder, RejectsPayloadSizeOverflowBeforeReserve)
     ASSERT_FALSE(gpio_overflow.has_value());
     EXPECT_EQ(gpio_overflow.error(), error_t::INVALID_ARGUMENT);
 }
+#else
+TEST(BytecodeEncoderDeathTest, RejectsWireLengthNarrowing)
+{
+    uint8_t buf[32] = {};
+    data::MemorySink sink{data::DataSpan{buf, sizeof(buf)}};
+    bytecode::BytecodeEncoder enc{sink};
+    uint8_t byte          = 0;
+    const size_t too_wide = static_cast<size_t>(UINT32_MAX) + 1u;
+
+    EXPECT_DEATH({ (void)enc.uartTransfer(0, {}, too_wide, bytecode::kDiscardStoreId); }, "rx_len exceeds the u32");
+    EXPECT_DEATH({ (void)enc.reportError(error_t::IO_ERROR, too_wide); }, "offset exceeds the u32");
+    EXPECT_DEATH(
+        { (void)enc.storeData(0, data::ConstDataSpan{&byte, static_cast<size_t>(UINT32_MAX) - 1u}); },
+        "instruction length exceeds the u32");
+}
+#endif
 
 // streamTransfer writes meta.size into a single u8 wire field. A meta span
 // larger than 255 (or an incoherent null-with-size span) must be rejected up
@@ -738,6 +935,57 @@ TEST(BytecodeRunner, TruncationAndTerminator)
     auto empty = rig.runner.run(data::ConstDataSpan{});
     ASSERT_TRUE(empty.has_value());
     EXPECT_EQ(empty.value(), 0u);
+}
+
+TEST(BytecodeRunner, StreamTransferRejectsShortPayloadAsProtocolError)
+{
+    bytecode::BytecodeRunner runner;
+    const uint8_t script[] = {1, static_cast<uint8_t>(bytecode::OpCode::BusStreamTransfer), 0};
+
+    auto result = runner.run(data::ConstDataSpan{script, sizeof(script)});
+    ASSERT_FALSE(result.has_value()) << "unexpected success";
+    EXPECT_EQ(result.error(), error_t::PROTOCOL_ERROR) << "err=" << error::toString(result.error());
+}
+
+TEST(BytecodeRunner, StreamTransferRejectsTruncatedMetaAsProtocolError)
+{
+    bytecode::BytecodeRunner runner;
+    // The fixed 12-byte payload claims one metadata byte but carries none.
+    const uint8_t script[] = {13,
+                              static_cast<uint8_t>(bytecode::OpCode::BusStreamTransfer),
+                              static_cast<uint8_t>(types::bus_kind_t::I2C),
+                              0,
+                              0,
+                              1,
+                              0,
+                              0,
+                              0,
+                              0,
+                              0,
+                              0,
+                              0,
+                              0,
+                              0};
+
+    auto result = runner.run(data::ConstDataSpan{script, sizeof(script)});
+    ASSERT_FALSE(result.has_value()) << "unexpected success";
+    EXPECT_EQ(result.error(), error_t::PROTOCOL_ERROR) << "err=" << error::toString(result.error());
+}
+
+TEST(BytecodeRunner, StreamTransferWithoutHandlerIsUnsupported)
+{
+    bytecode::BytecodeRunner runner;
+    uint8_t script[32] = {};
+    data::MemorySink sink{data::DataSpan{script, sizeof(script)}};
+    bytecode::BytecodeEncoder enc{sink};
+    auto encoded = enc.streamTransfer(types::bus_kind_t::I2C, 0, 0, 0, 0, {});
+    ASSERT_TRUE(encoded.has_value()) << "err=" << error::toString(encoded.error());
+    auto ended = enc.end();
+    ASSERT_TRUE(ended.has_value()) << "err=" << error::toString(ended.error());
+
+    auto result = runner.run(data::ConstDataSpan{script, sink.written()});
+    ASSERT_FALSE(result.has_value()) << "unexpected success";
+    EXPECT_EQ(result.error(), error_t::UNSUPPORTED) << "err=" << error::toString(result.error());
 }
 
 // ============================================================================

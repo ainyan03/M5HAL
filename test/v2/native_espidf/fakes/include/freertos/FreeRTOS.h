@@ -21,13 +21,13 @@ constexpr BaseType_t pdFAIL  = 0;
 
 constexpr TickType_t portMAX_DELAY = 0xFFFFFFFFu;
 
-// Fake tick rate: 1 tick == 1 ms, so pdMS_TO_TICKS is the identity. Only
-// m5_hal/variants/frameworks/freertos/hal/runtime/time.hpp reads
-// configTICK_RATE_HZ (timeoutMsToTicks); the state-machine code under test
-// never converts a wall-clock duration, so the exact rate is not
-// load-bearing for the regression scenarios -- only that it is defined.
-constexpr uint32_t configTICK_RATE_HZ      = 1000;
+// Use the common 100 Hz embedded configuration. A non-1:1 millisecond/tick
+// ratio makes timeout conversion tests capable of detecting truncation in a
+// path that promises to round finite waits up.
+constexpr uint32_t configTICK_RATE_HZ      = 100;
 constexpr UBaseType_t configMAX_PRIORITIES = 25;
+#define configSUPPORT_STATIC_ALLOCATION 1
+#define INCLUDE_vTaskSuspend            1
 
 // Single-core fake: core-placement queries resolve to core 0. Used by the
 // freertos runtime Task's core argument (TASK_CORE_SAME / TASK_CORE_OPPOSITE
@@ -41,7 +41,7 @@ inline BaseType_t xPortGetCoreID()
 
 inline TickType_t pdMS_TO_TICKS(uint32_t ms)
 {
-    return static_cast<TickType_t>(ms);
+    return static_cast<TickType_t>((static_cast<uint64_t>(ms) * configTICK_RATE_HZ) / 1000u);
 }
 
 // Real FreeRTOS portMUX_TYPE is a spinlock record; this harness is single
@@ -67,3 +67,11 @@ inline void portEXIT_CRITICAL_ISR(portMUX_TYPE*)
 inline void portYIELD_FROM_ISR()
 {
 }
+
+#if defined(M5HAL_TEST_ESPIDF_SPI_SLAVE_HOST_HARNESS)
+#include <thread>
+inline void taskYIELD()
+{
+    std::this_thread::yield();
+}
+#endif

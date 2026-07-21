@@ -6,25 +6,13 @@
 
 #include "../service/completion_gate.hpp"
 
+#include <cstdlib>
+
 namespace m5::hal::v2::gpio {
 
 namespace group_detail {
 
-// Minimal RAII guard over runtime::Mutex (matches bus/registry.hpp,
-// bus/hw_pool.hpp: bool lock(timeout) / void unlock()).
-struct Guard {
-    runtime::Mutex& m;
-    explicit Guard(runtime::Mutex& mtx) : m{mtx}
-    {
-        (void)m.lock(types::TIMEOUT_FOREVER);
-    }
-    ~Guard(void)
-    {
-        m.unlock();
-    }
-    Guard(const Guard&)            = delete;
-    Guard& operator=(const Guard&) = delete;
-};
+using Guard = runtime::MutexGuard;
 
 }  // namespace group_detail
 
@@ -142,7 +130,12 @@ result_t<void> GPIOGroup::setWatchSink(WatchSink sink, void* ctx, uint32_t poll_
         _watch_service_registered = false;
     }
     if (was_registered && _service_runner != nullptr) {
-        (void)_service_runner->remove(*this);  // R7: never call this while holding _watch_mutex
+        auto removed = _service_runner->remove(*this);  // R7: never call this while holding _watch_mutex
+        if (!removed.has_value()) {
+            group_detail::Guard guard{_watch_mutex};
+            _watch_service_registered = true;
+            return m5::stl::make_unexpected(removed.error());
+        }
     }
 
     if (sink == nullptr) {
@@ -166,17 +159,21 @@ result_t<void> GPIOGroup::setWatchSink(WatchSink sink, void* ctx, uint32_t poll_
             _watch_service_registered = true;
         }
     }
-    if (need_add && !_service_runner->add(*this)) {
-        // Deterministic failure state: NO sink and NO poll service. A
-        // failed REPLACE does not restore the previous sink — its
-        // service was already removed above and re-adding it could
-        // fail the same way, so "restore" cannot be guaranteed either.
-        // Callers see OUT_OF_RESOURCE and may retry.
-        group_detail::Guard guard{_watch_mutex};
-        _watch_sink               = nullptr;
-        _watch_sink_ctx           = nullptr;
-        _watch_service_registered = false;
-        return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+    if (need_add) {
+        auto added = _service_runner->add(*this);
+        if (!added.has_value()) {
+            // Deterministic failure state: NO sink and NO poll service. A
+            // failed REPLACE does not restore the previous sink — its
+            // service was already removed above and re-adding it could
+            // fail the same way, so "restore" cannot be guaranteed either.
+            // The exact registration error is preserved so callers can decide
+            // whether retrying is meaningful.
+            group_detail::Guard guard{_watch_mutex};
+            _watch_sink               = nullptr;
+            _watch_sink_ctx           = nullptr;
+            _watch_service_registered = false;
+            return m5::stl::make_unexpected(added.error());
+        }
     }
     return {};
 }

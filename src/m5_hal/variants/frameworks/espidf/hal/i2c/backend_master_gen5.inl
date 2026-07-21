@@ -8,8 +8,9 @@
 
 #include "backend_master_write_buffer.inl"
 
+#include "../../detail/esp_err_map.hpp"
+
 #include <driver/gpio.h>
-#include <esp_attr.h>
 #include <esp_err.h>
 #include <freertos/FreeRTOS.h>
 // ensureDevice()'s scl_wait_us clamp branches on CONFIG_IDF_TARGET_ESP32;
@@ -37,10 +38,6 @@ namespace detail = ::m5::variants::frameworks::espidf::hal::v2::i2c::detail;
 error::error_t mapEspErr(::esp_err_t err)
 {
     switch (err) {
-        case ESP_OK:
-            return error::error_t::OK;
-        case ESP_ERR_INVALID_ARG:
-            return error::error_t::INVALID_ARGUMENT;
         case ESP_ERR_INVALID_STATE:
             // The gen5 sync driver returns this for ANY transaction that did
             // not reach DONE: on v5.x that folds NACK, SCL timeout,
@@ -51,10 +48,6 @@ error::error_t mapEspErr(::esp_err_t err)
             // validation. I2C_BUS_ERROR is the closest truthful class the
             // return code allows.
             return error::error_t::I2C_BUS_ERROR;
-        case ESP_ERR_TIMEOUT:
-            return error::error_t::TIMEOUT_ERROR;
-        case ESP_ERR_NO_MEM:
-            return error::error_t::OUT_OF_RESOURCE;
         case ESP_ERR_NOT_FOUND:
             return error::error_t::I2C_NO_ACK;
         case ESP_ERR_INVALID_RESPONSE:
@@ -63,7 +56,7 @@ error::error_t mapEspErr(::esp_err_t err)
             // errors and therefore not mapped to I2C_NO_ACK).
             return error::error_t::I2C_NO_ACK;
         default:
-            return error::error_t::I2C_BUS_ERROR;
+            return ::m5::variants::frameworks::espidf::detail::mapEspErrCommon(err, error::error_t::I2C_BUS_ERROR);
     }
 }
 
@@ -119,38 +112,58 @@ int transactionTimeoutMs(uint32_t wire_timeout_ms, uint64_t total_bytes, uint32_
 }  // namespace impl_espidf_gen5
 }  // namespace
 
-error::error_t Bus_espidf::attach(::i2c_master_bus_handle_t bus_handle)
+error::error_t Bus_espidf::attachBorrowedNative(::i2c_master_bus_handle_t bus_handle)
 {
+    if (!initializationAllowed(false)) {
+        return error::error_t::INVALID_STATE;
+    }
     if (bus_handle == nullptr) {
         return error::error_t::INVALID_ARGUMENT;
     }
     if (_bus_handle != nullptr) {
-        auto released = release();
-        if (!released.has_value()) {
-            return released.error();
+        auto closed = teardownBackend();
+        if (closed.disposition != bus::CloseDisposition::Success) {
+            return closed.error_code;
         }
     }
-    _bus_handle = bus_handle;
-    _owns_bus   = false;
+    _bus_handle      = bus_handle;
+    _owns_bus        = false;
+    auto initialized = markInitializationSucceeded(false);
+    if (!initialized.has_value()) {
+        (void)teardownBackend();
+        return initialized.error();
+    }
     return error::error_t::OK;
 }
 
-result_t<void> Bus_espidf::init(const BusConfig_espidf& config)
+result_t<void> Bus_espidf::init(const IBusConfig& config)
 {
+    // The portable config deliberately has no controller field. Let the
+    // ESP-IDF gen5 driver choose any free HP controller so two independent
+    // portable buses can coexist; explicit controller assignment belongs to
+    // the logical allocation path below.
+    return initBackend(config, detail_espidf_i2c::kPortableControllerAuto);
+}
+
+result_t<void> Bus_espidf::initBackend(const IBusConfig& config, int8_t controller)
+{
+    if (!initializationAllowed(false)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
     if (config.pin_scl < 0 || config.pin_sda < 0) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
     if (_bus_handle != nullptr) {
-        auto released = release();
-        if (!released.has_value()) {
-            return m5::stl::make_unexpected(released.error());
+        auto closed = teardownBackend();
+        if (closed.disposition != bus::CloseDisposition::Success) {
+            return m5::stl::make_unexpected(closed.error_code);
         }
     }
     _config = config;
 
-    _controller_port                     = config.i2c_port;  // cached for controllerId()
+    _controller_port                     = controller;  // cached for controllerId()
     ::i2c_master_bus_config_t bus_config = {};
-    bus_config.i2c_port                  = config.i2c_port;
+    bus_config.i2c_port                  = controller;
     bus_config.scl_io_num                = static_cast<::gpio_num_t>(_config.pin_scl);
     bus_config.sda_io_num                = static_cast<::gpio_num_t>(_config.pin_sda);
 #if M5HAL_ESPIDF_I2C_LP_POOL
@@ -191,51 +204,50 @@ result_t<void> Bus_espidf::init(const BusConfig_espidf& config)
     }
     _owns_bus        = true;
     _rebuild_pending = false;
+    auto initialized = markInitializationSucceeded(false);
+    if (!initialized.has_value()) {
+        (void)teardownBackend();
+        return initialized;
+    }
     return {};
 }
 
-result_t<void> Bus_espidf::release(void)
+bus::CloseOutcome Bus_espidf::teardownBackend(void)
 {
-    if (_transfer_active) {
-        auto waited = waitTransfer(_transfer_owner, i2c::MasterAccessConfig{});
-        if (!waited.has_value()) {
-            return m5::stl::make_unexpected(waited.error());
-        }
-    }
-
     auto removed = removeDevice();
     if (!removed.has_value()) {
-        return m5::stl::make_unexpected(removed.error());
+        return bus::CloseOutcome::partialOrUnknown(removed.error());
     }
 
     if (_bus_handle != nullptr && _owns_bus) {
-        // Transactional release (D1/D9): clear the handle/ownership only after
+        // Transactional teardown: clear the handle/ownership only after
         // the ESP-IDF delete succeeds (see gen4). On error keep them set so the
         // dtor / a retry can free the bus, and a swap keeps a usable old backend.
         auto mapped = impl_espidf_gen5::mapEspErr(::i2c_del_master_bus(_bus_handle));
         if (error::isError(mapped)) {
-            return m5::stl::make_unexpected(mapped);
+            return bus::CloseOutcome::partialOrUnknown(mapped);
         }
-        _bus_handle      = nullptr;
-        _owns_bus        = false;
-        _rebuild_pending = false;
-        return {};
+        _bus_handle            = nullptr;
+        _owns_bus              = false;
+        _rebuild_pending       = false;
+        auto released_identity = releaseNativeIdentity();
+        if (!released_identity.has_value()) {
+            return bus::CloseOutcome::partialOrUnknown(released_identity.error());
+        }
+        return bus::CloseOutcome::success();
     }
-    _bus_handle      = nullptr;
-    _owns_bus        = false;
-    _rebuild_pending = false;
-    return {};
+    _bus_handle            = nullptr;
+    _owns_bus              = false;
+    _rebuild_pending       = false;
+    auto released_identity = releaseNativeIdentity();
+    if (!released_identity.has_value()) {
+        return bus::CloseOutcome::partialOrUnknown(released_identity.error());
+    }
+    return bus::CloseOutcome::success();
 }
 
 result_t<void> Bus_espidf::removeDevice(void)
 {
-    if (_transfer_active) {
-        auto waited = waitTransfer(_transfer_owner, i2c::MasterAccessConfig{});
-        if (!waited.has_value()) {
-            return m5::stl::make_unexpected(waited.error());
-        }
-    }
-
     if (_dev_handle == nullptr) {
         return {};
     }
@@ -245,7 +257,6 @@ result_t<void> Bus_espidf::removeDevice(void)
         return m5::stl::make_unexpected(mapped);
     }
     _dev_handle           = nullptr;
-    _dev_async            = false;
     _dev_addr             = 0;
     _dev_freq             = 0;
     _dev_scl_wait_us      = 0;
@@ -289,18 +300,17 @@ void Bus_espidf::recoverBusAfterWireFault(error::error_t mapped, uint32_t wire_t
     (void)::i2c_master_bus_reset(_bus_handle);
 
     if (_owns_bus) {
-        // Explicit release-then-init: init()'s internal release ignores a
-        // delete failure and would create a second bus on the same port on
-        // top of the leaked one.
-        BusConfig_espidf config;
-        config.pin_scl  = _config.pin_scl;
-        config.pin_sda  = _config.pin_sda;
-        config.i2c_port = _controller_port;
-        if (!release().has_value()) {
+        // Explicit teardown-then-init: avoid creating a second bus on the same
+        // port when deletion of the old bus fails.
+        IBusConfig config;
+        config.pin_scl = _config.pin_scl;
+        config.pin_sda = _config.pin_sda;
+        auto closed    = teardownBackend();
+        if (closed.disposition != bus::CloseDisposition::Success) {
             // Keep the old handle: it was FSM-reset above, so it stays usable
             // even though the driver-internal soft state could not be cleared.
-            M5_LIB_LOGW("I2C wire-fault recovery: rebuild skipped (release failed); continuing on reset bus");
-        } else if (!init(config).has_value()) {
+            M5_LIB_LOGW("I2C wire-fault recovery: rebuild skipped (teardown failed); continuing on reset bus");
+        } else if (!initBackend(config, static_cast<int8_t>(_controller_port)).has_value()) {
             // A transient failure (e.g. NO_MEM) must not permanently kill an
             // owned bus: transfer() retries the rebuild lazily on the next
             // call instead of reporting the null handle as caller misuse.
@@ -398,95 +408,16 @@ result_t<void> Bus_espidf::ensureDevice(const i2c::MasterAccessConfig& cfg)
     _dev_scl_wait_us      = scl_wait_us;
     _dev_address_is_10bit = cfg.address_is_10bit;
 
-    // Do not register i2c_master_event_callbacks here. Callback registration is
-    // only valid on an ESP-IDF async-queue bus, which would make probe/scan and
-    // multi-device ownership substantially harder to reason about.
-    _dev_async = false;
     return {};
 }
 
-service::ServicePoll Bus_espidf::serviceImpl(const service::ServiceContext& ctx)
+result_t<void> Bus_espidf::transferBackend(bus::OperationContext<i2c::MasterAccessConfig>& context,
+                                           const i2c::TransferDesc& desc, data::Source* src, size_t tx_len,
+                                           data::Sink* dst, size_t rx_len)
 {
-    return serviceTransfer(ctx);
-}
-
-bool IRAM_ATTR Bus_espidf::onTransferDone(::i2c_master_dev_handle_t dev, const ::i2c_master_event_data_t* evt,
-                                          void* arg)
-{
-    (void)dev;
-    auto* self = static_cast<Bus_espidf*>(arg);
-    if (self == nullptr) {
-        return false;
-    }
-    auto err = error::error_t::OK;
-    if (evt != nullptr) {
-        if (evt->event == I2C_EVENT_NACK) {
-            err = error::error_t::I2C_NO_ACK;
-        } else if (evt->event == I2C_EVENT_TIMEOUT) {
-            err = error::error_t::TIMEOUT_ERROR;
-        }
-    }
-    self->_transfer_callback_status = err;
-    return false;
-}
-
-void Bus_espidf::unregisterTransferService(void)
-{
-    if (_transfer_registered) {
-        (void)M5_Hal.Services.remove(*this);
-        _transfer_registered = false;
-    }
-}
-
-void Bus_espidf::clearTransferState(void)
-{
-    unregisterTransferService();
-    _transfer_owner = nullptr;
-    _transfer_dst   = nullptr;
-    _transfer_tx_buf.reset();
-    _transfer_tx_count        = 0;
-    _transfer_rx_count        = 0;
-    _transfer_active          = false;
-    _transfer_done            = true;
-    _transfer_callback_status = error::error_t::ASYNC_RUNNING;
-}
-
-service::ServiceResult Bus_espidf::serviceTransfer(const service::ServiceContext& ctx)
-{
-    (void)ctx;
-    if (!_transfer_active || _transfer_done) {
-        unregisterTransferService();
-        return service::ServiceResult::Done;
-    }
-    if (_transfer_callback_status == error::error_t::ASYNC_RUNNING) {
-        return service::ServiceResult::Idle;
-    }
-
-    unregisterTransferService();
-    if (error::isError(_transfer_callback_status)) {
-        return service::ServiceResult::Error;
-    }
-    if (_transfer_dst != nullptr && _transfer_rx_count > 0) {
-        auto committed = _transfer_dst->commit(_transfer_rx_count);
-        if (!committed.has_value()) {
-            _transfer_callback_status = committed.error();
-            return service::ServiceResult::Error;
-        }
-    }
-    _transfer_totals.tx += _transfer_tx_count;
-    _transfer_totals.rx += _transfer_rx_count;
-    _transfer_done = true;
-    return service::ServiceResult::Done;
-}
-
-result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const i2c::MasterAccessConfig& cfg,
-                                    const i2c::TransferDesc& desc, data::Source* src, size_t tx_len, data::Sink* dst,
-                                    size_t rx_len)
-{
-    auto waited = waitTransfer(owner, cfg);
-    if (!waited.has_value()) {
-        return m5::stl::make_unexpected(waited.error());
-    }
+    auto* owner     = &bus::OperationSlot::contextOwner(context);
+    const auto& cfg = context.config;
+    (void)owner;
     if (_bus_handle == nullptr) {
         if (!_rebuild_pending) {
             return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
@@ -494,11 +425,10 @@ result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const i2c::MasterAcce
         // Deferred wire-fault recovery (see recoverBusAfterWireFault): retry
         // the rebuild here; if it keeps failing, report the bus as faulted
         // rather than as caller misuse.
-        BusConfig_espidf config;
-        config.pin_scl  = _config.pin_scl;
-        config.pin_sda  = _config.pin_sda;
-        config.i2c_port = _controller_port;
-        if (!init(config).has_value()) {
+        IBusConfig config;
+        config.pin_scl = _config.pin_scl;
+        config.pin_sda = _config.pin_sda;
+        if (!initBackend(config, static_cast<int8_t>(_controller_port)).has_value()) {
             return m5::stl::make_unexpected(error::error_t::I2C_BUS_ERROR);
         }
     }
@@ -522,24 +452,9 @@ result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const i2c::MasterAcce
         if (cfg.address_is_10bit) {
             return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
         }
-        if (_dev_async && _owns_bus) {
-            BusConfig_espidf config;
-            config.pin_scl  = _config.pin_scl;
-            config.pin_sda  = _config.pin_sda;
-            config.i2c_port = _controller_port;
-            auto released   = release();
-            if (!released.has_value()) {
-                return m5::stl::make_unexpected(released.error());
-            }
-            auto initialized = init(config);
-            if (!initialized.has_value()) {
-                return m5::stl::make_unexpected(initialized.error());
-            }
-        } else {
-            auto removed = removeDevice();
-            if (!removed.has_value()) {
-                return m5::stl::make_unexpected(removed.error());
-            }
+        auto removed = removeDevice();
+        if (!removed.has_value()) {
+            return m5::stl::make_unexpected(removed.error());
         }
 
         auto err    = ::i2c_master_probe(_bus_handle, cfg.i2c_addr, timeout);
@@ -572,49 +487,8 @@ result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const i2c::MasterAcce
         return {};
     };
 
-    auto arm_async = [&](data::Sink* async_dst, size_t rx_count, size_t tx_count) {
-        _transfer_owner           = owner;
-        _transfer_dst             = async_dst;
-        _transfer_tx_count        = tx_count;
-        _transfer_rx_count        = rx_count;
-        _transfer_active          = true;
-        _transfer_done            = false;
-        _transfer_callback_status = error::error_t::ASYNC_RUNNING;
-    };
-    auto finish_async_start = [&](::esp_err_t err) -> result_t<void> {
-        auto result_map = impl_espidf_gen5::mapEspErr(err);
-        if (error::isError(result_map)) {
-            clearTransferState();
-            return m5::stl::make_unexpected(result_map);
-        }
-        if (owner == nullptr) {
-            auto done = waitTransfer(owner, cfg);
-            if (!done.has_value()) {
-                return m5::stl::make_unexpected(done.error());
-            }
-        } else if (M5_Hal.Services.add(*this)) {
-            _transfer_registered = true;
-        } else {
-            clearTransferState();
-            return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
-        }
-        return {};
-    };
-
     if (!have_rx) {
-        if (!_dev_async) {
-            return finish(::i2c_master_transmit(_dev_handle, write_bytes.data(), write_bytes.size(), timeout));
-        }
-
-        _transfer_tx_buf = memory::TempBuffer{memory::defaultAllocator(), write_bytes.size()};
-        if (!_transfer_tx_buf) {
-            return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
-        }
-        std::memcpy(_transfer_tx_buf.data(), write_bytes.data(), write_bytes.size());
-
-        arm_async(nullptr, 0, total);
-        return finish_async_start(::i2c_master_transmit(_dev_handle, static_cast<uint8_t*>(_transfer_tx_buf.data()),
-                                                        write_bytes.size(), timeout));
+        return finish(::i2c_master_transmit(_dev_handle, write_bytes.data(), write_bytes.size(), timeout));
     }
 
     auto rsv = dst->reserve(rx_len);
@@ -630,40 +504,6 @@ result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const i2c::MasterAcce
             return finish(::i2c_master_transmit(_dev_handle, write_bytes.data(), write_bytes.size(), timeout));
         }
         return finish(ESP_OK);
-    }
-
-    if (_dev_async) {
-        if (have_tx) {
-            _transfer_tx_buf = memory::TempBuffer{memory::defaultAllocator(), write_bytes.size()};
-            if (!_transfer_tx_buf) {
-                return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
-            }
-            std::memcpy(_transfer_tx_buf.data(), write_bytes.data(), write_bytes.size());
-        }
-        arm_async(dst, rx_span.size, total);
-        ::esp_err_t err = ESP_OK;
-        if (have_tx && cfg.use_restart) {
-            err = ::i2c_master_transmit_receive(_dev_handle, static_cast<uint8_t*>(_transfer_tx_buf.data()),
-                                                write_bytes.size(), rx_span.data, rx_span.size, timeout);
-        } else if (have_tx) {
-            ::i2c_operation_job_t ops[6] = {};
-            ops[0].command               = I2C_MASTER_CMD_START;
-            ops[1].command               = I2C_MASTER_CMD_WRITE;
-            ops[1].write.ack_check       = true;
-            ops[1].write.data            = static_cast<uint8_t*>(_transfer_tx_buf.data());
-            ops[1].write.total_bytes     = write_bytes.size();
-            ops[2].command               = I2C_MASTER_CMD_STOP;
-            ops[3].command               = I2C_MASTER_CMD_START;
-            ops[4].command               = I2C_MASTER_CMD_READ;
-            ops[4].read.ack_value        = I2C_NACK_VAL;
-            ops[4].read.data             = rx_span.data;
-            ops[4].read.total_bytes      = rx_span.size;
-            ops[5].command               = I2C_MASTER_CMD_STOP;
-            err                          = ::i2c_master_execute_defined_operations(_dev_handle, ops, 6, timeout);
-        } else {
-            err = ::i2c_master_receive(_dev_handle, rx_span.data, rx_span.size, timeout);
-        }
-        return finish_async_start(err);
     }
 
     ::esp_err_t err = ESP_OK;
@@ -689,38 +529,22 @@ result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const i2c::MasterAcce
     return finish(err);
 }
 
-result_t<bus::TransferTotals> Bus_espidf::waitTransfer(bus::IAccessor* owner, const i2c::MasterAccessConfig& cfg)
+result_t<bus::TransferTotals> Bus_espidf::waitTransferBackend(bus::OperationContext<i2c::MasterAccessConfig>& context)
 {
+    auto* owner     = &bus::OperationSlot::contextOwner(context);
+    const auto& cfg = context.config;
+    (void)owner;
     (void)cfg;
-    if (_transfer_active && _transfer_owner != owner) {
-        return m5::stl::make_unexpected(error::error_t::BUSY);
-    }
-    while (_transfer_active && !_transfer_done && !error::isError(_transfer_callback_status)) {
-        // serviceTransfer ignores the context (completion checks only, no
-        // timing) — a default-constructed one is sufficient here.
-        auto result = serviceTransfer(service::ServiceContext{});
-        if (result == service::ServiceResult::Error) {
-            break;
-        }
-        if (result == service::ServiceResult::Idle) {
-            runtime::yield();
-        }
-    }
-    if (error::isError(_transfer_callback_status)) {
-        const auto err = _transfer_callback_status;
-        clearTransferState();
-        return m5::stl::make_unexpected(err);
-    }
     auto totals = _transfer_totals;
     _transfer_totals.clear();
-    clearTransferState();
     return totals;
 }
 
-bool Bus_espidf::transferBusy(bus::IAccessor* owner)
+bool Bus_espidf::transferBusyBackend(bus::OperationContext<i2c::MasterAccessConfig>& context)
 {
-    return _transfer_active && _transfer_owner == owner && !_transfer_done &&
-           !error::isError(_transfer_callback_status);
+    auto* owner = &bus::OperationSlot::contextOwner(context);
+    (void)owner;
+    return false;
 }
 
 }  // namespace m5::hal::v2::i2c

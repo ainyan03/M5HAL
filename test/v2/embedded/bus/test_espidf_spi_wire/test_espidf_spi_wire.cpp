@@ -64,11 +64,10 @@ EspidfSpiBus& makeBus()
     // Static instance + re-init per test: a Unity assert failure
     // longjmps out of the test body, skipping local destructors - a
     // local Bus would leak the initialized SPI host and fail every
-    // later init with INVALID_STATE. Bus::init releases the previous
-    // ownership first, so re-init doubles as the cleanup path.
+    // later init with INVALID_STATE. Bus::init closes the previous backend
+    // first, so re-init doubles as the cleanup path.
     static EspidfSpiBus bus;
-    ::m5::hal::v2::spi::BusConfig_espidf bus_config;
-    bus_config.host     = M5HAL_TEST_ESPIDF_SPI_HOST;
+    ::m5::hal::v2::spi::BusConfig bus_config;
     bus_config.pin_clk  = M5HAL_TEST_ESPIDF_SPI_PIN_CLOCK;
     bus_config.pin_mosi = M5HAL_TEST_ESPIDF_SPI_PIN_MOSI;
     bus_config.pin_miso = M5HAL_TEST_ESPIDF_SPI_PIN_MISO;

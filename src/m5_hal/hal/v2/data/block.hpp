@@ -10,6 +10,8 @@
 
 namespace m5::hal::v2::data {
 
+class MuxFrameDecoder;
+
 // A Source backed by a queue of fixed-size memory blocks (typically
 // TempBuffer blocks of 256 bytes). Each block holds one frame built
 // by frame::buildDataFrame(). Blocks are consumed front-to-back;
@@ -24,7 +26,9 @@ class BlockSource : public Source {
 public:
     static constexpr size_t kMaxBlocks = 16;
 
-    BlockSource() = default;
+    BlockSource() : BlockSource{memory::defaultAllocator()}
+    {
+    }
 
     explicit BlockSource(memory::Allocator& alloc) : _alloc{&alloc}
     {
@@ -39,11 +43,6 @@ public:
     BlockSource& operator=(const BlockSource&) = delete;
     BlockSource(BlockSource&&)                 = delete;
     BlockSource& operator=(BlockSource&&)      = delete;
-
-    void setAllocator(memory::Allocator& alloc)
-    {
-        _alloc = &alloc;
-    }
 
     bool addBlock(uint8_t* block, size_t valid_len)
     {
@@ -133,6 +132,22 @@ public:
     }
 
 private:
+    friend class MuxFrameDecoder;
+
+    struct DeferredAllocatorBinding {};
+
+    explicit BlockSource(DeferredAllocatorBinding) : _alloc{nullptr}
+    {
+    }
+
+    void bindAllocatorOnce(memory::Allocator& alloc)
+    {
+        M5HAL_ASSERT(_alloc == nullptr, "BlockSource allocator may only be bound once");
+        if (_alloc == nullptr) {
+            _alloc = &alloc;
+        }
+    }
+
     struct Block {
         uint8_t* data = nullptr;
         size_t valid  = 0;

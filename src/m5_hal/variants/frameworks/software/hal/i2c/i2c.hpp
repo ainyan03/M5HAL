@@ -3,6 +3,8 @@
 #define M5_HAL_VARIANTS_FRAMEWORKS_SOFTWARE_HAL_I2C_I2C_HPP
 
 #include "../../../../../hal/v2/gpio/port.hpp"
+#include "../../../../../hal/v2/bus/hal_backend.hpp"
+#include "../../../../../hal/v2/bus/portable_factory.hpp"
 #include "../../../../../hal/v2/i2c/i2c.hpp"
 #include "../../../../../hal/v2/m5_hal.hpp"
 #include "../../../../../hal/v2/service/completion_gate.hpp"
@@ -13,7 +15,7 @@
 // I2C bit-bang implementation. Drives SCL / SDA through the
 // `m5::hal::v2::gpio::Pin` value type; callers populate
 // `IBusConfig::pin_scl` / `pin_sda` with `gpio_number_t` values.
-// `Bus::init` resolves them via `m5::hal::v2::M5_Hal.Gpio.tryGetPin(num)`
+// `Bus::init` resolves them through the injected LocalResourceContext GPIOGroup
 // (global lookup through the `M5HALCore` singleton) and stores the
 // resulting `IPort` / `Pin` in members. Any `gpio_number_t` is
 // accepted, including pins behind an I/O expander.
@@ -91,6 +93,25 @@ public:
     }
     ClockWaitResult waitClockHigh(const MasterLineDriver& lines, const MasterTiming& timing,
                                   ::m5::hal::v2::service::fast_tick_t now_tick) const;
+    template <typename State>
+    ::m5::hal::v2::service::ServiceResult serviceClockStretch(const MasterLineDriver& lines, const MasterTiming& timing,
+                                                              ::m5::hal::v2::service::fast_tick_t now_tick,
+                                                              State& state, State resume_state, State timeout_state,
+                                                              ::m5::hal::v2::error::error_t& error)
+    {
+        switch (waitClockHigh(lines, timing, now_tick)) {
+            case ClockWaitResult::Released:
+                scheduleAfterHalfFromNow(timing, now_tick, state, resume_state);
+                return ::m5::hal::v2::service::ServiceResult::Progress;
+            case ClockWaitResult::Timeout:
+                error = ::m5::hal::v2::error::error_t::TIMEOUT_ERROR;
+                state = timeout_state;
+                return ::m5::hal::v2::service::ServiceResult::Error;
+            case ClockWaitResult::Waiting:
+                return ::m5::hal::v2::service::ServiceResult::Idle;
+        }
+        return ::m5::hal::v2::service::ServiceResult::Idle;
+    }
 
 private:
     ::m5::hal::v2::service::fast_tick_t _due           = 0;
@@ -163,8 +184,6 @@ private:
     bool bitValue() const;
 
     void scheduleAfterHalf(::m5::hal::v2::service::fast_tick_t now_tick, State next);
-
-    void scheduleAfterHalfFromNow(::m5::hal::v2::service::fast_tick_t now_tick, State next);
 
     void waitClockHighOrSchedule(::m5::hal::v2::service::fast_tick_t now_tick, State next);
 
@@ -278,16 +297,8 @@ private:
 
 class MasterTransactionService {
 public:
-    enum class Operation : uint8_t { Idle, Start, WriteByte, ReadByte, Stop, Address, WriteBuffer, ReadBuffer };
+    enum class Operation : uint8_t { Idle, Stop, Address, WriteBuffer, ReadBuffer };
     enum class Phase : uint8_t { Idle, Start, Write, Read };
-
-    void beginStart(MasterLineDriver& lines, const MasterTiming& timing, ::m5::hal::v2::service::fast_tick_t now_tick);
-
-    void beginWriteByte(MasterLineDriver& lines, const MasterTiming& timing, uint8_t byte,
-                        ::m5::hal::v2::service::fast_tick_t now_tick);
-
-    void beginReadByte(MasterLineDriver& lines, const MasterTiming& timing, bool ack_after_read,
-                       ::m5::hal::v2::service::fast_tick_t now_tick);
 
     void beginStop(MasterLineDriver& lines, const MasterTiming& timing, ::m5::hal::v2::service::fast_tick_t now_tick);
 
@@ -305,10 +316,6 @@ public:
     Operation operation() const;
 
     ::m5::hal::v2::error::error_t error() const;
-
-    uint8_t byte() const;
-
-    bool acked() const;
 
     size_t transferred() const;
 
@@ -368,36 +375,45 @@ private:
 
 }  // namespace m5::variants::frameworks::software::hal::v2::i2c
 
-// The user-facing surface (Bus_software / BusConfig_software) lives in the
-// kind namespace per the variant naming rule (spec/design/variants.md);
-// the bit-bang machinery above stays in the variant namespace as an
-// implementation detail.
+// The direct software Bus lives in the kind namespace; the bit-bang machinery
+// above stays in the variant namespace as an implementation detail.
 namespace m5::hal::v2::i2c {
-
-// This variant needs no fields beyond the abstract kind config; the
-// empty derivation still gives `init` a variant-owned type, so a
-// sibling variant's config cannot be passed by accident.
-struct BusConfig_software : public IBusConfig {
-    using IBusConfig::IBusConfig;
-};
 
 class Bus_software : public IBus, private service::IService {
 public:
     ~Bus_software() override;
 
-    result_t<void> init(const BusConfig_software& config);
-    result_t<void> release(void) override;
+    result_t<void> close(void)
+    {
+        return i2c::IBus::close();
+    }
 
-    result_t<void> transfer(bus::IAccessor* owner, const MasterAccessConfig& cfg, const TransferDesc& desc,
-                            data::Source* src, size_t tx_len, data::Sink* dst, size_t rx_len) override;
-    result_t<bus::TransferTotals> waitTransfer(bus::IAccessor* owner, const MasterAccessConfig& cfg) override;
-    bool transferBusy(bus::IAccessor* owner) override;
+    result_t<void> init(const IBusConfig& config);
+
+    bus::BusCapabilities capabilities(void) const override
+    {
+        return bus::detail::BusCapabilitiesBuilder{bus::IBus::capabilities()}
+            .enable(bus::BusFeature::MasterTransfer)
+            .enable(bus::BusFeature::Transmit)
+            .enable(bus::BusFeature::Receive)
+            .build();
+    }
+
+private:
+    result_t<void> teardown(void);
+
+protected:
+    result_t<void> transferBackend(bus::OperationContext<MasterAccessConfig>& context, const TransferDesc& desc,
+                                   data::Source* src, size_t tx_len, data::Sink* dst, size_t rx_len) override;
+    result_t<bus::TransferTotals> waitTransferBackend(bus::OperationContext<MasterAccessConfig>& context) override;
+    bool transferBusyBackend(bus::OperationContext<MasterAccessConfig>& context) override;
+    bus::CloseOutcome closeBackend(void) override;
 
 private:
     service::ServicePoll serviceImpl(const service::ServiceContext& ctx) override;
     service::ServiceResult serviceTransfer(const service::ServiceContext& ctx);
-    void unregisterTransferService(void);
-    void clearTransferState(void);
+    result_t<void> unregisterTransferService(void);
+    result_t<void> clearTransferState(void);
 
     gpio::Pin _pin_scl{};
     gpio::Pin _pin_sda{};
@@ -409,23 +425,25 @@ private:
     bus::TransferTotals _transfer_totals{};
 };
 
-// Facade backend selection: i2c::Bus::init(BusConfig_software) -> Bus_software.
-template <>
-struct BackendFor<BusConfig_software> {
-    using type = Bus_software;
-};
+// Portable provider factory for the software backend.
+inline result_t<std::unique_ptr<IBus>> makePortableBackend_software(const bus::LocalResourceContext& resources,
+                                                                    const IBusConfig& config)
+{
+    return bus::makePortableBackend<IBus, Bus_software, IBusConfig>(resources, config);
+}
 
 // software backend factory: builds a bit-bang Bus_software from a
 // LogicalBusConfig's pins. M5HALCore wires this into i2c::BusView (the logical
 // acquire path). The software variant is always present, so this is the
 // universal software fallback used when a bus is not (or not yet) on hardware.
-inline IBus* makeSoftwareBackendForI2C(const LogicalBusConfig& logical)
+inline IBus* makeSoftwareBackendForI2C(const bus::LocalResourceContext& resources, const LogicalBusConfig& logical)
 {
     auto* backend = new (std::nothrow) Bus_software();
     if (backend == nullptr) {
         return nullptr;
     }
-    BusConfig_software cfg;
+    backend->bindLocalResources(resources);
+    IBusConfig cfg;
     cfg.pin_scl = logical.pin_scl;
     cfg.pin_sda = logical.pin_sda;
     auto r      = backend->init(cfg);
@@ -435,6 +453,14 @@ inline IBus* makeSoftwareBackendForI2C(const LogicalBusConfig& logical)
     }
     return backend;
 }
+
+template <class Policy>
+struct NativeProvider_software {
+    static result_t<std::shared_ptr<IBus>> acquire(bus::IHalBackend&, const IBusConfig&, Policy)
+    {
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
+};
 
 }  // namespace m5::hal::v2::i2c
 

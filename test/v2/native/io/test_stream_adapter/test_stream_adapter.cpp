@@ -85,12 +85,20 @@ public:
     result_t<size_t> write(ConstDataSpan src) override
     {
         if (_has_error) {
-            _has_error = false;
+            _has_error     = false;
+            const size_t n = std::min(src.size, accepted_before_error);
+            written.insert(written.end(), src.data, src.data + n);
+            _last_accepted = n;
             return m5::stl::make_unexpected(_armed_error);
         }
+        _last_accepted = 0;
         const size_t n = std::min(src.size, accept_limit);
         written.insert(written.end(), src.data, src.data + n);
         return n;
+    }
+    size_t partialWriteAccepted() const override
+    {
+        return _last_accepted;
     }
     void armError(error_t err)
     {
@@ -98,12 +106,59 @@ public:
         _has_error   = true;
     }
 
-    size_t accept_limit = static_cast<size_t>(-1);
+    size_t accept_limit          = static_cast<size_t>(-1);
+    size_t accepted_before_error = 0;
     std::vector<uint8_t> written;
 
 private:
-    error_t _armed_error = error_t::UNKNOWN_ERROR;
-    bool _has_error      = false;
+    error_t _armed_error  = error_t::UNKNOWN_ERROR;
+    bool _has_error       = false;
+    size_t _last_accepted = 0;
+};
+
+class OverreportingReader : public StreamReader {
+public:
+    result_t<size_t> read(DataSpan dst) override
+    {
+        return overreport ? dst.size + 1u : 0u;
+    }
+    result_t<size_t> readableBytes(void) override
+    {
+        return 1u;
+    }
+
+    bool overreport = true;
+};
+
+class OverreportingWriter : public StreamWriter {
+public:
+    enum class Mode { Success, PartialError };
+
+    explicit OverreportingWriter(Mode mode) : _mode{mode}
+    {
+    }
+
+    result_t<size_t> write(ConstDataSpan src) override
+    {
+        _offered = src.size;
+        if (!overreport) {
+            return src.size;
+        }
+        if (_mode == Mode::PartialError) {
+            return m5::stl::make_unexpected(error_t::CLOSED);
+        }
+        return src.size + 1u;
+    }
+    size_t partialWriteAccepted() const override
+    {
+        return _offered + 1u;
+    }
+
+    bool overreport = true;
+
+private:
+    Mode _mode;
+    size_t _offered = 0;
 };
 
 // ============================================================================
@@ -278,6 +333,34 @@ TEST(StreamSource, ReaderErrorsPropagate)
     EXPECT_FALSE(src.eof());
 }
 
+#if !defined(NDEBUG)
+TEST(StreamSourceDeathTest, ReaderOverreportAsserts)
+{
+    OverreportingReader reader;
+    uint8_t scratch[8];
+    StreamSource src{reader, DataSpan{scratch, sizeof scratch}};
+
+    EXPECT_DEATH({ (void)src.peek(4); }, "more bytes than requested");
+}
+#else
+TEST(StreamSource, ReaderOverreportReturnsIoErrorAndFaultsAdapter)
+{
+    OverreportingReader reader;
+    uint8_t scratch[8];
+    StreamSource src{reader, DataSpan{scratch, sizeof scratch}};
+
+    auto first = src.peek(4);
+    ASSERT_FALSE(first.has_value());
+    EXPECT_EQ(first.error(), error_t::IO_ERROR);
+    EXPECT_EQ(src.buffered(), 0u);
+
+    reader.overreport = false;
+    auto retry        = src.peek(4);
+    ASSERT_FALSE(retry.has_value());
+    EXPECT_EQ(retry.error(), error_t::IO_ERROR);
+}
+#endif
+
 // ============================================================================
 // StreamSink
 // ============================================================================
@@ -397,6 +480,78 @@ TEST(StreamSink, WriterErrorsPropagate)
     // A hard writer error (as opposed to a short write) accepts nothing.
     EXPECT_EQ(snk.partialCommitAccepted(), 0u);
 }
+
+TEST(StreamSink, WriterHardErrorPreservesAcceptedPrefix)
+{
+    FakeStreamWriter writer;
+    writer.accepted_before_error = 3;
+    writer.armError(error_t::CLOSED);
+    uint8_t scratch[8];
+    StreamSink snk{writer, DataSpan{scratch, sizeof scratch}};
+
+    auto reserved = snk.reserve(5);
+    ASSERT_TRUE(reserved.has_value());
+    std::memset(reserved->data, 0x5A, 5);
+    auto committed = snk.commit(5);
+    ASSERT_FALSE(committed.has_value());
+    EXPECT_EQ(committed.error(), error_t::CLOSED);
+    EXPECT_EQ(snk.partialCommitAccepted(), 3u);
+    EXPECT_EQ(writer.written.size(), 3u);
+}
+
+#if !defined(NDEBUG)
+TEST(StreamSinkDeathTest, WriterOverreportAsserts)
+{
+    OverreportingWriter writer{OverreportingWriter::Mode::Success};
+    uint8_t scratch[8];
+    StreamSink sink{writer, DataSpan{scratch, sizeof scratch}};
+
+    EXPECT_DEATH({ (void)sink.commit(4); }, "more bytes than offered");
+}
+
+TEST(StreamSinkDeathTest, PartialWriteOverreportAsserts)
+{
+    OverreportingWriter writer{OverreportingWriter::Mode::PartialError};
+    uint8_t scratch[8];
+    StreamSink sink{writer, DataSpan{scratch, sizeof scratch}};
+
+    EXPECT_DEATH({ (void)sink.commit(4); }, "partial count exceeds");
+}
+#else
+TEST(StreamSink, WriterOverreportReturnsIoErrorAndFaultsAdapter)
+{
+    OverreportingWriter writer{OverreportingWriter::Mode::Success};
+    uint8_t scratch[8];
+    StreamSink sink{writer, DataSpan{scratch, sizeof scratch}};
+
+    auto first = sink.commit(4);
+    ASSERT_FALSE(first.has_value());
+    EXPECT_EQ(first.error(), error_t::IO_ERROR);
+    EXPECT_EQ(sink.partialCommitAccepted(), 0u);
+
+    writer.overreport = false;
+    auto retry        = sink.commit(4);
+    ASSERT_FALSE(retry.has_value());
+    EXPECT_EQ(retry.error(), error_t::IO_ERROR);
+}
+
+TEST(StreamSink, PartialWriteOverreportReturnsIoErrorAndFaultsAdapter)
+{
+    OverreportingWriter writer{OverreportingWriter::Mode::PartialError};
+    uint8_t scratch[8];
+    StreamSink sink{writer, DataSpan{scratch, sizeof scratch}};
+
+    auto first = sink.commit(4);
+    ASSERT_FALSE(first.has_value());
+    EXPECT_EQ(first.error(), error_t::IO_ERROR);
+    EXPECT_EQ(sink.partialCommitAccepted(), 0u);
+
+    writer.overreport = false;
+    auto retry        = sink.reserve(4);
+    ASSERT_FALSE(retry.has_value());
+    EXPECT_EQ(retry.error(), error_t::IO_ERROR);
+}
+#endif
 
 }  // namespace
 

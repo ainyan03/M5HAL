@@ -66,7 +66,7 @@ public:
     const std::vector<uint8_t>& received()
     {
         _received.clear();
-        auto begin = accessor().beginTransaction(0);
+        auto begin = accessor().openWireFrame(0);
         if (!begin.has_value()) {
             return _received;
         }
@@ -75,7 +75,7 @@ public:
         if (read.has_value()) {
             _received.assign(buffer, buffer + read.value());
         }
-        (void)accessor().endTransaction();
+        (void)accessor().closeWireFrame();
         return _received;
     }
     const std::vector<bool>& masterAcks()
@@ -122,7 +122,7 @@ public:
             return m5::hal::v2::service::ServiceResult::Idle;
         }
         if (!_opened) {
-            auto begin = _endpoint.accessor().beginTransaction(0);
+            auto begin = _endpoint.accessor().openWireFrame(0);
             if (!begin.has_value()) {
                 return m5::hal::v2::service::ServiceResult::Idle;
             }
@@ -143,9 +143,9 @@ public:
             }
         }
 
-        auto complete = _endpoint.bus().transactionComplete(&_endpoint.accessor());
+        auto complete = _endpoint.bus().wireFrameComplete(&_endpoint.accessor());
         if (complete.has_value() && complete.value()) {
-            (void)_endpoint.accessor().endTransaction();
+            (void)_endpoint.accessor().closeWireFrame();
             _ended = true;
             if (_repeat) {
                 _opened = false;
@@ -195,7 +195,7 @@ public:
             return m5::hal::v2::service::ServiceResult::Idle;
         }
         if (!_opened) {
-            auto begin = _endpoint.accessor().beginTransaction(0);
+            auto begin = _endpoint.accessor().openWireFrame(0);
             if (!begin.has_value()) {
                 return m5::hal::v2::service::ServiceResult::Idle;
             }
@@ -208,9 +208,9 @@ public:
                 _off += wrote.value();
             }
         }
-        auto complete = _endpoint.bus().transactionComplete(&_endpoint.accessor());
+        auto complete = _endpoint.bus().wireFrameComplete(&_endpoint.accessor());
         if (complete.has_value() && complete.value()) {
-            (void)_endpoint.accessor().endTransaction();
+            (void)_endpoint.accessor().closeWireFrame();
             _ended = true;
             return m5::hal::v2::service::ServiceResult::Done;
         }

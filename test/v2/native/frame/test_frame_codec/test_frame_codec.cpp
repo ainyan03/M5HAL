@@ -171,6 +171,43 @@ TEST(FrameEncode, DataFrameLayout)
     EXPECT_EQ(std::memcmp(buf.data() + 4, payload, sizeof(payload)), 0);
 }
 
+TEST(FrameCodecProperty, DeterministicSeededRoundtrip)
+{
+    constexpr frame::Kind kinds[] = {frame::Kind::Data,     frame::Kind::Credit,    frame::Kind::Checkpoint,
+                                     frame::Kind::Control,  frame::Kind::Request,   frame::Kind::Response,
+                                     frame::Kind::HelloReq, frame::Kind::HelloResp, frame::Kind::Ping,
+                                     frame::Kind::Pong,     frame::Kind::Event};
+    uint32_t state                = 0x5A17C9E3u;
+    auto next                     = [&state]() {
+        state = state * 1664525u + 1013904223u;
+        return state;
+    };
+
+    std::array<uint8_t, frame::kMaxPayload> payload{};
+    std::array<uint8_t, frame::kMaxFrameSize> wire{};
+    for (size_t iteration = 0; iteration < 1000; ++iteration) {
+        const size_t payload_size = next() % (frame::kMaxPayload + 1u);
+        for (size_t i = 0; i < payload_size; ++i) {
+            payload[i] = static_cast<uint8_t>(next());
+        }
+        const auto kind  = kinds[next() % (sizeof(kinds) / sizeof(kinds[0]))];
+        const uint8_t b3 = static_cast<uint8_t>(next());
+        auto encoded     = frame::encodeChecked({wire.data(), wire.size()}, kind, b3, {payload.data(), payload_size});
+        ASSERT_TRUE(encoded.has_value()) << iteration;
+
+        frame::View view;
+        const auto decoded = frame::decode({wire.data(), encoded.value()}, view);
+        ASSERT_EQ(decoded.status, frame::DecodeStatus::Ok) << iteration;
+        EXPECT_EQ(decoded.consumed, encoded.value()) << iteration;
+        EXPECT_EQ(view.kind, kind) << iteration;
+        EXPECT_EQ(view.b3, b3) << iteration;
+        ASSERT_EQ(view.payload.size, payload_size) << iteration;
+        if (payload_size != 0) {
+            EXPECT_EQ(std::memcmp(view.payload.data, payload.data(), payload_size), 0) << iteration;
+        }
+    }
+}
+
 TEST(FrameEncode, CheckedFrameWithPayload)
 {
     const uint8_t payload[] = {0xAA, 0xBB};

@@ -37,9 +37,10 @@
 
 namespace hil {
 
-namespace uart  = ::m5::hal::v2::uart;
-namespace data  = ::m5::hal::v2::data;
-namespace error = ::m5::hal::v2::error;
+namespace uart   = ::m5::hal::v2::uart;
+namespace data   = ::m5::hal::v2::data;
+namespace error  = ::m5::hal::v2::error;
+namespace native = ::m5::hal::v2::native;
 
 // Serial device path for the device under test (e.g. /dev/cu.usbserial-XXXX).
 // nullptr when unset — a host driver should skip in that case.
@@ -107,12 +108,13 @@ inline void drain(uart::RxAccessor& dev)
 // different baud is read as garbage, drained, then the app's echo replies
 // cleanly). Returns true once the device echoes the marker. `bus` must outlive
 // the test that uses it. Takes the concrete POSIX backend (not the runtime
-// facade `uart::Bus`) because the host needs the backend-specific `open()` /
-// `nativeHandle()` -- the facade exposes only the kind-generic surface
+// facade `uart::Bus`) because the host needs the backend-specific native
+// handle after policy-based initialization
 // (follow-up; HIL hosts always run on the POSIX serial backend).
 inline bool openSynced(uart::Bus_posix& bus, const char* port, uint32_t baud)
 {
-    if (bus.open(port, baud) != error::error_t::OK) {
+    auto initialized = bus.init(uart::BusConfig{}, native::managed(uart::NativePath{port}));
+    if (!initialized.has_value()) {
         return false;
     }
     int fd = bus.nativeHandle();

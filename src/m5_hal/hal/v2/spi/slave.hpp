@@ -3,10 +3,10 @@
 #define M5_HAL_HAL_V2_SPI_SLAVE_HPP_
 
 #include "../bus/bus.hpp"
-#include "../data.hpp"
-#include "../data/memory.hpp"
 #include "../error.hpp"
-#include "../runtime/runtime.hpp"
+#include "../service/service.hpp"
+#include "../slave/event.hpp"
+#include "../slave/queue.hpp"
 #include "../types.hpp"
 
 #include <stddef.h>
@@ -14,128 +14,146 @@
 
 namespace m5::hal::v2::spi {
 
-/*!
-  @brief Slave-side SPI bus wiring + per-bus defaults.
+class SpiSlaveAccessor;
 
-  SPI slave is master-clocked, so there is no clock rate here (the master owns
-  SCLK): only the four wires, the SPI mode, the bit order, and an optional
-  controller index. `timeout_ms` is the default cap serve() waits for a
-  master transaction before returning empty.
- */
 struct SlaveBusConfig : public bus::IBusConfig {
     types::gpio_number_t pin_clk  = -1;
     types::gpio_number_t pin_mosi = -1;
     types::gpio_number_t pin_miso = -1;
     types::gpio_number_t pin_cs   = -1;
-    uint8_t spi_mode              = 0;  ///< SPI mode 0..3.
-    uint8_t spi_order             = 0;  ///< 0 = MSB first.
-    // Zero-based hardware controller index, e.g. the value returned by
-    // `bus::BusView::claimController` on the SPI BusView. -1 (default) means
-    // the backend's default SPI2 host outside the controller pool ledger; the
-    // caller is solely responsible for avoiding collisions in that mode.
-    int8_t controller    = -1;
-    uint8_t tx_fill_byte = 0x00;                    ///< MISO byte clocked once `tx` is exhausted.
-    uint32_t timeout_ms  = types::TIMEOUT_FOREVER;  ///< Default serve() wait for a transaction.
+    uint8_t spi_mode              = 0;
+    uint8_t spi_order             = 0;
+    int8_t controller             = -1;
+    uint8_t tx_fill_byte          = 0x00;
 
-    constexpr SlaveBusConfig(void) : bus::IBusConfig{types::bus_kind_t::SPI}
+    constexpr SlaveBusConfig() : bus::IBusConfig{types::bus_kind_t::SPI}
     {
     }
 };
 
-/*!
-  @brief SPI slave bus.
+struct SlaveAccessConfig : public bus::IAccessConfig {
+    uint32_t transaction_bytes = 4096;
+    slave::QueueMode tx_mode   = slave::QueueMode::Byte;
+    slave::QueueMode rx_mode   = slave::QueueMode::Frame;
 
-  Unlike I2C there is no addressing and no clock stretching: the master clocks a
-  full-duplex transaction unconditionally, so the slave must have a buffer queued
-  before the master starts and cannot stall mid-transaction. The whole
-  interaction is therefore ONE primitive — serve() exchanges a single CS-delimited
-  transaction. (The half-duplex register-map model of `spi_slave_hd` — HW v2 only
-  — is intentionally out of scope here; this is the all-chip full-duplex backend.)
- */
+    constexpr SlaveAccessConfig() : bus::IAccessConfig{types::bus_kind_t::SPI}
+    {
+    }
+};
+
 struct ISlaveBus : public bus::IBus {
-    const SlaveBusConfig &getConfig(void) const override
+    const SlaveBusConfig& getConfig() const override
     {
         return _config;
     }
 
-    virtual result_t<void> init(const SlaveBusConfig &cfg) = 0;
-    virtual result_t<void> release(void) override          = 0;
-
-    /*!
-      @brief Serve ONE full-duplex transaction.
-
-      Up to `len` bytes are pulled from `tx` (the slave's MISO data; once `tx` is
-      exhausted or null the remainder is the config `tx_fill_byte`) and clocked
-      out while the master's MOSI bytes are captured into `rx` (a null Sink
-      discards them). SPI is full-duplex, so a single `len` bounds BOTH directions
-      (the shared clock-cycle count) — the same reason the SPI master `transfer()`
-      takes one `len`. Blocks until the master completes a transaction (CS
-      deassert / `len` reached) or `timeout_ms` elapses with no transaction.
-      Returns the number of bytes actually exchanged (the master may clock fewer
-      than `len`, ending early on CS deassert).
-     */
-    virtual result_t<size_t> serve(bus::IAccessor *owner, data::Source *tx, data::Sink *rx, size_t len,
-                                   uint32_t timeout_ms) = 0;
+    virtual result_t<void> init(const SlaveBusConfig& cfg) = 0;
+    result_t<void> beginOperation(bus::OperationContext<SlaveAccessConfig>& context)
+    {
+        auto registered = _operation_slot.registerContext(context, this, _lock_owner);
+        if (!registered.has_value()) {
+            return registered;
+        }
+        auto begun = beginOperationBackend(context);
+        if (!begun.has_value()) {
+            _operation_slot.invalidate(context);
+        }
+        return begun;
+    }
+    result_t<void> endOperation(bus::OperationContext<SlaveAccessConfig>& context)
+    {
+        if (!_operation_slot.valid(context, this, _lock_owner)) {
+            if (_operation_slot.registered(context, this)) {
+                if (_operation_slot.restoreRegisteredRuntime(context, this, _lock_owner)) {
+                    (void)endOperationBackend(context);
+                }
+                _operation_slot.invalidate(context);
+            }
+            return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+        }
+        auto ended = endOperationBackend(context);
+        _operation_slot.invalidate(context);
+        return ended;
+    }
 
 protected:
+    virtual result_t<void> beginOperationBackend(bus::OperationContext<SlaveAccessConfig>& context)
+    {
+        (void)context;
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
+    virtual result_t<void> endOperationBackend(bus::OperationContext<SlaveAccessConfig>& context)
+    {
+        (void)context;
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
+    bus::IAccessor& operationOwner(bus::OperationContext<SlaveAccessConfig>& context)
+    {
+        return bus::OperationSlot::contextOwner(context);
+    }
+
     SlaveBusConfig _config;
+    bus::OperationSlot _operation_slot;
 };
 
 /*!
-  @brief Thin accessor exposing serve() to the application.
+  @brief Long-lived SPI slave endpoint backed by caller-owned SPSC queues.
 
-  Mirrors the role of the I2C `SlaveStreamAccessor`, but SPI's single-primitive
-  shape: there is no separate read / write or begin / endTransaction — one
-  serve() is one master-driven transaction. Bind with the ctor (or default-
-  construct and `bind()`), then call serve() per transaction in a resident loop.
+  `beginAccess()` starts accepting CS-delimited master transactions and
+  `endAccess()` stops the peripheral before releasing the bus. Local queue I/O
+  is non-blocking and remains available while inactive, allowing TX preload and
+  post-stop RX drain. One application task owns both local queue endpoints;
+  backend ISR/task code owns the opposite endpoints.
  */
 class SpiSlaveAccessor : public bus::IAccessor {
 public:
-    SpiSlaveAccessor(ISlaveBus &bus) : bus::IAccessor{bus}
-    {
-    }
+    SpiSlaveAccessor(ISlaveBus& bus, slave::QueueStorage<> tx_storage, slave::QueueStorage<> rx_storage,
+                     const SlaveAccessConfig& config = {});
 
-    const bus::IAccessConfig &getConfig(void) const override
-    {
-        return _access_config;
-    }
-    ISlaveBus &getBus(void) const
-    {
-        return static_cast<ISlaveBus &>(bus::IAccessor::getBus());
-    }
+    const SlaveAccessConfig& getConfig() const override;
+    result_t<void> setConfig(const SlaveAccessConfig& config);
+    ISlaveBus& getBus() const;
 
-    /*! @brief Source/Sink serve (streaming callers). */
-    result_t<size_t> serve(data::Source *tx, data::Sink *rx, size_t len, uint32_t timeout_ms = types::TIMEOUT_FOREVER)
-    {
-        if (!isBound()) {
-            return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
-        }
-        return getBus().serve(this, tx, rx, len, timeout_ms);
-    }
+    result_t<void> beginAccess(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+    result_t<void> endAccess(uint32_t timeout_ms = 1000);
+    bool inAccess() const;
 
-    /*!
-      @brief Span serve sugar.
+    result_t<size_t> write(data::ConstDataSpan src);
+    result_t<size_t> read(data::DataSpan dst);
+    size_t readable() const;
+    size_t writable() const;
 
-      Clocks out `tx` while capturing into `rx`; `len` is the larger of the two
-      span sizes (full-duplex). Pass an empty span for a one-way direction (the
-      other direction sends `tx_fill_byte` / is discarded).
-     */
-    result_t<size_t> serve(data::ConstDataSpan tx, data::DataSpan rx, uint32_t timeout_ms = types::TIMEOUT_FOREVER)
-    {
-        data::MemorySource src{tx};
-        data::MemorySink sink{rx};
-        const size_t len = (tx.size > rx.size) ? tx.size : rx.size;
-        return serve(&src, &sink, len, timeout_ms);
-    }
+    slave::FrameSinkView txFrames();
+    slave::FrameSourceView rxFrames();
+    result_t<void> clearTx();
+    result_t<void> clearRx();
+    slave::QueueStatus txStatus() const;
+    slave::QueueStatus rxStatus() const;
+    slave::QueueStatus clearTxStatus();
+    slave::QueueStatus clearRxStatus();
+
+    result_t<void> setEventCallback(slave::SlaveEventCallback callback, void* user);
+    result_t<void> dispatchEvents();
+    result_t<void> acknowledgeEvents(slave::SlaveEvent events);
+    service::IService& eventService();
+
+    // Backend endpoint. Applications should use the byte/frame views above.
+    slave::SlaveQueue& backendTxQueue();
+    slave::SlaveQueue& backendRxQueue();
+    slave::SlaveEventEndpoint& backendEvents();
 
 private:
-    struct AccessConfig : public bus::IAccessConfig {
-        constexpr AccessConfig(void) : bus::IAccessConfig{types::bus_kind_t::SPI}
-        {
-        }
-    } _access_config;
+    static slave::SlaveEventInfo probeEventLevel(void* user, uint32_t generation);
+
+    bus::OperationContext<SlaveAccessConfig> context_;
+    slave::SlaveQueue tx_queue_{};
+    slave::SlaveQueue rx_queue_{};
+    slave::SlaveEventEndpoint events_{};
+    error::error_t queue_bind_error_ = error::error_t::OK;
 };
 
 }  // namespace m5::hal::v2::spi
+
+#include "slave.inl"
 
 #endif  // M5_HAL_HAL_V2_SPI_SLAVE_HPP_

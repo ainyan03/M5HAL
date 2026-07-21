@@ -29,8 +29,7 @@ TEST(PosixTcpEndpointParse, RejectsOutOfRangeAndOverflowingPorts)
     cfg.response_timeout_ms = 50;
 
     const char* bad_endpoints[] = {
-        "127.0.0.1:0",
-        "127.0.0.1:65536",
+        "127.0.0.1:0", "127.0.0.1:65536",
         "127.0.0.1:4294967297",            // wraps 32-bit unsigned long to 1
         "127.0.0.1:18446744073709551617",  // wraps 64-bit unsigned long to 1
     };
@@ -161,6 +160,18 @@ bool serviceUntil(remote::BsdTcpRemoteServer& server, size_t want_count)
     return false;
 }
 
+bool waitForConnectionCount(remote::BsdTcpRemoteServer& server, size_t want_count)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (server.connectionCount() == want_count) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+}
+
 struct SessionPair {
     memory::Allocator& alloc = memory::defaultAllocator();
     uint8_t wire_ab_buf[4096], wire_ba_buf[4096];
@@ -181,10 +192,10 @@ public:
     {
     }
 
-    result_t<size_t> write(bus::IAccessor* owner, const uart::AccessConfig& cfg, data::Source* src, size_t len) override
+    result_t<size_t> writeBackend(bus::OperationContext<uart::AccessConfig>& context, data::Source* src,
+                                  size_t len) override
     {
-        (void)owner;
-        last_cfg = cfg;
+        last_cfg = context.config;
         ++write_calls;
         const size_t limit = len < max_write_per_call ? len : max_write_per_call;
         size_t done        = 0;
@@ -368,6 +379,257 @@ TEST_F(TcpRemoteServerE2E, ConnectionExposesRemoteGpioAfterSubscribeRoundTrip)
     EXPECT_EQ(a.conn->gpio()->getPortCount(), 1);
 }
 
+TEST_F(TcpRemoteServerE2E, HalRemoteGpioUsesLowestFreeSlotBeyondOne)
+{
+    server.setConnectionSetupHandler(
+        [](void*, remote::Server& srv) -> result_t<void> {
+            srv.setGPIOGroup(M5_Hal.Gpio);
+            return {};
+        },
+        nullptr);
+
+    const gpio::IGPIO* filler = M5_Hal.Gpio.getGPIO(0);
+    ASSERT_NE(filler, nullptr);
+
+    Hal hal;
+    ASSERT_OK_RESULT(hal.Gpio.addGPIO(filler, 0));
+    ASSERT_OK_RESULT(hal.Gpio.addGPIO(filler, 1));
+
+    char remote_endpoint[96];
+    std::snprintf(remote_endpoint, sizeof(remote_endpoint), "tcp:127.0.0.1:%u",
+                  static_cast<unsigned>(server.boundPort()));
+
+    ServerPump pump{server};
+    remote::DeviceConfig cfg;
+    cfg.response_timeout_ms = 500;
+    ASSERT_OK_RESULT(hal.connect(remote_endpoint, cfg));
+    ASSERT_TRUE(hal.hasRemoteGpio());
+    EXPECT_EQ(hal.remoteGpioSlot(), 2);
+    ASSERT_NE(hal.Gpio.getGPIO(2), nullptr);
+    EXPECT_NE(hal.Gpio.getGPIO(2), filler);
+}
+
+TEST_F(TcpRemoteServerE2E, HalRemoteGpioFullGroupFailurePreservesRemoteBinding)
+{
+    std::atomic<bool> expose_gpio{false};
+    server.setConnectionSetupHandler(
+        [](void* ctx, remote::Server& srv) -> result_t<void> {
+            if (static_cast<std::atomic<bool>*>(ctx)->load(std::memory_order_acquire)) {
+                srv.setGPIOGroup(M5_Hal.Gpio);
+            }
+            return {};
+        },
+        &expose_gpio);
+
+    char remote_endpoint[96];
+    std::snprintf(remote_endpoint, sizeof(remote_endpoint), "tcp:127.0.0.1:%u",
+                  static_cast<unsigned>(server.boundPort()));
+
+    ServerPump pump{server};
+    Hal hal;
+    remote::DeviceConfig cfg;
+    cfg.response_timeout_ms = 500;
+    ASSERT_OK_RESULT(hal.connect(remote_endpoint, cfg));
+    ASSERT_TRUE(hal.hasRemoteConnection());
+    ASSERT_FALSE(hal.hasRemoteGpio());
+    auto* old_backend         = hal.backend();
+    auto* old_session         = hal.session();
+    const gpio::IGPIO* filler = M5_Hal.Gpio.getGPIO(0);
+    ASSERT_NE(old_backend, nullptr);
+    ASSERT_NE(old_session, nullptr);
+    ASSERT_NE(filler, nullptr);
+    for (size_t slot = 0; slot < gpio::GPIOGroup::kMaxEntries; ++slot) {
+        ASSERT_OK_RESULT(hal.Gpio.addGPIO(filler, static_cast<types::gpio_slot_t>(slot)));
+    }
+
+    expose_gpio.store(true, std::memory_order_release);
+
+    auto connected = hal.connect(remote_endpoint, cfg);
+    ASSERT_FALSE(connected.has_value());
+    EXPECT_EQ(connected.error(), error::error_t::INVALID_ARGUMENT);
+    EXPECT_EQ(hal.backend(), old_backend);
+    EXPECT_EQ(hal.session(), old_session);
+    EXPECT_TRUE(hal.hasRemoteConnection());
+    EXPECT_FALSE(hal.hasRemoteGpio());
+    for (size_t slot = 0; slot < gpio::GPIOGroup::kMaxEntries; ++slot) {
+        EXPECT_TRUE(hal.Gpio.hasGPIO(static_cast<types::gpio_slot_t>(slot)));
+    }
+    auto pumped = hal.pumpRemote();
+    ASSERT_TRUE(pumped.has_value()) << "err=" << error::toString(pumped.error());
+}
+
+TEST_F(TcpRemoteServerE2E, HalKeepsRemoteOwnershipSnapshotAfterTransportCloses)
+{
+    char remote_endpoint[96];
+    std::snprintf(remote_endpoint, sizeof(remote_endpoint), "tcp:127.0.0.1:%u",
+                  static_cast<unsigned>(server.boundPort()));
+
+    Hal hal;
+    remote::DeviceConfig cfg;
+    cfg.response_timeout_ms = 200;
+    {
+        ServerPump pump{server};
+        ASSERT_OK_RESULT(hal.connect(remote_endpoint, cfg));
+    }
+    ASSERT_TRUE(hal.hasRemoteConnection());
+    ASSERT_NE(hal.session(), nullptr);
+
+    server.end();
+    auto ping = hal.session()->ping();
+    EXPECT_FALSE(ping.has_value());
+    EXPECT_TRUE(hal.hasRemoteConnection());
+}
+
+TEST_F(TcpRemoteServerE2E, HalRemoteToLocalClearsOwnershipAndClosesOldProxy)
+{
+    char remote_endpoint[96];
+    std::snprintf(remote_endpoint, sizeof(remote_endpoint), "tcp:127.0.0.1:%u",
+                  static_cast<unsigned>(server.boundPort()));
+
+    ServerPump pump{server};
+    Hal hal;
+    remote::DeviceConfig cfg;
+    cfg.response_timeout_ms = 200;
+    ASSERT_OK_RESULT(hal.connect(remote_endpoint, cfg));
+    ASSERT_TRUE(hal.hasRemoteConnection());
+
+    auto old_bus = hal.I2C.acquire(i2c::LogicalBusConfig{i2c::Scl{22}, i2c::Sda{21}});
+    ASSERT_TRUE(old_bus.has_value()) << "err=" << error::toString(old_bus.error());
+
+    ASSERT_OK_RESULT(hal.connect("local"));
+    EXPECT_FALSE(hal.hasRemoteConnection());
+
+    auto stale = old_bus.value()->probe(0x08);
+    ASSERT_FALSE(stale.has_value());
+    EXPECT_EQ(stale.error(), error::error_t::CLOSED);
+}
+
+TEST_F(TcpRemoteServerE2E, HalReconnectReclaimsRemoteGpioSlotWhenGroupIsFull)
+{
+    server.setConnectionSetupHandler(
+        [](void*, remote::Server& srv) -> result_t<void> {
+            srv.setGPIOGroup(M5_Hal.Gpio);
+            return {};
+        },
+        nullptr);
+
+    char remote_endpoint[96];
+    std::snprintf(remote_endpoint, sizeof(remote_endpoint), "tcp:127.0.0.1:%u",
+                  static_cast<unsigned>(server.boundPort()));
+
+    ServerPump pump{server};
+    Hal hal;
+    remote::DeviceConfig cfg;
+    cfg.response_timeout_ms = 500;
+    ASSERT_OK_RESULT(hal.connect(remote_endpoint, cfg));
+    ASSERT_TRUE(hal.hasRemoteGpio());
+    const auto old_slot       = hal.remoteGpioSlot();
+    const gpio::IGPIO* filler = M5_Hal.Gpio.getGPIO(0);
+    ASSERT_NE(filler, nullptr);
+
+    size_t added = 0;
+    for (size_t candidate = 0; candidate < gpio::GPIOGroup::kSlotCount && added < gpio::GPIOGroup::kMaxEntries - 1;
+         ++candidate) {
+        const auto slot = static_cast<types::gpio_slot_t>(candidate);
+        if (slot == old_slot) {
+            continue;
+        }
+        ASSERT_OK_RESULT(hal.Gpio.addGPIO(filler, slot));
+        ++added;
+    }
+    ASSERT_EQ(added, gpio::GPIOGroup::kMaxEntries - 1);
+
+    ASSERT_OK_RESULT(hal.connect(remote_endpoint, cfg));
+    ASSERT_TRUE(hal.hasRemoteGpio());
+    EXPECT_EQ(hal.remoteGpioSlot(), old_slot);
+}
+
+#if defined(M5HAL_TEST_REMOTE_ADOPTION_FAULTS)
+TEST_F(TcpRemoteServerE2E, HalReconnectRollbackFailureQuarantinesAndPreservesOriginalError)
+{
+    char remote_endpoint[96];
+    std::snprintf(remote_endpoint, sizeof(remote_endpoint), "tcp:127.0.0.1:%u",
+                  static_cast<unsigned>(server.boundPort()));
+
+    ServerPump pump{server};
+    Hal hal;
+    remote::DeviceConfig cfg;
+    cfg.response_timeout_ms = 500;
+    ASSERT_OK_RESULT(hal.connect(remote_endpoint, cfg));
+    ASSERT_TRUE(hal.hasRemoteConnection());
+    ASSERT_EQ(hal.Services.size(), 1u);
+    auto old_bus = hal.I2C.acquire(i2c::LogicalBusConfig{i2c::Scl{22}, i2c::Sda{21}});
+    ASSERT_TRUE(old_bus.has_value()) << "err=" << error::toString(old_bus.error());
+
+    using Step = Hal::RemoteAdoptionStep;
+    hal.setRemoteAdoptionFaults(Step::AddNewService, error::error_t::OUT_OF_RESOURCE, Step::AddOldServiceRollback,
+                                error::error_t::INVALID_STATE);
+    auto replaced = hal.connect(remote_endpoint, cfg);
+    ASSERT_FALSE(replaced.has_value());
+    EXPECT_EQ(replaced.error(), error::error_t::OUT_OF_RESOURCE)
+        << "rollback error must not mask the connection-swap error";
+    EXPECT_FALSE(hal.hasRemoteConnection());
+    EXPECT_FALSE(hal.hasRemoteGpio());
+    EXPECT_EQ(hal.backend(), nullptr);
+    EXPECT_EQ(hal.session(), nullptr);
+    EXPECT_EQ(hal.Services.size(), 0u);
+    auto idle_pass = hal.Services.runOnce();
+    ASSERT_TRUE(idle_pass.has_value()) << "err=" << error::toString(idle_pass.error());
+    EXPECT_FALSE(idle_pass.value());
+    auto stale = old_bus.value()->probe(0x08);
+    ASSERT_FALSE(stale.has_value());
+    EXPECT_EQ(stale.error(), error::error_t::CLOSED);
+    auto pumped = hal.pumpRemote();
+    ASSERT_FALSE(pumped.has_value());
+    EXPECT_EQ(pumped.error(), error::error_t::NOT_CONNECTED);
+
+    // Quarantine is a recoverable unbound state; consumed one-shot faults
+    // must not poison a later clean connection.
+    ASSERT_TRUE(waitForConnectionCount(server, 0u));
+    ASSERT_OK_RESULT(hal.connect(remote_endpoint, cfg));
+    EXPECT_TRUE(hal.hasRemoteConnection());
+    EXPECT_NE(hal.backend(), nullptr);
+}
+
+TEST_F(TcpRemoteServerE2E, HalReconnectGpioRollbackFailureNeverLeavesDanglingRegistration)
+{
+    server.setConnectionSetupHandler(
+        [](void*, remote::Server& srv) -> result_t<void> {
+            srv.setGPIOGroup(M5_Hal.Gpio);
+            return {};
+        },
+        nullptr);
+
+    char remote_endpoint[96];
+    std::snprintf(remote_endpoint, sizeof(remote_endpoint), "tcp:127.0.0.1:%u",
+                  static_cast<unsigned>(server.boundPort()));
+
+    ServerPump pump{server};
+    Hal hal;
+    remote::DeviceConfig cfg;
+    cfg.response_timeout_ms = 500;
+    ASSERT_OK_RESULT(hal.connect(remote_endpoint, cfg));
+    ASSERT_TRUE(hal.hasRemoteGpio());
+    const auto slot = hal.remoteGpioSlot();
+
+    using Step = Hal::RemoteAdoptionStep;
+    hal.setRemoteAdoptionFaults(Step::AddNewService, error::error_t::OUT_OF_RESOURCE, Step::RemoveNewGpioRollback,
+                                error::error_t::INVALID_STATE);
+    auto replaced = hal.connect(remote_endpoint, cfg);
+    ASSERT_FALSE(replaced.has_value());
+    EXPECT_EQ(replaced.error(), error::error_t::OUT_OF_RESOURCE);
+    EXPECT_FALSE(hal.hasRemoteConnection());
+    EXPECT_FALSE(hal.hasRemoteGpio());
+    EXPECT_FALSE(hal.Gpio.hasGPIO(slot));
+    EXPECT_EQ(hal.backend(), nullptr);
+
+    ASSERT_TRUE(waitForConnectionCount(server, 0u));
+    ASSERT_OK_RESULT(hal.connect(remote_endpoint, cfg));
+    EXPECT_TRUE(hal.hasRemoteConnection());
+    EXPECT_TRUE(hal.hasRemoteGpio());
+}
+#endif
+
 TEST_F(TcpRemoteServerE2E, HalReconnectKeepsOldGpioPinStorageClosedAndDistinct)
 {
     server.setConnectionSetupHandler(
@@ -456,11 +718,12 @@ TEST(TcpRemoteStreamSoak, UartWriteCompletesBeyondCreditDriftWindow)
     uart::Bus_remote bus{session, 0, bus_cfg};
     uart::AccessConfig access_cfg;
     access_cfg.write_timeout_ms = 1000;
+    uart::TxAccessor accessor{bus, access_cfg};
 
     // 520 KiB crosses the historical ~230 KiB credit-drift window while
     // exercising the real Server pending-stream executor, not a hand-rolled
     // drain harness.
-    auto written = bus.write(nullptr, access_cfg, &tx_src, tx_data.size());
+    auto written = accessor.write(tx_src, tx_data.size());
 
     ASSERT_TRUE(written.has_value()) << "err=" << error::toString(written.error()) << " consumed=" << sink.bytes.size()
                                      << " remaining_src=" << (tx_src.eof() ? 0 : 1);

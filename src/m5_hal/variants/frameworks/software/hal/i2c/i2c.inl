@@ -95,18 +95,8 @@ void StartConditionService::begin(MasterLineDriver& lines, const MasterTiming& t
             }
             break;
         case State::WaitClockHigh:
-            switch (_clock.waitClockHigh(*_lines, _timing, now_tick)) {
-                case MasterServiceTiming::ClockWaitResult::Released:
-                    _clock.scheduleAfterHalfFromNow(_timing, now_tick, _state, State::PullSdaLow);
-                    break;
-                case MasterServiceTiming::ClockWaitResult::Timeout:
-                    _error = ::m5::hal::v2::error::error_t::TIMEOUT_ERROR;
-                    _state = State::Timeout;
-                    break;
-                case MasterServiceTiming::ClockWaitResult::Waiting:
-                    return ::m5::hal::v2::service::ServiceResult::Idle;
-            }
-            break;
+            return _clock.serviceClockStretch(*_lines, _timing, now_tick, _state, State::PullSdaLow, State::Timeout,
+                                              _error);
         case State::PullSdaLow:
             _lines->writeSda(false);
             _clock.scheduleAfterHalfFromNow(_timing, now_tick, _state, State::PullSclLow);
@@ -213,18 +203,8 @@ void WriteByteService::restart(uint8_t byte, ::m5::hal::v2::service::fast_tick_t
             waitClockHighOrSchedule(now_tick, State::SampleAck);
             return ::m5::hal::v2::service::ServiceResult::Progress;
         case State::WaitClockHigh:
-            switch (_clock.waitClockHigh(*_lines, _timing, now_tick)) {
-                case MasterServiceTiming::ClockWaitResult::Released:
-                    scheduleAfterHalfFromNow(now_tick, _after_stretch);
-                    return ::m5::hal::v2::service::ServiceResult::Progress;
-                case MasterServiceTiming::ClockWaitResult::Timeout:
-                    _error = ::m5::hal::v2::error::error_t::TIMEOUT_ERROR;
-                    _state = State::Timeout;
-                    return ::m5::hal::v2::service::ServiceResult::Error;
-                case MasterServiceTiming::ClockWaitResult::Waiting:
-                    return ::m5::hal::v2::service::ServiceResult::Idle;
-            }
-            return ::m5::hal::v2::service::ServiceResult::Idle;
+            return _clock.serviceClockStretch(*_lines, _timing, now_tick, _state, _after_stretch, State::Timeout,
+                                              _error);
         case State::SampleAck:
             _acked = !_lines->readSda();
             _lines->writeSclLow();
@@ -293,11 +273,6 @@ void WriteByteService::scheduleAfterHalf(::m5::hal::v2::service::fast_tick_t now
     _clock.scheduleNextHalf(_timing, now_tick, _state, next);
 }
 
-void WriteByteService::scheduleAfterHalfFromNow(::m5::hal::v2::service::fast_tick_t now_tick, State next)
-{
-    _clock.scheduleAfterHalfFromNow(_timing, now_tick, _state, next);
-}
-
 void WriteByteService::waitClockHighOrSchedule(::m5::hal::v2::service::fast_tick_t now_tick, State next)
 {
     if (_lines->readScl()) {
@@ -344,18 +319,8 @@ void StopConditionService::begin(MasterLineDriver& lines, const MasterTiming& ti
             waitClockHighOrSchedule(now_tick, State::ReleaseSda);
             break;
         case State::WaitClockHigh:
-            switch (_clock.waitClockHigh(*_lines, _timing, now_tick)) {
-                case MasterServiceTiming::ClockWaitResult::Released:
-                    scheduleAfterHalf(now_tick, _after_stretch);
-                    break;
-                case MasterServiceTiming::ClockWaitResult::Timeout:
-                    _error = ::m5::hal::v2::error::error_t::TIMEOUT_ERROR;
-                    _state = State::Timeout;
-                    break;
-                case MasterServiceTiming::ClockWaitResult::Waiting:
-                    return ::m5::hal::v2::service::ServiceResult::Idle;
-            }
-            break;
+            return _clock.serviceClockStretch(*_lines, _timing, now_tick, _state, _after_stretch, State::Timeout,
+                                              _error);
         case State::ReleaseSda:
             _lines->writeSda(true);
             scheduleAfterHalf(now_tick, State::VerifySdaHigh);
@@ -481,18 +446,8 @@ void ReadByteService::restart(bool ack_after_read, ::m5::hal::v2::service::fast_
         case State::RaiseClock:
             break;
         case State::WaitClockHigh:
-            switch (_clock.waitClockHigh(*_lines, _timing, now_tick)) {
-                case MasterServiceTiming::ClockWaitResult::Released:
-                    scheduleAfterHalfFromNow(now_tick, _after_stretch);
-                    break;
-                case MasterServiceTiming::ClockWaitResult::Timeout:
-                    _error = ::m5::hal::v2::error::error_t::TIMEOUT_ERROR;
-                    _state = State::Timeout;
-                    break;
-                case MasterServiceTiming::ClockWaitResult::Waiting:
-                    return ::m5::hal::v2::service::ServiceResult::Idle;
-            }
-            break;
+            return _clock.serviceClockStretch(*_lines, _timing, now_tick, _state, _after_stretch, State::Timeout,
+                                              _error);
         case State::SampleBit:
             break;
         case State::RaiseAckClock:
@@ -576,30 +531,6 @@ void ReadByteService::waitClockHighOrSchedule(::m5::hal::v2::service::fast_tick_
     }
 }
 
-void MasterTransactionService::beginStart(MasterLineDriver& lines, const MasterTiming& timing,
-                                          ::m5::hal::v2::service::fast_tick_t now_tick)
-{
-    _operation = Operation::Start;
-    _error     = ::m5::hal::v2::error::error_t::OK;
-    _start.begin(lines, timing, now_tick);
-}
-
-void MasterTransactionService::beginWriteByte(MasterLineDriver& lines, const MasterTiming& timing, uint8_t byte,
-                                              ::m5::hal::v2::service::fast_tick_t now_tick)
-{
-    _operation = Operation::WriteByte;
-    _error     = ::m5::hal::v2::error::error_t::OK;
-    _write.begin(lines, timing, byte, now_tick);
-}
-
-void MasterTransactionService::beginReadByte(MasterLineDriver& lines, const MasterTiming& timing, bool ack_after_read,
-                                             ::m5::hal::v2::service::fast_tick_t now_tick)
-{
-    _operation = Operation::ReadByte;
-    _error     = ::m5::hal::v2::error::error_t::OK;
-    _read.begin(lines, timing, ack_after_read, now_tick);
-}
-
 void MasterTransactionService::beginStop(MasterLineDriver& lines, const MasterTiming& timing,
                                          ::m5::hal::v2::service::fast_tick_t now_tick)
 {
@@ -660,12 +591,6 @@ void MasterTransactionService::beginReadBuffer(MasterLineDriver& lines, const Ma
     }
 
     switch (_operation) {
-        case Operation::Start:
-            return serviceActive(_start, now_tick);
-        case Operation::WriteByte:
-            return serviceActive(_write, now_tick);
-        case Operation::ReadByte:
-            return serviceActive(_read, now_tick);
         case Operation::Stop:
             return serviceActive(_stop, now_tick);
         case Operation::Address:
@@ -690,16 +615,6 @@ MasterTransactionService::Operation MasterTransactionService::operation() const
     return _error;
 }
 
-uint8_t MasterTransactionService::byte() const
-{
-    return _read.byte();
-}
-
-bool MasterTransactionService::acked() const
-{
-    return _write.acked();
-}
-
 size_t MasterTransactionService::transferred() const
 {
     return _index;
@@ -708,12 +623,6 @@ size_t MasterTransactionService::transferred() const
 ::m5::hal::v2::service::fast_tick_t MasterTransactionService::dueTick() const
 {
     switch (_operation) {
-        case Operation::Start:
-            return _start.dueTick();
-        case Operation::WriteByte:
-            return _write.dueTick();
-        case Operation::ReadByte:
-            return _read.dueTick();
         case Operation::Stop:
             return _stop.dueTick();
         case Operation::Address:
@@ -1200,27 +1109,37 @@ private:
 }  // namespace impl_software
 }  // anonymous namespace
 
-result_t<void> Bus_software::init(const BusConfig_software& config)
+result_t<void> Bus_software::init(const IBusConfig& config)
 {
-    clearTransferState();
-    _config = config;
+    if (!initializationAllowed(false)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    const auto& resources = localResources();
+    if (!resources.valid()) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
 
-    // BusConfig_software uses the single gpio_number_t path. Resolve through
-    // `M5HALCore::Gpio` (the singleton GPIOGroup) with the CHECKED
+    // The portable config uses the single gpio_number_t path. Resolve through
+    // the creation-domain GPIOGroup with the CHECKED
     // `tryGetPin` — the pin numbers are caller input, so a bad value
     // must come back through the expected path, not the assert/UB
     // fast path of `getPin`. Cache the resulting `Pin` into
     // `_pin_scl` / `_pin_sda` so the transfer hot path skips the lookup.
-    if (_config.pin_scl < 0 || _config.pin_sda < 0) {
+    if (config.pin_scl < 0 || config.pin_sda < 0) {
         M5_LIB_LOGE("software::i2c::Bus_software::init: pins not set");
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
-    auto scl_pin = M5_Hal.Gpio.tryGetPin(_config.pin_scl);
-    auto sda_pin = M5_Hal.Gpio.tryGetPin(_config.pin_sda);
+    auto scl_pin = resources.gpio->tryGetPin(config.pin_scl);
+    auto sda_pin = resources.gpio->tryGetPin(config.pin_sda);
     if (!scl_pin.has_value() || !sda_pin.has_value()) {
         M5_LIB_LOGE("software::i2c::Bus_software::init: pin resolution failed");
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
+    auto reset = teardown();
+    if (!reset.has_value()) {
+        return reset;
+    }
+    _config  = config;
     _pin_scl = scl_pin.value();
     _pin_sda = sda_pin.value();
     _pin_scl.setMode(types::gpio_mode_t::OutputOpenDrainPullup);
@@ -1230,18 +1149,37 @@ result_t<void> Bus_software::init(const BusConfig_software& config)
     _pin_scl.writeHigh();
     m5::utility::delayMicroseconds(5);
     _pin_sda.writeHigh();
+    auto initialized = markInitializationSucceeded(false);
+    if (!initialized.has_value()) {
+        (void)teardown();
+        return initialized;
+    }
     return {};
 }
 
 Bus_software::~Bus_software()
 {
-    clearTransferState();
+    (void)teardown();
 }
 
-result_t<void> Bus_software::release(void)
+result_t<void> Bus_software::teardown(void)
 {
-    clearTransferState();
+    auto cleared = clearTransferState();
+    if (!cleared.has_value()) {
+        return m5::stl::make_unexpected(cleared.error());
+    }
+    _pin_scl = {};
+    _pin_sda = {};
     return {};
+}
+
+bus::CloseOutcome Bus_software::closeBackend(void)
+{
+    auto closed = teardown();
+    if (!closed.has_value()) {
+        return bus::CloseOutcome::partialOrUnknown(closed.error());
+    }
+    return bus::CloseOutcome::success();
 }
 
 service::ServicePoll Bus_software::serviceImpl(const service::ServiceContext& ctx)
@@ -1249,16 +1187,24 @@ service::ServicePoll Bus_software::serviceImpl(const service::ServiceContext& ct
     return serviceTransfer(ctx);
 }
 
-void Bus_software::unregisterTransferService(void)
+result_t<void> Bus_software::unregisterTransferService(void)
 {
     if (_transfer_registered.exchange(false, std::memory_order_relaxed)) {
-        (void)M5_Hal.Services.remove(*this);
+        auto removed = localResources().services->remove(*this);
+        if (!removed.has_value()) {
+            _transfer_registered.store(true, std::memory_order_relaxed);
+            return m5::stl::make_unexpected(removed.error());
+        }
     }
+    return {};
 }
 
-void Bus_software::clearTransferState(void)
+result_t<void> Bus_software::clearTransferState(void)
 {
-    unregisterTransferService();
+    auto unregistered = unregisterTransferService();
+    if (!unregistered.has_value()) {
+        return m5::stl::make_unexpected(unregistered.error());
+    }
     // The gate publishes visibility, not lifetime: deleting the state is
     // safe only after unregisterTransferService() (synchronous
     // ServiceRunner::remove()) guarantees no further serviceImpl call.
@@ -1268,6 +1214,7 @@ void Bus_software::clearTransferState(void)
     _transfer_error = error::error_t::OK;
     _transfer_totals.clear();
     _transfer_gate.reset();
+    return {};
 }
 
 service::ServiceResult Bus_software::serviceTransfer(const service::ServiceContext& ctx)
@@ -1276,35 +1223,46 @@ service::ServiceResult Bus_software::serviceTransfer(const service::ServiceConte
     auto* state     = static_cast<impl_software::TransferState*>(_transfer_state);
     const auto gate = _transfer_gate.state();
     if (gate != GateState::Busy) {
-        unregisterTransferService();
+        auto unregistered = unregisterTransferService();
+        if (!unregistered.has_value()) {
+            _transfer_error = unregistered.error();
+            return service::ServiceResult::Error;
+        }
         return gate == GateState::Error ? service::ServiceResult::Error : service::ServiceResult::Done;
     }
 
     auto result = state->service(ctx);
     // Terminal order matters: finish() must precede unregisterTransferService().
     // Once _transfer_registered is cleared, a concurrent teardown
-    // (release()/dtor/init) skips the synchronous remove() and may delete the
+    // (teardown/dtor/init) skips the synchronous remove() and may delete the
     // state and reset the gate -- a finish() issued after that would write
     // freed/cleared storage. Publishing first keeps every write to this object
     // inside the window the teardown's remove() still waits for.
+    // unregisterTransferService() cannot change the terminal outcome here:
+    // a registered transfer runs as ServiceRunner's current writer, whose
+    // remove() is an infallible direct write; an unregistered sole-pumper
+    // takes the idempotent no-op path. Keep finish() a single terminal
+    // transition and never rewrite payload after its release publication.
     if (result == service::ServiceResult::Error) {
         _transfer_error = state->error();
         _transfer_gate.finish(GateState::Error);
-        unregisterTransferService();
+        (void)unregisterTransferService();
     } else if (result == service::ServiceResult::Done || state->done()) {
         _transfer_totals = state->totals();
         _transfer_gate.finish(GateState::Done);
-        unregisterTransferService();
+        (void)unregisterTransferService();
         return service::ServiceResult::Done;
     }
     return result;
 }
 
-result_t<void> Bus_software::transfer(bus::IAccessor* owner, const i2c::MasterAccessConfig& cfg,
-                                      const i2c::TransferDesc& desc, data::Source* src, size_t tx_len, data::Sink* dst,
-                                      size_t rx_len)
+result_t<void> Bus_software::transferBackend(bus::OperationContext<i2c::MasterAccessConfig>& context,
+                                             const i2c::TransferDesc& desc, data::Source* src, size_t tx_len,
+                                             data::Sink* dst, size_t rx_len)
 {
-    auto waited = waitTransfer(owner, cfg);
+    auto* owner     = &bus::OperationSlot::contextOwner(context);
+    const auto& cfg = context.config;
+    auto waited     = waitTransferBackend(context);
     if (!waited.has_value()) {
         return m5::stl::make_unexpected(waited.error());
     }
@@ -1347,11 +1305,14 @@ result_t<void> Bus_software::transfer(bus::IAccessor* owner, const i2c::MasterAc
     auto first = serviceTransfer(service::ServiceContext{0, impl_software::serviceNowTick()});
     if (first == service::ServiceResult::Error) {
         const auto err = _transfer_error;
-        clearTransferState();
+        auto cleared   = clearTransferState();
+        if (!cleared.has_value()) {
+            return m5::stl::make_unexpected(cleared.error());
+        }
         return m5::stl::make_unexpected(err);
     }
     if (owner == nullptr) {
-        auto done = waitTransfer(owner, cfg);
+        auto done = waitTransferBackend(context);
         if (!done.has_value()) {
             return m5::stl::make_unexpected(done.error());
         }
@@ -1359,16 +1320,22 @@ result_t<void> Bus_software::transfer(bus::IAccessor* owner, const i2c::MasterAc
     }
     if (_transfer_gate.busy()) {
         _transfer_registered.store(true, std::memory_order_relaxed);
-        if (!M5_Hal.Services.add(*this)) {
-            clearTransferState();
-            return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+        auto added = localResources().services->add(*this);
+        if (!added.has_value()) {
+            auto cleared = clearTransferState();
+            if (!cleared.has_value()) {
+                return m5::stl::make_unexpected(cleared.error());
+            }
+            return m5::stl::make_unexpected(added.error());
         }
     }
     return {};
 }
 
-result_t<bus::TransferTotals> Bus_software::waitTransfer(bus::IAccessor* owner, const i2c::MasterAccessConfig& cfg)
+result_t<bus::TransferTotals> Bus_software::waitTransferBackend(bus::OperationContext<i2c::MasterAccessConfig>& context)
 {
+    auto* owner     = &bus::OperationSlot::contextOwner(context);
+    const auto& cfg = context.config;
     (void)cfg;
     using GateState = service::CompletionGate::State;
     if (_transfer_gate.state() != GateState::Idle && _transfer_owner != owner) {
@@ -1391,10 +1358,17 @@ result_t<bus::TransferTotals> Bus_software::waitTransfer(bus::IAccessor* owner, 
             // with the runner task (double-pump window at auto-run start).
             // The wait must eventually BLOCK, not merely yield: taskYIELD()
             // only yields to READY tasks of the SAME priority.
-            if (M5_Hal.Services.autoRunActive() || !M5_Hal.Services.runOnce()) {
+            if (localResources().services->autoRunActive()) {
                 backoff.step();
             } else {
-                backoff.reset();
+                auto pumped = localResources().services->runOnce();
+                // BUSY is transient runner contention; a successful false
+                // payload means the pass itself made no progress.
+                if (!pumped.has_value() || !pumped.value()) {
+                    backoff.step();
+                } else {
+                    backoff.reset();
+                }
             }
         } else {
             // Unpublished state: this thread is the sole pumper; spin at full
@@ -1408,16 +1382,23 @@ result_t<bus::TransferTotals> Bus_software::waitTransfer(bus::IAccessor* owner, 
     }
     if (_transfer_gate.state() == GateState::Error) {
         const auto err = _transfer_error;
-        clearTransferState();
+        auto cleared   = clearTransferState();
+        if (!cleared.has_value()) {
+            return m5::stl::make_unexpected(cleared.error());
+        }
         return m5::stl::make_unexpected(err);
     }
     const auto totals = _transfer_totals;
-    clearTransferState();
+    auto cleared      = clearTransferState();
+    if (!cleared.has_value()) {
+        return m5::stl::make_unexpected(cleared.error());
+    }
     return totals;
 }
 
-bool Bus_software::transferBusy(bus::IAccessor* owner)
+bool Bus_software::transferBusyBackend(bus::OperationContext<i2c::MasterAccessConfig>& context)
 {
+    auto* owner = &bus::OperationSlot::contextOwner(context);
     return _transfer_gate.busy() && _transfer_owner == owner;
 }
 

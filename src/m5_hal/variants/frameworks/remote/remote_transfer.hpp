@@ -19,6 +19,7 @@ constexpr size_t kMaxRemoteConfigCacheSize = bytecode::kUARTConfigSize;
 static_assert(bytecode::kI2CConfigSize <= kMaxRemoteConfigCacheSize, "remote config cache must fit i2c config");
 static_assert(bytecode::kSPIConfigSize <= kMaxRemoteConfigCacheSize, "remote config cache must fit spi config");
 static_assert(bytecode::kI2SConfigSize <= kMaxRemoteConfigCacheSize, "remote config cache must fit i2s config");
+static_assert(bytecode::kPDMConfigSize <= kMaxRemoteConfigCacheSize, "remote config cache must fit pdm config");
 
 class RemoteConfigCache {
 public:
@@ -65,17 +66,33 @@ inline std::shared_ptr<RemoteSessionHandle> makeBorrowedSessionHandle(RemoteSess
     return session.sharedHandle();
 }
 
-result_t<size_t> remoteTransferWire(const std::shared_ptr<RemoteSessionHandle>& handle, types::bus_kind_t kind,
-                                    uint8_t bus_id, data::ConstDataSpan cfg_bytes, data::ConstDataSpan meta,
-                                    data::Source* src, size_t tx_len, data::Sink* dst, size_t rx_len,
-                                    uint32_t timeout_ms, RemoteConfigCache* config_cache = nullptr);
+result_t<bus::TransferTotals> remoteTransferWire(const std::shared_ptr<RemoteSessionHandle>& handle,
+                                                 types::bus_kind_t kind, uint8_t bus_id, data::ConstDataSpan cfg_bytes,
+                                                 data::ConstDataSpan meta, data::Source* src, size_t tx_len,
+                                                 data::Sink* dst, size_t rx_len, uint32_t timeout_ms,
+                                                 RemoteConfigCache* config_cache = nullptr);
+
+// Transactional buses use the inline BusTransfer opcode so one public
+// transfer maps to exactly one backend/wire transaction. The bounded TX/RX
+// sizes are part of the remote backend contract; larger atomic transfers are
+// rejected instead of silently becoming several transactions.
+result_t<bus::TransferTotals> remoteAtomicTransferWire(const std::shared_ptr<RemoteSessionHandle>& handle,
+                                                       uint8_t bus_id, data::ConstDataSpan cfg_bytes,
+                                                       const i2c::TransferDesc& desc, data::Source* src, size_t tx_len,
+                                                       data::Sink* dst, size_t rx_len, uint32_t timeout_ms,
+                                                       RemoteConfigCache* config_cache = nullptr);
+result_t<bus::TransferTotals> remoteAtomicTransferWire(const std::shared_ptr<RemoteSessionHandle>& handle,
+                                                       uint8_t bus_id, data::ConstDataSpan cfg_bytes,
+                                                       const spi::TransferDesc& desc, data::Source* src, size_t tx_len,
+                                                       data::Sink* dst, size_t rx_len, uint32_t timeout_ms,
+                                                       RemoteConfigCache* config_cache = nullptr);
 
 // Compatibility seam for direct session tests and low-level callers. Proxy
 // buses retain one shared handle and use the overload above.
-result_t<size_t> remoteTransferWire(RemoteSession* session, types::bus_kind_t kind, uint8_t bus_id,
-                                    data::ConstDataSpan cfg_bytes, data::ConstDataSpan meta, data::Source* src,
-                                    size_t tx_len, data::Sink* dst, size_t rx_len, uint32_t timeout_ms,
-                                    RemoteConfigCache* config_cache = nullptr);
+result_t<bus::TransferTotals> remoteTransferWire(RemoteSession* session, types::bus_kind_t kind, uint8_t bus_id,
+                                                 data::ConstDataSpan cfg_bytes, data::ConstDataSpan meta,
+                                                 data::Source* src, size_t tx_len, data::Sink* dst, size_t rx_len,
+                                                 uint32_t timeout_ms, RemoteConfigCache* config_cache = nullptr);
 
 namespace detail {
 
@@ -104,6 +121,12 @@ inline data::ConstDataSpan encodeRemoteConfig(uint8_t* dst, const i2s::AccessCon
 {
     bytecode::detail::encodeConfig(dst, cfg);
     return {dst, bytecode::kI2SConfigSize};
+}
+
+inline data::ConstDataSpan encodeRemoteConfig(uint8_t* dst, const pdm::AccessConfig& cfg)
+{
+    bytecode::detail::encodeConfig(dst, cfg);
+    return {dst, bytecode::kPDMConfigSize};
 }
 
 }  // namespace detail

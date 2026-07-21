@@ -5,7 +5,7 @@
 // + std::timed_mutex), so the time assertions use generous lower
 // bounds only (no upper bounds — CI machines stall). Deterministic
 // assertions go through the variant-qualified stub fake. The Bus
-// integration tests pin the S7 BREAKING semantics: contention WAITS
+// integration tests pin the BREAKING lock semantics: contention WAITS
 // and fails with TIMEOUT_ERROR (not BUSY), timeout 0 is a try-lock.
 #include <gtest/gtest.h>
 #include "support/gtest_watchdog.hpp"
@@ -20,6 +20,65 @@ namespace {
 namespace runtime = ::m5::hal::v2::runtime;
 namespace stub_rt = ::m5::variants::frameworks::stub::hal::v2::runtime;
 
+struct TaskGate {
+    std::atomic<bool> entered{false};
+    std::atomic<bool> release{false};
+};
+
+void gatedTask(void* raw)
+{
+    auto& gate = *static_cast<TaskGate*>(raw);
+    gate.entered.store(true, std::memory_order_release);
+    while (!gate.release.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+}
+
+void incrementTask(void* raw)
+{
+    static_cast<std::atomic<unsigned>*>(raw)->fetch_add(1, std::memory_order_relaxed);
+}
+
+template <typename Task>
+void expectTaskStartContract()
+{
+    Task task;
+
+    auto invalid = task.start(nullptr, nullptr);
+    ASSERT_FALSE(invalid.has_value());
+    EXPECT_EQ(invalid.error(), ::m5::hal::v2::error::error_t::INVALID_ARGUMENT);
+    EXPECT_FALSE(task.joinable());
+
+    TaskGate gate;
+    auto started = task.start(&gatedTask, &gate);
+    ASSERT_TRUE(started.has_value());
+    while (!gate.entered.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    EXPECT_TRUE(task.joinable());
+
+    auto invalid_while_joinable = task.start(nullptr, nullptr);
+    ASSERT_FALSE(invalid_while_joinable.has_value());
+    EXPECT_EQ(invalid_while_joinable.error(), ::m5::hal::v2::error::error_t::INVALID_ARGUMENT);
+
+    auto duplicate = task.start(&gatedTask, &gate);
+    ASSERT_FALSE(duplicate.has_value());
+    EXPECT_EQ(duplicate.error(), ::m5::hal::v2::error::error_t::INVALID_STATE);
+
+    gate.release.store(true, std::memory_order_release);
+    task.join();
+    EXPECT_FALSE(task.joinable());
+
+    std::atomic<unsigned> calls{0};
+    auto restarted = task.start(&incrementTask, &calls);
+    ASSERT_TRUE(restarted.has_value());
+    task.join();
+    EXPECT_EQ(calls.load(std::memory_order_relaxed), 1u);
+
+    task.join();  // idempotent no-op
+    EXPECT_FALSE(task.joinable());
+}
+
 // ---- selection ------------------------------------------------------------
 
 static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME == M5HAL_V2_VARIANT_ID_FRAMEWORK_POSIX,
@@ -30,6 +89,44 @@ TEST(RuntimeSelection, FlatInjectionIsThePosixVariant)
     constexpr bool same =
         std::is_same<runtime::Mutex, ::m5::variants::frameworks::posix::hal::v2::runtime::Mutex>::value;
     EXPECT_TRUE(same);
+}
+
+TEST(RuntimeTask, PosixStartReportsStateAndArgumentErrors)
+{
+    expectTaskStartContract<runtime::Task>();
+}
+
+TEST(RuntimeTask, ThreadedStubMatchesTheStartContract)
+{
+    expectTaskStartContract<stub_rt::Task>();
+}
+
+TEST(RuntimeTask, HostThreadErrorClassificationIsDeterministic)
+{
+    using error_t        = ::m5::hal::v2::error::error_t;
+    const auto exhausted = std::make_error_code(std::errc::resource_unavailable_try_again);
+    const auto no_memory = std::make_error_code(std::errc::not_enough_memory);
+    const auto other     = std::make_error_code(std::errc::permission_denied);
+
+    EXPECT_EQ(::m5::variants::frameworks::detail::mapThreadCreateError(exhausted), error_t::OUT_OF_RESOURCE);
+    EXPECT_EQ(::m5::variants::frameworks::detail::mapThreadCreateError(no_memory), error_t::OUT_OF_RESOURCE);
+    EXPECT_EQ(::m5::variants::frameworks::detail::mapThreadCreateError(other), error_t::IO_ERROR);
+}
+
+TEST(RuntimeTask, ThreadlessStubRejectsLaunchWithoutInventingState)
+{
+    stub_rt::ThreadlessTask task;
+    auto invalid = task.start(nullptr, nullptr);
+    ASSERT_FALSE(invalid.has_value());
+    EXPECT_EQ(invalid.error(), ::m5::hal::v2::error::error_t::INVALID_ARGUMENT);
+
+    std::atomic<unsigned> calls{0};
+    auto unsupported = task.start(&incrementTask, &calls);
+    ASSERT_FALSE(unsupported.has_value());
+    EXPECT_EQ(unsupported.error(), ::m5::hal::v2::error::error_t::UNSUPPORTED);
+    EXPECT_FALSE(task.joinable());
+    task.join();
+    EXPECT_EQ(calls.load(std::memory_order_relaxed), 0u);
 }
 
 // ---- time (real clock through the posix variant) ---------------------------
@@ -75,23 +172,31 @@ TEST(RuntimeStubTime, FakeClockIsDeterministic)
 TEST(RuntimeMutex, TryLockAndRelease)
 {
     runtime::Mutex m;
-    EXPECT_TRUE(m.lock(0));
-    m.unlock();
-    EXPECT_TRUE(m.lock(0));
-    m.unlock();
+    auto locked = m.lock(0);
+    ASSERT_TRUE(locked.has_value()) << "err=" << ::m5::hal::v2::error::toString(locked.error());
+    auto unlocked = m.unlock();
+    ASSERT_TRUE(unlocked.has_value()) << "err=" << ::m5::hal::v2::error::toString(unlocked.error());
+    locked = m.lock(0);
+    ASSERT_TRUE(locked.has_value()) << "err=" << ::m5::hal::v2::error::toString(locked.error());
+    unlocked = m.unlock();
+    ASSERT_TRUE(unlocked.has_value()) << "err=" << ::m5::hal::v2::error::toString(unlocked.error());
 }
 
-TEST(RuntimeMutex, NonRecursiveRelockTimesOut)
+#if defined(M5HAL_TEST_POSIX_MUTEX_FAULTS) && defined(__cpp_exceptions)
+TEST(RuntimeMutex, MapsProviderSystemErrorToIoError)
 {
+    ::m5::variants::frameworks::posix::hal::v2::runtime::detail::failNextMutexLockWithSystemError();
     runtime::Mutex m;
-    ASSERT_TRUE(m.lock(0));
-    // Re-lock from the holding thread: waits until the timeout, then
-    // fails (non-recursive).
-    EXPECT_FALSE(m.lock(30));
-    m.unlock();
-    EXPECT_TRUE(m.lock(0));
-    m.unlock();
+    auto failed = m.lock(0);
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), ::m5::hal::v2::error::error_t::IO_ERROR);
+
+    auto retried = m.lock(0);
+    ASSERT_TRUE(retried.has_value()) << "err=" << ::m5::hal::v2::error::toString(retried.error());
+    auto unlocked = m.unlock();
+    ASSERT_TRUE(unlocked.has_value()) << "err=" << ::m5::hal::v2::error::toString(unlocked.error());
 }
+#endif
 
 TEST(RuntimeMutex, ContendedLockTimesOutThenSucceedsAfterRelease)
 {
@@ -100,12 +205,14 @@ TEST(RuntimeMutex, ContendedLockTimesOutThenSucceedsAfterRelease)
     std::atomic<bool> release{false};
 
     std::thread holder([&] {
-        ASSERT_TRUE(m.lock(0));
+        auto locked = m.lock(0);
+        ASSERT_TRUE(locked.has_value()) << "err=" << ::m5::hal::v2::error::toString(locked.error());
         held = true;
         while (!release) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        m.unlock();
+        auto unlocked = m.unlock();
+        ASSERT_TRUE(unlocked.has_value()) << "err=" << ::m5::hal::v2::error::toString(unlocked.error());
     });
     while (!held) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -113,13 +220,17 @@ TEST(RuntimeMutex, ContendedLockTimesOutThenSucceedsAfterRelease)
 
     // Contention: the wait is real (lower bound only), then times out.
     const uint32_t t0 = runtime::millis();
-    EXPECT_FALSE(m.lock(50));
+    auto timed_out    = m.lock(50);
+    ASSERT_FALSE(timed_out.has_value());
+    EXPECT_EQ(timed_out.error(), ::m5::hal::v2::error::error_t::TIMEOUT_ERROR);
     EXPECT_GE(runtime::millis() - t0, 40u);
 
     // The holder releases; a waiting lock with budget succeeds.
-    release = true;
-    EXPECT_TRUE(m.lock(2000));
-    m.unlock();
+    release     = true;
+    auto locked = m.lock(2000);
+    ASSERT_TRUE(locked.has_value()) << "err=" << ::m5::hal::v2::error::toString(locked.error());
+    auto unlocked = m.unlock();
+    ASSERT_TRUE(unlocked.has_value()) << "err=" << ::m5::hal::v2::error::toString(unlocked.error());
     holder.join();
 }
 
@@ -129,8 +240,11 @@ TEST(RuntimeEvent, NotifyBeforeWaitIsLatched)
 {
     runtime::Event e;
     e.notify();
-    EXPECT_TRUE(e.wait(0));   // the earlier notify is consumed, not lost
-    EXPECT_FALSE(e.wait(0));  // and consuming clears the latch
+    auto consumed = e.wait(0);
+    ASSERT_TRUE(consumed.has_value()) << "err=" << ::m5::hal::v2::error::toString(consumed.error());
+    auto empty = e.wait(0);  // and consuming clears the latch
+    ASSERT_FALSE(empty.has_value());
+    EXPECT_EQ(empty.error(), ::m5::hal::v2::error::error_t::TIMEOUT_ERROR);
 }
 
 TEST(RuntimeEvent, MultipleNotifiesMergeIntoOne)
@@ -139,15 +253,20 @@ TEST(RuntimeEvent, MultipleNotifiesMergeIntoOne)
     e.notify();
     e.notify();
     e.notify();
-    EXPECT_TRUE(e.wait(0));
-    EXPECT_FALSE(e.wait(0));  // merged: one consume drains them all
+    auto consumed = e.wait(0);
+    ASSERT_TRUE(consumed.has_value()) << "err=" << ::m5::hal::v2::error::toString(consumed.error());
+    auto empty = e.wait(0);  // merged: one consume drains them all
+    ASSERT_FALSE(empty.has_value());
+    EXPECT_EQ(empty.error(), ::m5::hal::v2::error::error_t::TIMEOUT_ERROR);
 }
 
 TEST(RuntimeEvent, WaitTimesOutWithoutNotify)
 {
     runtime::Event e;
     const uint32_t t0 = runtime::millis();
-    EXPECT_FALSE(e.wait(30));
+    auto timed_out    = e.wait(30);
+    ASSERT_FALSE(timed_out.has_value());
+    EXPECT_EQ(timed_out.error(), ::m5::hal::v2::error::error_t::TIMEOUT_ERROR);
     // The wait is real (lower bound only — CI machines stall).
     EXPECT_GE(runtime::millis() - t0, 25u);
 }
@@ -159,9 +278,12 @@ TEST(RuntimeEvent, WaitWakesOnNotifyFromAnotherThread)
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
         e.notify();
     });
-    EXPECT_TRUE(e.wait(2000));  // wakes through the notify, well inside the budget
+    auto woken = e.wait(2000);  // wakes through the notify, well inside the budget
+    ASSERT_TRUE(woken.has_value()) << "err=" << ::m5::hal::v2::error::toString(woken.error());
     notifier.join();
-    EXPECT_FALSE(e.wait(0));  // consumed by the wait above
+    auto empty = e.wait(0);  // consumed by the wait above
+    ASSERT_FALSE(empty.has_value());
+    EXPECT_EQ(empty.error(), ::m5::hal::v2::error::error_t::TIMEOUT_ERROR);
 }
 
 TEST(RuntimeEvent, ForeverWaitWakesOnNotify)
@@ -171,9 +293,25 @@ TEST(RuntimeEvent, ForeverWaitWakesOnNotify)
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
         e.notify();
     });
-    EXPECT_TRUE(e.wait(::m5::hal::v2::types::TIMEOUT_FOREVER));
+    auto woken = e.wait(::m5::hal::v2::types::TIMEOUT_FOREVER);
+    ASSERT_TRUE(woken.has_value()) << "err=" << ::m5::hal::v2::error::toString(woken.error());
     notifier.join();
 }
+
+#if defined(M5HAL_TEST_POSIX_EVENT_FAULTS) && defined(__cpp_exceptions)
+TEST(RuntimeEvent, MapsProviderSystemErrorToIoError)
+{
+    runtime::Event e;
+    ::m5::variants::frameworks::posix::hal::v2::runtime::detail::failNextEventWaitWithSystemError();
+    auto failed = e.wait(0);
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), ::m5::hal::v2::error::error_t::IO_ERROR);
+
+    e.notify();
+    auto recovered = e.wait(0);
+    ASSERT_TRUE(recovered.has_value()) << "err=" << ::m5::hal::v2::error::toString(recovered.error());
+}
+#endif
 
 // ---- event (stub fake) -------------------------------------------------------
 
@@ -182,12 +320,19 @@ TEST(RuntimeStubEvent, WaitNeverBlocksButLatchWorks)
     stub_rt::Event e;
     // Single-task fake: with nobody around to notify, blocking could never
     // end — even TIMEOUT_FOREVER fails immediately (documented exception).
-    EXPECT_FALSE(e.wait(10000));
-    EXPECT_FALSE(e.wait(::m5::hal::v2::types::TIMEOUT_FOREVER));
+    auto finite = e.wait(10000);
+    ASSERT_FALSE(finite.has_value());
+    EXPECT_EQ(finite.error(), ::m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+    auto forever = e.wait(::m5::hal::v2::types::TIMEOUT_FOREVER);
+    ASSERT_FALSE(forever.has_value());
+    EXPECT_EQ(forever.error(), ::m5::hal::v2::error::error_t::TIMEOUT_ERROR);
     e.notify();
     e.notify();  // merges
-    EXPECT_TRUE(e.wait(0));
-    EXPECT_FALSE(e.wait(0));
+    auto consumed = e.wait(0);
+    ASSERT_TRUE(consumed.has_value()) << "err=" << ::m5::hal::v2::error::toString(consumed.error());
+    auto empty = e.wait(0);
+    ASSERT_FALSE(empty.has_value());
+    EXPECT_EQ(empty.error(), ::m5::hal::v2::error::error_t::TIMEOUT_ERROR);
 }
 
 // ---- mutex (stub single-task guard) ----------------------------------------
@@ -195,13 +340,25 @@ TEST(RuntimeStubEvent, WaitNeverBlocksButLatchWorks)
 TEST(RuntimeStubMutex, ContentionFailsImmediately)
 {
     stub_rt::Mutex m;
-    ASSERT_TRUE(m.lock(0));
+    auto locked = m.lock(0);
+    ASSERT_TRUE(locked.has_value()) << "err=" << ::m5::hal::v2::error::toString(locked.error());
     // Single-task fake: a timeout cannot resolve without another task,
     // so even a large budget fails immediately (deterministic).
-    EXPECT_FALSE(m.lock(10000));
-    m.unlock();
-    EXPECT_TRUE(m.lock(0));
-    m.unlock();
+    auto timed_out = m.lock(10000);
+    ASSERT_FALSE(timed_out.has_value());
+    EXPECT_EQ(timed_out.error(), ::m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+    auto forever = m.lock(::m5::hal::v2::types::TIMEOUT_FOREVER);
+    ASSERT_FALSE(forever.has_value());
+    EXPECT_EQ(forever.error(), ::m5::hal::v2::error::error_t::TIMEOUT_ERROR);
+    auto unlocked = m.unlock();
+    ASSERT_TRUE(unlocked.has_value()) << "err=" << ::m5::hal::v2::error::toString(unlocked.error());
+    locked = m.lock(0);
+    ASSERT_TRUE(locked.has_value()) << "err=" << ::m5::hal::v2::error::toString(locked.error());
+    unlocked = m.unlock();
+    ASSERT_TRUE(unlocked.has_value()) << "err=" << ::m5::hal::v2::error::toString(unlocked.error());
+    auto invalid = m.unlock();
+    ASSERT_FALSE(invalid.has_value());
+    EXPECT_EQ(invalid.error(), ::m5::hal::v2::error::error_t::INVALID_STATE);
 }
 
 // ---- Bus integration (BREAKING: contention -> TIMEOUT_ERROR) ------------
@@ -216,6 +373,14 @@ struct TestBus : public m5::hal::v2::bus::IBus {
     const m5::hal::v2::bus::IBusConfig& getConfig(void) const override
     {
         return _cfg;
+    }
+    m5::hal::v2::result_t<void> acquire(m5::hal::v2::bus::IAccessor& owner, uint32_t timeout_ms)
+    {
+        return acquireAccessLock(owner, timeout_ms);
+    }
+    m5::hal::v2::result_t<void> release(m5::hal::v2::bus::IAccessor& owner)
+    {
+        return releaseAccessLock(owner);
     }
     TestBusConfig _cfg;
 };
@@ -243,11 +408,11 @@ TEST(BusLock, ContendedTryLockReportsTimeoutError)
     TestAccessor a1{bus};
     TestAccessor a2{bus};
 
-    ASSERT_TRUE(bus.lock(&a1, 0).has_value());
-    auto r = bus.lock(&a2, 0);  // try-lock: fails immediately under contention
+    ASSERT_TRUE(bus.acquire(a1, 0).has_value());
+    auto r = bus.acquire(a2, 0);  // try-lock: fails immediately under contention
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), m5::hal::v2::error::error_t::TIMEOUT_ERROR);
-    ASSERT_TRUE(bus.unlock(&a1).has_value());
+    ASSERT_TRUE(bus.release(a1).has_value());
 }
 
 TEST(BusLock, ContendedLockWaitsForHolderAcrossTasks)
@@ -259,23 +424,23 @@ TEST(BusLock, ContendedLockWaitsForHolderAcrossTasks)
 
     // The holder task takes the bus for ~150 ms; the waiter's budget
     // (2 s) covers it, so the waiter must succeed WITHOUT an error —
-    // the S7 "waiting lock" semantics, impossible with the old
+    // the waiting-lock semantics, impossible with the old
     // owner-pointer implementation.
     std::thread holder([&] {
-        ASSERT_TRUE(bus.lock(&holder_acc, 0).has_value());
+        ASSERT_TRUE(bus.acquire(holder_acc, 0).has_value());
         held = true;
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
-        ASSERT_TRUE(bus.unlock(&holder_acc).has_value());
+        ASSERT_TRUE(bus.release(holder_acc).has_value());
     });
     while (!held) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     const uint32_t t0 = runtime::millis();
-    auto r            = bus.lock(&waiter_acc, 2000);
+    auto r            = bus.acquire(waiter_acc, 2000);
     ASSERT_TRUE(r.has_value());
     EXPECT_GE(runtime::millis() - t0, 50u);  // it really waited
-    ASSERT_TRUE(bus.unlock(&waiter_acc).has_value());
+    ASSERT_TRUE(bus.release(waiter_acc).has_value());
     holder.join();
 }
 

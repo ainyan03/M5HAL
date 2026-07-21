@@ -1,46 +1,28 @@
 # examples/v2/HowToUse — v2 API examples
 
-Self-contained Arduino sketches for the v2 API. Each sketch is heavily
-commented and runnable as-is in the Arduino IDE; the table below is the
-quick map. Pin defaults assume M5Stack Core (Basic / Gray / Fire) style
-wiring unless noted.
+This directory contains runnable examples, not the API contract. Follow each
+example's source comments for setup details; use the linked specification for
+design and lifetime rules. Arduino sketches print progress at 115200 baud.
 
-| Example | Hardware | What it shows | Wiring |
-|---|---|---|---|
-| [I2C](I2C/) | Any ESP32 board with an I2C device (scans the bus, uses the first responder) | Bus / Accessor basics: scan, `probe`, `readRegister`, burst read, `ScopedAccess` | SDA=21, SCL=22 |
-| [I2CRegistry](I2CRegistry/) | Any ESP32 board; no I2C device required | `LogicalBusConfig`, intent-based `commitBuses()`, and querying `BackendKind` allocation results | shared bus SDA=21/SCL=22; intent buses internal SDA=21/SCL=22, PortA SDA=25/SCL=26, HAT SDA=18/SCL=19 |
-| [SPI](SPI/) | Any ESP32 board; no SPI slave required | Plain write, command+data, dummy clocks, explicit `beginTransaction` / `endTransaction` — wire activity for a logic analyzer | SCLK=18, MOSI=23, MISO=19, D/C=27, CS=14 |
-| [UART](UART/) | Any ESP32 board | UART Bus / Accessor basics; USB Serial for logs, `Serial1` as the M5HAL bus | TX=17, RX=16; jumper TX→RX for loopback |
-| [UARTEcho](UARTEcho/) | Any ESP32 board + an external UART peer | Echo through the `StreamReader` / `StreamSink` adapters (Source / Sink stream model) | peer TX→RX=16, peer RX←TX=17, shared GND. Do **not** jumper TX to RX on the same board |
-| [I2SAudio](I2SAudio/) | M5Stack Core2 V1.1 (verified); CoreS3 wiring included but unverified | 440 Hz sine playback through the local `i2s::Bus` TX path, including the board-specific amplifier setup | none (built-in speaker) |
-| [Bytecode](Bytecode/) | M5Stack Core BASIC | GPIO / I2C / SPI driven from bytecode scripts stored as const byte arrays; buttons A/B/C run the scripts | none (uses on-board LCD / power IC) |
-| [Remote](Remote/) | PC (POSIX native) + ESP32 with RemoteServer firmware | Remote I2C scan and GPIO read via the `Hal` facade: `connect(endpoint)`, `acquire`, `probe` | USB cable between PC and ESP32 |
-| [RemoteI2S](RemoteI2S/) | PC (POSIX native) + ESP32 with RemoteServerTCP or RemoteServer firmware, Core2-class amplifier wiring | Streaming a sine-wave tone to the remote I2S speaker path over `BusStreamTransfer` via the `Hal` facade | USB serial or TCP between PC and ESP32 |
+| Example | Required hardware / wiring | Expected result |
+|---|---|---|
+| [I2C](I2C/) | ESP32 + an I2C device; SDA=21, SCL=22 | Scans the bus, selects the first responder, and reports register reads |
+| [I2CRegistry](I2CRegistry/) | ESP32; no I2C device required | Reports shared-bus identity and allocation results for several wiring intents |
+| [SPI](SPI/) | ESP32; no slave required; SCLK=18, MOSI=23, MISO=19, D/C=27, CS=14 | Emits writes and framed transfers for observation with a logic analyzer |
+| [UART](UART/) | ESP32; jumper TX=17 to RX=16 | Sends periodic lines and receives them through loopback |
+| [UARTEcho](UARTEcho/) | ESP32 + external UART peer; peer TX→16, peer RX←17, shared GND | Echoes peer bytes and reports the running byte count |
+| [I2SAudio](I2SAudio/) | M5Stack Core2 V1.1 built-in speaker; CoreS3 wiring is included but unverified | Plays a 440 Hz sine wave |
+| [Bytecode](Bytecode/) | M5Stack Core BASIC, no external wiring | Buttons A/B/C run GPIO, I2C, and SPI bytecode sequences |
+| [Remote](Remote/) | POSIX PC + ESP32 running `examples/v2/RemoteServer/`; USB serial | Connects, scans remote I2C, reads GPIO, then prints `Done.` |
+| [RemoteI2S](RemoteI2S/) | POSIX PC + ESP32 RemoteServer with Core2-class speaker wiring; USB serial or TCP | Connects, acquires remote I2S, and streams a tone |
 
-Every sketch prints its progress to USB Serial (115200). Most sketches acquire
-an interned bus from `M5_Hal` (e.g. `M5_Hal.I2C.acquire(cfg)`) and own it through
-the returned `shared_ptr`; the registry itself retains only a weak reference.
-Bytecode keeps its buses as direct-constructed globals
-(the escape hatch) so its script-driven accessors bind at startup. To force a
-specific backend instead of the build's default, pass a suffixed config type
-(`BusConfig_software` / `_arduino` / `_espidf`) to acquire (see the comments in
-the sketch and `spec/design/variants.md` in the repository).
+The remote device can instead use
+[`RemoteServerTCP`](../RemoteServerTCP/) for TCP. Protocol-level validation
+lives in [`RemoteTest`](../RemoteTest/); it is a test harness rather than a
+HowToUse example.
 
-The I2S API itself supports local TX, local RX, and full duplex when the backend
-exposes DIN/DOUT. `I2SAudio` is intentionally only the built-in-speaker playback
-example; it is not the full I2S feature boundary.
-
-`Remote` is a native (non-Arduino) POSIX host binary, not an Arduino sketch: it
-connects from a PC to an ESP32 over USB serial. The device side runs the
-RemoteServer firmware from `examples/v2/RemoteServer/` (flash any
-`RemoteServer_*` PlatformIO env). The full protocol test harness is
-`RemoteTest_host` (`examples/v2/RemoteTest/`); this example focuses on the high-level
-`Hal` facade API (`connect(endpoint)` → `acquire` → `probe`).
-
-Remote buses and GPIO objects are connection-scoped. Reconnecting closes old
-bus proxies (`CLOSED`) rather than rebinding them to the new peer. Explicit
-`release(shared_ptr&)` requires the sole remaining owner, so destroy accessors
-and other aliases first; success clears the passed handle and failure preserves
-it. Retained GPIO objects are safe only while their `Hal` is alive; after a
-reconnect they retain their final cached reads and ignore writes/mode changes.
-See `spec/design/remote.md` for the complete session and callback contract.
+For API contracts, start at the [specification map](../../../spec/README.md).
+The [Bus / Accessor specification](../../../spec/design/bus_accessor.md)
+covers ownership and locking, [variants](../../../spec/design/variants.md)
+covers provider selection, and [remote](../../../spec/design/remote.md) covers
+connection lifetime.

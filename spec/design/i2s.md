@@ -18,7 +18,7 @@ WAV 等のコンテナ解釈・デコード・ミキシングは上位 (アプ�
 - MCLK は任意で、`-1` は無効を表す。
 - この `i2s` API は BCLK / WS を持つ standard I2S 専用であり、WS を持たない PDM を
   mode 分岐として受け入れない。PDM は公開 API / bus kind を分離し、物理的な I2S
-  controller の占有だけを standard I2S と共有する設計境界とする。
+  controller の占有だけを standard I2S と共有する。PDM側の契約は [pdm.md](pdm.md) を参照。
 
 ## write の意味論
 
@@ -68,19 +68,40 @@ write の鏡像。RX チャネル (`pin_din` 配線時) の DMA が取り込ん�
 ## API 形 — uart 同型の非トランザクショナル bus
 
 I2S は DMA 駆動の連続ストリームであり、I2C / SPI のような「開始 → 転送 → 終了」の
-トランザクション境界を持たない。このため transfer 形ではなく
-[uart](uart.md) と同型の write 系 API とする:
+物理トランザクション境界を持たない。単方向は[uart](uart.md)と同型のwrite/read系を主とし、
+全二重用にはTX/RXを一つの呼出しで進める複合`transfer`も持つ:
 
 ```cpp
 struct IBus : bus::IBus {
-    virtual expected<size_t, error_t> write(bus::IAccessor* owner, const AccessConfig& cfg,
-                                            data::Source* tx, size_t len);
-    virtual expected<size_t, error_t> writableBytes(bus::IAccessor* owner, const AccessConfig& cfg);
-    virtual expected<size_t, error_t> read(bus::IAccessor* owner, const AccessConfig& cfg,
-                                           data::Sink* rx, size_t len);
-    virtual expected<size_t, error_t> readableBytes(bus::IAccessor* owner, const AccessConfig& cfg);
+    result_t<void> beginOperation(bus::OperationContext<AccessConfig>& context);
+    result_t<void> endOperation(bus::OperationContext<AccessConfig>& context);
+    result_t<size_t> write(bus::OperationContext<AccessConfig>& context,
+                           data::Source* tx, size_t len);
+    result_t<size_t> writableBytes(bus::OperationContext<AccessConfig>& context);
+    result_t<size_t> read(bus::OperationContext<AccessConfig>& context,
+                          data::Sink* rx, size_t len);
+    result_t<bus::TransferTotals> transfer(
+        bus::OperationContext<AccessConfig>& tx_context,
+        bus::OperationContext<AccessConfig>& rx_context,
+        data::Source* tx, size_t tx_len, data::Sink* rx, size_t rx_len);
+    result_t<size_t> readableBytes(bus::OperationContext<AccessConfig>& context);
+
+protected:
+    // providerの派生点。上記non-virtual入口でContext検査後にだけ呼ばれる。
+    virtual result_t<void> beginOperationBackend(bus::OperationContext<AccessConfig>&);
+    virtual result_t<void> endOperationBackend(bus::OperationContext<AccessConfig>&);
+    virtual result_t<size_t> writeBackend(bus::OperationContext<AccessConfig>&, data::Source*, size_t);
+    virtual result_t<size_t> writableBytesBackend(bus::OperationContext<AccessConfig>&);
+    virtual result_t<size_t> readBackend(bus::OperationContext<AccessConfig>&, data::Sink*, size_t);
+    virtual result_t<bus::TransferTotals> transferBackend(
+        bus::OperationContext<AccessConfig>&, bus::OperationContext<AccessConfig>&,
+        data::Source*, size_t, data::Sink*, size_t);
+    virtual result_t<size_t> readableBytesBackend(bus::OperationContext<AccessConfig>&);
     // 独立 TX/RX チャネルロック (uart 同型)。lock/unlock は TxRx 合成。
-    result_t<void> lockChannel(bus::IAccessor* owner, Channel ch, uint32_t timeout_ms);
+    virtual result_t<void> lockChannel(
+        bus::IAccessor& owner,
+        Channel ch,
+        uint32_t timeout_ms = types::TIMEOUT_FOREVER);
 };
 struct TxAccessor : bus::IAccessor, data::StreamWriter;  // 再生 = StreamWriter
 struct RxAccessor : bus::IAccessor, data::StreamReader;  // 録音 = StreamReader
@@ -95,19 +116,35 @@ struct Accessor;  // TX + RX 束ね (全二重を 1 つで)
   remote proxy の channel 所有権も同じだが、標準 `RemoteSession` の個々の wire RPC は共通
   session gate で直列化される。1 RPC 内の全二重は複合 transfer が担う
   ([remote.md](remote.md) §SEQ)。
+- 公開ライフサイクルは `beginAccess()` / `endAccess()` であり、**非ネスト**。開始時に方向別
+  lock を取得して `Bus::beginOperation(context)` を1回呼び、終了時に
+  `Bus::endOperation(context)` を1回呼んでから lock を解放する。ここでの
+  Operation は物理フレーム境界ではなく、要求設定を適用し同一方向を排他する連続 stream の
+  利用区間である。`write` / `read` sugar は既存 Access を借用し、無ければ一時 Access を開閉する。
+- BusはTX/RX別slotへContext address、Accessor、generation、live channel ownerを登録する。
+  `write/writableBytes`はTX、`read/readableBytes`はRXを検査し、複合`transfer`は二つのContextを同時検査する。
+  providerはprotected `*Backend` hookだけをoverrideし、raw owner/configを公開virtual引数として受けない。
+- `Accessor` の複合 Access は TX→RX の順に開始し、RX 開始失敗時は TX を rollback する。終了は
+  RX→TX。子 accessor が直接 Access 中なら複合開始を `INVALID_STATE` で拒否する。
+- 各 `write` / `read` / 複合 `transfer` は個別の `result_t` を返し、成功・short transfer・失敗を
+  `getLastTransferStatus()` でも直近1件として取得できる。Access 全体の totals は集計しない。
 
 ## Bus の入手
 
 共通機構は [bus_accessor.md](bus_accessor.md) §Bus の保持 を参照。本 kind 固有の差分のみ以下に示す。
 
-- **identity = BCLK / WS / DOUT / DIN**。MCLK / buffer size / role は identity 外だが、
-  同一 identity の typed acquire で食い違う場合は `INVALID_STATE` を返す (既存 bus は再構成しない)。
+- **portable acquireのidentity projection = `Pins` tagのBCLK / WS / DOUT / DIN**。MCLK / buffer size / role は identity 外だが、
+  同一 identity の acquire で食い違う場合は `INVALID_STATE` を返す (既存 bus は再構成しない)。
 - I2S backend は **espidf のみ提供** (software/host では未提供)。
 - I2S は **static-backend policy**。`commitBuses()` は no-op、`hardwareInUse()` は 0。
   `acquire(LogicalBusConfig)` は I2C/SPI と同じ surface と validation を持つが、現時点では
-  有効な logical request に `NOT_IMPLEMENTED` を返す。bus 生成は `acquire<CfgT>(cfg)` が担い、
-  backend は初回 acquire の config 型で固定される。
+  有効な logical request に `NOT_IMPLEMENTED` を返す。bus生成はportable `acquire(cfg)`が担い、
+  providerはbuildのwinner bindingで固定される。
 - 直接構築 (`i2s::Bus bus; bus.init(cfg);`) も可。
+
+ESP-IDF backendでは、PDMと共通のcontroller leaseを使う。standard I2Sは番号の高いcontrollerから取得して
+I2S0をPDM用に残し、単一controller SoCでは両kindを相互排他にする。この物理controller選択はbackend内部の
+実装詳細であり、static-backend policyの`hardwareInUse() == 0`という公開契約は変えない。
 
 ## 設定の分担
 
@@ -116,9 +153,11 @@ struct Accessor;  // TX + RX 束ね (全二重を 1 つで)
 | `IBusConfig` | pins (bclk / ws / dout / din / mclk)、`tx_buffer_size` / `rx_buffer_size` (各方向 DMA 総量の目安)、`role` (Master / Slave、既定 Master・identity 外) | bus を生成・登録する側 (device) |
 | `AccessConfig` | `sample_rate_hz` / `bits_per_sample` (当面 16) / `channels` (論理PCM形状: 1=mono, 2=L/R interleaved stereo) / `write_timeout_ms` / `read_timeout_ms` | アクセスする側 |
 
-他バスと同じく AccessConfig は呼び出しごとに渡され、backend は前回設定と異なる場合のみ
-再構成する (明示的な start / stop API は置かない。DMA channel は最初の write / read で
-遅延開始し、停止は release / 再構成で行う)。
+`AccessConfig` は accessor 内の `OperationContext` が値として保持する。backend は
+`beginOperation` で要求設定を適用し、同じ Access 内の個々の I/O では再構成しない。DMA channel は
+最初の `beginAccess` で遅延開始するが、`endAccess` は連続 DMA を物理停止・drain する境界ではない。
+停止はclose / 再構成で行う。全二重で TX/RX Access が同時に存在する場合、sample rate / width /
+channels が一致しない後発 Access は `INVALID_STATE` とし、先行方向の設定を破壊しない。
 
 **既知の制約 — 全二重 reconfigure 境界の bus-level quiesce**: IDF に drain API が無いため、
 reconfigure (sample rate / channels 変更) の境界で in-flight バッファはそのまま切れる。
@@ -160,9 +199,7 @@ variant config は `using IBusConfig::IBusConfig;` でこのタグ ctor を継�
 
 詳細は [remote.md](remote.md) §データチャネル / §Transport 層 — frame mux 多重化 (credit 通知) を参照。remote I2S の TX/RX は
 `BusStreamTransfer` + `Data` frame stream で搬送する。remote proxy は stream request の前に
-同じ bytecode script 内で `BusConfigure` を送るため、`AccessConfig` の sample rate / bit depth /
-channel count / timeout は転送ごとに server 側 accessor へ反映される。
-
-## 将来拡張
-
-- 8 / 24 / 32 bit、PCM short / MSB 等のスロット形式
+`beginOperation` は `BusConfigure` を送って、`AccessConfig` の sample rate / bit depth /
+channel count / timeout を Access 開始時に server 側 accessor へ反映する。個々の wire RPC は
+session gate の都合で短く完結し、現行 protocol は server 側の物理 Access を複数 RPC にまたがって
+保持しない。

@@ -2,10 +2,12 @@
 #ifndef M5_HAL_VARIANTS_PLATFORMS_ESPRESSIF_ESP32_HAL_GPIO_PIN_BACKUP_HPP
 #define M5_HAL_VARIANTS_PLATFORMS_ESPRESSIF_ESP32_HAL_GPIO_PIN_BACKUP_HPP
 
-// Saves / restores the full GPIO-matrix + IO_MUX routing state of a single
-// MCU pin, so a pin currently bound to a peripheral (I2C / SPI ...) can be
-// borrowed for ad-hoc bit-bang GPIO control and then returned to its exact
-// previous role. Mirrors LovyanGFX gpio::pin_backup_t.
+// Saves / restores the GPIO-matrix + IO_MUX routing state associated with a
+// single MCU pin, so a pin currently bound to a peripheral (I2C / SPI ...) can
+// be borrowed for ad-hoc bit-bang GPIO control and then returned to its
+// previous role. The input-side backup is deliberately limited to the matrix
+// signal whose index matches the pin's output signal; unrelated or multiple
+// input routes are outside this utility's contract.
 //
 // The register macros come from the ESP-IDF soc headers and are uniform
 // across the ESP32 family (ESP32 / S3 / C3 / C6 / H2 / P4), so a single
@@ -41,6 +43,20 @@
 extern "C" const uint32_t GPIO_PIN_MUX_REG[] __attribute__((weak));
 
 namespace m5::variants::platforms::espressif::esp32::hal::v2::gpio {
+
+namespace detail {
+
+// IN_SEL stores a GPIO number, not a peripheral signal index. Keep this
+// comparison in a named helper so the two number spaces cannot be confused.
+constexpr bool inputRouteSelectsPin(size_t pin, uint32_t reg, uint32_t shift, uint32_t mask)
+{
+    return pin == ((reg >> shift) & mask);
+}
+
+static_assert(inputRouteSelectsPin(21, 21u << 3, 3, 0x3Fu));
+static_assert(!inputRouteSelectsPin(21, 22u << 3, 3, 0x3Fu));
+
+}  // namespace detail
 
 // Routing-state backup for one MCU pin. `backup()` is explicit (the ctor
 // only records the target pin); call `restore()` to write the captured
@@ -87,8 +103,10 @@ public:
         _gpio_enable = (*reinterpret_cast<volatile uint32_t*>(GPIO_ENABLE_REG) >> (pin & 31)) & 1;
 #endif
 
-        // If this pin feeds a peripheral input via the GPIO matrix, save that
-        // input-routing register too so restore() rewires the input side.
+        // Preserve the symmetric input route: use the output signal index to
+        // select one input-routing register, then verify that its IN_SEL GPIO
+        // number is this pin. Non-symmetric and multiple input routes are not
+        // scanned; doing so would require variable-size backup state.
         const size_t func_num = (_gpio_func_out_reg >> GPIO_FUNC0_OUT_SEL_S) & GPIO_FUNC0_OUT_SEL_V;
         // `::GPIO` (global soc instance) — the unqualified `GPIO` would bind to
         // the variant's `class GPIO` in this same namespace.
@@ -96,11 +114,11 @@ public:
         if (func_num < in_count) {
 #if defined(GPIO_FUNC0_IN_SEL_CFG_REG)
             const uint32_t in_reg = *reinterpret_cast<volatile uint32_t*>(GPIO_FUNC0_IN_SEL_CFG_REG + (func_num * 4));
-            const bool hit        = func_num == ((in_reg >> GPIO_FUNC0_IN_SEL_S) & GPIO_FUNC0_IN_SEL_V);
+            const bool hit        = detail::inputRouteSelectsPin(pin, in_reg, GPIO_FUNC0_IN_SEL_S, GPIO_FUNC0_IN_SEL_V);
 #else
             const uint32_t in_reg =
                 *reinterpret_cast<volatile uint32_t*>(GPIO_FUNC1_IN_SEL_CFG_REG + ((func_num - 1) * 4));
-            const bool hit = func_num == ((in_reg >> GPIO_FUNC1_IN_SEL_S) & GPIO_FUNC1_IN_SEL_V);
+            const bool hit = detail::inputRouteSelectsPin(pin, in_reg, GPIO_FUNC1_IN_SEL_S, GPIO_FUNC1_IN_SEL_V);
 #endif
             if (hit) {
                 _gpio_func_in_reg = in_reg;

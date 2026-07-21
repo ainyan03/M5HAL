@@ -6,6 +6,7 @@
 #include "./allocation_core.hpp"
 #include "./hal_backend.hpp"
 #include "./managed_bus.hpp"
+#include "../resource_domain.hpp"
 
 #include <new>
 
@@ -17,10 +18,91 @@ namespace m5::hal::v2::bus {
 
 //-------------------------------------------------------------------------
 /*!
+  @brief Type-erased local provider for portable acquisition.
+
+  A provider is registered independently of a config's concrete C++ type.
+  It validates registry hits with the kind Traits and builds a ready backend
+  on misses. Provider objects are borrowed and must outlive LocalBackend.
+ */
+struct ILocalPortableProvider {
+    virtual types::bus_kind_t kind(void) const                                                  = 0;
+    virtual ResourceKey identityFromConfig(const IBusConfig& cfg) const                         = 0;
+    virtual bool configCompatible(const IBusConfig& current, const IBusConfig& requested) const = 0;
+    virtual result_t<std::shared_ptr<IBus>> createFacade(const LocalResourceContext& resources,
+                                                         const IBusConfig& cfg) const           = 0;
+    virtual ~ILocalPortableProvider()                                                           = default;
+};
+
+/*!
+  @brief Traits adapter for a selected variant's portable backend factory.
+
+  `Factory` receives only the kind-level config and returns an initialized
+  backend. The adapter wraps it in the kind's runtime facade so all providers
+  share the same registry and public bus type.
+ */
+template <class Traits>
+class LocalPortableProvider : public ILocalPortableProvider {
+public:
+    using KindIBus   = typename Traits::IBus;
+    using KindConfig = typename Traits::IBusConfig;
+    using BusType    = typename Traits::BusType;
+    using Factory    = result_t<std::unique_ptr<KindIBus>> (*)(const LocalResourceContext&, const KindConfig&);
+
+    explicit LocalPortableProvider(Factory factory) : _factory{factory}
+    {
+    }
+
+    types::bus_kind_t kind(void) const override
+    {
+        return Traits::KIND;
+    }
+
+    ResourceKey identityFromConfig(const IBusConfig& cfg) const override
+    {
+        return Traits::identityFromConfig(static_cast<const KindConfig&>(cfg));
+    }
+
+    bool configCompatible(const IBusConfig& current, const IBusConfig& requested) const override
+    {
+        return Traits::configCompatible(static_cast<const KindConfig&>(current),
+                                        static_cast<const KindConfig&>(requested));
+    }
+
+    result_t<std::shared_ptr<IBus>> createFacade(const LocalResourceContext& resources,
+                                                 const IBusConfig& cfg) const override
+    {
+        if (_factory == nullptr) {
+            return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
+        }
+        auto made = _factory(resources, static_cast<const KindConfig&>(cfg));
+        if (!made.has_value()) {
+            return m5::stl::make_unexpected(made.error());
+        }
+        if (!made.value()) {
+            return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+        }
+        std::shared_ptr<BusType> facade{new (std::nothrow) BusType()};
+        if (!facade) {
+            return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+        }
+        facade->bindLocalResources(resources);
+        auto adopted = facade->adoptPortableBackend(std::move(made.value()), static_cast<const KindConfig&>(cfg));
+        if (!adopted.has_value()) {
+            return m5::stl::make_unexpected(adopted.error());
+        }
+        return std::shared_ptr<IBus>{std::move(facade)};
+    }
+
+private:
+    Factory _factory = nullptr;
+};
+
+//-------------------------------------------------------------------------
+/*!
   @brief Extended kind adapter for LocalBackend's logical acquire path.
 
   Adds facade creation and intent retagging to the base IAllocationKind.
-  The AllocationCore only needs IAllocationKind (factory + commit hooks);
+  The AllocationCore only needs IAllocationKind (planning + atomic commit hooks);
   LocalBackend additionally needs to create facades on a logical-acquire
   miss and retag intents on a hit.
  */
@@ -45,7 +127,7 @@ struct ILocalKindAdapter : public IAllocationKind {
       @brief Access the kind's AllocationCore (null for non-intent kinds).
 
       Intent-driven kinds (I2C/SPI) return their embedded core; static kinds
-      (UART/I2S) return nullptr. Used by LocalBackend for commitBuses and
+      (UART/I2S/PDM) return nullptr. Used by LocalBackend for commitBuses and
       hardwareInUse.
      */
     virtual AllocationCore* allocationCore(void)             = 0;
@@ -72,7 +154,7 @@ struct ILocalKindAdapter : public IAllocationKind {
   @brief Per-kind adapter template for LocalBackend.
 
   Implements ILocalKindAdapter (facade creation + intent retag) and the full
-  IAllocationKind interface (factory hooks + commit hooks used by AllocationCore).
+  IAllocationKind interface (planning + commit hooks used by AllocationCore).
   Extracted from the former `BusViewBase<Traits>` — the same logic, now owned
   by LocalBackend instead of BusView.
 
@@ -82,7 +164,7 @@ struct ILocalKindAdapter : public IAllocationKind {
 
   Traits contract: same as the former BusViewBase Traits — `IBus`, `BusType`,
   `LogicalBusConfig`, `KIND`, `CAPS_HARDWARE`, `applyAdopt`, `fillLogical`,
-  and the `BackendFor` selector. `SoftwareBackendFactory` / `HardwareBackendFactory`
+  `SoftwareBackendFactory` / `HardwareBackendFactory`
   follow the BusViewBase convention: function pointers taking `LogicalBusConfig`.
  */
 template <class Traits>
@@ -91,8 +173,8 @@ public:
     using KindIBus         = typename Traits::IBus;
     using BusType          = typename Traits::BusType;
     using LogicalBusConfig = typename Traits::LogicalBusConfig;
-    using SwFactory        = KindIBus* (*)(const LogicalBusConfig&);
-    using HwFactory        = KindIBus* (*)(const LogicalBusConfig&, int8_t controller);
+    using SwFactory        = KindIBus* (*)(const LocalResourceContext&, const LogicalBusConfig&);
+    using HwFactory        = KindIBus* (*)(const LocalResourceContext&, const LogicalBusConfig&, int8_t controller);
 
     /*!
       @brief Non-uniform controller topology: the pieces a kind's variant
@@ -119,13 +201,27 @@ public:
     };
 
     LocalKindAdapter(BusRegistry& registry, SwFactory sw, HwFactory hw = nullptr, uint8_t hw_capacity = 0,
-                     Topology topo = {})
-        : _sw_factory{sw}, _hw_factory{hw}, _capacity{hw_capacity}, _core{registry, *this, hw_capacity}, _topo{topo}
+                     Topology topo = {}, LocalResourceContext resources = {})
+        : _sw_factory{sw},
+          _hw_factory{hw},
+          _capacity{hw_capacity},
+          _core{registry, *this, hw_capacity},
+          _topo{topo},
+          _resources{std::move(resources)}
     {
     }
 
     LocalKindAdapter(const LocalKindAdapter&)            = delete;
     LocalKindAdapter& operator=(const LocalKindAdapter&) = delete;
+
+    void setLocalResources(LocalResourceContext resources)
+    {
+        _resources = std::move(resources);
+    }
+    void bindLifetime(const std::shared_ptr<void>& lifetime)
+    {
+        _lifetime = lifetime;
+    }
 
     AllocationCore* allocationCore(void) override
     {
@@ -141,11 +237,13 @@ public:
     result_t<std::shared_ptr<IBus>> createLogicalFacade(const AllocationRequest& req) const override
     {
         const auto& logical = *static_cast<const LogicalBusConfig*>(req.config);
+        auto resources      = localResources();
         std::shared_ptr<BusType> facade{new (std::nothrow) BusType()};
         if (!facade) {
             return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
         }
-        std::unique_ptr<KindIBus> sw{_sw_factory != nullptr ? _sw_factory(logical) : nullptr};
+        facade->bindLocalResources(resources);
+        std::unique_ptr<KindIBus> sw{_sw_factory != nullptr ? _sw_factory(resources, logical) : nullptr};
         if (!sw) {
             return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
         }
@@ -180,16 +278,6 @@ public:
     {
         return static_cast<BusType&>(b);
     }
-    IBus* makePlaceholder(IManagedBus& mb, const types::AllocationIntent& intent) const override
-    {
-        auto& self = static_cast<BusType&>(mb);
-        return _sw_factory != nullptr ? _sw_factory(self.logicalConfig(intent)) : nullptr;
-    }
-    IBus* makeHardware(IManagedBus& mb, const types::AllocationIntent& intent, int8_t controller) const override
-    {
-        auto& self = static_cast<BusType&>(mb);
-        return _hw_factory != nullptr ? _hw_factory(self.logicalConfig(intent), controller) : nullptr;
-    }
     result_t<void> commitPlaceholder(IManagedBus& mb, const types::AllocationIntent& intent,
                                      uint32_t timeout_ms) const override
     {
@@ -201,15 +289,15 @@ public:
         // controller instead of leaving the bus without a backend.
         const int8_t cur = self.controllerId();
         // A null placeholder is a valid outcome ONLY for a software-less
-        // kind (makePlaceholder() returns null by design there, not by
+        // kind (_makePlaceholder() returns null by design there, not by
         // failure). A kind WITH a software factory returning null instead
         // means the build itself failed (e.g. OOM): that must be treated as
         // a swap failure so the rollback factory below runs, rather than
         // silently landing the bus on no backend at all.
         return self.swapBackendWith(
             timeout_ms, /*allow_null=*/_sw_factory == nullptr,
-            [&]() -> IBus* { return this->makePlaceholder(mb, intent); },
-            [this, &mb, &intent, cur]() -> IBus* { return this->makeHardware(mb, intent, cur); });
+            [&]() -> IBus* { return this->_makePlaceholder(mb, intent); },
+            [this, &mb, &intent, cur]() -> IBus* { return this->_makeHardware(mb, intent, cur); });
     }
     result_t<void> commitHardware(IManagedBus& mb, const types::AllocationIntent& intent, int8_t controller,
                                   uint32_t timeout_ms) const override
@@ -219,11 +307,11 @@ public:
         // commitPlaceholder above -- a same-pass demote runs first), so the
         // rollback factory recreating the placeholder is always correct: for
         // a kind with a software placeholder it rebuilds that backend, and
-        // for a software-less kind makePlaceholder() itself returns null,
+        // for a software-less kind _makePlaceholder() itself returns null,
         // which is the correct pending fallback.
         return self.swapBackendWith(
-            timeout_ms, /*allow_null=*/false, [&]() -> IBus* { return this->makeHardware(mb, intent, controller); },
-            [this, &mb, &intent]() -> IBus* { return this->makePlaceholder(mb, intent); });
+            timeout_ms, /*allow_null=*/false, [&]() -> IBus* { return this->_makeHardware(mb, intent, controller); },
+            [this, &mb, &intent]() -> IBus* { return this->_makePlaceholder(mb, intent); });
     }
     bool uniformControllers(void) const override
     {
@@ -256,37 +344,100 @@ public:
     }
 
 private:
+    LocalResourceContext localResources(void) const
+    {
+        auto resources = _resources;
+        if (auto lifetime = _lifetime.lock()) {
+            resources.lifetime = std::move(lifetime);
+        }
+        return resources;
+    }
+
+    IBus* _makePlaceholder(IManagedBus& mb, const types::AllocationIntent& intent) const
+    {
+        auto& self     = static_cast<BusType&>(mb);
+        auto resources = localResources();
+        return _sw_factory != nullptr ? _sw_factory(resources, self.logicalConfig(intent)) : nullptr;
+    }
+
+    IBus* _makeHardware(IManagedBus& mb, const types::AllocationIntent& intent, int8_t controller) const
+    {
+        auto& self     = static_cast<BusType&>(mb);
+        auto resources = localResources();
+        return _hw_factory != nullptr ? _hw_factory(resources, self.logicalConfig(intent), controller) : nullptr;
+    }
+
     SwFactory _sw_factory = nullptr;
     HwFactory _hw_factory = nullptr;
     uint8_t _capacity     = 0;
     AllocationCore _core;
     Topology _topo{};
+    LocalResourceContext _resources;
+    std::weak_ptr<void> _lifetime;
 };
 
 //-------------------------------------------------------------------------
 /*!
-  @brief Local (on-device) backend: owns the bus registry and per-kind adapters.
+  @brief Local backend bound to a co-owned ResourceDomain.
 
-  Implements IHalBackend for the local case. The typed acquire path is handled
-  by BusView calling `busRegistry().acquireOrFind()` directly (template make-
-  lambda, no virtual needed). The logical path and commit go through virtuals.
+  Implements IHalBackend for the local case. Portable acquire is routed to a
+  registered type-erased provider, while the logical path is routed to the
+  allocation adapter. Both paths intern facades in the domain registry.
 
-  Per-kind adapters are registered at construction time (M5HALCore ctor) and
-  borrowed (not owned). The adapters live as M5HALCore members, declared before
-  the BusViews in member-init order. Each adapter owns its AllocationCore.
+  The registry and GPIO/Services/Memory dependencies come from the injected
+  domain. Per-kind adapters are borrowed from the owning local connection
+  state; each allocation adapter owns its AllocationCore, while portable
+  provider adapters hold the selected variant factory.
  */
 class LocalBackend : public IHalBackend {
 public:
     LocalBackend(void) = default;
+    explicit LocalBackend(const ResourceDomain& domain) : _domain{domain}
+    {
+    }
 
     LocalBackend(const LocalBackend&)            = delete;
     LocalBackend& operator=(const LocalBackend&) = delete;
 
     void registerKind(ILocalKindAdapter& adapter);
+    void registerPortableProvider(ILocalPortableProvider& provider);
+
+    BusRegistry& busRegistry(void) override
+    {
+        return _domain.busRegistry();
+    }
+    const BusRegistry& busRegistry(void) const override
+    {
+        return _domain.busRegistry();
+    }
+
+    const ResourceDomain& resourceDomain(void) const
+    {
+        return _domain;
+    }
+    const ResourceDomain* localResourceDomain(void) const override
+    {
+        return &_domain;
+    }
+    LocalResourceContext localResources(void) const override
+    {
+        auto resources = _domain.localResources();
+        if (auto lifetime = _lifetime.lock()) {
+            resources.lifetime = std::move(lifetime);
+        }
+        return resources;
+    }
+    void bindLifetime(const std::shared_ptr<void>& lifetime)
+    {
+        _lifetime = lifetime;
+    }
 
     // --- IHalBackend ------------------------------------------------------
 
-    result_t<std::shared_ptr<IBus>> acquireBusLogical(types::bus_kind_t kind, const IdentityKey& id,
+    result_t<std::shared_ptr<IBus>> acquireBusPortable(types::bus_kind_t kind, const ResourceKey& id,
+                                                       const IBusConfig& cfg) override;
+
+    result_t<std::shared_ptr<IBus>> acquireBusLogical(types::bus_kind_t kind, const ResourceKey& id,
                                                       const AllocationRequest& req) override;
 
     result_t<void> completeLogicalRequest(types::bus_kind_t kind, void* logical_config) override;
@@ -300,10 +451,13 @@ public:
     result_t<void> releaseClaimedController(types::bus_kind_t kind, int8_t controller) override;
 
 private:
-    static constexpr size_t kMaxKinds = 5;
+    ResourceDomain _domain;
+    std::weak_ptr<void> _lifetime;
+    static constexpr size_t kMaxKinds = 6;
 
     struct KindSlot {
-        ILocalKindAdapter* adapter = nullptr;
+        ILocalKindAdapter* adapter                = nullptr;
+        ILocalPortableProvider* portable_provider = nullptr;
     };
     KindSlot _slots[kMaxKinds];
 

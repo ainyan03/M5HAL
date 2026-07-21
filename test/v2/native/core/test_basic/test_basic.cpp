@@ -7,6 +7,19 @@
 
 namespace {
 
+#define EXPECT_SERVICE_OK(expression)                                                                \
+    do {                                                                                             \
+        const auto result_ = (expression);                                                           \
+        EXPECT_TRUE(result_.has_value()) << "err=" << m5::hal::v2::error::toString(result_.error()); \
+    } while (false)
+
+#define EXPECT_SERVICE_RUN(expression, expected_progress)                                            \
+    do {                                                                                             \
+        const auto result_ = (expression);                                                           \
+        ASSERT_TRUE(result_.has_value()) << "err=" << m5::hal::v2::error::toString(result_.error()); \
+        EXPECT_EQ(result_.value(), (expected_progress));                                             \
+    } while (false)
+
 class CountingService : public m5::hal::v2::service::IService {
 public:
     explicit CountingService(m5::hal::v2::service::ServiceResult result) : _result(result)
@@ -36,6 +49,7 @@ TEST(ErrorToString, ReturnsTheEnumeratorSpelling)
     EXPECT_STREQ(toString(error_t::I2C_NO_ACK), "I2C_NO_ACK");
     EXPECT_STREQ(toString(error_t::TIMEOUT_ERROR), "TIMEOUT_ERROR");
     EXPECT_STREQ(toString(error_t::DEVICE_MISMATCH), "DEVICE_MISMATCH");
+    EXPECT_STREQ(toString(error_t::WOULD_BLOCK), "WOULD_BLOCK");
 }
 
 TEST(ErrorToString, UnknownWireValuesDoNotCrash)
@@ -53,6 +67,39 @@ TEST(ErrorCodes, DeviceMismatchStaysInsideTheWireRange)
     using m5::hal::v2::error::error_t;
     // int8_t wire constraint (spec/design/errors.md).
     EXPECT_EQ(static_cast<int8_t>(error_t::DEVICE_MISMATCH), -19);
+}
+
+TEST(ErrorCodes, WouldBlockExtendsTheContiguousWireRange)
+{
+    using m5::hal::v2::error::error_t;
+    EXPECT_EQ(static_cast<int8_t>(error_t::WOULD_BLOCK), -22);
+    EXPECT_EQ(m5::hal::v2::remote::mapRemoteError(-22), error_t::WOULD_BLOCK);
+    EXPECT_EQ(m5::hal::v2::remote::mapRemoteError(-23), error_t::REMOTE_FAULT);
+}
+
+TEST(OperationRuntime, UsesWrapSafeRemainingBudgetAndNonzeroGeneration)
+{
+    namespace bus   = m5::hal::v2::bus;
+    namespace types = m5::hal::v2::types;
+
+    bus::OperationRuntime runtime;
+    runtime.generation = UINT32_MAX;
+    runtime.begin(UINT32_MAX - 3u, 10u, bus::OperationMode::TxRx);
+    EXPECT_EQ(runtime.generation, 1u);
+    EXPECT_EQ(bus::remainingTimeout(runtime, 2u), 4u);
+    EXPECT_EQ(bus::remainingTimeout(runtime, 7u), 0u);
+
+    runtime.begin(123u, types::TIMEOUT_FOREVER, bus::OperationMode::Slave);
+    EXPECT_EQ(bus::remainingTimeout(runtime, 456u), types::TIMEOUT_FOREVER);
+    EXPECT_EQ(runtime.mode, bus::OperationMode::Slave);
+}
+
+TEST(TransferStatus, ZeroIdIsTheUninitializedSentinel)
+{
+    m5::hal::v2::bus::TransferStatus status;
+    EXPECT_EQ(status.transfer_id, 0u);
+    EXPECT_EQ(status.error, m5::hal::v2::error::error_t::OK);
+    EXPECT_EQ(status.completion, m5::hal::v2::bus::CompletionLevel::None);
 }
 
 TEST(NativeEnvironment, GoogleTestRuns)
@@ -87,22 +134,24 @@ TEST(ServiceRunner, RunsRegisteredServicesInOrder)
     CountingService idle{ServiceResult::Idle};
     CountingService progress{ServiceResult::Progress};
 
-    EXPECT_TRUE(runner.add(idle));
-    EXPECT_TRUE(runner.add(progress));
-    EXPECT_FALSE(runner.add(idle));
+    EXPECT_SERVICE_OK(runner.add(idle));
+    EXPECT_SERVICE_OK(runner.add(progress));
+    const auto duplicate = runner.add(idle);
+    ASSERT_FALSE(duplicate.has_value());
+    EXPECT_EQ(duplicate.error(), m5::hal::v2::error::error_t::INVALID_STATE);
     EXPECT_EQ(runner.size(), size_t{2});
 
-    EXPECT_TRUE(runner.runOnce(m5::hal::v2::service::ServiceContext{1234, 0}));
+    EXPECT_SERVICE_RUN(runner.runOnce(m5::hal::v2::service::ServiceContext{1234, 0}), true);
     EXPECT_EQ(idle.count, 1);
     EXPECT_EQ(progress.count, 1);
     EXPECT_EQ(idle.last_elapsed, 1234u);
     EXPECT_EQ(progress.last_elapsed, 1234u);
 
-    EXPECT_TRUE(runner.remove(idle));
-    EXPECT_FALSE(runner.remove(idle));
+    EXPECT_SERVICE_OK(runner.remove(idle));
+    EXPECT_SERVICE_OK(runner.remove(idle));
     EXPECT_EQ(runner.size(), size_t{1});
 
-    EXPECT_TRUE(runner.runOnce(m5::hal::v2::service::ServiceContext{4444, 0}));
+    EXPECT_SERVICE_RUN(runner.runOnce(m5::hal::v2::service::ServiceContext{4444, 0}), true);
     EXPECT_EQ(idle.count, 1);
     EXPECT_EQ(progress.count, 2);
     EXPECT_EQ(progress.last_elapsed, 4444u);
@@ -147,18 +196,21 @@ TEST(M5HALCore, OwnsGlobalServiceRunner)
     using m5::hal::v2::service::ServiceResult;
 
     auto& runner = m5::hal::v2::M5_Hal.Services;
-    runner.clear();
+    EXPECT_SERVICE_OK(runner.clear());
 
     CountingService service{ServiceResult::Progress};
-    EXPECT_TRUE(runner.add(service));
-    EXPECT_TRUE(m5::hal::v2::getM5_Hal().Services.runOnce(m5::hal::v2::service::ServiceContext{1000, 0}));
+    EXPECT_SERVICE_OK(runner.add(service));
+    EXPECT_SERVICE_RUN(m5::hal::v2::getM5_Hal().Services.runOnce(m5::hal::v2::service::ServiceContext{1000, 0}), true);
     EXPECT_EQ(service.count, 1);
 
-    EXPECT_TRUE(runner.remove(service));
+    EXPECT_SERVICE_OK(runner.remove(service));
     EXPECT_EQ(runner.size(), size_t{0});
 }
 
 }  // namespace
+
+#undef EXPECT_SERVICE_OK
+#undef EXPECT_SERVICE_RUN
 
 int main(int argc, char** argv)
 {

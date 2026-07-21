@@ -3,17 +3,21 @@
 #define M5_HAL_HAL_V2_I2C_SLAVE_INL_
 
 #include "slave.hpp"
+#include "slave_accessor.hpp"
+#include "../service/completion_gate.hpp"
+
+#include <cstdlib>
 
 namespace m5::hal::v2::i2c {
 
-result_t<void> SlaveStreamAccessor::beginTransaction(uint32_t timeout_ms)
+result_t<void> SlaveStreamAccessor::openWireFrame(uint32_t timeout_ms)
 {
     if (!isBound()) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
     const uint32_t start_ms = runtime::millis();
     for (;;) {
-        auto r = getBus().beginTransaction(this, 0);
+        auto r = getBus().tryOpenWireFrame(this);
         if (r.has_value() || r.error() != error::error_t::TIMEOUT_ERROR || timeout_ms == 0) {
             return r;
         }
@@ -28,12 +32,12 @@ result_t<void> SlaveStreamAccessor::beginTransaction(uint32_t timeout_ms)
     }
 }
 
-result_t<void> SlaveStreamAccessor::endTransaction(void)
+result_t<void> SlaveStreamAccessor::closeWireFrame(void)
 {
     if (!isBound()) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
-    return getBus().endTransaction(this);
+    return getBus().closeWireFrame(this);
 }
 
 result_t<size_t> SlaveStreamAccessor::read(data::DataSpan dst)
@@ -55,7 +59,7 @@ result_t<size_t> SlaveStreamAccessor::read(data::DataSpan dst)
             return getBus().read(this, dst);
         }
 
-        auto complete = getBus().transactionComplete(this);
+        auto complete = getBus().wireFrameComplete(this);
         if (!complete.has_value()) {
             return m5::stl::make_unexpected(complete.error());
         }
@@ -97,17 +101,17 @@ result_t<size_t> SlaveStreamAccessor::readableBytes(void)
     return getBus().readableBytes(this);
 }
 
-result_t<bool> SlaveStreamAccessor::transactionComplete(void)
+result_t<bool> SlaveStreamAccessor::wireFrameComplete(void)
 {
     if (!isBound()) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
-    return getBus().transactionComplete(this);
+    return getBus().wireFrameComplete(this);
 }
 
 result_t<size_t> SlaveStreamAccessor::serve(data::Source *src, data::Sink *dst, uint32_t timeout_ms)
 {
-    auto begin = beginTransaction(timeout_ms);
+    auto begin = openWireFrame(timeout_ms);
     if (!begin.has_value()) {
         return m5::stl::make_unexpected(begin.error());
     }
@@ -234,7 +238,7 @@ result_t<size_t> SlaveStreamAccessor::serve(data::Source *src, data::Sink *dst, 
         if (progressed) {
             last_progress_ms = runtime::millis();
         } else {
-            auto complete = transactionComplete();
+            auto complete = wireFrameComplete();
             if (!complete.has_value()) {
                 err    = complete.error();
                 failed = true;
@@ -283,7 +287,7 @@ result_t<size_t> SlaveStreamAccessor::serve(data::Source *src, data::Sink *dst, 
                     // assumes the master finishes once the stretch lifts, but nothing
                     // arrived for another full deadline -- the master itself went
                     // inactive (died / aborted with no visible STOP). Waiting on
-                    // transactionComplete() would hang forever; abandon outright.
+                    // wireFrameComplete() would hang forever; abandon outright.
                     // Bus-safe: no-progress means the ring is empty, so no RX_FULL
                     // hold is pending, and a TX-side hold self-heals via the
                     // responder task's stretch budget (fill-byte fallback).
@@ -306,7 +310,7 @@ result_t<size_t> SlaveStreamAccessor::serve(data::Source *src, data::Sink *dst, 
         }
     }
 
-    auto ended = endTransaction();
+    auto ended = closeWireFrame();
     if (failed) {
         return m5::stl::make_unexpected(err);
     }
@@ -337,7 +341,7 @@ result_t<void> SlaveRegMapAccessor::serve(uint32_t timeout_ms)
         // ISlaveBus::bindIsrRegMap). Nothing here needs beginExchange/ingest/
         // composeReply -- just open the transaction and wait for the backend to
         // report it complete (the master's STOP).
-        auto begin = _stream.beginTransaction(timeout_ms);
+        auto begin = _stream.openWireFrame(timeout_ms);
         if (!begin.has_value()) {
             return begin;
         }
@@ -356,9 +360,9 @@ result_t<void> SlaveRegMapAccessor::serve(uint32_t timeout_ms)
         uint32_t last_progress_ms = runtime::millis();
         bool stalled              = false;
         for (;;) {
-            auto complete = _stream.transactionComplete();
+            auto complete = _stream.wireFrameComplete();
             if (!complete.has_value()) {
-                (void)_stream.endTransaction();
+                (void)_stream.closeWireFrame();
                 return m5::stl::make_unexpected(complete.error());
             }
             if (complete.value()) {
@@ -373,14 +377,14 @@ result_t<void> SlaveRegMapAccessor::serve(uint32_t timeout_ms)
                 last_progress_ms = runtime::millis();
             }
         }
-        auto ended = _stream.endTransaction();
+        auto ended = _stream.closeWireFrame();
         if (stalled) {
             return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
         }
         return ended;
     }
 
-    auto begin = _stream.beginTransaction(timeout_ms);
+    auto begin = _stream.openWireFrame(timeout_ms);
     if (!begin.has_value()) {
         return begin;
     }
@@ -469,7 +473,7 @@ result_t<void> SlaveRegMapAccessor::serve(uint32_t timeout_ms)
         //    the read reply pumped. Drain everything available BEFORE checking
         //    complete: the final write bytes are pushed into the rx queue by
         //    the STOP interrupt, so they become readable at the same moment
-        //    transactionComplete() turns true. Checking complete first would
+        //    wireFrameComplete() turns true. Checking complete first would
         //    leave that tail unread.
         while (!failed) {
             auto more = _stream.readableBytes();
@@ -491,7 +495,7 @@ result_t<void> SlaveRegMapAccessor::serve(uint32_t timeout_ms)
                     continue;
                 }
             }
-            auto complete = _stream.transactionComplete();
+            auto complete = _stream.wireFrameComplete();
             if (!complete.has_value()) {
                 err    = complete.error();
                 failed = true;
@@ -559,7 +563,7 @@ result_t<void> SlaveRegMapAccessor::serve(uint32_t timeout_ms)
 
     // Always close the transaction (even on a mid-exchange error) so the bus
     // is not left open. Report the first hard error if there was one.
-    auto ended = _stream.endTransaction();
+    auto ended = _stream.closeWireFrame();
     if (failed) {
         return m5::stl::make_unexpected(err);
     }
@@ -567,7 +571,7 @@ result_t<void> SlaveRegMapAccessor::serve(uint32_t timeout_ms)
         // Report the stall even if the close also failed: like `failed` above,
         // the policy is "first abnormality wins" (the stall was detected before
         // the close was attempted). Matches SlaveStreamAccessor::serve(), whose
-        // escape return likewise takes priority over the endTransaction result.
+        // escape return likewise takes priority over the closeWireFrame result.
         return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
     }
     return ended;
@@ -629,8 +633,9 @@ result_t<void> ScopedSlaveServiceRegistration::registerTo(service::ServiceRunner
     if (svc == nullptr) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
-    if (!runner.add(*svc)) {
-        return m5::stl::make_unexpected(error::error_t::BUSY);
+    auto added = runner.add(*svc);
+    if (!added.has_value()) {
+        return m5::stl::make_unexpected(added.error());
     }
     _runner  = &runner;
     _service = svc;
@@ -640,6 +645,9 @@ result_t<void> ScopedSlaveServiceRegistration::registerTo(service::ServiceRunner
 void ScopedSlaveServiceRegistration::release()
 {
     if (_runner != nullptr && _service != nullptr) {
+        // release() is also used by the destructor and move assignment, which
+        // cannot report teardown errors. Explicit registerTo() still reports
+        // the exact registration error.
         (void)_runner->remove(*_service);
     }
     _runner  = nullptr;
@@ -653,13 +661,29 @@ bool ScopedSlaveServiceRegistration::registered() const
 
 result_t<void> SlaveBus_software::init(SlaveLineDriver &lines, const SlaveBusConfig &config)
 {
+    if (!initializationAllowed(false)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    auto locked = _queued_mutex.lock(types::TIMEOUT_FOREVER);
+    if (!locked.has_value()) {
+        return m5::stl::make_unexpected(locked.error());
+    }
+    runtime::ScopedUnlock unlock{_queued_mutex};
+
+    if (_queued_active || _queued_frame_active) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
     if (config.address_is_10bit || config.address > 0x7F) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
     _lines  = &lines;
     _config = config;
     resetProtocol();
-    return {};
+    _queued_lifecycle_used = false;
+    _queued_active         = false;
+    _queued_accessor       = nullptr;
+    _queued_context        = nullptr;
+    return markInitializationSucceeded(false);
 }
 
 result_t<void> SlaveBus_software::init(const SlaveBusConfig &cfg)
@@ -668,15 +692,38 @@ result_t<void> SlaveBus_software::init(const SlaveBusConfig &cfg)
     return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
 }
 
-result_t<void> SlaveBus_software::release(void)
+result_t<void> SlaveBus_software::teardownBackend(void)
 {
+    auto locked = _queued_mutex.lock(types::TIMEOUT_FOREVER);
+    if (!locked.has_value()) {
+        return m5::stl::make_unexpected(locked.error());
+    }
+    runtime::ScopedUnlock unlock{_queued_mutex};
+
+    if (_queued_active || _open != nullptr || _current != nullptr) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
     if (_lines != nullptr) {
         _lines->pullSdaLow(false);
         _lines->pullSclLow(false);
     }
-    _lines = nullptr;
-    _open  = nullptr;
+    _lines           = nullptr;
+    _open            = nullptr;
+    _open_owner      = nullptr;
+    _queued_active   = false;
+    _queued_closing  = false;
+    _queued_accessor = nullptr;
+    _queued_context  = nullptr;
     return {};
+}
+
+bus::CloseOutcome SlaveBus_software::closeBackend(void)
+{
+    auto closed = teardownBackend();
+    if (closed.has_value()) {
+        return bus::CloseOutcome::success();
+    }
+    return bus::CloseOutcome::noMutation(closed.error());
 }
 
 service::IService *SlaveBus_software::service()
@@ -684,10 +731,18 @@ service::IService *SlaveBus_software::service()
     return this;
 }
 
-result_t<void> SlaveBus_software::beginTransaction(bus::IAccessor *owner, uint32_t timeout_ms)
+result_t<void> SlaveBus_software::tryOpenWireFrame(bus::IAccessor *owner)
 {
-    (void)timeout_ms;
-    if (owner == nullptr || _open != nullptr) {
+    auto locked = _queued_mutex.lock(types::TIMEOUT_FOREVER);
+    if (!locked.has_value()) {
+        return m5::stl::make_unexpected(locked.error());
+    }
+    runtime::ScopedUnlock unlock{_queued_mutex};
+
+    if (!_config.legacy_wire_frame_window || _queued_lifecycle_used) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    if (owner == nullptr || _open != nullptr || _queued_active) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
     Transaction *txn = oldestOpenableTransaction();
@@ -701,8 +756,14 @@ result_t<void> SlaveBus_software::beginTransaction(bus::IAccessor *owner, uint32
     return {};
 }
 
-result_t<void> SlaveBus_software::endTransaction(bus::IAccessor *owner)
+result_t<void> SlaveBus_software::closeWireFrame(bus::IAccessor *owner)
 {
+    auto locked = _queued_mutex.lock(types::TIMEOUT_FOREVER);
+    if (!locked.has_value()) {
+        return m5::stl::make_unexpected(locked.error());
+    }
+    runtime::ScopedUnlock unlock{_queued_mutex};
+
     if (owner == nullptr || _open == nullptr || _open_owner != owner) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
@@ -714,6 +775,12 @@ result_t<void> SlaveBus_software::endTransaction(bus::IAccessor *owner)
 
 result_t<size_t> SlaveBus_software::read(bus::IAccessor *owner, data::DataSpan dst)
 {
+    auto locked = _queued_mutex.lock(types::TIMEOUT_FOREVER);
+    if (!locked.has_value()) {
+        return m5::stl::make_unexpected(locked.error());
+    }
+    runtime::ScopedUnlock unlock{_queued_mutex};
+
     if (!isOpenOwner(owner) || (dst.data == nullptr && dst.size != 0)) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
@@ -734,6 +801,12 @@ result_t<size_t> SlaveBus_software::read(bus::IAccessor *owner, data::DataSpan d
 
 result_t<size_t> SlaveBus_software::write(bus::IAccessor *owner, data::ConstDataSpan src)
 {
+    auto locked = _queued_mutex.lock(types::TIMEOUT_FOREVER);
+    if (!locked.has_value()) {
+        return m5::stl::make_unexpected(locked.error());
+    }
+    runtime::ScopedUnlock unlock{_queued_mutex};
+
     if (!isOpenOwner(owner) || (src.data == nullptr && src.size != 0)) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
@@ -760,18 +833,150 @@ result_t<size_t> SlaveBus_software::write(bus::IAccessor *owner, data::ConstData
 
 result_t<size_t> SlaveBus_software::readableBytes(bus::IAccessor *owner)
 {
+    auto locked = _queued_mutex.lock(types::TIMEOUT_FOREVER);
+    if (!locked.has_value()) {
+        return m5::stl::make_unexpected(locked.error());
+    }
+    runtime::ScopedUnlock unlock{_queued_mutex};
+
     if (!isOpenOwner(owner)) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
     return readableBytesOf(*_open);
 }
 
-result_t<bool> SlaveBus_software::transactionComplete(bus::IAccessor *owner)
+result_t<bool> SlaveBus_software::wireFrameComplete(bus::IAccessor *owner)
 {
+    auto locked = _queued_mutex.lock(types::TIMEOUT_FOREVER);
+    if (!locked.has_value()) {
+        return m5::stl::make_unexpected(locked.error());
+    }
+    runtime::ScopedUnlock unlock{_queued_mutex};
+
     if (!isOpenOwner(owner)) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
     return _open->complete;
+}
+
+result_t<void> SlaveBus_software::beginOperationBackend(bus::OperationContext<SlaveAccessConfig> &context)
+{
+    const uint32_t remaining = bus::remainingTimeout(context.runtime, runtime::millis());
+    auto locked              = _queued_mutex.lock(remaining);
+    if (!locked.has_value()) {
+        return m5::stl::make_unexpected(locked.error());
+    }
+    runtime::ScopedUnlock unlock{_queued_mutex};
+
+    if (_config.legacy_wire_frame_window || context.config.tx_mode == slave::QueueMode::Frame) {
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
+    if (_lines == nullptr || _queued_active || _open != nullptr || _current != nullptr) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    for (const auto &txn : _transactions) {
+        if (txn.in_use) {
+            return m5::stl::make_unexpected(error::error_t::BUSY);
+        }
+    }
+
+    auto &queued = static_cast<SlaveAccessor &>(operationOwner(context));
+    if (queued.backendTxQueue().mode() != slave::QueueMode::Byte) {
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
+
+    _queued_accessor         = &queued;
+    _queued_context          = &context;
+    _queued_active           = true;
+    _queued_closing          = false;
+    _queued_lifecycle_used   = true;
+    _queued_frame_active     = false;
+    _queued_frame_dropping   = false;
+    _queued_segment_active   = false;
+    _queued_segment_details  = true;
+    _queued_tx_from_queue    = false;
+    _queued_tx_fill_selected = false;
+    _queued_frame_underrun   = false;
+    _state                   = State::Idle;
+    _is_address              = true;
+    _matched                 = false;
+    _stretching              = false;
+    _current                 = nullptr;
+    _open                    = nullptr;
+    _open_owner              = nullptr;
+    _lines->pullSdaLow(false);
+    _lines->pullSclLow(false);
+    _prev_scl = _lines->readScl();
+    _prev_sda = _lines->readSda();
+    return {};
+}
+
+result_t<void> SlaveBus_software::endOperationBackend(bus::OperationContext<SlaveAccessConfig> &context)
+{
+    auto &accessor = operationOwner(context);
+    service::SpinBackoff backoff;
+    for (;;) {
+        const uint32_t remaining = bus::remainingTimeout(context.runtime, runtime::millis());
+        auto locked              = _queued_mutex.lock(types::TIMEOUT_FOREVER);
+        if (!locked.has_value()) {
+            return m5::stl::make_unexpected(locked.error());
+        }
+        if (!_queued_active || _queued_accessor != &accessor || _queued_context != &context) {
+            auto unlocked = _queued_mutex.unlock();
+            if (!unlocked.has_value()) {
+                markAccessBroken();
+            }
+            return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+        }
+
+        _queued_closing = true;
+        if (!_queued_frame_active) {
+            _queued_active           = false;
+            _state                   = State::Idle;
+            _is_address              = true;
+            _matched                 = false;
+            _stretching              = false;
+            _queued_tx_from_queue    = false;
+            _queued_tx_fill_selected = false;
+            _queued_accessor         = nullptr;
+            _queued_context          = nullptr;
+            _lines->pullSdaLow(false);
+            _lines->pullSclLow(false);
+            auto unlocked = _queued_mutex.unlock();
+            if (!unlocked.has_value()) {
+                markAccessBroken();
+            }
+            return unlocked;
+        }
+
+        if (remaining == 0) {
+            finishQueuedFrame(slave::FrameFlags::Begin | slave::FrameFlags::End | slave::FrameFlags::Aborted |
+                                  slave::FrameFlags::Truncated,
+                              error::error_t::TIMEOUT_ERROR);
+            _queued_active           = false;
+            _state                   = State::Idle;
+            _is_address              = true;
+            _matched                 = false;
+            _stretching              = false;
+            _queued_tx_from_queue    = false;
+            _queued_tx_fill_selected = false;
+            _queued_accessor         = nullptr;
+            _queued_context          = nullptr;
+            _lines->pullSdaLow(false);
+            _lines->pullSclLow(false);
+            auto unlocked = _queued_mutex.unlock();
+            if (!unlocked.has_value()) {
+                markAccessBroken();
+            }
+            return m5::stl::make_unexpected(error::error_t::TIMEOUT_ERROR);
+        }
+        auto unlocked = _queued_mutex.unlock();
+        if (!unlocked.has_value()) {
+            markAccessBroken();
+            return m5::stl::make_unexpected(unlocked.error());
+        }
+        backoff.step();
+    }
 }
 
 void SlaveBus_software::setMaxAckedWriteBytes(size_t count)
@@ -806,6 +1011,10 @@ size_t SlaveBus_software::rxOverflowCount() const
 
 service::ServicePoll SlaveBus_software::serviceImpl(const service::ServiceContext &ctx)
 {
+    if (!_queued_mutex.lock(0).has_value()) {
+        return service::ServiceResult::Progress;
+    }
+    runtime::ScopedUnlock unlock{_queued_mutex};
     if (_lines == nullptr) {
         return service::ServiceResult::Idle;
     }
@@ -825,8 +1034,9 @@ service::ServicePoll SlaveBus_software::serviceImpl(const service::ServiceContex
     if (_state == State::WaitTx) {
         if (txAvailableForCurrent() || stretchExpired(_svc_now)) {
             _lines->pullSclLow(false);
-            _state     = State::Transmit;
-            _bit_count = 0;
+            _stretching = false;
+            _state      = State::Transmit;
+            _bit_count  = 0;
             driveTxBit();
             result = service::ServiceResult::Progress;
         }
@@ -837,16 +1047,27 @@ service::ServicePoll SlaveBus_software::serviceImpl(const service::ServiceContex
         ++_bit_count;
         if (_bit_count == 8) {
             if (_is_address) {
-                const uint8_t addr = _byte >> 1;
-                _matched           = (addr == _config.address);
-                _read_phase        = (_byte & 1) != 0;
-                if (_matched && _current == nullptr) {
+                const uint8_t addr       = _byte >> 1;
+                const bool legacy_accept = _config.legacy_wire_frame_window && !_queued_lifecycle_used;
+                const bool queued_accept = _queued_active && (!_queued_closing || _queued_frame_active);
+                _matched                 = (addr == _config.address) && (legacy_accept || queued_accept);
+                _read_phase              = (_byte & 1) != 0;
+                if (_matched && _queued_active) {
+                    if (beginQueuedFrame()) {
+                        beginQueuedSegment(_read_phase ? I2cFrameDirection::Read : I2cFrameDirection::Write);
+                    }
+                } else if (_matched && _current == nullptr) {
                     _current = allocateTransaction();
                 }
                 _drive_ack = _matched;
             } else {
-                const bool stored = storeReceivedByte(_byte);
-                _drive_ack        = _matched && !_read_phase && stored && (currentRxSize() <= _max_acked_write_bytes);
+                if (_queued_active) {
+                    storeQueuedReceivedByte(_byte);
+                    _drive_ack = _matched && !_read_phase;
+                } else {
+                    const bool stored = storeReceivedByte(_byte);
+                    _drive_ack = _matched && !_read_phase && stored && (currentRxSize() <= _max_acked_write_bytes);
+                }
             }
             _state = State::AckSetup;
         }
@@ -863,6 +1084,7 @@ service::ServicePoll SlaveBus_software::serviceImpl(const service::ServiceContex
         if (++_bit_count < 8) {
             driveTxBit();
         } else {
+            completeQueuedTransmitByte();
             _lines->pullSdaLow(false);
             _state = State::ReadMasterAck;
         }
@@ -903,7 +1125,7 @@ service::ServicePoll SlaveBus_software::serviceImpl(const service::ServiceContex
         result = service::ServiceResult::Progress;
     }
 
-    if (_prev_scl && !_prev_sda && sda) {
+    if (_prev_scl && scl && !_prev_sda && sda) {
         stopCondition();
         result = service::ServiceResult::Progress;
     }
@@ -915,24 +1137,39 @@ service::ServicePoll SlaveBus_software::serviceImpl(const service::ServiceContex
 
 void SlaveBus_software::resetProtocol()
 {
-    _state             = State::Idle;
-    _prev_scl          = true;
-    _prev_sda          = true;
-    _is_address        = true;
-    _matched           = false;
-    _read_phase        = false;
-    _drive_ack         = false;
-    _master_ack        = false;
-    _byte              = 0;
-    _bit_count         = 0;
-    _current           = nullptr;
-    _open              = nullptr;
-    _open_owner        = nullptr;
-    _stop_count        = 0;
-    _rx_overflow_count = 0;
-    _master_ack_count  = 0;
-    _next_seq          = 1;
-    _stretching        = false;
+    _state                      = State::Idle;
+    _prev_scl                   = true;
+    _prev_sda                   = true;
+    _is_address                 = true;
+    _matched                    = false;
+    _read_phase                 = false;
+    _drive_ack                  = false;
+    _master_ack                 = false;
+    _byte                       = 0;
+    _bit_count                  = 0;
+    _current                    = nullptr;
+    _open                       = nullptr;
+    _open_owner                 = nullptr;
+    _stop_count                 = 0;
+    _rx_overflow_count          = 0;
+    _master_ack_count           = 0;
+    _next_seq                   = 1;
+    _stretching                 = false;
+    _queued_frame               = I2cObservedFrameReservation{};
+    _queued_frame_active        = false;
+    _queued_frame_dropping      = false;
+    _queued_segment_active      = false;
+    _queued_segment_details     = true;
+    _queued_tx_from_queue       = false;
+    _queued_tx_fill_selected    = false;
+    _queued_frame_underrun      = false;
+    _queued_frame_id            = 0;
+    _queued_frame_wire_bytes    = 0;
+    _queued_frame_write_bytes   = 0;
+    _queued_frame_dropped_bytes = 0;
+    _queued_segment_offset      = 0;
+    _queued_segment_length      = 0;
+    _queued_segment_ordinal     = 0;
     for (auto &txn : _transactions) {
         txn = Transaction{};
     }
@@ -947,6 +1184,9 @@ void SlaveBus_software::resetProtocol()
 
 void SlaveBus_software::startCondition()
 {
+    if (_queued_active && _queued_frame_active) {
+        finishQueuedSegment();
+    }
     _state      = State::Receive;
     _byte       = 0;
     _bit_count  = 0;
@@ -959,7 +1199,9 @@ void SlaveBus_software::startCondition()
 
 void SlaveBus_software::stopCondition()
 {
-    if (_current != nullptr) {
+    if (_queued_active && _queued_frame_active) {
+        finishQueuedFrame(slave::FrameFlags::Begin | slave::FrameFlags::End, error::error_t::OK);
+    } else if (_current != nullptr) {
         _current->complete = true;
         _current->tx_size  = _current->tx_read;
         _current           = nullptr;
@@ -1064,16 +1306,254 @@ void SlaveBus_software::storeMasterAck(bool ack)
 
 bool SlaveBus_software::txAvailableForCurrent() const
 {
+    if (_queued_active && _queued_accessor != nullptr) {
+        return _queued_accessor->backendTxQueue().readable() != 0;
+    }
     return _current != nullptr && _current->opened && _current->tx_read < _current->tx_size;
 }
 
 uint8_t SlaveBus_software::nextTxByte()
 {
+    if (_queued_active && _queued_accessor != nullptr) {
+        auto bytes = _queued_accessor->backendTxQueue().peekBytes(1);
+        if (bytes.has_value() && bytes->first.size != 0) {
+            _queued_tx_from_queue    = true;
+            _queued_tx_fill_selected = false;
+            return static_cast<const uint8_t *>(bytes->first.data)[0];
+        }
+        _queued_tx_from_queue    = false;
+        _queued_tx_fill_selected = true;
+        return _config.tx_fill_byte;
+    }
     if (txAvailableForCurrent()) {
         // tx[] is a power-of-two ring; consume at the wrapped read cursor.
         return _current->tx[(_current->tx_read++) & (kTxCapacity - 1)];
     }
     return _config.tx_fill_byte;
+}
+
+bool SlaveBus_software::queuedAccepting() const
+{
+    return _queued_active && _queued_accessor != nullptr && _queued_context != nullptr;
+}
+
+bool SlaveBus_software::beginQueuedFrame()
+{
+    if (!queuedAccepting()) {
+        return false;
+    }
+    if (_queued_frame_active) {
+        return true;
+    }
+
+    _queued_frame_active        = true;
+    _queued_frame_dropping      = false;
+    _queued_segment_active      = false;
+    _queued_segment_details     = true;
+    _queued_frame_underrun      = false;
+    _queued_tx_fill_selected    = false;
+    _queued_frame_wire_bytes    = 0;
+    _queued_frame_write_bytes   = 0;
+    _queued_frame_dropped_bytes = 0;
+    _queued_segment_offset      = 0;
+    _queued_segment_length      = 0;
+    _queued_segment_ordinal     = 0;
+    ++_queued_frame_id;
+    if (_queued_frame_id == 0) {
+        ++_queued_frame_id;
+    }
+
+    if (_queued_context->config.rx_mode == slave::QueueMode::Frame) {
+        auto begun = _queued_accessor->backendRxFrames().beginFrame();
+        if (!begun.has_value()) {
+            _queued_frame_dropping  = true;
+            _queued_segment_details = false;
+            if (begun.error() != error::error_t::WOULD_BLOCK && begun.error() != error::error_t::OUT_OF_RESOURCE) {
+                publishQueuedEvent(slave::SlaveEvent::BusBroken);
+            }
+            return true;
+        }
+        _queued_frame = std::move(*begun);
+    }
+    return true;
+}
+
+void SlaveBus_software::beginQueuedSegment(I2cFrameDirection direction)
+{
+    if (!_queued_frame_active) {
+        return;
+    }
+    _queued_segment_active    = true;
+    _queued_segment_direction = direction;
+    _queued_segment_offset    = _queued_frame_wire_bytes;
+    _queued_segment_length    = 0;
+}
+
+void SlaveBus_software::finishQueuedSegment()
+{
+    if (!_queued_segment_active) {
+        return;
+    }
+    if (!_queued_frame_dropping && _queued_segment_details &&
+        _queued_context->config.rx_mode == slave::QueueMode::Frame) {
+        I2cFrameSegment segment;
+        segment.offset    = _queued_segment_offset;
+        segment.length    = _queued_segment_length;
+        segment.direction = _queued_segment_direction;
+        if (_queued_segment_ordinal != 0) {
+            segment.flags = I2cSegmentFlags::RepeatedStart;
+        }
+        auto appended = _queued_accessor->backendRxFrames().appendSegment(_queued_frame, segment);
+        if (!appended.has_value()) {
+            if (appended.error() == error::error_t::WOULD_BLOCK ||
+                appended.error() == error::error_t::OUT_OF_RESOURCE) {
+                _queued_segment_details = false;
+            } else {
+                (void)_queued_accessor->backendRxFrames().cancelFrame(_queued_frame);
+                _queued_frame_dropping  = true;
+                _queued_segment_details = false;
+                publishQueuedEvent(slave::SlaveEvent::BusBroken);
+            }
+        }
+    }
+    ++_queued_segment_ordinal;
+    _queued_segment_active = false;
+}
+
+void SlaveBus_software::finishQueuedFrame(slave::FrameFlags flags, error::error_t frame_error)
+{
+    if (!_queued_frame_active || _queued_accessor == nullptr || _queued_context == nullptr) {
+        return;
+    }
+    finishQueuedSegment();
+    if (_queued_frame_underrun) {
+        flags |= slave::FrameFlags::Underrun;
+    }
+
+    slave::SlaveEvent events = slave::SlaveEvent::None;
+    if (_queued_context->config.rx_mode == slave::QueueMode::Frame) {
+        if (_queued_frame_dropping) {
+            _queued_accessor->backendRecordDroppedFrame(_queued_frame_write_bytes);
+            events |= slave::SlaveEvent::Overflow;
+        } else {
+            slave::FrameMetadata metadata;
+            metadata.frame_id   = _queued_frame_id;
+            metadata.wire_bytes = _queued_frame_wire_bytes;
+            metadata.flags      = flags;
+            metadata.error      = frame_error;
+            auto committed      = _queued_accessor->backendRxFrames().commitFrame(_queued_frame, metadata);
+            if (committed.has_value()) {
+                events |= slave::SlaveEvent::FrameCompleted;
+                if (_queued_accessor->readable() != 0) {
+                    events |= slave::SlaveEvent::RxAvailable;
+                }
+            } else {
+                _queued_accessor->backendRecordDroppedFrame(_queued_frame_write_bytes);
+                events |= slave::SlaveEvent::Overflow | slave::SlaveEvent::BusBroken;
+            }
+        }
+    } else {
+        if (_queued_frame_dropped_bytes != 0) {
+            _queued_accessor->backendRecordDroppedFrame(_queued_frame_dropped_bytes);
+            events |= slave::SlaveEvent::Overflow;
+        }
+        events |= slave::SlaveEvent::FrameCompleted;
+        if (_queued_accessor->readable() != 0) {
+            events |= slave::SlaveEvent::RxAvailable;
+        }
+    }
+    if (slave::any(flags & slave::FrameFlags::Aborted)) {
+        events |= slave::SlaveEvent::FrameAborted;
+    }
+    publishQueuedEvent(events);
+
+    _queued_frame            = I2cObservedFrameReservation{};
+    _queued_frame_active     = false;
+    _queued_frame_dropping   = false;
+    _queued_segment_active   = false;
+    _queued_segment_details  = true;
+    _queued_tx_from_queue    = false;
+    _queued_tx_fill_selected = false;
+    _queued_frame_underrun   = false;
+}
+
+void SlaveBus_software::storeQueuedReceivedByte(uint8_t value)
+{
+    if (!_queued_frame_active || _queued_accessor == nullptr || _queued_context == nullptr) {
+        return;
+    }
+    if (_queued_frame_wire_bytes != UINT32_MAX) {
+        ++_queued_frame_wire_bytes;
+    }
+    if (_queued_frame_write_bytes != UINT32_MAX) {
+        ++_queued_frame_write_bytes;
+    }
+    if (_queued_segment_length != UINT32_MAX) {
+        ++_queued_segment_length;
+    }
+
+    result_t<size_t> stored = size_t{0};
+    if (_queued_context->config.rx_mode == slave::QueueMode::Frame) {
+        if (!_queued_frame_dropping) {
+            stored = _queued_accessor->backendRxFrames().appendReceived(_queued_frame, {&value, 1});
+            if (!stored.has_value() && stored.error() != error::error_t::WOULD_BLOCK &&
+                stored.error() != error::error_t::OUT_OF_RESOURCE) {
+                (void)_queued_accessor->backendRxFrames().cancelFrame(_queued_frame);
+                _queued_frame_dropping  = true;
+                _queued_segment_details = false;
+                publishQueuedEvent(slave::SlaveEvent::BusBroken);
+            }
+        }
+    } else {
+        stored = _queued_accessor->backendWriteRx({&value, 1});
+        if (!stored.has_value() || *stored == 0) {
+            if (_queued_frame_dropped_bytes != UINT32_MAX) {
+                ++_queued_frame_dropped_bytes;
+            }
+        }
+    }
+    if (stored.has_value() && *stored != 0) {
+        publishQueuedEvent(slave::SlaveEvent::RxAvailable);
+    } else if (!stored.has_value() && stored.error() == error::error_t::WOULD_BLOCK) {
+        publishQueuedEvent(slave::SlaveEvent::Overflow);
+    }
+}
+
+void SlaveBus_software::completeQueuedTransmitByte()
+{
+    if (!_queued_active || !_queued_frame_active || _queued_segment_direction != I2cFrameDirection::Read ||
+        _queued_accessor == nullptr) {
+        return;
+    }
+    if (_queued_frame_wire_bytes != UINT32_MAX) {
+        ++_queued_frame_wire_bytes;
+    }
+    if (_queued_segment_length != UINT32_MAX) {
+        ++_queued_segment_length;
+    }
+    if (_queued_tx_from_queue) {
+        auto popped = _queued_accessor->backendTxQueue().popBytes(1);
+        if (popped.has_value()) {
+            publishQueuedEvent(slave::SlaveEvent::TxSpace);
+        } else {
+            publishQueuedEvent(slave::SlaveEvent::BusBroken);
+        }
+    } else if (_queued_tx_fill_selected) {
+        _queued_frame_underrun = true;
+        _queued_accessor->backendTxQueue().recordUnderrun();
+        publishQueuedEvent(slave::SlaveEvent::Underrun);
+    }
+    _queued_tx_from_queue    = false;
+    _queued_tx_fill_selected = false;
+}
+
+void SlaveBus_software::publishQueuedEvent(slave::SlaveEvent events)
+{
+    if (_queued_accessor == nullptr || _queued_context == nullptr || !slave::any(events)) {
+        return;
+    }
+    _queued_accessor->backendEvents().publish(events, _queued_accessor->readable(), _queued_accessor->writable(),
+                                              _queued_context->runtime.generation);
 }
 
 void SlaveBus_software::driveTxBit()

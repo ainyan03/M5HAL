@@ -4,7 +4,9 @@
 
 ハードウェア依存・フレームワーク依存のコードを、 コンパイル時に差し替える仕組み。
 
-判断軸の詳細は [../reference/directory-layout.md](../reference/directory-layout.md)。
+配置とinclude先は[../reference/directory-layout.md](../reference/directory-layout.md)、追加手順は
+[../porting_guide/framework.md](../porting_guide/framework.md)を参照。本書は選択・申告・識別・依存の
+規範契約を扱う。
 
 ## variant の分類 (3 軸)
 
@@ -14,9 +16,16 @@
 | **framework variant** | ソフトウェア抽象層 (Arduino SDK, ESP-IDF, POSIX, ソフト実装、 リモート等) に依存。 複数共存可能 | `arduino`, `espidf`, `posix`, `software`, `stub` |
 | **stub variant** | 常時末尾フォールバック。 実装済みの no-op 具象だけを申告する (現行は GPIO) | `frameworks/stub/` |
 
-複数 variant が同じ HAL kind を申告した場合、 **scan 順で最初に申告した variant** が勝者となり、 無印名 (`i2c::Bus` 等) の型 alias を得る。 勝者以外の variant も suffix 付きの実名 (`i2c::Bus_software` 等) で常に参照できる。
+kind別overrideがない場合、複数 variant が同じ HAL kind を申告すると **scan 順で最初に申告した variant**
+が勝者となり、無印名 (`i2c::BusConfig` 等) の型 alias を得る。`M5HAL_CONFIG_VARIANT_<KIND>`へ
+stable variant IDを指定した場合は、一致するvariantの最初のofferだけが勝者になる。勝者以外のvariantも
+suffix付きの実名 (`i2c::Bus_software` 等) で常に参照できる。
 
 scan 順と勝者 alias の詳細は §走査順・§`_offer.hpp`・§`offer_all.inl` で扱う。
+
+ordered first-hitは、既存buildの無印aliasをprovider追加だけで変えず、単純なcompile-time選択を維持するための
+互換既定である。kind別stable ID overrideにより明示選択と誤指定のcompile errorは得られるため、offer registryと
+selection policyの全面分離は、複数の同格providerを動的な規則で選ぶ実需が生じるまで導入しない。
 
 ## 走査順 (`M5HAL_v2.hpp` 内)
 
@@ -26,7 +35,7 @@ scan 順と勝者 alias の詳細は §走査順・§`_offer.hpp`・§`offer_all
 3. arduino framework     (M5HAL_FRAMEWORK_HAS_ARDUINO のとき)
 4. espidf framework      (M5HAL_FRAMEWORK_HAS_ESPIDF のとき。 Arduino と併存可)
 5. posix framework       (M5HAL_FRAMEWORK_HAS_POSIX のとき = 素の POSIX host。 UART のみ申告)
-6. remote framework      (M5HAL_CONFIG_REMOTE_VARIANT=1 のとき。 I2C/SPI/UART/I2S の proxy backend を申告。 opt-in: 既定 off)
+6. remote framework      (M5HAL_CONFIG_REMOTE_VARIANT=1 のとき。 I2C/SPI/UART/I2S/PDM の proxy backend を申告。 opt-in: 既定 off)
 7. software framework    (ビットバン fallback、 常に scan)
 8. stub fallback         (常に末尾、 必ず scan)
 ```
@@ -35,93 +44,29 @@ freertos は arduino / espidf より前に scan することで RUNTIME_MUTEX / 
 arduino / espidf は RUNTIME (time functions) を勝つ。 同一環境で freertos + arduino (or espidf) が
 同時に有効化し、 sub-kind ごとに別 variant が勝者になる。
 
-将来 zephyr 等が追加されたら適切な位置に挿入する。
+新しい framework variant を追加する場合も、kind ごとのwinnerが意図したproviderになる位置へ
+挿入し、既存の優先順位を偶発的に変えない。
 
 「最初に申告した variant」 が flat 注入される。 stub は実装済みの no-op 具象だけを申告し、 上位 variant が先に注入した HAL では fallback として控える。
 
 posix は素の POSIX host (Arduino / ESP-IDF SDK を含まないビルド) で **UART と runtime** を申告し、 host serial を既定の UART provider にする (host の UART スロットは他の host variant が埋めないため)。 UART は **opt-out**: 既定で有効、 `M5HAL_CONFIG_POSIX_UART=0` で抑止する (host で UART を意図的に未提供へ戻したいテスト等)。 この opt-out は **UART kind のみ** に作用し variant 自体は止めない — runtime まで止めると host の Bus が stub フェイク mutex へ静かに退行するため ([runtime.md](runtime.md))。 stub は host 実装を持たない HAL kind の no-op を引き続き担う。
 
-## ディレクトリ配置
+## 配置境界
 
-```
-src/m5_hal/variants/
-  frameworks/
-    _checker.hpp          framework 軸の検出 (M5HAL_FRAMEWORK_HAS_*)
-    arduino/
-      _offer.hpp            capability 申告
-      hal.hpp / hal.inl     per-kind hub (hal/gpio/gpio.hpp + hal/i2c/i2c.hpp + hal/spi/spi.hpp を include)
-      hal/
-        gpio/gpio.{hpp,inl}   Pin / Port / GPIO + 実装
-        i2c/i2c.{hpp,inl}     IBus + 実装 (caller-provided TwoWire 委譲)
-        spi/spi.{hpp,inl}     IBus + 実装 (caller-provided SPIClass 委譲)
-        uart/uart.{hpp,inl}   IBus + 実装 (caller-provided HardwareSerial 委譲)
-    freertos/
-      _offer.hpp              RUNTIME_MUTEX + RUNTIME_TASK + RUNTIME_EVENT を申告 (bus kind は申告しない)
-      hal/runtime/mutex.hpp   FreeRTOS Mutex (xSemaphoreCreateMutex)
-      hal/runtime/task.hpp    FreeRTOS Task (xTaskCreatePinnedToCore)
-      hal/runtime/event.hpp   FreeRTOS Event (xSemaphoreCreateBinary)
-      hal/runtime/time.hpp    timeout 変換ユーティリティ (内部用、 offer 対象外)
-    bsd/
-      hal/tcp/bsd_tcp.{hpp,inl}  BSD socket TCP transport (posix / espidf 共通の実装)
-    espidf/
-      _offer.hpp
-      detail/espidf_version.hpp
-      hal.hpp / hal.inl
-      hal/gpio/gpio.hpp       GPIO 実装 (ESP-IDF GPIO driver)
-      hal/i2c/i2c.{hpp,inl}   IBus + 実装 (ESP-IDF I2C master driver、 gen5/gen4 backend)
-      hal/i2s/i2s.{hpp,inl}   IBus + 実装 (ESP-IDF gen5 I2S standard driver)
-      hal/spi/spi.{hpp,inl}   IBus + 実装 (ESP-IDF SPI master driver)
-      hal/uart/uart.{hpp,inl}  IBus + 実装 (ESP-IDF UART driver)
-    software/
-      _offer.hpp
-      hal.hpp / hal.inl
-      hal/i2c/i2c.{hpp,inl}   bit-bang I2C 実装
-      hal/spi/spi.{hpp,inl}   bit-bang SPI 実装
-    posix/
-      _offer.hpp
-      hal.hpp / hal.inl
-      hal/uart/uart.{hpp,inl}          IBus + 実装 (termios serial)
-      hal/uart/ports.{hpp,inl}         ポート列挙 (listSerialPorts)
-      hal/tcp/tcp.{hpp,inl}            BSD socket TCP transport (BsdTcpStream)
-      hal/runtime/runtime.hpp          POSIX runtime (CLOCK_MONOTONIC + std::timed_mutex)
-      hal/remote/uart_connection.hpp   UART 経由 remote 接続確立
-      hal/remote/tcp_connection.hpp    TCP 経由 remote 接続確立
-    remote/
-      _offer.hpp
-      hal.hpp
-      hal/i2c/i2c.hpp   I2C proxy (remote backend、 M5HAL_CONFIG_REMOTE_VARIANT=1 時有効)
-      hal/spi/spi.hpp   SPI proxy
-      hal/uart/uart.hpp UART proxy
-      hal/i2s/i2s.hpp   I2S proxy
-      hal/gpio/gpio.hpp GPIO proxy
-    stub/
-      _offer.hpp              実装済み no-op capability だけ申告
-      hal.hpp                 no-op 具象 (inline 定義のみ、 hal.inl 不要)
-      hal/gpio/gpio.hpp
-  platforms/
-    _checker.hpp          platform 軸の検出 (`M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID` / `M5HAL_V2_DETECTED_PLATFORM_VARIANT_PATH`。 番号は ../ids.hpp)
-    espressif/
-      esp32/                chip-family 単位 (ESP32 / S2 / S3 / C2 / C3 / C5 / C6 / C61 / H2 / P4 を統合)
-        _offer.hpp
-        hal.hpp / hal.inl   chip family 内で必要なら CONFIG_IDF_TARGET_* で ifdef 分岐、
-                            chip 別差分はサブフォルダ (例: hal/gpio/esp32s3/...) に格納
-        hal/gpio/gpio.hpp   ESP32 family 統合 GPIO (W1TS/W1TC 直叩き、 per-bank dispatch)
-```
-
-namespace は物理階層と厳密 1:1:
-
-- `src/m5_hal/variants/frameworks/arduino/hal/i2c/i2c.hpp` ⇔ `m5::variants::frameworks::arduino::hal::v2::i2c::*`
-- `src/m5_hal/variants/platforms/espressif/esp32/hal/gpio/gpio.hpp` ⇔ `m5::variants::platforms::espressif::esp32::hal::v2::gpio::*`
-
-frameworks 配下は vendor 階層なし (`variants::frameworks::<name>`)。 platforms 配下は vendor + chip-family の 2 階層 (`variants::platforms::<vendor>::<chip-family>`)。 chip-family は同一 SDK / 同一レジスタ抽象を共有する chip 群を 1 variant にまとめる単位。 詳細は [../reference/directory-layout.md](../reference/directory-layout.md)。
+framework、platform、メタファイル、kind実装の物理treeとnamespace対応は
+[../reference/directory-layout.md](../reference/directory-layout.md)を正本とする。本書で規定するのは、
+各variantがself-containedな申告単位であることと、公開provider symbolとvariant内部構造の境界である。
 
 ## variant 間の依存関係
 
 各 variant は **HAL 層の抽象基底のみに依存** する。 他の variant の具象には直接依存しない (依存性逆転原則)。
 
-例: `variants::frameworks::software` のビットバン I2C を実装する際、 `m5::hal::v2::gpio::IPort` / `m5::hal::v2::gpio::Pin` の抽象に対してコードを書く。 具体的にどの variant の Pin 具象が注入されるかは知らない。 BusConfig は `gpio_number_t` 単一 path で受け取り、 init() 内で raw config を検証してから `m5::hal::v2::M5_Hal.Gpio.tryGetPin(num)` 経由で Pin を解決する。
+例: `variants::frameworks::software` のビットバンI2Cを実装する際、`gpio::IPort` / `gpio::Pin`の抽象に
+対してコードを書く。factoryは`LocalResourceContext`を受け、具体的なPin具象を知らずに注入された
+`GPIOGroup` / `ServiceRunner` / `Allocator`へ束縛する。BusConfigは`gpio_number_t`単一pathで受け取り、
+init時にraw configを検証してからcontextの`gpio->tryGetPin(num)`でPinを解決する。
 
-Framework variant が SDK native object を必要とする場合は、共通 `IBusConfig` を直接肥大化させず、variant 固有 `BusConfig` を追加する。Arduino なら `TwoWire*` / `SPIClass*` / `HardwareSerial*`、ESP-IDF なら `i2c_port` / `spi_host_device_t` / `uart_port` のように、その framework で意味を持つ値だけを variant 側に置く。これにより、Arduino の `Serial` が USB CDC になるような board/config 差異を M5HAL が暗黙解決しない。
+Framework variant が SDK native object を必要とする場合も、公開 `BusConfig` はportableなまま維持する。native objectやprovider固有optionはconfig fieldへ混ぜず、対応providerが同名の`acquire(config, native::borrowed(resource))` / `acquire(config, native::managed(args...))` overloadで受ける。Arduinoなら`TwoWire` / `SPIClass` / `HardwareSerial`、ESP-IDFならcontroller handle等をpolicy側のprovider-private型として扱う。これにより、Arduinoの`Serial`がUSB CDCになるようなboard/config差異をM5HALが暗黙解決せず、通常callerへvariant固有型も露出しない。
 
 この設計により、 ビットバン実装は `stub::Port` のモック注入で native ユニットテスト可能。 任意の expander IGPIO を `M5_Hal.Gpio` に slot 指定で register すれば、 同じ単一 path で driving できる。
 
@@ -164,29 +109,24 @@ kind 別ファイルは自己完結 (include guard、 namespace スキャフォ�
 
 - これらのマクロは `offer_all.inl` 側で消費後に undef される。 `_offer.hpp` 自身では undef しない
 
-### offer 要件 (申告する kind が公開すべき型)
+### offer 要件 (facade bus kind)
 
-bus kind を申告する variant は、 **`m5::hal::v2::<kind>` 直下**に
-**`Bus_<variant>` と `BusConfig_<variant>`** (例: `i2c::Bus_arduino` /
-`i2c::BusConfig_arduino`) を必ず定義する。 勝者選択 (offer scan) はこの 2 つに
-無印 alias (`using Bus = Bus_<variant>; using BusConfig = BusConfig_<variant>;`)
-を張るので、物理型`m5::hal::v2::<kind>::Bus` / `BusConfig`が**どのbuildでも常に存在**する。
-`m5::hal::<kind>`から見えるのはv2をinline namespaceに選んだbuildだけである。
-「`BusConfig`を作って`Bus::init`に渡す」イディオムが全variant
-で型整合する。 この命名の利点:
+facade bus kind (I2C / SPI / UART / I2S / PDM) を申告するvariantは、
+**`m5::hal::v2::<kind>`直下**に次を定義する。
 
-- エラーメッセージ / デバッガ表示が短い (`m5::hal::v2::i2c::Bus_arduino`)
-- `i2c::Bus` の正体が型 alias 1 段で追える
-- IDE 補完で `Bus_` から backend 一覧が見える。 variant 明示も
-  `using MyBus = i2c::Bus_espidf;` と短い
-- suffix が異なるので多 variant 共存 (arduino + espidf 同居) も自然
+- provider実体`Bus_<variant>`
+- portable `IBusConfig`からprovider backendを作る`makePortableBackend_<variant>`
+- native ownership policyを提供する場合だけ`NativeProvider_<variant><Policy>`の対応specialization
 
-拡張フィールドが不要な variant も **alias ではなく空派生**で定義する
-(`struct BusConfig_software : public IBusConfig { using IBusConfig::IBusConfig; };`) —
-typed init が variant 固有型を受けることで、 抽象 config や兄弟 variant の config の
-流入がコンパイルエラーになる (型安全の一貫性)。 kind の config 基底 `IBusConfig` は
-**常に派生される抽象基底**であり、 直接インスタンス化しない
-([../style/coding_style.md](../style/coding_style.md) §抽象基底命名)。
+公開`BusConfig`はkind headerが定義するportable configであり、variant suffixを持たない。
+勝者選択はconfig型ではなく、portable factoryと`NativeProvider`をbindする。従って通常利用者は
+どのproviderでも`BusConfig cfg; Hal.<kind>.acquire(cfg)`と書き、provider名を覚えない。
+既存native resourceを使う場合も、対応providerに限り同じ`acquire`へ
+`native::borrowed(...)` / `native::managed(...)`を追加する。
+
+`Bus_<variant>`の直接利用はprovider固有初期化が必要なadvanced escape hatchである。provider固有の
+private configやnative型を持つことはできるが、公開acquireのselectorとして
+`BusConfig_<variant>`を追加してはならない。
 
 gpio kind は `Port_<variant>` / `GPIO_<variant>` と
 `getMCUGPIO_<variant>()` / `getGPIO_<variant>()` を同じ規約で公開する
@@ -207,22 +147,23 @@ Mutex / Task / Event は型 alias で注入し、 bus kind と同じ first-hit �
 sub-kind ごとに独立した勝者が選ばれるため、 同一ビルドで freertos が Mutex/Task を、
 arduino/espidf が time functions を供給する構成が自然に成立する。
 
-例外: **facade kind (I2C / SPI / UART / I2S) の無印 `Bus` は runtime facade クラス** ([i2c.md](i2c.md)
-§Bus 他)。 offer scan は facade kind では `using BusConfig = BusConfig_<勝者>` の alias だけを張り、
-**`using Bus` は張らない** (`Bus` は各 kind ヘッダの facade クラスが名乗るため、 alias を張ると再定義
-衝突になる)。 facade は `init(cfg)` の config 型から `BackendFor` trait で勝者/明示 backend
-(`Bus_<variant>`) を選ぶので、「`BusConfig` を作って `Bus::init` に渡す」イディオムは facade でも型整合する。
+**facade kind (I2C / SPI / UART / I2S / PDM) の無印 `Bus` は runtime facade クラス** ([i2c.md](i2c.md)
+§Bus 他)。offer scanは`Bus` / `BusConfig` aliasを張らず、勝者のportable factoryを
+`makeSelectedPortableBackend`へ、native policy templateを`NativeProvider`へbindする。
+facadeの`init(const IBusConfig&)`はportable factoryを通じて勝者`Bus_<variant>`を選ぶ。
 マクロ機構では各 facade kind 分岐が `M5HAL_OFFER_KIND_FACADE_` を立て、 `offer_kind.inl` がその kind の
-`using Bus` を抑止する。 **全 bus kind (I2C/SPI/UART/I2S) が facade 化済**。
-I2C / SPI は intent 駆動 HW 割当を持つ managed policy、UART / I2S は同じ public surface を持つ
+`using Bus` を抑止する。 **全 bus kind (I2C/SPI/UART/I2S/PDM) が facade 化済**。
+I2C / SPI は intent 駆動 HW 割当を持つ managed policy、UART / I2S / PDM は同じ public surface を持つ
 static-backend policy。
 
-`init` は **variant の `BusConfig` を直接受ける非 virtual メンバ**として宣言する
-(`init(const BusConfig&)`)。 基底 `bus::IBus` に virtual `init` は置かない — 初期化には variant 固有
-情報 (native handle / port / device path) が必須で kind 汎用の `init` は成立せず、 旧 virtual +
-ダウンキャスト形は「兄弟 config を渡せてしまい UB になる」誤用経路だけを提供していた。
-typed init では誤用 (抽象 config や別 variant の config を拡張フィールド持ち variant へ渡す) が
-**コンパイルエラー**になる。 `release()` は引数を取らないため基底 virtual のまま。
+facadeの`init`はportable `IBusConfig`を直接受ける非virtualメンバである。基底`bus::IBus`に
+virtual `init`やpublic `close`は置かない。local providerのdirect concrete/facade wrapperだけがpublic `close()`を持ち、
+成功後は同じobjectを`init()`で再利用できる。registry-bound busは
+`Hal.<kind>.close(shared_ptr&)`だけでconsuming final closeする。provider終了hookはprotected
+`closeBackend()`で、`NoMutation`失敗はrollback、`PartialOrUnknown`失敗はquarantineへ分類する。
+remoteの`Bus_remote`は`RemoteBackend`が生成するconnection-bound proxyおよびprotocol test seamであり、
+local direct provider escape hatchではない。利用者のremote取得・終了は常にremote `Hal`の
+`acquire` / `close`を使い、proxyのconstructor / `init`をdirect lifecycle APIとして扱わない。
 
 ### `_offer.hpp` の例 (arduino framework)
 
@@ -244,12 +185,11 @@ typed init では誤用 (抽象 config や別 variant の config を拡張フィ
 
 各 `_offer.hpp` の直後に再 include され、 以下を実行:
 
-1. `M5HAL_VARIANT_CURRENT_HAS_HAL_<KIND>_` の有無を確認
-2. その kind の **first hit のみ**、 勝者 alias を `m5::hal::v2::<kind>` に生成:
-   - bus kind: `using Bus = Bus_<ALIAS>; using BusConfig = BusConfig_<ALIAS>;`
-     (token paste で suffix を合成)
-   - **facade kind (i2c / spi / i2s / uart)**: `using BusConfig = BusConfig_<ALIAS>;` のみ。
-     `using Bus` は張らない (`Bus` は facade クラスが名乗る、 [i2c.md](i2c.md) §Bus)
+1. `M5HAL_VARIANT_CURRENT_HAS_HAL_<KIND>_` の有無と、kind別selectorが`NONE`または
+   `M5HAL_VARIANT_CURRENT_ID_`に一致することを確認
+2. 条件を満たすその kind の **first hit のみ**、 勝者bindingを `m5::hal::v2::<kind>` に生成:
+   - **facade kind (i2c / spi / i2s / uart / pdm)**: `makeSelectedPortableBackend`と
+     `NativeProvider<Policy>`を勝者providerへbindする。`Bus` / `BusConfig` aliasは張らない
    - gpio: `using Port = Port_<ALIAS>; using GPIO = GPIO_<ALIAS>;` +
      `getMCUGPIO()` / `getGPIO()` の inline wrapper
    - runtime (time): `using namespace ::m5::<BASE_NS>::hal::v2::runtime;` (型 alias で
@@ -273,7 +213,7 @@ kind ブロック側に残るのはマクロ名が kind 固有でディレクテ
 注意: `BASE_NS_` は runtime kind の注入にのみ使われ、 値に層名 `::hal` を含めない
 (`offer_kind.inl` が `::hal` を挟む。 [runtime.md](runtime.md))。
 
-**runtime kind の early scan**: runtime (time / mutex / task の 3 sub-kind) だけは
+**runtime kind の early scan**: runtime (time / mutex / task / event の 4 sub-kind) だけは
 `M5HAL_v2.hpp` 末尾の本 scan より前に `hal/v2/runtime/runtime.hpp` が選択を済ませる
 (`bus::IBus` が `runtime::Mutex` を値で内蔵するため)。 early scan は
 `_macro/offer_runtime_only.inl` で runtime 以外の HAS フラグをマスクして同じ `offer_all.inl`
@@ -293,16 +233,29 @@ RUNTIME_MUTEX / RUNTIME_TASK / RUNTIME_EVENT を勝ち取る)。
 - 値域 (10 進グループ、 各レンジ内は **append-only**): 0 = `M5HAL_V2_VARIANT_ID_NONE`
   (未検出/未選択)、 **1〜49 = framework** (`..._FRAMEWORK_<NAME>`)、 **50〜99 = platform (host OS)**、
   **100〜249 = platform (MCU)** (いずれも `..._PLATFORM_<NAME>`)、 250〜65535 = 予約。
-- **ワイヤ形式は 2 バイト (u16) 固定** (将来プロトコルに載せる場合)。 現行値は読みやすさのため
-  250 未満に収める。 予約域は将来の分散割当 (例: out-of-tree variant の名前ハッシュ由来 ID) に
-  充てうる。
+- **ワイヤ形式は 2 バイト (u16) 固定**。現行値は250未満に収め、250〜65535は予約域とする。
+  現行selectorで予約域をout-of-tree variantへ割り当てることはできない。
 - **変更不可規約**: 1.x 公開済みリリースに含まれた値は以後変更不可 (改番禁止)。 廃止は欠番として残す
   (再利用禁止)。 利用者は**定数名で参照する**こと (生数値のハードコードは契約外)。
-- 「検出されるが variant 未実装」のエントリ (AVR 等) も同じレジストリに置く — 実装有無は属性で
-  あって、 番号空間を分ける理由にしない。
+- 実装を持たないplatformの識別entry (AVR等) も同じレジストリに置く。実装有無は属性であり、
+  番号空間を分けない。
 
-`offer_all.inl` は flat 注入 (first hit) と同時に、 勝者の variant ID を
-**`M5HAL_V2_SELECTED_VARIANT_<KIND>`** (KIND = GPIO / I2C / SPI / I2S / UART / RUNTIME / RUNTIME_MUTEX / RUNTIME_TASK / RUNTIME_EVENT) に焼き付ける。
+選択の入力と結果は別macroで表す:
+
+| 役割 | macro | `M5HAL_V2_VARIANT_ID_NONE`の意味 |
+|---|---|---|
+| user input | `M5HAL_CONFIG_VARIANT_<KIND>` | overrideなし。ordered first-hitで自動選択 |
+| read-only output | `M5HAL_V2_SELECTED_VARIANT_<KIND>` | scan参加variantがそのkindを一つもofferしなかった |
+
+`<KIND>`はGPIO / I2C / SPI / I2S / PDM / UART / RUNTIME / RUNTIME_MUTEX / RUNTIME_TASK /
+RUNTIME_EVENT。入力にはレジストリの名前付きIDを使う。指定IDが未登録、buildのscanに不参加、対象kindを
+offerしない、またはfeature gateでofferが無効ならcompile errorとなり、出力を`NONE`へ黙って縮退させない。
+入力macroは定義済みのC++整数定数式へ展開する必要があり、名前付きIDの綴り誤りも`NONE`扱いにはならない。
+たとえばremote指定には別途`M5HAL_CONFIG_REMOTE_VARIANT=1`が必要で、POSIX UARTを指定しながら
+`M5HAL_CONFIG_POSIX_UART=0`にする構成も成立しない。
+
+`offer_all.inl` はflat注入（selector一致後のfirst hit）と同時に、勝者のvariant IDを
+**`M5HAL_V2_SELECTED_VARIANT_<KIND>`** (KIND = GPIO / I2C / SPI / I2S / PDM / UART / RUNTIME / RUNTIME_MUTEX / RUNTIME_TASK / RUNTIME_EVENT) に焼き付ける。
 どの variant も offer しなかった kind は `M5HAL_V2_VARIANT_ID_NONE` になる
 (`M5HAL_v2.hpp` が scan 後に補完)。
 各 `_offer.hpp` は自分の ID を `M5HAL_VARIANT_CURRENT_ID_` で申告する。
@@ -314,22 +267,19 @@ RUNTIME_MUTEX / RUNTIME_TASK / RUNTIME_EVENT を勝ち取る)。
 static_assert(M5HAL_V2_SELECTED_VARIANT_I2C == M5HAL_V2_VARIANT_ID_FRAMEWORK_ARDUINO,
               "this sketch assumes the arduino I2C variant");
 
-// 選択結果による条件コンパイル (ctor 引数が variant で異なる場合など)
+// 選択結果による条件コンパイル (native provider を直接指定する場合など)
 m5hal::i2c::BusConfig cfg;
 cfg.pin_scl = SCL;
 cfg.pin_sda = SDA;
 #if M5HAL_V2_SELECTED_VARIANT_I2C == M5HAL_V2_VARIANT_ID_FRAMEWORK_ARDUINO
-cfg.wire = &Wire;  // 選択 variant 固有のフィールドだけ条件分岐
+auto bus = M5_Hal.I2C.acquire(cfg, m5hal::native::borrowed(Wire));
+#else
+auto bus = M5_Hal.I2C.acquire(cfg);
 #endif
 ```
 
-型レベルの確認イディオムも marker と独立に常に成立する: 勝者の無印名は型 alias なので、
-無印名と suffix 付き実名は**同一エンティティ**を指す。
-
-```cpp
-static_assert(std::is_same<m5hal::i2c::Bus, m5hal::i2c::Bus_arduino>::value,
-              "the winner alias resolved to an unexpected variant");
-```
+facade bus kindの無印`Bus`はruntime facadeであり、`Bus_<variant>`の型aliasではない。勝者の確認には
+selected-variant markerを使う。GPIOの`Port` / `GPIO`とruntimeの`Mutex` / `Task` / `Event`は型aliasである。
 
 実装注: `#define` は置換リストを展開しないため、 first-hit 時の `M5HAL_VARIANT_CURRENT_ID_` の
 **値**を別マクロへ転送することはプリプロセッサでは不可能 — `offer_all.inl` の各 kind ブロックに
@@ -378,183 +328,72 @@ static_assert(M5HAL_V2_SELECTED_VARIANT_GPIO == M5HAL_V2_DETECTED_PLATFORM_VARIA
 
 ### arduino variant の対応コア (build gate)
 
-arduino variant は元々 **arduino-esp32 コア専用**だった (`TwoWire::begin(sda, scl)`、
-`SPIClass::transferBytes` 等のコア拡張 API に依存)。 RP2040 / RP2350 ARM (arduino-pico)、
-UNO R4 Minima (ArduinoCore-renesas)、 SAMD51 (Adafruit/Arduino SAMD コア)、 STM32
-(公式 ST コア / STM32duino)、 nRF52840 (Adafruit nRF52 コア)、 ESP8266 (公式 ESP8266
-Arduino コア)、 Sony SPRESENSE (公式 Arduino package) は build-check レベルで対応済み:
-ESP32 専用 API はすべて `#if defined(ESP_PLATFORM)` で分岐し、 非 ESP32 コアはポータブルな
-Arduino API (`Wire.begin()`, `SPI.begin()`, `SPIClass::transfer()` バイトループ等) へフォール
-バックする。 ESP8266 は Espressif シリコンだが ESP-IDF API 面 (`ESP_PLATFORM`) を持たず、
-原則この汎用経路を通る (例外 = call site 単位で明示分岐: I2C の `begin(sda, scl)` int-pin
-オーバーロードと UART の `SerialConfig` enum 全組み合わせは ESP8266 コアにも存在するため
-そちらを使う)。 `frameworks/_checker.hpp` の `M5HAL_ARDUINO_VARIANT_SUPPORTED_` allowlist が
-対応コアを列挙し、 それ以外の Arduino コア (AVR、 Arduino-mbed 系 — mbed 系は RP2040 ボード
-でも `ARDUINO_ARCH_RP2040` を定義するため `ARDUINO_ARCH_MBED` で明示除外。 nRF52 も
-Adafruit コア限定で、 sandeepmistry 系 `ARDUINO_ARCH_NRF5` と mbed 系 Nano 33 BLE は対象外
-— 等) は依然 `#error` で早期に明示する (variant ヘッダ深部の不可解なコンパイルエラーで
-死なせない)。
+`frameworks/_checker.hpp`のallowlistは、arduino-esp32、RP2040 / RP2350 ARM
+(arduino-pico)、UNO R4 Minima、SAMD51、STM32 (公式STコア)、nRF52840 (Adafruit nRF52)、
+ESP8266、SPRESENSE MainCoreを受理する。それ以外のArduinoコアは`#error`で拒否する。
+Arduino-mbed、RP2040 RISC-V、SPRESENSE SubCore、sandeepmistry nRF5は対象外である。
+
+ESP32専用APIは`ESP_PLATFORM`で分岐し、他コアはportable Arduino APIへfallbackする。
+ESP8266はESP-IDF API面を持たないため原則fallback経路を使い、利用可能なI2C pin指定と
+UART `SerialConfig`だけを専用分岐で使う。
 
 **スコープと既知の制約**:
-- v0 は非対応のまま (レガシー API、 arduino-esp32 専用)。 ただし Arduino builder が
-  install 済み library の全 TU を compile する契約に合わせ、 `M5HAL_v0.cpp` は非 ESP32
-  Arduino で empty TU となる。 利用者が `M5HAL_v0.hpp` または v0 compatibility shim
-  `M5HAL.hpp` を明示 include した場合は、 `M5HAL_v2.hpp` を使うよう `#error` で早期に
-  拒否する。 check env は v0 TU を除外せず、配布 library と同じ全 `src` をビルドする
-- runtime kind の Mutex/Task/Event は非 `ESP_PLATFORM` コアではすべて `stub` variant の
-  フォールバック実装が使われる (単一タスク前提、 ISR 非対応は元から想定内)。 **下層に
-  FreeRTOS が実在する nRF52840 でも同様** — 詳細と利用制限は下の未解決ギャップ
-- **実機 HIL 検証は未実施** (bench rig に非 ESP32 コアのボードが無い)。 ビルド成功のみを
-  保証する build-check gate であり、 実機での I2C/SPI/UART の動作保証ではない
-- UNO R4 の strict enum (`PinMode` / `PinStatus`) に合わせ、 GPIO variant は Arduino core が
-  公開する型を保持して `pinMode()` / `digitalWrite()` へ渡す。 Minima (RA4M1) の既定 pool 設定を
-  含む共通 API fence の実測は static RAM 13,132 / 32,768 bytes、 flash 101,476 / 262,144 bytes
-- SPRESENSE は公式 core `3.4.7` の MainCore / Memory=768、 bundled GCC 9.2.1 に
-  `-std=gnu++17` を明示して共通 API fence をビルドする。 Arduino CLI に未加工の public
-  library tree を渡し、 v0 empty-TU 契約を含む配布形を検査する。 NuttX SDK は
-  BSD 形状の socket header を持つが semantics 未検証のため TCP server transport は明示的に無効。
-  SubCore、 audio、 multicore、 peripheral 実動作は対象外。 実測 size は
-  234,272 / 786,432 bytes。 `library.properties` の `architectures=esp32` は正式な配布対象を示す
-  ため変更せず、 SPRESENSE lane の architecture warning は build-only gate では想定内
+- v0はarduino-esp32専用であり、非ESP32 Arduinoではv2だけを利用できる。`M5HAL_v0.cpp`は
+  配布treeの全TU compileを許すempty TUとなるが、v0 headerのincludeは`#error`で拒否する
+- 非ESP32コアの保証範囲はbuild-checkであり、I2C / SPI / UARTの実機動作を保証しない
+- 非`ESP_PLATFORM`コアのMutex / Task / Eventは単一task・非ISR前提のstubとなる。nRF52840でも
+  FreeRTOS variantは選ばれないため、M5HALの呼び出しを単一taskに限定する
+- GPIO `read()` は Arduino core の `digitalRead()` をそのまま使う。Arduino-ESP32ではM5HALの
+  `Output` / `OutputOpenDrain` 設定後も入力経路を有効にし、出力中のpad levelとremote watcherを
+  ESP-IDF variantと同じ契約で保証する。非ESP coreはbuild-checkのみで、Output設定中のread意味論は
+  core依存 (例: Adafruit nRF52は出力latchを返す) のため保証しない。物理入力の観測が必要なら
+  `Input` 系modeを使う
+- SPRESENSEのNuttX socketはsemantics未検証のためBSD TCP transportを無効とする。SubCore、audio、
+  multicore、peripheral実動作は対象外である
 - UART の `SERIAL_*` フォーマット定数は、 非 ESP32 コアではコアが macro として定義する分
-  だけを使う (定数の有無 = その UART ペリフェラルの実能力。 例: nRF52 UARTE は odd parity
-  非対応で Adafruit コアは `SERIAL_8O1/8O2` を定義しない)。 未定義の組み合わせはコンパイルを
-  落とさず、 実行時に `INVALID_ARGUMENT` でリジェクトする (「未対応値」の契約どおり、
-  uart.md)。 arduino-esp32 と ESP8266 コアは enum (`SerialConfig`) で全組み合わせを定義
-  するため対象外。 受理した組み合わせは全コアで `begin(baud, config)` 系オーバーロードへ
-  実際に渡して適用する。 信号反転 (`invert`) は arduino-esp32 と ESP8266 のみ適用可能で、
-  他コアでは `invert=true` を `INVALID_ARGUMENT` でリジェクトする (無言無視しない)。
-  この適用・検証契約は `HardwareSerial` 束縛時のみ — plain `Stream` 束縛 (CDC 含む) は
-  線路フォーマットを適用も検証もしない設計 (例外の正本 = uart.md §variants)
+  だけを使い、未定義の組み合わせを`INVALID_ARGUMENT`で拒否する。信号反転はarduino-esp32と
+  ESP8266だけが対応する。この契約は`HardwareSerial`束縛時だけで、plain `Stream`には適用しない
+  ([uart.md](uart.md) §variants)
 - remote bus server (`hal/v2/remote/server_bus_pool.*`) は引き続き arduino-esp32 専用
   (SPIClass のコア別レイアウト差、 ESP-IDF 専用 API に依存するため)。 非 ESP32 Arduino コアでは
   無効化 (`M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_BUS_CONFIG_` が ESP_PLATFORM 必須)
 - ESP8266 固有の縮退 (コアのペリフェラル実能力に追従):
   - GPIO の pulldown は GPIO16 のみ (`INPUT_PULLDOWN_16`)。 他 pin は素の `INPUT` へ縮退
     (OUTPUT+pull 欠落と同じ縮退ポリシー)
-  - `TwoWire::end()` が存在しないため、 I2C の `release()` はペリフェラルを構成したまま残す
+  - `TwoWire::end()` が存在しないため、 I2C の`closeBackend()`はペリフェラルを構成したまま残す
     (`begin()` が再初期化する)
   - UART の RX バッファ malloc はコアの `begin()` 内で行われ、 失敗するとポートが不能のまま
     残る (`HardwareSerial::operator bool()` が false)。 M5HAL は `begin()` 後にこれを検査し
     `OUT_OF_RESOURCE` を返す (成功扱いにしない)。 `rx_buffer_size` は指定があれば
     `setRxBufferSize()` で反映する (TX は FIFO+blocking のため `tx_buffer_size` は適用対象なし)
-  - lx106 に atomic RMW 命令が無く GCC は `std::atomic` の RMW を `__atomic_*` libcall に
-    落とすが、 コアは libatomic を同梱しないためリンクで落ちる。 M5HAL が使う演算のみ
-    interrupt-mask 実装の weak シンボルで提供する (単一コアなので割り込み禁止で十分。
-    `arduino/hal/runtime/atomic_libcalls.inl`。 未提供の演算は引き続きリンクエラーで
-    明示的に落ちる)
-  - toolchain (lx106 newlib) の `assert()` は式中に `PSTR()` の static 配列宣言を展開し
-    constexpr 関数内で ill-formed になるため、 M5Utility 側 `stl/expected.hpp` の
-    `TL_ASSERT` 既定を ESP8266 では no-op にする (M5Utility portability パッチに含む)
-- **既知の未解決ギャップ (検出済み・意図的に実装見送り)**:
-  - nRF52840 (Adafruit コア) は FreeRTOS 上で動くが、 FreeRTOS 検出が ESP-IDF の include
-    レイアウト (`<freertos/FreeRTOS.h>`) 限定のため freertos runtime variant が選ばれず、
-    Mutex/Task/Event は単一タスク前提の stub になる (Task 実装が Espressif 拡張
-    `xTaskCreatePinnedToCore` に依存するため意図的に未拡大、 `_checker.hpp` のコメント参照)。
-    **複数の FreeRTOS task から M5HAL を呼ぶと stub Mutex (非 atomic bool) がデータ競合を
-    起こすため、 nRF52840 では M5HAL の呼び出しを単一 task に限定すること**。 正しい対処 =
-    portable FreeRTOS runtime backend (`<FreeRTOS.h>` レイアウト対応 + Task の Espressif
-    固有部分の分離)。 arduino-pico 等も FreeRTOS ヘッダを同梱しうるため検出拡大は他コアへの
-    波及確認も要り、 実機検証手段の無い並行性クリティカル変更を避けて本 milestone では
-    見送り (下の RP2040 第2コアの項と同じ判断)
-  - `wire_timeout_ms` (I2C) / SCL・SDA pin 指定は非 ESP32 コアで無言で無視される
-    (`Wire.begin()` は引数無しのみ呼ぶ)。 呼び出し側が要求した設定と実際の配線が食い違っても
-    検出できない (例外: ESP8266 は SDA/SCL pin 指定のみ `begin(sda, scl)` で尊重する)。SPIは
-    同じ縮退を許さず、型指定 `BusConfig_arduino` のCLK・MISO・MOSI指定を`NOT_IMPLEMENTED`で
-    拒否する。board既定配線は三pinを未指定にして選び、任意pinが必要な場合はlogical acquireの
-    software allocationを使う
-  - `bus::IdentityKey` (registry.hpp) は pin 番号でバス識別する設計だが、 非 ESP32 コアでは
-    pin が物理的に意味を持たないため、 異なる `TwoWire`/`SPIClass` インスタンス
-    (`Wire`/`Wire1` 等) を同一識別として扱う、 または同一インスタンスを異なる識別として
-    扱う誤りが起きうる (one-physical-bus/one-lock 不変条件が壊れる可能性)。 正しい修正には
-    identity 計算を pin から native instance ポインタ基準へ変更する必要があり、 i2c/spi
-    双方の registry 設計に跨る変更のため本 milestone では見送り。 **非 ESP32 コアで複数の
-    Wire/SPI インスタンスを同時に使う場合は現状未検証**、 単一インスタンスのみの利用を推奨
-  - RP2040 では `hal/v2/memory/pool.inl` の allocator lock (bool + 割り込み禁止方式、
-    ARMv6-M に atomic RMW 命令が無く libatomic も無いため) と `hal/v2/service/service.inl` の
-    `sharedNowUs()` が `noInterrupts()`/`interrupts()` ベースで、 第2コアを保護しない。
-    RP2350 (Cortex-M33) の allocator lock は通常の `std::atomic_flag` をリンクできるが、
-    `sharedNowUs()` は同じ current-core 割り込み禁止方式のまま
-    (SAMD51 は allocator lock が `std::atomic_flag` で、 かつ元来シングルコア)。
-    正しい修正には RP2040 のハードウェア spinlock (`pico/sync.h`) が要るが、 実機検証手段が
-    無い状態で並行性クリティカルなコードを書くリスクを避け、 本 milestone では単一コア前提の
-    現状維持とする。 **RP2040 / RP2350 の第2コア (core1) を使う場合は現状未検証**
-- SAMD51 の CMSIS デバイスヘッダは `DAC` を、 STM32 の CMSIS デバイスヘッダは `ADC`
-  (legacy alias) を、 それぞれレジスタベースアドレスの macro として定義するため、
-  `types.hpp` は `BusKind` enumerator 定義の直前で `<Arduino.h>` を自ら include した上で
-  `DAC`/`ADC` を永続的に `#undef` する (include 順序に依存せず、 以後の TU 全体で
-  `BusKind::DAC`/`BusKind::ADC` の呼び出し側も保護する。 定義箇所だけ shadow して元に戻すと、
-  次の呼び出し側で同じ文字列置換が再発するため)
+  - lx106のatomic RMWはM5HALが使う演算だけinterrupt-mask実装で提供し、未提供演算はlink errorとする
+  - M5Utilityの`TL_ASSERT`はlx106 newlibとの互換性のためno-opとなる
+- 非ESP32 ArduinoのI2C `wire_timeout_ms`とSCL / SDA指定は適用されない。ただしESP8266のpin指定は
+  適用する。SPIは指定pinを適用できない場合に`UNSUPPORTED`を返す
+- native resourceは`acquire(config, native::borrowed(resource))`を提供する。Arduino core間で生成・
+  破棄契約を統一できないためmanaged取得は`UNSUPPORTED`とする
+- RP2040 / RP2350のcore1からM5HALを使う構成は未検証であり、allocator / serviceの保護を保証しない
+- SAMD51 / STM32のCMSIS `DAC` / `ADC` macroとの衝突を避けるため、`types.hpp`はこれらを`#undef`する
 
-## 追加時チェックリスト
+## 追加方法
 
-### framework variant を追加する
+framework variant、HAL kind、chip capabilityの追加手順とチェックリストは
+[../porting_guide/framework.md](../porting_guide/framework.md)を正本とする。選択規則や申告形式を
+変更する場合は、本書の該当契約も同時に更新する。
 
-1. `variants/frameworks/<name>/` を作り、 `_offer.hpp` / `hal.hpp` / 必要なら `hal.inl` を置く
-2. `variants/frameworks/_checker.hpp` に `M5HAL_FRAMEWORK_HAS_<NAME>` を追加する。ユーザーが切り替える挙動なら
-   `M5HAL_CONFIG_*` として [configuration.md](configuration.md) に登録する
-3. `variants/ids.hpp` に `M5HAL_V2_VARIANT_ID_FRAMEWORK_<NAME>` を追加し (framework レンジ 1〜49 の
-   末尾に +1、 append-only。 X-macro リスト `M5HAL_V2_VARIANT_ID_LIST_` にも同位置に追加)、
-   `_offer.hpp` で `M5HAL_VARIANT_CURRENT_ID_` として申告する。
-   `_macro/offer_all.inl` の各 kind の `#elif` チェーンにも 1 行ずつ追加する
-   (§選択 variant の診断 の実装注を参照。 漏れはチェーン末尾の `#error` で止まる)
-4. `M5HAL_v2.hpp` の scan order に header include + `_offer.hpp` + `offer_all.inl` を追加する。実装が `.inl`
-   を持つ場合は `M5HAL_v2.cpp` にも include を追加する
-5. 既存 kind を提供する場合は `_offer.hpp` で `M5HAL_VARIANT_CURRENT_HAS_HAL_<KIND>_` を申告し、 kind の
-   namespace 直下に `Bus_<variant>` と `BusConfig_<variant>` を公開する (§offer 要件)。未完成の kind は申告しない
-6. `test/v2/build_check/build_check.hpp` に suffix 付き variant 型（例:
-   `m5::hal::v2::<kind>::Bus_<name>`）の compile fence を足す
-7. `spec/reference/directory-layout.md` と本ページの配置表 / 走査順を更新する
-
-### HAL kind を追加する
-
-1. `src/m5_hal/hal/v2/<kind>/<kind>.hpp`（必要なら `.inl`）で共通抽象と config / accessor / desc を定義する
-2. `types::BusKind` に kind tag を追加し、 `BusConfig` / `AccessConfig` 派生の ctor でその tag を設定する
-3. `M5HAL_v2.hpp` / `M5HAL_v2.cpp` に共通 header / impl を include する
-4. `_macro/offer_all.inl` に新 kind のディスパッチブロックを追加する (既存 kind のブロックを複製して
-   kind トークンを差し替える: HAS ゲート / `M5HAL_OFFER_KIND_NS_` / platform 束縛ガード /
-   `M5HAL_V2_SELECTED_VARIANT_<KIND>` チェーン + `offer_kind.inl` の include)。 `M5HAL_v2.hpp` の
-   scan 後 NONE 補完にも 1 ブロック追加する
-5. 各 variant の `_offer.hpp` は、具象が揃った variant だけ新 kind を申告する。stub が fallback を担う場合は
-   stub の具象も同時に用意する
-6. native build_check と、最低1つの API-level unit test を追加する
-
-手順 1〜2 は bus kind の形。 bus 構造を持たない設備 kind (現行は runtime のみ) は手順 1 を
-「kind 契約の定義」 に読み替え、 手順 2 を省く ([runtime.md](runtime.md)。 NONE 補完も runtime
-は持たない — 選択不成立は early scan の `#error` で止める)
-
-### chip capability を追加する
-
-chip capability は `PinBackup` のように、HAL kind の勝者選択とは独立したチップ固有ユーティリティを指す。
-当面は **platform header から公開 namespace へ named `using` 宣言で明示公開**する。`offer_all.inl` の
-HAL kind 申告には載せない。
-
-1. platform variant 内の適切な `hal/<area>/` に型を置く
-2. platform header が常に include される経路で、`m5::hal::v2::<area>` へ named `using` 宣言を追加する
-3. `test/v2/build_check/build_check.hpp` で公開名から到達できることを compile fence に入れる
-4. `spec/design/<area>.md` に、HAL kind ではなく chip capability として公開する理由、対象 chip / no-op 条件、
-   実機検証状況を書く
-
-chip capability が複数増えて named `using` が煩雑になった時点で、HAL kind とは別の capability 用 offer
-機構を検討する。それまでは明示公開の方が読みやすく、勝者選択機構との責務境界も保ちやすい。
-
-## v2 初期スコープ
+## 現行の提供 variant
 
 | カテゴリ | variant | 役割 |
 |---|---|---|
 | frameworks | `freertos/` | FreeRTOS OS プリミティブ (Mutex, Task, Event)。 arduino / espidf と同時有効化し、 RUNTIME_MUTEX / RUNTIME_TASK / RUNTIME_EVENT を供給 |
 | frameworks | `bsd/` | BSD socket TCP transport (posix / espidf 共通)。 offer 機構非参加 (transport は bus kind ではない)。 `M5HAL_FRAMEWORK_HAS_BSD_SOCKET` で検出 |
-| frameworks | `arduino/` | Arduino-ESP32 framework の HAL 具象 + runtime time (Arduino core millis/micros/delay) |
+| frameworks | `arduino/` | allowlist対象Arduino coreのHAL具象 + runtime time (Arduino core millis/micros/delay) |
 | frameworks | `espidf/` | ESP-IDF framework の HAL 具象 + runtime time (esp_timer + vTaskDelay) |
 | frameworks | `posix/` | POSIX host の UART 具象 (termios serial。 opt-out = 既定有効、 `M5HAL_CONFIG_POSIX_UART=0` で UART kind のみ抑止) + runtime (CLOCK_MONOTONIC + std::timed_mutex) |
-| frameworks | `remote/` | I2C/SPI/UART/I2S の remote proxy 型。 `Hal::connect` 経由の remote acquire 自体はフラグ不要 (proxy と backend は umbrella `M5HAL_v2.hpp` と `M5HAL_v2.cpp` が無条件に include / コンパイルする)。 `M5HAL_CONFIG_REMOTE_VARIANT=1` は winner scan への参加 (remote variant の型 alias compile fence / host-side remote build) だけを opt-in する |
+| frameworks | `remote/` | I2C/SPI/UART/I2S/PDM の remote proxy 型。 `Hal::connect` 経由の remote acquire 自体はフラグ不要 (proxy と backend は umbrella `M5HAL_v2.hpp` と `M5HAL_v2.cpp` が無条件に include / コンパイルする)。 `M5HAL_CONFIG_REMOTE_VARIANT=1` は winner scan への参加 (remote variant の型 alias compile fence / host-side remote build) だけを opt-in する |
 | frameworks | `software/` | software bit-bang による I2C / SPI の framework 中立具象 |
 | frameworks | `stub/` | 実装済み kind の no-op / フェイク fallback (現行は GPIO と runtime、 test 用) |
 | platforms | `espressif/esp32/` | ESP32 family (`esp32` / `s2` / `s3` / `c2` / `c3` / `c5` / `c6` / `c61` / `h2` / `p4`) のレジスタ直叩き具象 |
-
-将来追加候補:
-- frameworks: `stdcpp/`, `zephyr/`、 posix への SPI/I2C 追加
-- platforms: `host/`、 他 vendor (`stmicroelectronics::stm32` 等)
 
 ## 関連
 

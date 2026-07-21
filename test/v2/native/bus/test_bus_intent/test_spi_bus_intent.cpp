@@ -18,55 +18,6 @@
 // placeholder). The shared allocation contract stays in the common tests;
 // SPI-specific feature filtering is exercised near the end of this file.
 
-// Test-local config + backend for the TYPED acquire<CfgT> path (an explicit
-// backend choice). The BackendFor specialization lets `BusView::acquire(cfg)`
-// build it through `Bus::init<CfgT>`; such a bus is NOT intent-managed, so
-// commitBuses() must leave it on this backend.
-namespace m5::hal::v2::spi {
-struct TypedFakeConfig : public IBusConfig {
-    using IBusConfig::IBusConfig;
-};
-class TypedFakeBackend : public IBus {
-public:
-    m5::hal::v2::result_t<void> init(const TypedFakeConfig& cfg)
-    {
-        _config = cfg;
-        return {};
-    }
-    // backendKind() keeps the base default (Software).
-};
-template <>
-struct BackendFor<TypedFakeConfig> {
-    using type = TypedFakeBackend;
-};
-
-// Typed (unmanaged) HARDWARE backend pinned to controller 0: commitBuses()
-// must reserve its controller so a managed bus is not assigned the same one.
-struct TypedFakeHwConfig : public IBusConfig {
-    using IBusConfig::IBusConfig;
-};
-class TypedFakeHwBackend : public IBus {
-public:
-    m5::hal::v2::result_t<void> init(const TypedFakeHwConfig& cfg)
-    {
-        _config = cfg;
-        return {};
-    }
-    m5::hal::v2::types::backend_kind_t backendKind(void) const override
-    {
-        return m5::hal::v2::types::backend_kind_t::Hardware;
-    }
-    int8_t controllerId(void) const override
-    {
-        return 0;
-    }
-};
-template <>
-struct BackendFor<TypedFakeHwConfig> {
-    using type = TypedFakeHwBackend;
-};
-}  // namespace m5::hal::v2::spi
-
 namespace {
 namespace v2 = m5::hal::v2;
 
@@ -99,11 +50,13 @@ private:
 // Factories injected into the test BusView. The hardware factory plays the role
 // espidf fills in a real build; the software factory plays the always-present
 // bit-bang fallback. Neither touches GPIO (this test is about allocation).
-v2::spi::IBus* fakeSwFactory(const v2::spi::LogicalBusConfig& /*logical*/)
+v2::spi::IBus* fakeSwFactory(const v2::bus::LocalResourceContext& /*resources*/,
+                             const v2::spi::LogicalBusConfig& /*logical*/)
 {
     return new (std::nothrow) FakeBackend(v2::types::backend_kind_t::Software, -1);
 }
-v2::spi::IBus* fakeHwFactory(const v2::spi::LogicalBusConfig& /*logical*/, int8_t controller)
+v2::spi::IBus* fakeHwFactory(const v2::bus::LocalResourceContext& /*resources*/,
+                             const v2::spi::LogicalBusConfig& /*logical*/, int8_t controller)
 {
     return new (std::nothrow) FakeBackend(v2::types::backend_kind_t::Hardware, controller);
 }
@@ -140,24 +93,6 @@ struct SpiIntentHarness {
         backend.registerKind(adapter);
     }
 };
-
-v2::spi::TypedFakeConfig makeTypedFakeConfig(void)
-{
-    v2::spi::TypedFakeConfig typed;
-    typed.pin_clk  = 14;
-    typed.pin_mosi = 13;
-    typed.pin_miso = 12;
-    return typed;
-}
-
-v2::spi::TypedFakeHwConfig makeTypedFakeHwConfig(void)
-{
-    v2::spi::TypedFakeHwConfig pinned_cfg;
-    pinned_cfg.pin_clk  = 10;
-    pinned_cfg.pin_mosi = 11;
-    pinned_cfg.pin_miso = 9;
-    return pinned_cfg;
-}
 
 v2::types::backend_caps_t hardwareWithoutSharedRx(int8_t)
 {
@@ -196,26 +131,6 @@ TEST(SpiBusIntent, RequireControllerClaimsSpecificController)
 {
     SpiIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
     v2::test::bus_contract::expectRequireControllerClaimsSpecificController(h.view, &reqByIndex);
-}
-
-TEST(SpiBusIntent, TypedAcquireIsNotManagedByCommit)
-{
-    SpiIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
-    v2::test::bus_contract::expectTypedAcquireIsNotManagedByCommit(h.view, &reqByIndex, &makeTypedFakeConfig);
-}
-
-TEST(SpiBusIntent, TypedReacquireThroughLogicalBecomesManaged)
-{
-    SpiIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
-    v2::test::bus_contract::expectTypedReacquireThroughLogicalBecomesManaged(h.view, &reqByIndex,
-                                                                             &makeTypedFakeConfig);
-}
-
-TEST(SpiBusIntent, UnmanagedHardwareBusReservesItsController)
-{
-    SpiIntentHarness h{&fakeSwFactory, &fakeHwFactory, /*hw_capacity=*/2};
-    v2::test::bus_contract::expectUnmanagedHardwareBusReservesItsController(h.view, &reqByIndex,
-                                                                            &makeTypedFakeHwConfig);
 }
 
 TEST(SpiBusIntent, SoftwareForbidKeepsHardwareOff)

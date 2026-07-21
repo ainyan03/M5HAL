@@ -3,7 +3,10 @@
 #define M5_HAL_VARIANTS_FRAMEWORKS_ESPIDF_HAL_I2S_I2S_HPP
 
 #include "../../detail/espidf_version.hpp"
+#include "controller_lease.hpp"
 #include "../../../../../hal/v2/bus/bus.hpp"
+#include "../../../../../hal/v2/bus/hal_backend.hpp"
+#include "../../../../../hal/v2/bus/portable_factory.hpp"
 #include "../../../../../hal/v2/i2s/i2s.hpp"
 
 namespace m5::hal::v2::i2s::detail_espidf_i2s {
@@ -31,18 +34,9 @@ inline size_t collapseStereo16RxPairsToMonoLeft(uint8_t* dst, const uint8_t* src
 
 namespace m5::hal::v2::i2s {
 
-// This variant needs no fields beyond the abstract kind config; the
-// empty derivation still gives `init` a variant-owned type, so a
-// sibling variant's config cannot be passed by accident (the same
-// typed-init guarantee as variants with extra fields).
-struct BusConfig_espidf : public i2s::IBusConfig {
-    using IBusConfig::IBusConfig;
-};
-
 // ESP-IDF gen5 (driver/i2s_std.h) concrete I2S bus (TX and/or RX).
-// The channels are created lazily on the first write / read. On each call the
-// AccessConfig is compared to the previous one; if it changed the channels are
-// disabled, reconfigured, then re-enabled. Which channels exist is pin-driven:
+// The channels are created lazily when an Access begins. The requested
+// AccessConfig is applied once for that Access. Which channels exist is pin-driven:
 // pin_dout >= 0 creates a TX channel, pin_din >= 0 creates an RX channel, both
 // create a full-duplex pair on one controller (shared BCLK / WS, independent
 // DMA). Role (master / slave) sets the clock direction. Underruns are silent
@@ -51,21 +45,42 @@ struct BusConfig_espidf : public i2s::IBusConfig {
 // readableBytes().
 class Bus_espidf : public i2s::IBus {
 public:
-    ~Bus_espidf() override
+    ~Bus_espidf() override;
+
+    result_t<void> init(const IBusConfig& config);
+    result_t<void> close(void)
     {
-        (void)release();
+        return bus::IBus::close();
     }
 
-    result_t<void> init(const BusConfig_espidf& config);
-    result_t<void> release(void) override;
+    types::backend_kind_t backendKind(void) const override
+    {
+        return types::backend_kind_t::Hardware;
+    }
+    bus::BusCapabilities capabilities(void) const override
+    {
+        return bus::detail::BusCapabilitiesBuilder{i2s::IBus::capabilities()}
+            .enable(bus::BusFeature::Transmit, _config.pin_dout >= 0)
+            .enable(bus::BusFeature::Receive, _config.pin_din >= 0)
+            .enable(bus::BusFeature::FullDuplex, _config.pin_dout >= 0 && _config.pin_din >= 0)
+            .build();
+    }
 
-    result_t<size_t> write(bus::IAccessor* owner, const i2s::AccessConfig& cfg, data::Source* src, size_t len) override;
+protected:
+    result_t<void> beginOperationBackend(bus::OperationContext<i2s::AccessConfig>& context) override;
+    result_t<void> endOperationBackend(bus::OperationContext<i2s::AccessConfig>& context) override;
 
-    result_t<size_t> writableBytes(bus::IAccessor* owner, const i2s::AccessConfig& cfg) override;
+    result_t<size_t> writeBackend(bus::OperationContext<i2s::AccessConfig>& context, data::Source* src,
+                                  size_t len) override;
 
-    result_t<size_t> read(bus::IAccessor* owner, const i2s::AccessConfig& cfg, data::Sink* dst, size_t len) override;
+    result_t<size_t> writableBytesBackend(bus::OperationContext<i2s::AccessConfig>& context) override;
 
-    result_t<size_t> readableBytes(bus::IAccessor* owner, const i2s::AccessConfig& cfg) override;
+    result_t<size_t> readBackend(bus::OperationContext<i2s::AccessConfig>& context, data::Sink* dst,
+                                 size_t len) override;
+
+    result_t<size_t> readableBytesBackend(bus::OperationContext<i2s::AccessConfig>& context) override;
+
+    bus::CloseOutcome closeBackend(void) override;
 
 private:
     // Lazily open (or reconfigure) the I2S channels to match cfg. Creates a TX
@@ -73,7 +88,9 @@ private:
     result_t<void> ensureChannel(const i2s::AccessConfig& cfg);
 
     // Close and delete both channels if they exist.
-    void destroyChannel(void);
+    bus::CloseOutcome teardownBackend(void);
+    result_t<void> resetForInitialization(void);
+    result_t<void> failAfterSetup(error::error_t cause);
 
     // Recompute _expand_mono / _swap16 from cfg (see the field comments below
     // for why HW v2 needs them) and report the resulting frame size (bytes per
@@ -88,6 +105,7 @@ private:
 
     ::i2s_chan_handle_t _tx_handle = nullptr;
     ::i2s_chan_handle_t _rx_handle = nullptr;
+    int8_t _controller             = -1;
     bool _channel_enabled          = false;
 
     // Serializes channel create / reconfigure. ensureChannel() runs while the
@@ -97,6 +115,14 @@ private:
     // _configured inside) so the two directions cannot double-create or destroy
     // each other's handle. Taken alone, never nested with the channel locks.
     runtime::Mutex _setup_mutex;
+
+    // Coordinates the independently locked TX/RX Access scopes while applying
+    // the one physical channel configuration shared by both directions.
+    runtime::Mutex _operation_mutex;
+    std::atomic<bus::IAccessor*> _active_tx_owner{nullptr};
+    std::atomic<bus::IAccessor*> _active_rx_owner{nullptr};
+    i2s::AccessConfig _active_operation_cfg;
+    bool _operation_configured = false;
 
     // Bytes of OUR data currently in the TX DMA pipeline. write() adds; the
     // on_sent callback subtracts with a clamp at zero. The clamp is what
@@ -158,10 +184,18 @@ private:
     bool _configured = false;
 };
 
-// Facade backend selection: i2s::Bus::init(BusConfig_espidf) -> Bus_espidf.
-template <>
-struct BackendFor<BusConfig_espidf> {
-    using type = Bus_espidf;
+inline result_t<std::unique_ptr<IBus>> makePortableBackend_espidf(const bus::LocalResourceContext& resources,
+                                                                  const IBusConfig& config)
+{
+    return bus::makePortableBackend<IBus, Bus_espidf, IBusConfig>(resources, config);
+}
+
+template <class Policy>
+struct NativeProvider_espidf {
+    static result_t<std::shared_ptr<IBus>> acquire(bus::IHalBackend&, const IBusConfig&, Policy)
+    {
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
 };
 
 }  // namespace m5::hal::v2::i2s

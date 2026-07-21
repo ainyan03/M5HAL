@@ -19,41 +19,6 @@ namespace impl_software {
 
 constexpr uint32_t kNsecPerSec = 1000000000u;
 
-struct BusDcLevelCache {
-    const void* bus = nullptr;
-    bool high       = false;
-};
-
-BusDcLevelCache g_bus_dc_levels[8];
-
-bool busDcLevelHigh(const void* bus)
-{
-    for (const auto& entry : g_bus_dc_levels) {
-        if (entry.bus == bus) {
-            return entry.high;
-        }
-    }
-    return false;
-}
-
-void noteBusDcLevel(const void* bus, bool high)
-{
-    BusDcLevelCache* empty = nullptr;
-    for (auto& entry : g_bus_dc_levels) {
-        if (entry.bus == bus) {
-            entry.high = high;
-            return;
-        }
-        if (empty == nullptr && entry.bus == nullptr) {
-            empty = &entry;
-        }
-    }
-    if (empty != nullptr) {
-        empty->bus  = bus;
-        empty->high = high;
-    }
-}
-
 result_t<service::fast_tick_t> halfPeriodTick(const spi::MasterAccessConfig& cfg)
 {
     if (cfg.freq == 0) {
@@ -118,13 +83,13 @@ bool isSingleLaneHalfDuplexMode(spi::spi_data_mode_t mode)
            mode == spi_data_mode_t::HalfDuplexWithDcBit;
 }
 
-result_t<void> resolveOptionalPin(types::gpio_number_t gpio_num, gpio::Pin& out)
+result_t<void> resolveOptionalPin(gpio::GPIOGroup& gpio_group, types::gpio_number_t gpio_num, gpio::Pin& out)
 {
     out = {};
     if (gpio_num < 0) {
         return {};
     }
-    auto pin = M5_Hal.Gpio.tryGetPin(gpio_num);
+    auto pin = gpio_group.tryGetPin(gpio_num);
     if (!pin.has_value()) {
         return m5::stl::make_unexpected(pin.error());
     }
@@ -751,13 +716,33 @@ Bus_software::Bus_software()
 
 Bus_software::~Bus_software()
 {
-    clearTransferService();
+    (void)teardown();
 }
 
-result_t<void> Bus_software::release(void)
+result_t<void> Bus_software::teardown(void)
 {
-    clearTransferService();
+    auto cleared = clearTransferService();
+    if (!cleared.has_value()) {
+        return m5::stl::make_unexpected(cleared.error());
+    }
+    _pin_clk        = {};
+    _pin_dc         = {};
+    _pin_dc_acc     = {};
+    _acc_dc_num     = -1;
+    _dc_level_high  = false;
+    _pin_mosi       = {};
+    _pin_miso       = {};
+    _transaction_cs = {};
     return {};
+}
+
+bus::CloseOutcome Bus_software::closeBackend(void)
+{
+    auto closed = teardown();
+    if (!closed.has_value()) {
+        return bus::CloseOutcome::partialOrUnknown(closed.error());
+    }
+    return bus::CloseOutcome::success();
 }
 
 service::ServicePoll Bus_software::serviceImpl(const service::ServiceContext& ctx)
@@ -765,16 +750,24 @@ service::ServicePoll Bus_software::serviceImpl(const service::ServiceContext& ct
     return serviceTransfer(ctx);
 }
 
-void Bus_software::unregisterTransferService(void)
+result_t<void> Bus_software::unregisterTransferService(void)
 {
     if (_transfer_registered.exchange(false, std::memory_order_relaxed)) {
-        (void)M5_Hal.Services.remove(*this);
+        auto removed = localResources().services->remove(*this);
+        if (!removed.has_value()) {
+            _transfer_registered.store(true, std::memory_order_relaxed);
+            return m5::stl::make_unexpected(removed.error());
+        }
     }
+    return {};
 }
 
-void Bus_software::clearTransferService(void)
+result_t<void> Bus_software::clearTransferService(void)
 {
-    unregisterTransferService();
+    auto unregistered = unregisterTransferService();
+    if (!unregistered.has_value()) {
+        return m5::stl::make_unexpected(unregistered.error());
+    }
     if (_transfer_service != nullptr) {
         delete static_cast<impl_software::TransferService*>(_transfer_service);
         _transfer_service = nullptr;
@@ -783,13 +776,18 @@ void Bus_software::clearTransferService(void)
     _transfer_error = error::error_t::OK;
     _transfer_totals.clear();
     _transfer_gate.reset();
+    return {};
 }
 
 service::ServicePoll Bus_software::serviceTransfer(const service::ServiceContext& ctx)
 {
     using GateState = service::CompletionGate::State;
     if (_transfer_gate.state() != GateState::Busy) {
-        unregisterTransferService();
+        auto unregistered = unregisterTransferService();
+        if (!unregistered.has_value()) {
+            _transfer_error = unregistered.error();
+            return service::ServiceResult::Error;
+        }
         return service::ServiceResult::Idle;
     }
 
@@ -797,60 +795,81 @@ service::ServicePoll Bus_software::serviceTransfer(const service::ServiceContext
     auto result   = service->service(ctx);
     // Terminal order matters: finish() must precede unregisterTransferService().
     // Once _transfer_registered is cleared, a concurrent teardown
-    // (release()/dtor/init) skips the synchronous remove() and may delete the
+    // (teardown/dtor/init) skips the synchronous remove() and may delete the
     // service and reset the gate -- a finish() issued after that would write
     // freed/cleared storage. Publishing first keeps every write to this object
     // inside the window the teardown's remove() still waits for.
+    // unregisterTransferService() cannot change the terminal outcome here:
+    // a registered transfer runs as ServiceRunner's current writer, whose
+    // remove() is an infallible direct write; an unregistered sole-pumper
+    // takes the idempotent no-op path. Keep finish() a single terminal
+    // transition and never rewrite payload after its release publication.
     if (result == service::ServiceResult::Error) {
         _transfer_error  = service->error();
         _transfer_totals = service->totals();
         _transfer_gate.finish(GateState::Error);
-        unregisterTransferService();
+        (void)unregisterTransferService();
         return result;
     }
     if (result == service::ServiceResult::Done) {
         _transfer_totals = service->totals();
         _transfer_gate.finish(GateState::Done);
-        unregisterTransferService();
+        (void)unregisterTransferService();
         return result;
     }
     return result;
 }
 
-result_t<void> Bus_software::init(const BusConfig_software& config)
+result_t<void> Bus_software::init(const IBusConfig& config)
 {
-    clearTransferService();
-    _config = config;
+    if (!initializationAllowed(false)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    const auto& resources = localResources();
+    if (!resources.valid()) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
 
-    if (_config.pin_clk < 0) {
+    if (config.pin_clk < 0) {
         M5_LIB_LOGE("software::spi::Bus_software::init: CLK pin not set");
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
-    auto clk = M5_Hal.Gpio.tryGetPin(_config.pin_clk);
+    auto clk = resources.gpio->tryGetPin(config.pin_clk);
     if (!clk.has_value()) {
         return m5::stl::make_unexpected(clk.error());
     }
-    _pin_clk = clk.value();
 
-    auto dc = impl_software::resolveOptionalPin(_config.pin_dc, _pin_dc);
+    gpio::Pin pin_dc;
+    gpio::Pin pin_mosi;
+    gpio::Pin pin_miso;
+    auto dc = impl_software::resolveOptionalPin(*resources.gpio, config.pin_dc, pin_dc);
     if (!dc.has_value()) {
         return m5::stl::make_unexpected(dc.error());
     }
-    auto mosi = impl_software::resolveOptionalPin(_config.pin_mosi, _pin_mosi);
+    auto mosi = impl_software::resolveOptionalPin(*resources.gpio, config.pin_mosi, pin_mosi);
     if (!mosi.has_value()) {
         return m5::stl::make_unexpected(mosi.error());
     }
-    auto miso = impl_software::resolveOptionalPin(_config.pin_miso, _pin_miso);
+    auto miso = impl_software::resolveOptionalPin(*resources.gpio, config.pin_miso, pin_miso);
     if (!miso.has_value()) {
         return m5::stl::make_unexpected(miso.error());
     }
+    auto reset = teardown();
+    if (!reset.has_value()) {
+        return reset;
+    }
+    _config   = config;
+    _pin_clk  = clk.value();
+    _pin_dc   = pin_dc;
+    _pin_mosi = pin_mosi;
+    _pin_miso = pin_miso;
 
     _pin_clk.setMode(types::gpio_mode_t::Output);
     _pin_clk.writeLow();
     if (_pin_dc.isValid()) {
         _pin_dc.setMode(types::gpio_mode_t::Output);
         _pin_dc.writeHigh();
-        impl_software::noteBusDcLevel(this, true);
+        _dc_level_high = true;
     }
     if (_pin_mosi.isValid()) {
         _pin_mosi.setMode(types::gpio_mode_t::Output);
@@ -859,14 +878,21 @@ result_t<void> Bus_software::init(const BusConfig_software& config)
     if (_pin_miso.isValid()) {
         _pin_miso.setMode(types::gpio_mode_t::Input);
     }
+    auto initialized = markInitializationSucceeded(false);
+    if (!initialized.has_value()) {
+        (void)teardown();
+        return initialized;
+    }
     return {};
 }
 
-result_t<void> Bus_software::transfer(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg,
-                                      const spi::TransferDesc& desc, data::Source* src, size_t tx_len, data::Sink* dst,
-                                      size_t rx_len)
+result_t<void> Bus_software::transferBackend(bus::OperationContext<spi::MasterAccessConfig>& context,
+                                             const spi::TransferDesc& desc, data::Source* src, size_t tx_len,
+                                             data::Sink* dst, size_t rx_len)
 {
-    auto waited = waitTransfer(owner, cfg);
+    auto* owner     = &bus::OperationSlot::contextOwner(context);
+    const auto& cfg = context.config;
+    auto waited     = waitTransferBackend(context);
     if (!waited.has_value()) {
         return m5::stl::make_unexpected(waited.error());
     }
@@ -884,7 +910,7 @@ result_t<void> Bus_software::transfer(bus::IAccessor* owner, const spi::MasterAc
                                 mode == spi_data_mode_t::OctalOutput || mode == spi_data_mode_t::OctalIo;
         half_duplex = impl_software::isSingleLaneHalfDuplexMode(mode);
         if (multi_lane) {
-            return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
+            return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
         }
     }
     if (!_pin_clk.isValid()) {
@@ -908,7 +934,7 @@ result_t<void> Bus_software::transfer(bus::IAccessor* owner, const spi::MasterAc
     // bus-level default. The override pin is resolved/configured once
     // and cached (resolution walks the GPIOGroup; too slow per call).
     if (cfg.pin_dc >= 0 && cfg.pin_dc != _acc_dc_num) {
-        auto acc_dc = M5_Hal.Gpio.tryGetPin(cfg.pin_dc);
+        auto acc_dc = localResources().gpio->tryGetPin(cfg.pin_dc);
         if (!acc_dc.has_value()) {
             return m5::stl::make_unexpected(acc_dc.error());
         }
@@ -923,14 +949,14 @@ result_t<void> Bus_software::transfer(bus::IAccessor* owner, const spi::MasterAc
     if (!has_phase_dc && dc_pin.isValid() && desc.dc_level_valid) {
         dc_pin.write(desc.dc_level);
         if (cfg.pin_dc < 0) {
-            impl_software::noteBusDcLevel(this, desc.dc_level);
+            _dc_level_high = desc.dc_level;
         }
     }
     if (cfg.pin_dc < 0 && has_phase_dc) {
         if (desc.data_dc_level >= 0) {
-            impl_software::noteBusDcLevel(this, desc.data_dc_level != 0);
+            _dc_level_high = desc.data_dc_level != 0;
         } else if (desc.command_dc_level >= 0 || desc.address_dc_level >= 0) {
-            impl_software::noteBusDcLevel(this, true);
+            _dc_level_high = true;
         }
     }
 
@@ -952,24 +978,31 @@ result_t<void> Bus_software::transfer(bus::IAccessor* owner, const spi::MasterAc
     auto first = serviceTransfer(service::ServiceContext{0, service::fastTick()});
     if (first == service::ServiceResult::Error) {
         const auto err = _transfer_error;
-        clearTransferService();
+        auto cleared   = clearTransferService();
+        if (!cleared.has_value()) {
+            return m5::stl::make_unexpected(cleared.error());
+        }
         return m5::stl::make_unexpected(err);
     }
 
     if (_transfer_gate.busy()) {
         _transfer_registered.store(true, std::memory_order_relaxed);
-        if (!M5_Hal.Services.add(*this)) {
-            clearTransferService();
-            return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+        auto added = localResources().services->add(*this);
+        if (!added.has_value()) {
+            auto cleared = clearTransferService();
+            if (!cleared.has_value()) {
+                return m5::stl::make_unexpected(cleared.error());
+            }
+            return m5::stl::make_unexpected(added.error());
         }
     }
 
     return {};
 }
 
-result_t<bus::TransferTotals> Bus_software::waitTransfer(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg)
+result_t<bus::TransferTotals> Bus_software::waitTransferBackend(bus::OperationContext<spi::MasterAccessConfig>& context)
 {
-    (void)cfg;
+    auto* owner     = &bus::OperationSlot::contextOwner(context);
     using GateState = service::CompletionGate::State;
     if (_transfer_gate.state() != GateState::Idle && _transfer_owner != owner) {
         return m5::stl::make_unexpected(error::error_t::BUSY);
@@ -992,10 +1025,17 @@ result_t<bus::TransferTotals> Bus_software::waitTransfer(bus::IAccessor* owner, 
             // with the runner task (double-pump window at auto-run start).
             // The wait must eventually BLOCK, not merely yield: taskYIELD()
             // only yields to READY tasks of the SAME priority.
-            if (M5_Hal.Services.autoRunActive() || !M5_Hal.Services.runOnce()) {
+            if (localResources().services->autoRunActive()) {
                 backoff.step();
             } else {
-                backoff.reset();
+                auto pumped = localResources().services->runOnce();
+                // BUSY is transient runner contention; a successful false
+                // payload means the pass itself made no progress.
+                if (!pumped.has_value() || !pumped.value()) {
+                    backoff.step();
+                } else {
+                    backoff.reset();
+                }
             }
         } else {
             // Unpublished state: this thread is the sole pumper; spin at full
@@ -1010,28 +1050,35 @@ result_t<bus::TransferTotals> Bus_software::waitTransfer(bus::IAccessor* owner, 
 
     if (_transfer_gate.state() == GateState::Error) {
         const auto err = _transfer_error;
-        clearTransferService();
+        auto cleared   = clearTransferService();
+        if (!cleared.has_value()) {
+            return m5::stl::make_unexpected(cleared.error());
+        }
         return m5::stl::make_unexpected(err);
     }
 
     const auto totals = _transfer_totals;
-    clearTransferService();
+    auto cleared      = clearTransferService();
+    if (!cleared.has_value()) {
+        return m5::stl::make_unexpected(cleared.error());
+    }
     return totals;
 }
 
-bool Bus_software::transferBusy(bus::IAccessor* owner)
+bool Bus_software::transferBusyBackend(bus::OperationContext<spi::MasterAccessConfig>& context)
 {
+    auto* owner = &bus::OperationSlot::contextOwner(context);
     return _transfer_gate.busy() && _transfer_owner == owner;
 }
 
-result_t<void> Bus_software::beginTransaction(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg)
+result_t<void> Bus_software::beginOperationBackend(bus::OperationContext<spi::MasterAccessConfig>& context)
 {
-    (void)owner;
+    const auto& cfg = context.config;
     if (!_pin_clk.isValid()) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
 
-    auto cs_result = impl_software::resolveOptionalPin(cfg.pin_cs, _transaction_cs);
+    auto cs_result = impl_software::resolveOptionalPin(*localResources().gpio, cfg.pin_cs, _transaction_cs);
     if (!cs_result.has_value()) {
         return m5::stl::make_unexpected(cs_result.error());
     }
@@ -1041,16 +1088,17 @@ result_t<void> Bus_software::beginTransaction(bus::IAccessor* owner, const spi::
         _transaction_cs.setMode(types::gpio_mode_t::Output);
         _transaction_cs.writeLow();
     }
-    if (_pin_dc.isValid() && !impl_software::busDcLevelHigh(this)) {
+    if (_pin_dc.isValid() && !_dc_level_high) {
         _pin_dc.writeHigh();
-        impl_software::noteBusDcLevel(this, true);
+        _dc_level_high = true;
     }
     return {};
 }
 
-result_t<void> Bus_software::endTransaction(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg)
+result_t<void> Bus_software::endOperationBackend(bus::OperationContext<spi::MasterAccessConfig>& context)
 {
-    auto waited = waitTransfer(owner, cfg);
+    const auto& cfg = context.config;
+    auto waited     = waitTransferBackend(context);
     _pin_clk.write((cfg.spi_mode & 0x02) != 0);
     if (_transaction_cs.isValid()) {
         _transaction_cs.writeHigh();

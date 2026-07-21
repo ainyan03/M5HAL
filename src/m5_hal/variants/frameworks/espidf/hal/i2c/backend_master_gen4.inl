@@ -8,6 +8,8 @@
 
 #include "backend_master_write_buffer.inl"
 
+#include "../../detail/esp_err_map.hpp"
+
 #include <esp_err.h>
 
 #include <cstdint>
@@ -26,21 +28,11 @@ namespace detail = ::m5::variants::frameworks::espidf::hal::v2::i2c::detail;
 
 error::error_t mapEspErr(::esp_err_t err)
 {
-    switch (err) {
-        case ESP_OK:
-            return error::error_t::OK;
-        case ESP_ERR_INVALID_ARG:
-        case ESP_ERR_INVALID_STATE:
-            return error::error_t::INVALID_ARGUMENT;
-        case ESP_ERR_TIMEOUT:
-            return error::error_t::TIMEOUT_ERROR;
-        case ESP_ERR_NO_MEM:
-            return error::error_t::OUT_OF_RESOURCE;
-        case ESP_FAIL:
-            return error::error_t::I2C_NO_ACK;
-        default:
-            return error::error_t::I2C_BUS_ERROR;
+    // The command-link driver reports a NACKed transfer as plain ESP_FAIL.
+    if (err == ESP_FAIL) {
+        return error::error_t::I2C_NO_ACK;
     }
+    return ::m5::variants::frameworks::espidf::detail::mapEspErrCommon(err, error::error_t::I2C_BUS_ERROR);
 }
 
 bool isValidAddress(const i2c::MasterAccessConfig& cfg)
@@ -83,22 +75,30 @@ bool isValidAddress(const i2c::MasterAccessConfig& cfg)
 }  // namespace impl_espidf_gen4
 }  // namespace
 
-result_t<void> Bus_espidf::init(const BusConfig_espidf& config)
+result_t<void> Bus_espidf::init(const IBusConfig& config)
 {
+    return initBackend(config, static_cast<int8_t>(I2C_NUM_0));
+}
+
+result_t<void> Bus_espidf::initBackend(const IBusConfig& config, int8_t controller)
+{
+    if (!initializationAllowed(false)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
     if (config.pin_scl < 0 || config.pin_sda < 0) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
-    // Release the previous driver while `_port` still names the OLD port;
+    // Tear down the previous driver while `_port` still names the OLD port;
     // adopting the new config first would delete the wrong driver and
     // leak the old one.
     if (_installed) {
-        auto released = release();
-        if (!released.has_value()) {
-            return m5::stl::make_unexpected(released.error());
+        auto closed = teardownBackend();
+        if (closed.disposition != bus::CloseDisposition::Success) {
+            return m5::stl::make_unexpected(closed.error_code);
         }
     }
     _config = config;
-    _port   = config.i2c_port;
+    _port   = static_cast<::i2c_port_t>(controller);
 
     ::i2c_config_t conf   = {};
     conf.mode             = I2C_MODE_MASTER;
@@ -117,28 +117,33 @@ result_t<void> Bus_espidf::init(const BusConfig_espidf& config)
     if (error::isError(mapped)) {
         return m5::stl::make_unexpected(mapped);
     }
-    _installed    = true;
-    _applied_freq = conf.master.clk_speed;
+    _installed       = true;
+    _applied_freq    = conf.master.clk_speed;
+    auto initialized = markInitializationSucceeded(false);
+    if (!initialized.has_value()) {
+        (void)teardownBackend();
+        return initialized;
+    }
     return {};
 }
 
-result_t<void> Bus_espidf::release(void)
+bus::CloseOutcome Bus_espidf::teardownBackend(void)
 {
     if (_installed) {
-        // Transactional release (D1/D9): clear ownership flags only AFTER the
+        // Transactional teardown: clear ownership flags only AFTER the
         // ESP-IDF free succeeds. i2c_driver_delete returns an error on bad args /
         // wrong state without having freed the driver, so on error we keep
-        // _installed set -- the dtor (or a retried release) can try again, and a
+        // _installed set -- the dtor (or a retried close) can try again, and a
         // swap that aborts on this error keeps a usable old backend instead of a
         // half-torn-down one.
         auto mapped = impl_espidf_gen4::mapEspErr(::i2c_driver_delete(_port));
         if (error::isError(mapped)) {
-            return m5::stl::make_unexpected(mapped);
+            return bus::CloseOutcome::noMutation(mapped);
         }
         _installed    = false;
         _applied_freq = 0;
     }
-    return {};
+    return bus::CloseOutcome::success();
 }
 
 // Unlike the gen5 driver, the legacy `i2c_master_cmd_begin` timeout paths
@@ -146,10 +151,12 @@ result_t<void> Bus_espidf::release(void)
 // call `i2c_hw_fsm_reset()` -- which folds in a clear-bus -- synchronously,
 // before returning ESP_ERR_TIMEOUT. So this backend already returns with the
 // bus terminated on a timeout; no additional recovery call is needed here.
-result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const i2c::MasterAccessConfig& cfg,
-                                    const i2c::TransferDesc& desc, data::Source* src, size_t tx_len, data::Sink* dst,
-                                    size_t rx_len)
+result_t<void> Bus_espidf::transferBackend(bus::OperationContext<i2c::MasterAccessConfig>& context,
+                                           const i2c::TransferDesc& desc, data::Source* src, size_t tx_len,
+                                           data::Sink* dst, size_t rx_len)
 {
+    auto* owner     = &bus::OperationSlot::contextOwner(context);
+    const auto& cfg = context.config;
     (void)owner;
     _transfer_totals.clear();
     if (!_installed || cfg.freq == 0 || !impl_espidf_gen4::isValidAddress(cfg)) {
@@ -275,8 +282,10 @@ result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const i2c::MasterAcce
     return {};
 }
 
-result_t<bus::TransferTotals> Bus_espidf::waitTransfer(bus::IAccessor* owner, const i2c::MasterAccessConfig& cfg)
+result_t<bus::TransferTotals> Bus_espidf::waitTransferBackend(bus::OperationContext<i2c::MasterAccessConfig>& context)
 {
+    auto* owner     = &bus::OperationSlot::contextOwner(context);
+    const auto& cfg = context.config;
     (void)owner;
     (void)cfg;
     auto totals = _transfer_totals;
@@ -284,8 +293,9 @@ result_t<bus::TransferTotals> Bus_espidf::waitTransfer(bus::IAccessor* owner, co
     return totals;
 }
 
-bool Bus_espidf::transferBusy(bus::IAccessor* owner)
+bool Bus_espidf::transferBusyBackend(bus::OperationContext<i2c::MasterAccessConfig>& context)
 {
+    auto* owner = &bus::OperationSlot::contextOwner(context);
     (void)owner;
     return false;
 }

@@ -10,9 +10,12 @@
 //   pio run -e BuildTest_esp32
 //   pio run -e BuildTest_esp32s3
 //   pio run -e BuildTest_host       (POSIX native)
+// The same file is included by the official ESP-IDF and SPRESENSE CI wrappers.
 // =============================================================================
 
 #include <M5HAL_v2.hpp>
+
+#include <type_traits>
 
 namespace m5hal = m5::hal::v2;
 
@@ -72,8 +75,9 @@ static void checkBusBase()
     (void)sizeof(m5hal::bus::IAccessConfig);
     (void)sizeof(m5hal::bus::IAccessor);
     (void)sizeof(m5hal::bus::IBus);
-    (void)sizeof(m5hal::bus::ScopedLock);
-
+    (void)sizeof(m5hal::bus::BusCapabilities);
+    (void)m5hal::bus::BusFeature::MasterTransfer;
+    (void)m5hal::bus::BusLimit::MaxAtomicTxBytes;
     m5hal::bus::TransferTotals totals;
     totals.tx = 1;
     totals.rx = 2;
@@ -89,21 +93,20 @@ static void checkBusBase()
     if (false) {
         (void)bus->getConfig();
         (void)bus->getBusKind();
-        (void)bus->release();
-        (void)bus->lock(accessor);
-        (void)bus->unlock(accessor);
         (void)bus->backendKind();
         (void)bus->controllerId();
         (void)bus->maxFrequency();
         (void)bus->backendGeneration();
+        const auto caps = bus->capabilities();
+        (void)caps.supports(m5hal::bus::BusFeature::Transmit);
+        (void)caps.limit(m5hal::bus::BusLimit::MaxFrequencyHz);
+        (void)caps.generation();
 
         (void)accessor->getConfig();
         (void)accessor->getBusKind();
         (void)accessor->isBound();
         (void)accessor->getBus();
         (void)accessor->getBusConfig();
-        (void)accessor->beginAccess();
-        (void)accessor->endAccess();
         (void)accessor->inAccess();
     }
 }
@@ -136,46 +139,56 @@ static void checkAllocationAndBusViews()
     m5hal::spi::BusView spi_view;
     m5hal::uart::BusView uart_view;
     m5hal::i2s::BusView i2s_view;
+    m5hal::pdm::BusView pdm_view;
     (void)i2c_view;
     (void)spi_view;
     (void)uart_view;
     (void)i2s_view;
+    (void)pdm_view;
 
     m5hal::i2c::LogicalBusConfig i2c_log{m5hal::i2c::Scl{22}, m5hal::i2c::Sda{21}, require_hw};
     m5hal::spi::LogicalBusConfig spi_log{m5hal::spi::Clk{18}, m5hal::spi::Mosi{23}, m5hal::spi::Miso{19}, prefer_hw};
     m5hal::uart::LogicalBusConfig uart_log{m5hal::uart::Tx{17}, m5hal::uart::Rx{16}, auto_intent};
     m5hal::i2s::LogicalBusConfig i2s_log{m5hal::i2s::Bclk{26}, m5hal::i2s::Ws{25}, m5hal::i2s::Dout{22},
                                          m5hal::i2s::Din{21}, software_only};
+    m5hal::pdm::LogicalBusConfig pdm_log{m5hal::pdm::Clk{0}, m5hal::pdm::Din{34}, require_hw};
     (void)i2c_log.pin_scl;
     (void)spi_log.pin_clk;
     (void)uart_log.pin_tx;
     (void)i2s_log.pin_bclk;
+    (void)pdm_log.pin_clk;
 
     if (false) {
         auto i2c_bus = i2c_view.acquire(i2c_log);
-        (void)i2c_view.release(i2c_bus.value());
+        (void)i2c_view.close(i2c_bus.value());
         (void)i2c_view.commitBuses();
         (void)i2c_view.hardwareInUse();
         (void)i2c_view.createBusConfig(m5hal::i2c::Scl{22}, m5hal::i2c::Sda{21}, require_hw);
 
         auto spi_bus = spi_view.acquire(spi_log);
-        (void)spi_view.release(spi_bus.value());
+        (void)spi_view.close(spi_bus.value());
         (void)spi_view.commitBuses();
         (void)spi_view.hardwareInUse();
         (void)spi_view.createBusConfig(m5hal::spi::Clk{18}, m5hal::spi::Mosi{23}, m5hal::spi::Miso{19}, prefer_hw);
 
         auto uart_bus = uart_view.acquire(uart_log);
-        (void)uart_view.release(uart_bus.value());
+        (void)uart_view.close(uart_bus.value());
         (void)uart_view.commitBuses();
         (void)uart_view.hardwareInUse();
         (void)uart_view.createBusConfig(m5hal::uart::Tx{17}, m5hal::uart::Rx{16}, auto_intent);
 
         auto i2s_bus = i2s_view.acquire(i2s_log);
-        (void)i2s_view.release(i2s_bus.value());
+        (void)i2s_view.close(i2s_bus.value());
         (void)i2s_view.commitBuses();
         (void)i2s_view.hardwareInUse();
         (void)i2s_view.createBusConfig(m5hal::i2s::Bclk{26}, m5hal::i2s::Ws{25}, m5hal::i2s::Dout{22},
                                        m5hal::i2s::Din{21}, software_only);
+
+        auto pdm_bus = pdm_view.acquire(pdm_log);
+        (void)pdm_view.close(pdm_bus.value());
+        (void)pdm_view.commitBuses();
+        (void)pdm_view.hardwareInUse();
+        (void)pdm_view.createBusConfig(m5hal::pdm::Clk{0}, m5hal::pdm::Din{34}, require_hw);
     }
 }
 
@@ -232,21 +245,18 @@ static void checkI2C()
     m5hal::data::MemorySink dst{buf, sizeof(buf)};
     if (false) {
         (void)bus->probe(0x3C);
-        (void)bus->transfer(&accessor, acc_cfg, no_prefix, &src, sizeof(buf), &dst, sizeof(buf));
-        (void)bus->waitTransfer(&accessor, acc_cfg);
-        (void)bus->transferBusy(&accessor);
 
         (void)accessor.bind(*bus);
         (void)accessor.getConfig();
         (void)accessor.getBus();
         (void)accessor.setConfig(acc_cfg);
-        (void)accessor.beginTransaction();
+        (void)accessor.beginAccess();
         (void)accessor.transfer(no_prefix, m5hal::data::ConstDataSpan{buf, sizeof(buf)},
                                 m5hal::data::DataSpan{buf, sizeof(buf)});
         (void)accessor.transfer(no_prefix, &src, sizeof(buf), &dst, sizeof(buf));
-        (void)accessor.endTransaction();
+        (void)accessor.endAccess();
         (void)accessor.transferBusy();
-        (void)accessor.waitTransfer();
+        (void)accessor.getLastTransferStatus();
         (void)accessor.write(m5hal::data::ConstDataSpan{buf, sizeof(buf)});
         (void)accessor.write(src, sizeof(buf));
         (void)accessor.write(buf, sizeof(buf));
@@ -276,7 +286,6 @@ static void checkSPI()
     (void)sizeof(m5hal::spi::LogicalBusConfig);
     (void)sizeof(m5hal::spi::MasterAccessConfig);
     (void)sizeof(m5hal::spi::MasterAccessor);
-    (void)sizeof(m5hal::spi::ScopedTransaction);
     (void)sizeof(m5hal::spi::TransferDesc);
     (void)sizeof(m5hal::spi::Clk);
     (void)sizeof(m5hal::spi::Mosi);
@@ -347,25 +356,24 @@ static void checkSPI()
     uint8_t buf[4]        = {};
     m5hal::data::MemorySource src{buf, sizeof(buf)};
     m5hal::data::MemorySink dst{buf, sizeof(buf)};
+    using Operation = m5hal::bus::OperationContext<m5hal::spi::MasterAccessConfig>;
+    static_assert(!std::is_default_constructible<Operation>::value, "OperationContext is an Accessor-owned capability");
+    static_assert(!std::is_constructible<Operation, const m5hal::spi::MasterAccessConfig&>::value,
+                  "OperationContext cannot be externally constructed from config");
+    static_assert(!std::is_copy_constructible<Operation>::value, "OperationContext authority must not be copied");
     if (false) {
-        (void)bus->beginTransaction(&accessor, acc_cfg);
-        (void)bus->endTransaction(&accessor, acc_cfg);
-        (void)bus->transfer(&accessor, acc_cfg, desc, &src, sizeof(buf), &dst, sizeof(buf));
-        (void)bus->waitTransfer(&accessor, acc_cfg);
-        (void)bus->transferBusy(&accessor);
-
         (void)accessor.bind(*bus);
         (void)accessor.getConfig();
         (void)accessor.getBus();
         (void)accessor.setConfig(acc_cfg);
-        (void)accessor.beginTransaction();
+        (void)accessor.beginAccess();
         (void)accessor.transfer(desc, m5hal::data::ConstDataSpan{buf, sizeof(buf)},
                                 m5hal::data::DataSpan{buf, sizeof(buf)});
         (void)accessor.transfer(desc, &src, sizeof(buf), &dst, sizeof(buf));
         (void)accessor.transfer(desc, &src, &dst, sizeof(buf));
-        (void)accessor.endTransaction();
+        (void)accessor.endAccess();
         (void)accessor.transferBusy();
-        (void)accessor.waitTransfer();
+        (void)accessor.getLastTransferStatus();
         (void)accessor.write(m5hal::data::ConstDataSpan{buf, sizeof(buf)});
         (void)accessor.write(src, sizeof(buf));
         (void)accessor.write(buf, sizeof(buf));
@@ -387,10 +395,10 @@ static void checkSPI()
                                               m5hal::data::DataSpan{buf, sizeof(buf)});
         (void)accessor.readCommandAddressData(uint32_t{0x0B}, uint32_t{0x010203}, dst, sizeof(buf));
         (void)accessor.sendDummyClock(8);
-        m5hal::spi::ScopedTransaction tx_scope{accessor};
-        (void)tx_scope.has_error();
-        (void)tx_scope.ok();
-        (void)tx_scope.error();
+        m5hal::bus::ScopedAccess access_scope{accessor};
+        (void)access_scope.has_error();
+        (void)access_scope.ok();
+        (void)access_scope.error();
     }
 }
 
@@ -455,12 +463,6 @@ static void checkUART()
     m5hal::data::MemorySource src{buf, sizeof(buf)};
     m5hal::data::MemorySink dst{buf, sizeof(buf)};
     if (false) {
-        (void)bus->write(&tx, acc_cfg, &src, sizeof(buf));
-        (void)bus->read(&rx, acc_cfg, &dst, sizeof(buf));
-        (void)bus->readableBytes(&rx, acc_cfg);
-        (void)bus->lockChannel(&tx, m5hal::uart::Channel::Tx);
-        (void)bus->unlockChannel(&tx, m5hal::uart::Channel::Tx);
-
         (void)tx.bind(*bus);
         (void)tx.getConfig();
         (void)tx.getBus();
@@ -567,13 +569,6 @@ static void checkI2S()
     m5hal::data::MemorySource src{buf, sizeof(buf)};
     m5hal::data::MemorySink dst{buf, sizeof(buf)};
     if (false) {
-        (void)bus->write(&tx, acc_cfg, &src, sizeof(buf));
-        (void)bus->writableBytes(&tx, acc_cfg);
-        (void)bus->read(&rx, acc_cfg, &dst, sizeof(buf));
-        (void)bus->readableBytes(&rx, acc_cfg);
-        (void)bus->lockChannel(&tx, m5hal::i2s::Channel::Tx);
-        (void)bus->unlockChannel(&tx, m5hal::i2s::Channel::Tx);
-
         (void)tx.bind(*bus);
         (void)tx.getConfig();
         (void)tx.getBus();
@@ -615,6 +610,56 @@ static void checkI2S()
         (void)accessor.read(dst, sizeof(buf));
         (void)accessor.read(buf, sizeof(buf));
         (void)accessor.readableBytes();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PDM types
+// ---------------------------------------------------------------------------
+static void checkPDM()
+{
+    (void)sizeof(m5hal::pdm::IBus);
+    (void)sizeof(m5hal::pdm::IBusConfig);
+    (void)sizeof(m5hal::pdm::LogicalBusConfig);
+    (void)sizeof(m5hal::pdm::AccessConfig);
+    (void)sizeof(m5hal::pdm::RxAccessor);
+    (void)sizeof(m5hal::pdm::Clk);
+    (void)sizeof(m5hal::pdm::Din);
+
+    m5hal::pdm::IBusConfig bus_cfg{m5hal::pdm::Clk{0}, m5hal::pdm::Din{34}};
+    bus_cfg.rx_buffer_size = 8192;
+    (void)bus_cfg.pin_clk;
+    (void)bus_cfg.pin_din;
+    (void)bus_cfg.getBusKind();
+
+    m5hal::pdm::AccessConfig acc_cfg;
+    acc_cfg.sample_rate_hz  = 16000;
+    acc_cfg.read_timeout_ms = 100;
+    acc_cfg.bits_per_sample = 16;
+    acc_cfg.channels        = 1;
+    (void)acc_cfg.getBusKind();
+
+    m5hal::pdm::RxAccessor rx;
+    m5hal::pdm::RxAccessor configured{acc_cfg};
+    (void)rx;
+    (void)configured;
+
+    m5hal::pdm::IBus* bus = nullptr;
+    uint8_t buf[8]        = {};
+    m5hal::data::MemorySink dst{buf, sizeof(buf)};
+    if (false) {
+        (void)rx.bind(*bus);
+        (void)rx.getConfig();
+        (void)rx.getBus();
+        (void)rx.setConfig(acc_cfg);
+        (void)rx.beginAccess();
+        (void)rx.endAccess();
+        (void)rx.inAccess();
+        (void)rx.getLastTransferStatus();
+        (void)rx.read(m5hal::data::DataSpan{buf, sizeof(buf)});
+        (void)rx.read(dst, sizeof(buf));
+        (void)rx.read(buf, sizeof(buf));
+        (void)rx.readableBytes();
     }
 }
 
@@ -779,6 +824,14 @@ static void checkData()
 
     m5hal::data::MuxFrameEncoder mux_encoder{m5hal::memory::defaultAllocator()};
     m5hal::data::MuxFrameDecoder mux_decoder{m5hal::memory::defaultAllocator()};
+    m5hal::data::MuxFrameEncoder default_mux_encoder;
+    m5hal::data::MuxFrameDecoder default_mux_decoder;
+    m5hal::data::BlockSource default_blocks;
+    m5hal::data::BlockSource custom_blocks{m5hal::memory::defaultAllocator()};
+    (void)default_mux_encoder.allocator();
+    (void)default_mux_decoder.allocator();
+    (void)default_blocks.blockCount();
+    (void)custom_blocks.blockCount();
     (void)mux_encoder.attach(1, mem_src);
     (void)mux_encoder.stream(1);
     (void)mux_encoder.pump();
@@ -839,29 +892,29 @@ static void checkBytecode()
     (void)m5hal::bytecode::kSPIConfigSize;
     (void)m5hal::bytecode::kUARTConfigSize;
     (void)m5hal::bytecode::kI2SConfigSize;
+    (void)m5hal::bytecode::kPDMConfigSize;
     (void)m5hal::bytecode::kI2CConfigWireTimeoutOffset;
     (void)m5hal::bytecode::kUARTConfigFirstByteTimeoutOffset;
     (void)m5hal::bytecode::kUARTConfigInterByteTimeoutOffset;
     (void)m5hal::bytecode::kUARTConfigWriteTimeoutOffset;
     (void)m5hal::bytecode::kI2SConfigWriteTimeoutOffset;
     (void)m5hal::bytecode::kI2SConfigReadTimeoutOffset;
+    (void)m5hal::bytecode::kPDMConfigReadTimeoutOffset;
 
     uint8_t buf[256] = {};
     m5hal::data::MemorySink sink{buf, sizeof(buf)};
     m5hal::bytecode::BytecodeEncoder enc{sink};
     m5hal::bytecode::BytecodeRunner runner;
     m5hal::bytecode::LenVar len = m5hal::bytecode::decodeLenVar(m5hal::data::ConstDataSpan{buf, sizeof(buf)});
-    size_t encoded              = m5hal::bytecode::encodeLenVar(buf, 12);
     (void)len.value;
     (void)len.consumed;
     (void)len.valid;
-    (void)m5hal::bytecode::lenVarSize(12);
-    (void)encoded;
 
     m5hal::i2c::MasterAccessConfig i2c_cfg;
     m5hal::spi::MasterAccessConfig spi_cfg;
     m5hal::uart::AccessConfig uart_cfg;
     m5hal::i2s::AccessConfig i2s_cfg;
+    m5hal::pdm::AccessConfig pdm_cfg;
     m5hal::i2c::TransferDesc i2c_desc;
     m5hal::spi::TransferDesc spi_desc;
     m5hal::types::gpio_number_t pins[2] = {1, 2};
@@ -872,6 +925,7 @@ static void checkBytecode()
         (void)enc.configure(0, spi_cfg);
         (void)enc.configure(0, uart_cfg);
         (void)enc.i2sConfig(0, i2s_cfg);
+        (void)enc.pdmConfig(0, pdm_cfg);
         (void)enc.transfer(0, i2c_desc, m5hal::data::ConstDataSpan{buf, 1}, 1);
         (void)enc.transfer(0, spi_desc, m5hal::data::ConstDataSpan{buf, 1}, 1);
         (void)enc.uartTransfer(0, m5hal::data::ConstDataSpan{buf, 1}, 1);
@@ -1050,6 +1104,14 @@ static void checkMemory()
     (void)m5hal::memory::usage_t::PersistentSlow;
 
     m5hal::memory::Allocator allocator;
+    m5hal::memory::FallbackOps fallback_ops;
+    m5hal::memory::FallbackOps fallback_pair{nullptr, nullptr};
+    m5hal::memory::FallbackOps fallback_triple{nullptr, nullptr, nullptr};
+    m5hal::memory::Allocator custom_allocator{fallback_ops};
+    (void)fallback_ops.valid();
+    (void)fallback_pair.valid();
+    (void)fallback_triple.valid();
+    (void)custom_allocator.usedBlocks();
     (void)allocator.usedBlocks();
     (void)allocator.largestFreeRun();
     (void)m5hal::memory::Allocator::tempBlockSize();
@@ -1067,9 +1129,6 @@ static void checkMemory()
         void* ptr = allocator.allocate(16, m5hal::memory::usage_t::Temp);
         (void)allocator.reallocate(ptr, 16, 32, m5hal::memory::usage_t::Persistent);
         allocator.deallocate(ptr);
-        allocator.setFallback(nullptr, nullptr);
-        allocator.setFallback(nullptr, nullptr, nullptr);
-
         m5hal::memory::TempBuffer temp{allocator, 16};
         (void)temp.reallocate(32);
         temp.reset();
@@ -1131,11 +1190,16 @@ static void checkService()
     (void)runner.capacity();
     (void)runner.autoRunActive();
     if (false) {
+        m5hal::runtime::Task task;
+        (void)task.start(nullptr, nullptr);
+        task.join();
+        (void)task.joinable();
+
         (void)runner.runOnce(ctx);
         (void)runner.runOnce();
         (void)runner.startAutoRun();
-        runner.stopAutoRun();
-        runner.clear();
+        (void)runner.stopAutoRun();
+        (void)runner.clear();
     }
 }
 
@@ -1148,9 +1212,12 @@ static void checkSlaveTypes()
     (void)sizeof(m5hal::i2c::SlaveBusConfig);
     (void)sizeof(m5hal::i2c::SlaveLineDriver);
     (void)sizeof(m5hal::i2c::ISlaveBus);
+    (void)sizeof(m5hal::i2c::SlaveAccessConfig);
+    (void)sizeof(m5hal::i2c::SlaveAccessor);
     (void)sizeof(m5hal::i2c::SlaveStreamAccessor);
     (void)sizeof(m5hal::i2c::SlaveRegMapAccessor);
     (void)sizeof(m5hal::spi::SlaveBusConfig);
+    (void)sizeof(m5hal::spi::SlaveAccessConfig);
     (void)sizeof(m5hal::spi::ISlaveBus);
     (void)sizeof(m5hal::spi::SpiSlaveAccessor);
 
@@ -1175,7 +1242,6 @@ static void checkSlaveTypes()
     spi_cfg.spi_order    = 0;
     spi_cfg.controller   = -1;
     spi_cfg.tx_fill_byte = 0;
-    spi_cfg.timeout_ms   = m5hal::types::TIMEOUT_FOREVER;
     (void)spi_cfg.getBusKind();
 
     m5hal::i2c::ISlaveBus* i2c_bus = nullptr;
@@ -1185,26 +1251,41 @@ static void checkSlaveTypes()
     m5hal::data::MemorySink dst{buf, sizeof(buf)};
     if (false) {
         (void)i2c_bus->init(i2c_cfg);
-        (void)i2c_bus->beginTransaction(nullptr);
-        (void)i2c_bus->endTransaction(nullptr);
+        (void)i2c_bus->tryOpenWireFrame(nullptr);
+        (void)i2c_bus->closeWireFrame(nullptr);
         (void)i2c_bus->read(nullptr, m5hal::data::DataSpan{buf, sizeof(buf)});
         (void)i2c_bus->write(nullptr, m5hal::data::ConstDataSpan{buf, sizeof(buf)});
         (void)i2c_bus->readableBytes(nullptr);
-        (void)i2c_bus->transactionComplete(nullptr);
+        (void)i2c_bus->wireFrameComplete(nullptr);
         (void)i2c_bus->service();
         (void)i2c_bus->waitForActivity(nullptr, 1);
 
         m5hal::i2c::SlaveStreamAccessor i2c_acc{*i2c_bus};
         (void)i2c_acc.getConfig();
         (void)i2c_acc.getBus();
-        (void)i2c_acc.beginTransaction();
-        (void)i2c_acc.endTransaction();
+        (void)i2c_acc.openWireFrame();
+        (void)i2c_acc.closeWireFrame();
         (void)i2c_acc.read(m5hal::data::DataSpan{buf, sizeof(buf)});
         (void)i2c_acc.write(m5hal::data::ConstDataSpan{buf, sizeof(buf)});
         (void)i2c_acc.readableBytes();
-        (void)i2c_acc.transactionComplete();
+        (void)i2c_acc.wireFrameComplete();
         (void)i2c_acc.waitForActivity(1);
         (void)i2c_acc.serve(&src, &dst, 1);
+
+        m5hal::slave::StaticSlaveQueueStorage<8, 8, 2, 2> i2c_storage;
+        m5hal::i2c::StaticI2cSegmentStorage<2> i2c_segments;
+        m5hal::i2c::SlaveAccessConfig i2c_access_cfg;
+        m5hal::i2c::SlaveAccessor i2c_queue_acc{*i2c_bus, i2c_storage.tx(), i2c_storage.rx(), i2c_segments.storage(),
+                                                i2c_access_cfg};
+        (void)i2c_queue_acc.getConfig();
+        (void)i2c_queue_acc.getBus();
+        (void)i2c_queue_acc.write(m5hal::data::ConstDataSpan{buf, sizeof(buf)});
+        (void)i2c_queue_acc.beginAccess(1);
+        (void)i2c_queue_acc.dispatchEvents();
+        (void)i2c_queue_acc.acknowledgeEvents(m5hal::slave::SlaveEvent::FrameCompleted);
+        (void)i2c_queue_acc.endAccess(1);
+        (void)i2c_queue_acc.read(m5hal::data::DataSpan{buf, sizeof(buf)});
+        (void)i2c_queue_acc.clearRx();
 
         m5hal::i2c::SlaveRegMapAccessor reg_map{*i2c_bus, m5hal::data::DataSpan{buf, sizeof(buf)}};
         (void)reg_map.getRegister(0);
@@ -1215,19 +1296,27 @@ static void checkSlaveTypes()
         (void)reg_map.serve(1);
 
         (void)spi_bus->init(spi_cfg);
-        (void)spi_bus->release();
-        (void)spi_bus->serve(nullptr, &src, &dst, sizeof(buf), 1);
 
 #if defined(ESP_PLATFORM) && M5HAL_ESPIDF_SPI_HAS_MASTER
-        m5hal::spi::Bus_espidf attached_bus;
-        (void)attached_bus.attach(SPI2_HOST, 0);
+        m5hal::spi::Bus_espidf direct_bus;
+        m5hal::spi::BusConfig direct_cfg;
+        (void)direct_bus.init(direct_cfg);
+        (void)direct_bus.close();
 #endif
 
-        m5hal::spi::SpiSlaveAccessor spi_acc{*spi_bus};
+        m5hal::slave::StaticSlaveQueueStorage<8, 8, 2, 2> spi_storage;
+        m5hal::spi::SlaveAccessConfig spi_access_cfg;
+        spi_access_cfg.transaction_bytes = sizeof(buf);
+        m5hal::spi::SpiSlaveAccessor spi_acc{*spi_bus, spi_storage.tx(), spi_storage.rx(), spi_access_cfg};
         (void)spi_acc.getConfig();
         (void)spi_acc.getBus();
-        (void)spi_acc.serve(&src, &dst, sizeof(buf), 1);
-        (void)spi_acc.serve(m5hal::data::ConstDataSpan{buf, sizeof(buf)}, m5hal::data::DataSpan{buf, sizeof(buf)}, 1);
+        (void)spi_acc.write(m5hal::data::ConstDataSpan{buf, sizeof(buf)});
+        (void)spi_acc.beginAccess(1);
+        (void)spi_acc.dispatchEvents();
+        (void)spi_acc.acknowledgeEvents(m5hal::slave::SlaveEvent::FrameCompleted);
+        (void)spi_acc.endAccess(1);
+        (void)spi_acc.rxFrames().peekFrame();
+        (void)spi_acc.clearRx();
     }
 }
 
@@ -1240,6 +1329,11 @@ static void checkHal()
     (void)sizeof(m5hal::M5HALCore);
 
     m5hal::Hal hal;
+    m5hal::ResourceDomain default_domain;
+    m5hal::ResourceDomain fallback_domain{m5hal::memory::FallbackOps{}};
+    m5hal::Hal domain_hal{default_domain};
+    (void)fallback_domain.memory();
+    (void)domain_hal.backend();
     (void)hal.Gpio;
     (void)hal.Services;
     (void)hal.Memory;
@@ -1247,8 +1341,9 @@ static void checkHal()
     (void)hal.SPI;
     (void)hal.UART;
     (void)hal.I2S;
+    (void)hal.PDM;
     (void)hal.backend();
-    (void)hal.isConnected();
+    (void)hal.hasRemoteConnection();
     (void)hal.remoteGpioSlot();
     (void)hal.hasRemoteGpio();
     (void)m5hal::getM5_Hal();
@@ -1279,6 +1374,7 @@ void setup()
     checkSPI();
     checkUART();
     checkI2S();
+    checkPDM();
     checkGPIO();
     checkData();
     checkBytecode();
@@ -1302,6 +1398,7 @@ extern "C" void app_main()
     checkSPI();
     checkUART();
     checkI2S();
+    checkPDM();
     checkGPIO();
     checkData();
     checkBytecode();
@@ -1322,6 +1419,7 @@ int main()
     checkSPI();
     checkUART();
     checkI2S();
+    checkPDM();
     checkGPIO();
     checkData();
     checkBytecode();

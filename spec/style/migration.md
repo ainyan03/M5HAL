@@ -3,66 +3,59 @@
 > **読者**: 利用者向け。
 
 v0 API 利用者が v2 API に移行する際の指針を示す。
+旧v2 `begin/endTransaction`から統一Access lifecycleへの移行は
+[accessor_lifecycle_migration.md](accessor_lifecycle_migration.md)を参照する。
+
+## 旧v2 Bus取得APIからの移行
+
+旧v2 Bus取得APIを利用するコードは次の形へ移行する。この表はv0からの移行には適用しない。
+
+| 旧v2 prototype | 現行形 | 要点 |
+|---|---|---|
+| `acquire(BusConfig_<variant>{...})` | `acquire(BusConfig{...})` | config型でproviderを選ばない。buildで選ばれたproviderがportable configを受ける |
+| `BackendFor<Config>` | 通常は`Hal.<kind>.acquire(cfg)` | direct provider型が必要な場合だけ`Bus_<variant>::init(...)`をadvanced escape hatchとして使う |
+| `attach(native)` / `open(path)` | `acquire(cfg, native::borrowed(native))` / `acquire(cfg, native::managed(native))` | 対応policyはproviderごとに明示される。未対応の組合せは利用できない |
+| `bus.release()` | registry管理: `Hal.<kind>.close(handle)`、direct: `bus.close()` | registry管理handleのcloseはsole ownerを要求し、成功時にhandleを消費する |
+
+registryから取得したBusは、具象型へdowncastして`close()`を迂回呼出ししてはならない。
+実装もregistry-bound instanceを`INVALID_STATE`で拒否する。direct Busは`close()`成功後に同じ
+オブジェクトを`init()`で再利用できる。
 
 ## 基本方針
 
 - v0 対応 target で既存コードをそのまま使い続ける場合は `<M5HAL.hpp>` または `<M5HAL_v0.hpp>` を使う。非 ESP32 Arduino target では v0 entry は利用できないため、`<M5HAL_v2.hpp>` を使う
 - v2 API を使う場合は `<M5HAL_v2.hpp>` を使う
 - v0 対応 target では v0 と v2 が同一ライブラリ内で共存し、 **同一 translation unit での両エントリ include も可能** (移行途中のファイル等。 [design/v0_v2_coexistence.md](../design/v0_v2_coexistence.md) §エントリヘッダ)。 ただし可読性のため、 通常は TU ごとに使う世代を明示する
-- v2 への移行は、 旧 API の置き換えではなく **新しい API 体系への移行** として扱う
+- v2への移行では、対応表の「再構成」を単純なsymbol置換として扱わない
 
 ## ヘッダ選択
 
 詳細は [design/v0_v2_coexistence.md](../design/v0_v2_coexistence.md) §エントリヘッダ を参照。
 
-## 移行の考え方
+## 移行分類と対応表
 
-各 API は次の 3 区分で考える。
+分類は旧symbolがv2に同名で残るかではなく、**利用者が行う移行作業**で決める。
 
 | 区分 | 意味 |
 |---|---|
-| **保持** | 命名・役割をほぼ維持して使える |
-| **再構成** | 概念は残るが、 使い方や責務が変わる |
-| **廃止** | v2 では使わない |
+| **保持** | 呼出し側の役割と基本契約を維持する。世代namespaceやmacro prefixの機械的変更は許容 |
+| **再構成** | use caseには移行先があるが、所有権・責務・呼出し形を組み替える。drop-in置換ではない |
+| **廃止** | v2に対応概念がなく、移行時に削除または上位設計へ吸収する |
 
-## 維持される要素
+この表をv0→v2の利用者作業の正本とする。設計契約は各design文書を参照する。
 
-| API | 配置 | 備考 |
-|---|---|---|
-| `error::error_t` / `error::isError` / `error::isOk` | `hal/error.hpp` | cross-cutting な型 |
-| `types::GpioMode` | `hal/types.hpp` | 命名維持 |
-| `types::gpio_number_t` | `hal/types.hpp` | pin 指定の基本型 |
-| `M5HAL_V2_DETECTED_PLATFORM_VARIANT_*` / `M5HAL_FRAMEWORK_HAS_*` | 各 `_checker.hpp` | variant 機構で利用。 platform 系は世代分離のため `M5HAL_V2_` プレフィックス (無印は v0 が所有) |
-
-## v0 → v2 読み替え一覧
-
-| v0 の考え方 / API | v2 の考え方 / API | 備考 |
-|---|---|---|
-| バス操作は旧 chain API で行う | `transfer` を核に行う | Bus / BusConfig / AccessConfig は構造維持 |
-| `beginAccess` / `endAccess` chain virtual | `beginAccess` / `endAccess` + sugar を中心に再構成 | Accessor 抽象 |
-| `interface::io::Input` / `Output` 系 | `Source` / `Sink` | [design/data_io.md](../design/data_io.md) §向き (direction) の規約 参照 |
-| 旧 I2C 操作 / software I2C singleton | `write` / `read` / `writeRegister` / `readRegister` / `probe` + software variant | [design/i2c.md](../design/i2c.md) 参照 |
-| `Bus::beginAccess(AccessConfig&)` factory | 利用者が `Accessor` を直接構築 | [design/bus_accessor.md](../design/bus_accessor.md) §Bus の保持 参照 |
-| 旧 `interface::gpio::*` 抽象 | `IGPIO` / `IPort` / `Pin` / `GPIOGroup` | [design/gpio.md](../design/gpio.md) 参照 |
-| `types::BusType` / `types::PeripheralType` | `types::BusKind` (`bus_kind_t`) | 識別子を英語コメントと整合させ改名 (旧 `bus_type_t` 等は v0 のみ)。`PeripheralType` は v0/platform 固有概念で v2 `hal/types.hpp` には対応物なし。[style/glossary.md](glossary.md) 参照 |
-
-## v2 で使わない要素
-
-| API | 備考 |
-|---|---|
-| `interface::io::Input` / `Output` 系 | `Source` / `Sink` へ置換 |
-| 旧 `bus::Accessor` chain virtual | `transfer` ベースへ置換 |
-| `Bus::beginAccess(AccessConfig&)` factory | 利用者が `Accessor` を直接構築 |
-| 旧 software I2C singleton 群 | software variant に置換 |
-| 旧 `interface::gpio::*` 抽象 | v2 GPIO 抽象へ置換 |
-
-## v2 専用 (v0 対応なし)
-
-以下は v2 のみが持つ機能で、 v0 から移行する概念がない:
-
-| 機能 | 説明 |
-|---|---|
-| リモートバス機構 | `Hal::connect(endpoint)` (endpoint = `"uart:<path>"` / `"tcp:<host>:<port>"`。 typed API `initUart(port)` / `initTcp("host:port")` も存続) で遠隔 M5HAL server に接続し、 同型 `hal.I2C.acquire()` / `SPI.acquire()` 等で proxy bus を取得する。reconnect 前の proxy は旧 connection を延命せず以後 `CLOSED`。明示解放は Accessor/alias を先に破棄して `hal.<KIND>.release(bus)` を呼び、成功時に handle 自体が reset される。追加のビルドフラグは不要 (`M5HAL_CONFIG_REMOTE_VARIANT=1` は winner scan へ remote variant を参加させる別用途の opt-in)。 詳細は [design/remote.md](../design/remote.md) / [design/bus_accessor.md](../design/bus_accessor.md) |
+| 分類 | v0の考え方 / API | v2の考え方 / API | 移行上の要点 |
+|---|---|---|---|
+| 保持 | `error::error_t` / `isError` / `isOk` | 同名 (`m5::hal::v2::error`) | cross-cuttingな結果型・判定の役割を維持 |
+| 保持 | `types::GpioMode` / `gpio_number_t` | 同名 (`m5::hal::v2::types`) | pin指定の値とmode名を維持 |
+| 保持 | framework/platform検出macro | `M5HAL_FRAMEWORK_HAS_*` / `M5HAL_V2_DETECTED_PLATFORM_VARIANT_*` | platform出力だけ世代分離prefixを付ける (無印はv0が所有) |
+| 再構成 | `Bus` / `BusConfig` / `AccessConfig`と旧chain操作 | 同じ役割の型 + `transfer`を核とする操作 | 型の役割は残るがcall chainは互換でない |
+| 再構成 | `beginAccess` / `endAccess` chain virtual、`Bus::beginAccess()` factory | 利用者が`Accessor`を直接構築し、access window + sugarを使う | BusはAccessorを所有しない。[bus_accessor.md](../design/bus_accessor.md) §Busの保持 |
+| 再構成 | `interface::io::Input` / `Output` | `data::Source` / `Sink` | directionとcursor契約を明示。[data_io.md](../design/data_io.md) §向きの規約 |
+| 再構成 | 旧I2C操作 / software I2C singleton | `write` / `read` / register sugar / `probe` + software variant | instanceとbackend選択を分離。[i2c.md](../design/i2c.md) |
+| 再構成 | `interface::gpio::*` | `IGPIO` / `IPort` / `Pin` / `GPIOGroup` | global pin番号とport/groupをv2所有モデルへ移す。[gpio.md](../design/gpio.md) |
+| 再構成 | `types::BusType` (`bus_type_t`) | `types::BusKind` (`bus_kind_t`) | kind識別へ名称を統一。[glossary.md](glossary.md) |
+| 廃止 | `types::PeripheralType` | 対応物なし | v0/platform固有概念。必要な資源選択は各BusConfig / controller policyへ吸収 |
 
 ## 移行時の確認項目
 
@@ -75,6 +68,7 @@ v0 API 利用者が v2 API に移行する際の指針を示す。
 ## 関連
 
 - [../design/bus_accessor.md](../design/bus_accessor.md)
+- [../design/bus_capabilities.md](../design/bus_capabilities.md)
 - [../design/data_io.md](../design/data_io.md)
 - [../design/gpio.md](../design/gpio.md)
 - [../design/i2c.md](../design/i2c.md)

@@ -4,22 +4,23 @@
 
 // Hal — the public HAL facade type.
 //
-// `Hal` bundles HAL sub-objects (GPIOGroup, ServiceRunner, memory
-// Allocator, per-kind BusViews) behind a backend pointer. Callers
+// `Hal` exposes ResourceDomain-owned GPIOGroup, ServiceRunner, memory
+// Allocator, and registry-backed per-kind BusViews behind a backend pointer. Callers
 // write `void scan(Hal& hal) { hal.I2C.acquire(...); }` and the
 // same function works for both local and remote backends.
 //
-// Two construction modes:
-//   - Local (M5_Hal singleton): M5HALCore creates Hal with LocalBackend.
+// Three construction modes:
+//   - Default local: M5_Hal bootstraps its own ResourceDomain.
+//   - Isolated/shared local: Hal() owns an independent domain; Hal(domain)
+//     shares the supplied domain. init()/connect("local") binds its backend.
 //   - Remote: user creates `Hal remote;` then `remote.connect(endpoint)`.
 //     connect establishes the transport, creates a RemoteBackend, and
 //     wires BusViews to it. After connect, `remote.I2C.acquire()` creates
 //     proxy buses on the remote peer.
 //
-// M5HALCore — internal singleton owning the local backend.
+// M5HALCore — internal singleton bootstrapping the default Hal facade.
 //
-// Holds a `LocalBackend`, per-kind adapters, and a `Hal` instance
-// wired to that backend. The Hal is exposed through `getM5_Hal()`
+// The Hal is exposed through `getM5_Hal()`
 // and `M5_Hal`.
 //
 // Instance access:
@@ -50,6 +51,7 @@
 #include "i2s/i2s.hpp"
 #include "memory/allocator.hpp"
 #include "remote/remote_connection.hpp"
+#include "resource_domain.hpp"
 #include "service/service.hpp"
 #include "spi/spi.hpp"
 #include "uart/uart.hpp"
@@ -63,14 +65,18 @@ M5HAL_INLINE_V2 namespace v2
     namespace remote {
     struct RemoteConnectionState;
     }
+    namespace detail {
+    struct LocalConnectionState;
+    }
 
     /*!
       @brief Public HAL facade — local and remote share this surface.
 
-      A `Hal` bundles the HAL sub-objects (GPIO, service runner, memory
-      allocator, per-kind bus views) behind an `IHalBackend*`. The local
-      singleton (`M5_Hal`) is backed by `LocalBackend` inside
-      `M5HALCore`; remote instances are backed by `RemoteBackend`.
+      A `Hal` exposes the resource objects co-owned by its `ResourceDomain`
+      (GPIO, service runner, memory allocator, registry) and per-kind bus views
+      behind an `IHalBackend*`. A local binding is owned per Hal; `M5HALCore`
+      only bootstraps the default `M5_Hal`. Remote instances are backed by
+      `RemoteBackend`.
       User code writes `void scan(Hal& hal)` and works with either:
       @code
       void scanI2C(Hal& hal) {
@@ -88,7 +94,30 @@ M5HAL_INLINE_V2 namespace v2
       (e.g. `std::vector<std::unique_ptr<Hal>>`).
      */
     class Hal {
+#if defined(M5HAL_TEST_REMOTE_ADOPTION_FAULTS)
+    public:
+        enum class RemoteAdoptionStep : uint8_t {
+            RemoveOldService,
+            RemoveOldGpio,
+            AddNewGpio,
+            AddNewService,
+            RemoveNewGpioRollback,
+            AddOldGpioRollback,
+            AddOldServiceRollback,
+        };
+
+    private:
+        struct RemoteAdoptionFault {
+            RemoteAdoptionStep step = RemoteAdoptionStep::RemoveOldService;
+            error::error_t error    = error::error_t::OK;
+        };
+        RemoteAdoptionFault _remote_adoption_faults[2]{};
+        size_t _remote_adoption_fault_count = 0;
+        size_t _remote_adoption_fault_next  = 0;
+#endif
+        ResourceDomain _domain;
         bus::IHalBackend* _backend;
+        std::shared_ptr<detail::LocalConnectionState> _local_connection;
         remote::RemoteConnectionState* _connection = nullptr;
         // A Pin/PortAccess is a non-owning value handle.  Preserve only the
         // disconnected GPIO ports until this Hal dies; never retain the old
@@ -96,16 +125,16 @@ M5HAL_INLINE_V2 namespace v2
         std::unique_ptr<remote::RemoteGpioOwner> _retired_remote_gpios;
 
     public:
-        gpio::GPIOGroup Gpio;
-        service::ServiceRunner Services;
-        memory::Allocator Memory;
+        gpio::GPIOGroup& Gpio;
+        service::ServiceRunner& Services;
+        memory::Allocator& Memory;
 
         /*!
           @name Per-kind bus access.
 
           All kinds are backend-delegating views:
           `hal.I2C.acquire(cfg)` / `hal.SPI.acquire(cfg)` /
-          `hal.UART.acquire(cfg)` / `hal.I2S.acquire(cfg)` intern the bus
+          `hal.UART.acquire(cfg)` / `hal.I2S.acquire(cfg)` / `hal.PDM.acquire(cfg)` intern the bus
           for `cfg`'s pins and return a `shared_ptr` — one physical wiring,
           one shared instance.
           @{
@@ -114,11 +143,21 @@ M5HAL_INLINE_V2 namespace v2
         spi::BusView SPI;
         uart::BusView UART;
         i2s::BusView I2S;
+        pdm::BusView PDM;
         /*! @} */
 
-        Hal() : _backend{nullptr}
+        Hal()
+            : _domain{}, _backend{nullptr}, Gpio{_domain.gpio()}, Services{_domain.services()}, Memory{_domain.memory()}
         {
-            Gpio.bindServiceRunner(&Services);
+        }
+
+        explicit Hal(const ResourceDomain& domain)
+            : _domain{domain},
+              _backend{nullptr},
+              Gpio{_domain.gpio()},
+              Services{_domain.services()},
+              Memory{_domain.memory()}
+        {
         }
 
         ~Hal();
@@ -126,6 +165,11 @@ M5HAL_INLINE_V2 namespace v2
         bus::IHalBackend* backend(void)
         {
             return _backend;
+        }
+
+        const ResourceDomain& resourceDomain(void) const
+        {
+            return _domain;
         }
 
         /*!
@@ -152,13 +196,20 @@ M5HAL_INLINE_V2 namespace v2
           and mode changes are no-ops.
           @{
          */
-        result_t<void> connect(const char* endpoint = nullptr, const remote::DeviceConfig& cfg = {});
-        result_t<void> init(void);
+        [[nodiscard]] result_t<void> connect(const char* endpoint = nullptr, const remote::DeviceConfig& cfg = {});
+        [[nodiscard]] result_t<void> init(void);
         result_t<void> initUart(const char* port, const remote::DeviceConfig& cfg = {});
         result_t<void> initTcp(const char* endpoint, const remote::DeviceConfig& cfg = {});
         /*! @} */
 
-        bool isConnected(void) const
+        /*! @brief Whether this Hal currently owns a remote connection.
+
+          This is a binding-kind snapshot, not a transport liveness probe.
+          It is false for both an unbound Hal and a Hal bound to the local
+          backend. A transport failure does not destroy the connection
+          object, so operation `result_t` values remain authoritative.
+         */
+        bool hasRemoteConnection(void) const
         {
             return _connection != nullptr;
         }
@@ -171,6 +222,17 @@ M5HAL_INLINE_V2 namespace v2
         remote::RemoteSession* session(void);
         const remote::Capabilities* capabilities(void) const;
         result_t<bool> pumpRemote(const remote::PumpConfig& cfg = {});
+
+#if defined(M5HAL_TEST_REMOTE_ADOPTION_FAULTS)
+        void setRemoteAdoptionFaults(RemoteAdoptionStep first, error::error_t first_error, RemoteAdoptionStep second,
+                                     error::error_t second_error)
+        {
+            _remote_adoption_faults[0]   = {first, first_error};
+            _remote_adoption_faults[1]   = {second, second_error};
+            _remote_adoption_fault_count = 2;
+            _remote_adoption_fault_next  = 0;
+        }
+#endif
 
         types::gpio_slot_t remoteGpioSlot(void) const
         {
@@ -188,14 +250,47 @@ M5HAL_INLINE_V2 namespace v2
 
     protected:
         explicit Hal(bus::IHalBackend* backend)
-            : _backend{backend}, I2C{backend}, SPI{backend}, UART{backend}, I2S{backend}
+            : _domain{},
+              _backend{backend},
+              Gpio{_domain.gpio()},
+              Services{_domain.services()},
+              Memory{_domain.memory()},
+              I2C{backend},
+              SPI{backend},
+              UART{backend},
+              I2S{backend},
+              PDM{backend}
         {
-            Gpio.bindServiceRunner(&Services);
         }
 
         friend class M5HALCore;
 
     private:
+#if defined(M5HAL_TEST_REMOTE_ADOPTION_FAULTS)
+        error::error_t takeRemoteAdoptionFault(RemoteAdoptionStep step)
+        {
+            if (_remote_adoption_fault_next < _remote_adoption_fault_count &&
+                _remote_adoption_faults[_remote_adoption_fault_next].step == step) {
+                return _remote_adoption_faults[_remote_adoption_fault_next++].error;
+            }
+            return error::error_t::OK;
+        }
+#endif
+        template <typename Operation>
+        result_t<void> runRemoteAdoptionStep(
+#if defined(M5HAL_TEST_REMOTE_ADOPTION_FAULTS)
+            RemoteAdoptionStep step,
+#endif
+            Operation&& operation)
+        {
+#if defined(M5HAL_TEST_REMOTE_ADOPTION_FAULTS)
+            const auto injected = takeRemoteAdoptionFault(step);
+            if (error::isError(injected)) {
+                return m5::stl::make_unexpected(injected);
+            }
+#endif
+            return operation();
+        }
         void setBackendAll(bus::IHalBackend* backend)
         {
             _backend = backend;
@@ -203,18 +298,54 @@ M5HAL_INLINE_V2 namespace v2
             SPI.setBackend(backend);
             UART.setBackend(backend);
             I2S.setBackend(backend);
+            PDM.setBackend(backend);
         }
-        void registerRemoteGPIO(const gpio::IGPIO* gpio)
+        // Select the lowest slot before touching the current connection. The
+        // current remote slot is reclaimable because connection replacement
+        // removes it before committing the new registration.
+        result_t<bool> preflightRemoteGPIO(const gpio::IGPIO* gpio, types::gpio_slot_t& selected_slot) const
         {
             if (gpio == nullptr) {
-                return;
+                return false;
             }
-            types::gpio_slot_t slot = Gpio.hasGPIO(0) ? 1 : 0;
-            auto r                  = Gpio.addGPIO(gpio, slot);
-            if (r.has_value()) {
-                _remote_gpio_slot = slot;
-                _has_remote_gpio  = true;
+
+            const uint16_t pin_count = gpio->getPinCount();
+            if (pin_count == 0 || pin_count > 256) {
+                return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
             }
+
+            size_t occupied = 0;
+            bool found      = false;
+            for (size_t candidate = 0; candidate < gpio::GPIOGroup::kSlotCount; ++candidate) {
+                const auto slot                = static_cast<types::gpio_slot_t>(candidate);
+                const bool reclaiming_old_slot = _has_remote_gpio && slot == _remote_gpio_slot;
+                if (Gpio.hasGPIO(slot) && !reclaiming_old_slot) {
+                    ++occupied;
+                    continue;
+                }
+                if (!found) {
+                    selected_slot = slot;
+                    found         = true;
+                }
+            }
+
+            if (!found || occupied >= gpio::GPIOGroup::kMaxEntries) {
+                return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+            }
+            return true;
+        }
+        result_t<void> registerRemoteGPIO(const gpio::IGPIO* gpio, types::gpio_slot_t slot)
+        {
+            if (gpio == nullptr) {
+                return {};
+            }
+            auto r = Gpio.addGPIO(gpio, slot);
+            if (!r.has_value()) {
+                return m5::stl::make_unexpected(r.error());
+            }
+            _remote_gpio_slot = slot;
+            _has_remote_gpio  = true;
+            return {};
         }
         void retireRemoteGPIO()
         {
@@ -227,12 +358,197 @@ M5HAL_INLINE_V2 namespace v2
                 _retired_remote_gpios = std::move(owner);
             }
         }
+        void retainRemoteGPIOOwner(remote::RemoteConnectionState* connection)
+        {
+            if (connection == nullptr) {
+                return;
+            }
+            auto owner = connection->releaseGpioOwnership();
+            if (owner != nullptr) {
+                owner->next           = std::move(_retired_remote_gpios);
+                _retired_remote_gpios = std::move(owner);
+            }
+        }
+        void quarantineRemoteAdoption(remote::RemoteConnectionState* old_connection,
+                                      std::unique_ptr<remote::RemoteConnectionState>& next_connection)
+        {
+            // A rollback failure means neither registration set can be
+            // represented truthfully. Stop both producers, close both
+            // transports, and publish one unbound facade. Cleanup is best
+            // effort, but GPIO owners are retained even when an entry cannot
+            // be removed so GPIOGroup never contains a dangling pointer.
+            if (old_connection != nullptr && old_connection->service() != nullptr) {
+                (void)Services.remove(*old_connection->service());
+            }
+            if (next_connection != nullptr && next_connection->service() != nullptr) {
+                (void)Services.remove(*next_connection->service());
+            }
+            if (_has_remote_gpio) {
+                (void)Gpio.removeGPIO(_remote_gpio_slot);
+            }
+            _has_remote_gpio = false;
+
+            if (old_connection != nullptr) {
+                auto handle = old_connection->sessionHandle();
+                if (handle != nullptr) {
+                    (void)handle->close();
+                }
+            }
+            if (next_connection != nullptr) {
+                auto handle = next_connection->sessionHandle();
+                if (handle != nullptr) {
+                    (void)handle->close();
+                }
+            }
+            retainRemoteGPIOOwner(old_connection);
+            retainRemoteGPIOOwner(next_connection.get());
+            _connection = nullptr;
+            setBackendAll(nullptr);
+            delete old_connection;
+        }
+        result_t<void> adoptRemoteConnection(std::unique_ptr<remote::RemoteConnectionState> connection)
+        {
+            if (connection == nullptr) {
+                return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
+            }
+
+            types::gpio_slot_t next_gpio_slot = 0;
+            auto gpio_plan                    = preflightRemoteGPIO(connection->gpio(), next_gpio_slot);
+            if (!gpio_plan.has_value()) {
+                return m5::stl::make_unexpected(gpio_plan.error());
+            }
+
+            auto* old_connection            = _connection;
+            const bool restore_remote_gpio  = _has_remote_gpio;
+            const auto old_remote_gpio_slot = _remote_gpio_slot;
+            const auto* old_remote_gpio =
+                restore_remote_gpio && old_connection != nullptr ? old_connection->gpio() : nullptr;
+
+            if (old_connection != nullptr && old_connection->service() != nullptr) {
+                auto removed = runRemoteAdoptionStep(
+#if defined(M5HAL_TEST_REMOTE_ADOPTION_FAULTS)
+                    RemoteAdoptionStep::RemoveOldService,
+#endif
+                    [&]() { return Services.remove(*old_connection->service()); });
+                if (!removed.has_value()) {
+                    return m5::stl::make_unexpected(removed.error());
+                }
+            }
+            if (_has_remote_gpio) {
+                auto removed = runRemoteAdoptionStep(
+#if defined(M5HAL_TEST_REMOTE_ADOPTION_FAULTS)
+                    RemoteAdoptionStep::RemoveOldGpio,
+#endif
+                    [&]() { return Gpio.removeGPIO(_remote_gpio_slot); });
+                if (!removed.has_value()) {
+                    if (old_connection != nullptr && old_connection->service() != nullptr) {
+                        auto restored = runRemoteAdoptionStep(
+#if defined(M5HAL_TEST_REMOTE_ADOPTION_FAULTS)
+                            RemoteAdoptionStep::AddOldServiceRollback,
+#endif
+                            [&]() { return Services.add(*old_connection->service()); });
+                        if (!restored.has_value()) {
+                            const auto original = removed.error();
+                            quarantineRemoteAdoption(old_connection, connection);
+                            return m5::stl::make_unexpected(original);
+                        }
+                    }
+                    return m5::stl::make_unexpected(removed.error());
+                }
+                _has_remote_gpio = false;
+            }
+
+            auto restore_old_registration = [&]() -> result_t<void> {
+                if (_has_remote_gpio) {
+                    auto removed = runRemoteAdoptionStep(
+#if defined(M5HAL_TEST_REMOTE_ADOPTION_FAULTS)
+                        RemoteAdoptionStep::RemoveNewGpioRollback,
+#endif
+                        [&]() { return Gpio.removeGPIO(_remote_gpio_slot); });
+                    if (!removed.has_value()) {
+                        return m5::stl::make_unexpected(removed.error());
+                    }
+                    _has_remote_gpio = false;
+                }
+                if (restore_remote_gpio) {
+                    auto restored = runRemoteAdoptionStep(
+#if defined(M5HAL_TEST_REMOTE_ADOPTION_FAULTS)
+                        RemoteAdoptionStep::AddOldGpioRollback,
+#endif
+                        [&]() { return Gpio.addGPIO(old_remote_gpio, old_remote_gpio_slot); });
+                    if (!restored.has_value()) {
+                        return m5::stl::make_unexpected(restored.error());
+                    }
+                    _remote_gpio_slot = old_remote_gpio_slot;
+                    _has_remote_gpio  = true;
+                }
+                if (old_connection != nullptr && old_connection->service() != nullptr) {
+                    auto restored = runRemoteAdoptionStep(
+#if defined(M5HAL_TEST_REMOTE_ADOPTION_FAULTS)
+                        RemoteAdoptionStep::AddOldServiceRollback,
+#endif
+                        [&]() { return Services.add(*old_connection->service()); });
+                    if (!restored.has_value()) {
+                        return m5::stl::make_unexpected(restored.error());
+                    }
+                }
+                return {};
+            };
+
+            if (gpio_plan.value()) {
+                auto registration = runRemoteAdoptionStep(
+#if defined(M5HAL_TEST_REMOTE_ADOPTION_FAULTS)
+                    RemoteAdoptionStep::AddNewGpio,
+#endif
+                    [&]() { return registerRemoteGPIO(connection->gpio(), next_gpio_slot); });
+                if (!registration.has_value()) {
+                    auto restored = restore_old_registration();
+                    if (!restored.has_value()) {
+                        const auto original = registration.error();
+                        quarantineRemoteAdoption(old_connection, connection);
+                        return m5::stl::make_unexpected(original);
+                    }
+                    return m5::stl::make_unexpected(registration.error());
+                }
+            }
+            if (_has_remote_gpio) {
+                connection->bindGpioEvents(Gpio, _remote_gpio_slot);
+            }
+            if (connection->service() != nullptr) {
+                auto added = runRemoteAdoptionStep(
+#if defined(M5HAL_TEST_REMOTE_ADOPTION_FAULTS)
+                    RemoteAdoptionStep::AddNewService,
+#endif
+                    [&]() { return Services.add(*connection->service()); });
+                if (!added.has_value()) {
+                    auto restored = restore_old_registration();
+                    if (!restored.has_value()) {
+                        const auto original = added.error();
+                        quarantineRemoteAdoption(old_connection, connection);
+                        return m5::stl::make_unexpected(original);
+                    }
+                    return m5::stl::make_unexpected(added.error());
+                }
+            }
+
+            if (old_connection != nullptr) {
+                auto old_handle = old_connection->sessionHandle();
+                if (old_handle != nullptr) {
+                    (void)old_handle->close();
+                }
+                retireRemoteGPIO();
+            }
+            _connection = connection.release();
+            setBackendAll(&_connection->backend());
+            delete old_connection;
+            return {};
+        }
         types::gpio_slot_t _remote_gpio_slot = 0;
         bool _has_remote_gpio                = false;
     };
 
     /*!
-      @brief Internal singleton owning the local backend and adapters.
+      @brief Internal singleton bootstrapping the default Hal facade.
 
       The public surface lives in `Hal _hal`; callers interact through
       `getM5_Hal()` / `M5_Hal` which return `Hal&`.
@@ -251,10 +567,6 @@ M5HAL_INLINE_V2 namespace v2
 
     private:
         M5HALCore();
-
-        bus::LocalBackend _backend;
-        bus::LocalKindAdapter<i2c::BusTraits> _i2c_adapter;
-        bus::LocalKindAdapter<spi::BusTraits> _spi_adapter;
         Hal _hal;
 
         friend Hal& getM5_Hal();

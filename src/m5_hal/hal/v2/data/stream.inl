@@ -18,6 +18,10 @@ m5::hal::v2::result_t<size_t> readUntil(StreamReader& reader, uint8_t delim, Dat
         if (!r.has_value()) {
             return m5::stl::make_unexpected(r.error());
         }
+        if (r.value() > 1) {
+            M5HAL_ASSERT(false, "StreamReader returned more bytes than requested");
+            return m5::stl::make_unexpected(m5::hal::v2::error::error_t::IO_ERROR);
+        }
         if (r.value() == 0) {
             break;  // the reader's timeout expired: a partial read is normal
         }
@@ -39,6 +43,9 @@ StreamSource::StreamSource(StreamReader* reader, DataSpan scratch) : _reader{rea
 
 m5::hal::v2::result_t<ConstDataSpan> StreamSource::peek(size_t max_len)
 {
+    if (_faulted) {
+        return m5::stl::make_unexpected(m5::hal::v2::error::error_t::IO_ERROR);
+    }
     if (_reader == nullptr) {
         return ConstDataSpan{};
     }
@@ -73,9 +80,15 @@ m5::hal::v2::result_t<ConstDataSpan> StreamSource::peek(size_t max_len)
     // `readableBytes()` first.
     const size_t want = std::min(max_len, _scratch.size);
     if (want > buffered() && _filled < _scratch.size) {
-        auto got = _reader->read(DataSpan{_scratch.data + _filled, _scratch.size - _filled});
+        const size_t capacity = _scratch.size - _filled;
+        auto got              = _reader->read(DataSpan{_scratch.data + _filled, capacity});
         if (!got.has_value()) {
             return m5::stl::make_unexpected(got.error());
+        }
+        if (got.value() > capacity) {
+            _faulted = true;
+            M5HAL_ASSERT(false, "StreamReader returned more bytes than requested");
+            return m5::stl::make_unexpected(m5::hal::v2::error::error_t::IO_ERROR);
         }
         _filled += got.value();
     }
@@ -87,6 +100,9 @@ m5::hal::v2::result_t<ConstDataSpan> StreamSource::peek(size_t max_len)
 
 m5::hal::v2::result_t<void> StreamSource::advance(size_t N)
 {
+    if (_faulted) {
+        return m5::stl::make_unexpected(m5::hal::v2::error::error_t::IO_ERROR);
+    }
     if (_reader == nullptr) {
         return {};
     }
@@ -127,6 +143,9 @@ void StreamSource::discardBuffered(void)
 
 m5::hal::v2::result_t<void> StreamSource::drainSkip(bool blocking)
 {
+    if (_faulted) {
+        return m5::stl::make_unexpected(m5::hal::v2::error::error_t::IO_ERROR);
+    }
     while (_pending_skip > 0) {
         size_t want = std::min(_pending_skip, _scratch.size);
         if (!blocking) {
@@ -142,6 +161,11 @@ m5::hal::v2::result_t<void> StreamSource::drainSkip(bool blocking)
         auto got = _reader->read(DataSpan{_scratch.data, want});
         if (!got.has_value()) {
             return m5::stl::make_unexpected(got.error());
+        }
+        if (got.value() > want) {
+            _faulted = true;
+            M5HAL_ASSERT(false, "StreamReader returned more bytes than requested");
+            return m5::stl::make_unexpected(m5::hal::v2::error::error_t::IO_ERROR);
         }
         if (got.value() == 0) {
             return {};
@@ -161,6 +185,9 @@ StreamSink::StreamSink(StreamWriter* writer, DataSpan scratch) : _writer{writer}
 
 m5::hal::v2::result_t<DataSpan> StreamSink::reserve(size_t max_len)
 {
+    if (_faulted) {
+        return m5::stl::make_unexpected(m5::hal::v2::error::error_t::IO_ERROR);
+    }
     if (_writer == nullptr) {
         return DataSpan{};
     }
@@ -176,6 +203,9 @@ m5::hal::v2::result_t<void> StreamSink::commit(size_t N)
     // accepted count from a previous commit() for callers that consult
     // partialCommitAccepted() after ANY failing commit.
     _last_accepted = 0;
+    if (_faulted) {
+        return m5::stl::make_unexpected(m5::hal::v2::error::error_t::IO_ERROR);
+    }
     if (_writer == nullptr) {
         return m5::stl::make_unexpected(m5::hal::v2::error::error_t::CLOSED);
     }
@@ -188,8 +218,19 @@ m5::hal::v2::result_t<void> StreamSink::commit(size_t N)
     }
     auto wrote = _writer->write(ConstDataSpan{_scratch.data, N});
     if (!wrote.has_value()) {
-        _last_accepted = 0;
+        const size_t accepted = _writer->partialWriteAccepted();
+        if (accepted > N) {
+            _faulted = true;
+            M5HAL_ASSERT(false, "StreamWriter partial count exceeds the offered byte count");
+            return m5::stl::make_unexpected(m5::hal::v2::error::error_t::IO_ERROR);
+        }
+        _last_accepted = accepted;
         return m5::stl::make_unexpected(wrote.error());
+    }
+    if (wrote.value() > N) {
+        _faulted = true;
+        M5HAL_ASSERT(false, "StreamWriter returned more bytes than offered");
+        return m5::stl::make_unexpected(m5::hal::v2::error::error_t::IO_ERROR);
     }
     _last_accepted = wrote.value();
     if (wrote.value() != N) {

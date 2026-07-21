@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.16.0)
 #
 # Builds M5HAL (and its M5Utility dependency) as ESP-IDF components straight
 # from the local source trees, then builds the tiny consumer in main/ that
-# exercises the public API surface (test/v2/build_check). Run with the official
+# exercises the canonical public API surface (examples/v2/BuildTest). Run with the official
 # espressif/idf toolchain via `idf.py set-target <chip> build`, locally or in
 # CI (.github/workflows/build-check-idf.yml). This is the authoritative full-family
 # verification (esp32 / s3 / c3 / c6 / h2 / p4) — official ESP-IDF supports

@@ -96,6 +96,10 @@ public:
     ::m5::hal::v2::result_t<size_t> readableBytes(void) override;
     // StreamWriter
     ::m5::hal::v2::result_t<size_t> write(data::ConstDataSpan src) override;
+    size_t partialWriteAccepted() const override
+    {
+        return _last_write_accepted;
+    }
 
 protected:
     /*!
@@ -119,8 +123,9 @@ protected:
      */
     ::m5::hal::v2::error::error_t configureSocket(int fd);
 
-    int _fd       = -1;
-    bool _owns_fd = false;
+    int _fd                     = -1;
+    bool _owns_fd               = false;
+    size_t _last_write_accepted = 0;
 };
 
 /*!

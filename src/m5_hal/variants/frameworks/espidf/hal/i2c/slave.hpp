@@ -11,6 +11,9 @@
 #if defined(ESP_PLATFORM) || defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)
 #include <soc/soc_caps.h>
 #endif
+#if defined(ESP_PLATFORM) && defined(__XTENSA__)
+#include <xtensa/config/core-isa.h>
+#endif
 
 // The espidf slave backend ships in one of three flavors, selected in this
 // priority order (LL > BE > v2 driver):
@@ -25,7 +28,7 @@
 //   * v2 driver (M5HAL_ESPIDF_I2C_HAS_SLAVE_V2, the fallback when neither LL
 //     probe's headers are available): the existing best-effort fill-only path,
 //     kept verbatim.
-// The transaction-window state machine is HW-independent and shared by all three.
+// The legacy wire-frame-window state machine is HW-independent and shared by all three.
 //
 // The LL path is written against the i2c_ll_* helpers (which abstract the
 // SoC-specific register layout) plus a handful of portable direct pokes, so it
@@ -82,6 +85,18 @@
 #define M5HAL_ESPIDF_I2C_SLAVE_LL_BE 0
 #endif
 
+// IDF 5.4 renamed the two FIFO setup helpers used by both direct backends.
+// The host harness models the current spelling and deliberately has no
+// esp_idf_version.h, so keep its selection explicit instead of evaluating an
+// undefined ESP_IDF_VERSION_VAL() in native tests.
+#if defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)
+#define M5HAL_DETAIL_ESPIDF_I2C_SLAVE_LL_V54_API_ 1
+#elif defined(ESP_PLATFORM) && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+#define M5HAL_DETAIL_ESPIDF_I2C_SLAVE_LL_V54_API_ 1
+#else
+#define M5HAL_DETAIL_ESPIDF_I2C_SLAVE_LL_V54_API_ 0
+#endif
+
 // IRAM placement for the LL stretch ISR path. By default the I2C-slave ISR and
 // every function/datum it reaches live in IRAM, so the slave keeps answering its
 // clock-stretched master even while the flash cache is disabled (an OTA / NVS /
@@ -101,6 +116,39 @@
 #ifndef M5HAL_CONFIG_ESPIDF_I2C_SLAVE_IRAM_ISR
 #define M5HAL_CONFIG_ESPIDF_I2C_SLAVE_IRAM_ISR 1
 #endif
+
+// The bridge needs ISR-safe, bounded 32-bit atomics rather than the stricter
+// ISO meaning of lock-free. ESP-IDF supplies interrupt-masked __atomic_*_4
+// helpers on single-core chips without native atomics (for example S2/C3).
+// Multi-core chips must have a real CAS instruction; an interrupt mask on one
+// core cannot serialize the other core. When the ISR itself is cache-safe, the
+// single-core fallback functions must also be linked into IRAM.
+#if defined(ESP_PLATFORM) && (M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_SLAVE_LL_BE)
+#if SOC_CPU_CORES_NUM > 1
+#if defined(__XTENSA__)
+static_assert(XCHAL_HAVE_S32C1I == 1, "multi-core I2C slave queue requires native 32-bit atomics");
+#elif defined(__riscv)
+#if !defined(__riscv_atomic) || __riscv_atomic != 1
+#error "multi-core I2C slave queue requires the RISC-V atomic extension"
+#endif
+#else
+#error "multi-core I2C slave queue atomic capability is unknown"
+#endif
+#elif (defined(__XTENSA__) && XCHAL_HAVE_S32C1I == 1) || \
+    (defined(__riscv) && defined(__riscv_atomic) && __riscv_atomic == 1)
+// A single core with native 32-bit atomics does not call libc fallback helpers.
+#elif M5HAL_CONFIG_ESPIDF_I2C_SLAVE_IRAM_ISR && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+// IDF 5.1-5.4 place stdatomic in the noflash section unconditionally. IDF 5.5
+// introduced this Kconfig switch, so only newer fallback builds must require it.
+#if !defined(CONFIG_LIBC_MISC_IN_IRAM) || !CONFIG_LIBC_MISC_IN_IRAM
+#error "single-core IRAM I2C slave queue requires CONFIG_LIBC_MISC_IN_IRAM"
+#endif
+#endif
+#elif defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)
+static_assert(__atomic_always_lock_free(sizeof(uint32_t), nullptr),
+              "host I2C slave harness requires lock-free 32-bit atomics");
+#endif
+
 #if (M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_SLAVE_LL_BE) && M5HAL_CONFIG_ESPIDF_I2C_SLAVE_IRAM_ISR
 #define M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_       IRAM_ATTR
 #define M5HAL_DETAIL_I2C_SLAVE_ISR_INTR_FLAGS_ (ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_LEVEL3)
@@ -108,6 +156,11 @@
 #define M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_
 #define M5HAL_DETAIL_I2C_SLAVE_ISR_INTR_FLAGS_ (ESP_INTR_FLAG_LEVEL3)
 #endif
+
+#define M5HAL_DETAIL_I2C_SLAVE_QUEUE_ISR_INLINE_ __attribute__((always_inline))
+#include "detail/slave_queue_bridge.hpp"
+#undef M5HAL_DETAIL_I2C_SLAVE_QUEUE_ISR_INLINE_
+#include "detail/slave_tx_ledger.hpp"
 
 // M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS: body gate opens for the host harness too (the
 // class itself is unchanged; only fake headers stand in for the real SDK).
@@ -165,17 +218,47 @@ public:
     SlaveBus_espidf() = default;
     ~SlaveBus_espidf() override
     {
-        (void)release();
+        (void)teardownBackend();
     }
 
     result_t<void> init(const i2c::SlaveBusConfig& cfg) override;
-    result_t<void> release(void) override;
-    result_t<void> beginTransaction(bus::IAccessor* owner, uint32_t timeout_ms = 0) override;
-    result_t<void> endTransaction(bus::IAccessor* owner) override;
+    result_t<void> close(void)
+    {
+        return bus::IBus::close();
+    }
+    types::backend_kind_t backendKind(void) const override
+    {
+        return types::backend_kind_t::Hardware;
+    }
+    int8_t controllerId(void) const override
+    {
+        return _config.controller;
+    }
+    bus::BusCapabilities capabilities(void) const override
+    {
+        auto builder = bus::detail::BusCapabilitiesBuilder{bus::IBus::capabilities()};
+        if (_config.legacy_wire_frame_window) {
+            builder.enable(bus::BusFeature::SlaveLegacyWireFrame);
+        }
+#if M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_SLAVE_LL_BE
+        if (!_config.legacy_wire_frame_window) {
+            builder.enable(bus::BusFeature::SlaveByteTx).enable(bus::BusFeature::SlaveByteRx);
+        }
+#endif
+#if M5HAL_ESPIDF_I2C_SLAVE_LL
+        builder.enable(bus::BusFeature::ClockStretch, _config.tx_underrun == i2c::TxUnderrun::Stretch);
+#endif
+#if M5HAL_ESPIDF_I2C_SLAVE_LL_BE
+        builder.enable(bus::BusFeature::IsrRegMap);
+#endif
+        return builder.build();
+    }
+    result_t<void> tryOpenWireFrame(bus::IAccessor* owner) override;
+    result_t<void> closeWireFrame(bus::IAccessor* owner) override;
     result_t<size_t> read(bus::IAccessor* owner, data::DataSpan dst) override;
     result_t<size_t> write(bus::IAccessor* owner, data::ConstDataSpan src) override;
     result_t<size_t> readableBytes(bus::IAccessor* owner) override;
-    result_t<bool> transactionComplete(bus::IAccessor* owner) override;
+    result_t<bool> wireFrameComplete(bus::IAccessor* owner) override;
     service::IService* service() override
     {
         return nullptr;
@@ -184,6 +267,18 @@ public:
     // gives on any RX/TX/STOP activity (short safety timeout), so a fast master is
     // drained promptly. Overrides the base 1 ms poll.
     result_t<bool> waitForActivity(bus::IAccessor* owner, uint32_t timeout_ms) override;
+
+#if M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_SLAVE_LL_BE
+    void notifyOperationActivity(bus::IAccessor* owner) override;
+#if defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)
+    void testHoldQueuedWorkerSession();
+    void testFailNextQueuedBeginWithHeldWorker();
+    void testRunWorkerDuringQueuedEnd();
+    void testReleaseHeldQueuedWorkerSession();
+    bool testQueuedEndpointsDetached() const;
+    bool testQueuedProducerTaskPresent() const;
+#endif
+#endif
 
 #if M5HAL_ESPIDF_I2C_SLAVE_LL_BE
     // ISR register-map fast path (see i2c::ISlaveBus::bindIsrRegMap): only the BE
@@ -210,8 +305,21 @@ public:
         return _rx_overflow_count;
     }
 
+protected:
+#if M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_SLAVE_LL_BE
+    result_t<void> beginOperationBackend(bus::OperationContext<i2c::SlaveAccessConfig>& context) override;
+    result_t<void> endOperationBackend(bus::OperationContext<i2c::SlaveAccessConfig>& context) override;
+#endif
+    bus::CloseOutcome closeBackend(void) override
+    {
+        return teardownBackend();
+    }
+
 private:
-    // ---- Shared transaction-window state machine (HW independent) ----------
+    bus::CloseOutcome teardownBackend(void);
+    result_t<void> resetForInitialization(void);
+
+    // ---- Shared legacy wire-frame-window state machine (HW independent) ----
     struct Transaction {
         bool in_use                  = false;
         bool complete                = false;
@@ -245,6 +353,9 @@ private:
     void M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ notifyConsumerFromISR(bool& task_woken);
     void notifyTaskFromTask();
     void requestTaskLoop();
+#if M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_SLAVE_LL_BE
+    result_t<void> stopQueuedProducerAndQuiesce(uint32_t generation);
+#endif
     ::TickType_t requestWaitTicksLocked(::TickType_t now_tick) const;
     bool collectPendingWrite(uint8_t* dst, size_t& len, bool& generated_fill);
     void markWriteCommitted(size_t len);
@@ -276,7 +387,6 @@ private:
     bool _request_pending      = false;
     bool _task_stop            = false;
     bool _task_running         = false;
-    bool _pending_fill         = false;
     size_t _pending_commit_len = 0;
     // Identity captured with the backend-owned copy passed to the driver.
     // The slot pointer alone is insufficient because a completed slot can be
@@ -318,9 +428,14 @@ private:
     uint32_t M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ clearHoldLocked();
     void M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ enableMaskedInterrupts(uint32_t mask);
     void restorePins();
+    void processQueuedWorker();
+    void resumeQueuedHardwareFromTask();
+    bool M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ handleQueuedIsrLocked(::i2c_dev_t* hw, uint32_t ints, uint32_t rx,
+                                                                bool is_read, bool& task_woken);
 
     ::i2c_dev_t* _hw      = nullptr;
     ::intr_handle_t _intr = nullptr;
+    int8_t _port          = -1;
     int _pin_scl          = -1;
     int _pin_sda          = -1;
     enum class HoldKind : uint8_t{none, address_read, tx_empty, rx_full};
@@ -328,12 +443,33 @@ private:
     uint32_t _masked_intrs   = 0;
     uint32_t _baseline_intrs = 0;
 
+    static constexpr size_t kQueuedEventCapacity = 64;
+    static constexpr size_t kQueuedRxCapacity    = 128;
+    static constexpr size_t kQueuedTxCapacity    = 128;
+    using QueuedBridge = detail::SlaveQueueBridge<kQueuedEventCapacity, kQueuedRxCapacity, kQueuedTxCapacity>;
+    QueuedBridge _queued_bridge{};
+    detail::SlaveTxLedger<SOC_I2C_FIFO_LEN> _queued_tx_ledger{};
+    SlaveAccessor* _queued_accessor                                = nullptr;  // worker task only dereferences
+    bus::OperationContext<i2c::SlaveAccessConfig>* _queued_context = nullptr;  // worker task only dereferences
+    uint32_t _queued_generation                                    = 0;
+    size_t _queued_copied_unique                                   = 0;
+    size_t _queued_popped_confirmed                                = 0;
+    bool _queued_active                                            = false;
+    bool _queued_lifecycle_used                                    = false;
+    uint32_t _queued_broken                                        = 0;
+    uint32_t _queued_dropped_rx                                    = 0;
+    uint32_t _queued_worker_runs                                   = 0;
+#if defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)
+    QueuedBridge::WorkerSession* _test_held_queued_worker = nullptr;
+    bool _test_fail_next_queued_begin                     = false;
+#endif
+
     // Backend-owned snapshot of the composed reply for the in-flight read. The
     // accessor writes its reply into the open transaction's tx queue; on the first
     // fill we copy it here and serve the whole read (including the TX_EMPTY refills
     // a >FIFO read needs) from this buffer. That decouples the byte stream the
     // master is clocking from the accessor's transaction lifecycle -- the app may
-    // endTransaction() right after write(), and a refill must not chase a freed
+    // closeWireFrame() right after write(), and a refill must not chase a freed
     // transaction (which raced as intermittent mid-read underruns).
     uint8_t _resp[kTxCapacity] = {};
     size_t _resp_len           = 0;
@@ -362,6 +498,10 @@ private:
     // space with tx_fill_byte (not a single byte) -- see the class comment above.
     void M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ fillTxFromRespLocked();
     void restorePins();
+    void processQueuedWorker();
+    void resumeQueuedHardwareFromTask();
+    bool M5HAL_DETAIL_I2C_SLAVE_ISR_IRAM_ handleQueuedBeIsrLocked(::i2c_dev_t* hw, uint32_t ints, uint32_t rx,
+                                                                  bool& task_woken);
 
     // ISR register-map fast path (bound via bindIsrRegMap): while _isr_binding
     // is non-null, drainRxLocked/snapshotResponseLocked/fillTxFromRespLocked
@@ -394,8 +534,33 @@ private:
 
     ::i2c_dev_t* _hw      = nullptr;
     ::intr_handle_t _intr = nullptr;
+    int8_t _port          = -1;
     int _pin_scl          = -1;
     int _pin_sda          = -1;
+
+    static constexpr size_t kQueuedEventCapacity = 64;
+    static constexpr size_t kQueuedRxCapacity    = 128;
+    static constexpr size_t kQueuedTxCapacity    = 128;
+    using QueuedBridge = detail::SlaveQueueBridge<kQueuedEventCapacity, kQueuedRxCapacity, kQueuedTxCapacity>;
+    QueuedBridge _queued_bridge{};
+    detail::SlaveTxLedger<SOC_I2C_FIFO_LEN> _queued_tx_ledger{};
+    SlaveAccessor* _queued_accessor                                = nullptr;
+    bus::OperationContext<i2c::SlaveAccessConfig>* _queued_context = nullptr;
+    uint32_t _queued_generation                                    = 0;
+    size_t _queued_copied_unique                                   = 0;
+    size_t _queued_popped_confirmed                                = 0;
+    bool _queued_active                                            = false;
+    bool _queued_lifecycle_used                                    = false;
+    bool _queued_be_reload_pending                                 = false;
+    bool _queued_closing                                           = false;
+    uint32_t _queued_broken                                        = 0;
+    uint32_t _queued_dropped_rx                                    = 0;
+    uint32_t _queued_worker_runs                                   = 0;
+#if defined(M5HAL_TEST_ESPIDF_I2C_SLAVE_HOST_HARNESS)
+    QueuedBridge::WorkerSession* _test_held_queued_worker = nullptr;
+    bool _test_fail_next_queued_begin                     = false;
+    bool _test_run_worker_during_queued_end               = false;
+#endif
 
     // Same backend-owned reply snapshot as the LL flavor (see its comment) --
     // decouples the byte stream the master is clocking from the accessor's

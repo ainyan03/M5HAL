@@ -49,6 +49,10 @@ constexpr size_t kMaxTransferRx = 244;
 static_assert(kMaxTransferRx + 8 <= kMaxScriptSize,
               "kMaxTransferRx leaves insufficient room for response script overhead "
               "(StoreData header + ReportComplete + terminator = 7 bytes; 8 chosen for margin)");
+/*! @brief Maximum inline TX bytes in one atomic I2C transfer before its prefix is subtracted. */
+constexpr size_t kMaxAtomicI2CTxBase = 243;
+/*! @brief Maximum inline TX bytes in one atomic SPI transfer. */
+constexpr size_t kMaxAtomicSPITx = 229;
 /*!
   @brief Default store slot for response data.
 
@@ -79,9 +83,10 @@ constexpr uint32_t clampBelowForever(uint32_t v)
     return v == types::TIMEOUT_FOREVER ? types::TIMEOUT_FOREVER - 1 : v;
 }
 
-constexpr uint32_t remoteUartWriteResponseTimeoutMs(uint32_t write_timeout_ms)
+constexpr uint32_t remoteUartWriteResponseTimeoutMs(uint32_t write_timeout_ms, size_t tx_len)
 {
-    return clampBelowForever(saturatingAddU32(write_timeout_ms, kRemoteUartTimeoutMarginMs));
+    const uint32_t nominal = saturatingMulU32(static_cast<uint32_t>(tx_len), write_timeout_ms);
+    return clampBelowForever(saturatingAddU32(nominal, kRemoteUartTimeoutMarginMs));
 }
 
 constexpr uint32_t remoteUartReadResponseTimeoutMs(uint32_t first_byte_timeout_ms, uint32_t inter_byte_timeout_ms,
@@ -90,6 +95,20 @@ constexpr uint32_t remoteUartReadResponseTimeoutMs(uint32_t first_byte_timeout_m
     const uint32_t gaps = rx_len != 0 ? saturatingMulU32(static_cast<uint32_t>(rx_len - 1), inter_byte_timeout_ms) : 0;
     return clampBelowForever(
         saturatingAddU32(saturatingAddU32(first_byte_timeout_ms, gaps), kRemoteUartTimeoutMarginMs));
+}
+
+constexpr uint32_t remoteUartTransferResponseTimeoutMs(uint32_t write_timeout_ms, uint32_t first_byte_timeout_ms,
+                                                       uint32_t inter_byte_timeout_ms, size_t tx_len, size_t rx_len)
+{
+    uint32_t nominal = 0;
+    if (tx_len != 0) {
+        nominal = saturatingAddU32(nominal, saturatingMulU32(static_cast<uint32_t>(tx_len), write_timeout_ms));
+    }
+    if (rx_len != 0) {
+        const uint32_t gaps = saturatingMulU32(static_cast<uint32_t>(rx_len - 1), inter_byte_timeout_ms);
+        nominal             = saturatingAddU32(nominal, saturatingAddU32(first_byte_timeout_ms, gaps));
+    }
+    return clampBelowForever(saturatingAddU32(nominal, kRemoteUartTimeoutMarginMs));
 }
 
 }  // namespace detail
@@ -102,7 +121,7 @@ constexpr uint32_t remoteUartReadResponseTimeoutMs(uint32_t first_byte_timeout_m
  */
 constexpr m5::hal::v2::error::error_t mapRemoteError(int8_t code)
 {
-    return (code >= static_cast<int8_t>(m5::hal::v2::error::error_t::NOT_CONNECTED) &&
+    return (code >= static_cast<int8_t>(m5::hal::v2::error::error_t::WOULD_BLOCK) &&
             code <= static_cast<int8_t>(m5::hal::v2::error::error_t::ASYNC_RUNNING))
                ? static_cast<m5::hal::v2::error::error_t>(code)
                : m5::hal::v2::error::error_t::REMOTE_FAULT;
@@ -115,18 +134,25 @@ struct DeviceConfig {
     void* progress_ctx                      = nullptr;
 };
 
+constexpr uint8_t kHelloFlagGpio                 = 0x01u;
+constexpr uint8_t kHelloFlagBusCreate            = 0x02u;
+constexpr uint8_t kHelloFlagBusCapabilities      = 0x04u;
+constexpr uint8_t kHelloExtensionBusCapabilities = 0x01u;
+
 /*! @brief Capability summary carried by `HelloResp`. */
 struct Capabilities {
     struct BusEntry {
         types::bus_kind_t kind = types::bus_kind_t::Unknown;
         uint8_t bus_id         = 0;
+        bus::BusCapabilities capabilities{};
     };
     static constexpr size_t kMaxEntries = 4 * bytecode::kMaxBusBindings;
 
-    uint8_t proto_ver        = 0;
-    bool has_gpio            = false;
-    bool supports_bus_create = false;
-    size_t bus_count         = 0;
+    uint8_t proto_ver         = 0;
+    bool has_gpio             = false;
+    bool supports_bus_create  = false;
+    bool has_bus_capabilities = false;
+    size_t bus_count          = 0;
     BusEntry buses[kMaxEntries];
     uint8_t gpio_port_count = 0;
     uint16_t gpio_pin_count = 0;

@@ -64,6 +64,13 @@ struct StreamWriter {
     virtual ~StreamWriter() = default;
 
     virtual m5::hal::v2::result_t<size_t> write(ConstDataSpan src) = 0;
+
+    // Bytes accepted before the most recent failing write(). Writers whose
+    // hard-error path is all-or-nothing keep the default zero.
+    virtual size_t partialWriteAccepted() const
+    {
+        return 0;
+    }
 };
 
 /*!
@@ -123,7 +130,10 @@ m5::hal::v2::result_t<size_t> readUntil(StreamReader& reader, uint8_t delim, Dat
   `closed()` keeps its default (= eof()): an attached stream may always
   produce more bytes. Hard stream errors are reported through the error
   path and never latch EOF; an idle timeout is represented by an empty
-  successful peek.
+  successful peek. A reader that reports more bytes than the supplied
+  destination can hold violates the stream contract: debug builds assert,
+  release builds return `IO_ERROR`, and the adapter remains faulted until it
+  is reconstructed.
  */
 class StreamSource : public Source {
 public:
@@ -170,6 +180,7 @@ private:
     size_t _head         = 0;
     size_t _filled       = 0;
     size_t _pending_skip = 0;
+    bool _faulted        = false;
 };
 
 /*!
@@ -187,7 +198,9 @@ private:
 
   `closed()` is true only for a detached adapter (null writer);
   committing while detached returns `CLOSED` instead of silently
-  dropping bytes.
+  dropping bytes. A writer (including `partialWriteAccepted()`) that reports
+  more than the offered byte count causes a debug assertion; release builds
+  return `IO_ERROR` and permanently fault the adapter.
  */
 class StreamSink : public Sink {
 public:
@@ -212,6 +225,7 @@ private:
     StreamWriter* _writer = nullptr;
     DataSpan _scratch{};
     size_t _last_accepted = 0;
+    bool _faulted         = false;
 };
 
 }  // namespace m5::hal::v2::data

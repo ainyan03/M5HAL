@@ -94,7 +94,7 @@ result_t<size_t> BsdTcpRemoteServer::service()
     }
 
     for (auto& slot : _slots) {
-        if (!slot.active) {
+        if (!slot.active.load(std::memory_order_relaxed)) {
             continue;
         }
         auto r = slot.adapter()->service();
@@ -114,7 +114,7 @@ size_t BsdTcpRemoteServer::connectionCount() const
 {
     size_t count = 0;
     for (const auto& slot : _slots) {
-        if (slot.active) {
+        if (slot.active.load(std::memory_order_relaxed)) {
             ++count;
         }
     }
@@ -188,13 +188,13 @@ result_t<void> BsdTcpRemoteServer::activateSlot(ConnectionSlot& slot, int fd)
     wireConnection(*slot.server(), slot.pool, slot.handler, *slot.adapter(), cfg);
 
     M5HAL_DIAG("slot activate fd=%d", fd);
-    slot.active = true;
+    slot.active.store(true, std::memory_order_relaxed);
     return {};
 }
 
 void BsdTcpRemoteServer::teardownSlot(ConnectionSlot& slot)
 {
-    const bool was_active = slot.active;
+    const bool was_active = slot.active.load(std::memory_order_relaxed);
     if (slot.server_ok) {
         slot.pool.releaseAll();
     }
@@ -212,7 +212,7 @@ void BsdTcpRemoteServer::teardownSlot(ConnectionSlot& slot)
     slot.stream.close();
     slot.pool    = ServerBusPool{};
     slot.handler = RemoteServerHandler{};
-    slot.active  = false;
+    slot.active.store(false, std::memory_order_relaxed);
     if (was_active) {
         M5HAL_DIAG("slot teardown");
     }
@@ -221,7 +221,7 @@ void BsdTcpRemoteServer::teardownSlot(ConnectionSlot& slot)
 BsdTcpRemoteServer::ConnectionSlot* BsdTcpRemoteServer::firstFreeSlot()
 {
     for (auto& slot : _slots) {
-        if (!slot.active) {
+        if (!slot.active.load(std::memory_order_relaxed)) {
             return &slot;
         }
     }

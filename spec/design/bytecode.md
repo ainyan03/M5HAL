@@ -17,6 +17,7 @@
 
 - マルチバイト整数は **little endian** 統一
 - **LenVar (LE)**: `0x00-0xFC` = その値 1 byte / `0xFD` + u16 LE / `0xFE` + u32 LE / `0xFF` 予約 (出現したら `PROTOCOL_ERROR`)
+- **長さ上限**: LenVarへ入る公開APIの長さ・offsetはu32以下を契約とする。超過はdebug assert、release `INVALID_ARGUMENT`であり、切り捨て・飽和はしない。raw encoderはinternalな`uint32_t`入力だけを受け、公開入口の検査後に使う
 - **前方互換**: すべての命令が長さ前置なので、未知 opcode は size 分スキップして続行できる
 - **critical フラグ (opcode bit7)**: 「黙って無視されては困る」将来命令のための区分。未知 opcode は bit7=0 ならスキップ (件数は `unknownSkipped()` で観測可)、bit7=1 なら `PROTOCOL_ERROR` で停止
 
@@ -36,18 +37,21 @@
 | `GpioRead` | 0x23 | `[store_id:1]([gpio_num:u16])*` | ピン列を読み、LSB 詰めのビット列をスロットへ |
 | `GpioSubscribe` | 0x24 | `([gpio_num:u16])*` | ピン列を変化通知の購読に追加 (実行環境が購読機構を持たない場合 UNSUPPORTED。意味論は [remote.md](remote.md) §push イベント) |
 | `GpioUnsubscribe` | 0x25 | `([gpio_num:u16])*` (空 = 全解除) | 購読解除 |
-| `GpioAllowlist` | 0x26 | `([pin:u8])*` | 指定ピンで AllowlistGPIO + GPIOGroup を構築し `setGPIOGroup()` で登録。空リスト = GPIO 無効化。非 critical なので非対応サーバは skip |
+| `GpioAllowlist` | 0x26 | `([pin:u8])*` | runner埋込み側が指定ピンのallowlistを反映するためのoptional hook。標準`Server`は物理GPIO providerを所有しないため`UNSUPPORTED`。空リストは対応実装でGPIO無効化。非criticalなのでhandler未登録のrunnerはskip |
 | `GpioPortRead` | 0x27 | `[store_id:1][slot:1][port_index:1]` | ポート一括読み出し。32-bit LE をスロットへ。deny_mask 対象ビットは 0 |
 | `GpioPortWrite` | 0x28 | `[slot:1][port_index:1][set_mask:u32 LE][clear_mask:u32 LE]` | ポート一括書き込み (W1TS/W1TC 方式)。deny_mask 対象ビットはマスクされて書き込まれない |
 | `StoreData` | 0x40 | `[store_id:1][data...]` | (応答) データをスロットへ |
 | `ReportError` | 0x41 | `[error:i8][offset:LenVar]` | (応答) エラーと発生位置 |
 | `ReportComplete` | 0x42 | `[status:i8]` | (応答) 完了通知 |
 | `EvtGpioState` | 0x60 | `([gpio_num:u16][level:u8])*` | (イベント) 変化したピンと新レベル。受信側 runner はハンドラ未登録なら黙って無視 |
-| `BusBeginTransaction` | 0xB4 (critical) | `[kind:1][bus_id:1]` | バストランザクション開始 (現在 SPI のみ)。CS window の明示的制御。depth counting で入れ子をサポート |
-| `BusEndTransaction` | 0xB5 (critical) | `[kind:1][bus_id:1]` | バストランザクション終了 |
+| `BusBeginTransaction` | 0xB4 (critical) | `[kind:1][bus_id:1]` | legacy wire名。現在SPI Access開始へadapterし、CS windowを開く |
+| `BusEndTransaction` | 0xB5 (critical) | `[kind:1][bus_id:1]` | legacy wire名。SPI Access終了へadapterする |
 
-- `kind` は `types::bus_kind_t` の値 (I2C/SPI/UART/I2S)。`gpio_num` は統合 `gpio_number_t` 空間 (スロット込み) の u16 表現
+- `kind` は `types::bus_kind_t` の値 (I2C/SPI/UART/I2S/PDM)。`gpio_num` は統合 `gpio_number_t` 空間 (スロット込み) の u16 表現
 - 0xB4-0xB5 が critical (bit7) なのは、これらを知らない実行環境による黙殺 = 「CS 制御漏れ」を `PROTOCOL_ERROR` で即検出するため
+- B4/B5のopcode名と値はwire互換のため維持する。Runnerはbinding内だけでlegacy depthを吸収し、
+  concrete `spi::MasterAccessor`には最外一回の`beginAccess` / `endAccess`しか呼ばない。Accessor自体は
+  non-nestableである
 - `store_id` は応答データのラベル (任意値)。`0xFF` は「読み捨て」
 - GPIO はピン列操作 (0x20-0x26) とポート一括操作 (0x27-0x28) の 2 形式を持つ。ピン列は GPIOGroup → 個別 Pin モデルに対応し、ポート一括は IPort の 32-bit レジスタ操作 (W1TS/W1TC) に対応する。両者の deny_mask は GPIOGroup が管理し、個別pinからport ordinal / bitへの対応には`IGPIO::locatePin()`を使う
 
@@ -61,9 +65,15 @@ pin は全て **little-endian signed 16-bit** (`int16_t` の LE 表現、-1 = �
 | SPI (2) | `[clk:i16][mosi:i16][miso:i16]` | 6 B |
 | UART (4) | `[tx:i16][rx:i16][port_num:u8][rx_buf_256:u8][tx_buf_256:u8]` | 7 B |
 | I2S (3) | `[bclk:i16][ws:i16][dout:i16][din:i16][role:u8][tx_buf_kb:u8][rx_buf_kb:u8]` | 11 B |
+| PDM (9) | `[clk:i16][din:i16][rx_buf_kb:u8]` | 5 B |
 
 - buf サイズ: I2S は KB 単位 (0x08 = 8192)、UART は 256B 単位 (0x08 = 2048)
-- `store_id` は `kDiscardStoreId` (0xFF) とし、応答は `ReportComplete` / `ReportError` のみ
+- `store_id = kDiscardStoreId` (0xFF) は旧host互換の読み捨て要求で、応答は
+  `ReportComplete` / `ReportError`のみ。その他のstore IDでは、bindingされた新serverは成功応答に
+  `StoreData(store_id, BusCapabilities record)`を加える。recordは
+  [bus_capabilities.md](bus_capabilities.md)のschemaである
+- 新hostが旧serverからstatusだけを受け取った場合、Bus作成は成功のまま、instance feature/limitは
+  保守的な空snapshotとする。旧hostは0xFFを送り、新serverから追加storeを受け取らない
 - Hello (新接続) 時に全動的バスを自動 release (server 側)
 
 ### BusConfigure の cfg payload
@@ -76,6 +86,7 @@ accessor の現在の config を起点に、既知フィールドだけ上書き
 | SPI | `pin_cs:i16, pin_dc:i16, freq:u32, data_mode:u8, mode:u8 (bit0-1=spi_mode, bit2=order), cmd_len:u8, addr_len:u8, read_dummy:u8, write_dummy:u8` | 14 B |
 | UART | `baud:u32, first_byte:u32, inter_byte:u32, write_timeout:u32, data_bits:u8, stop_bits:u8, parity:u8, invert:u8` | 20 B |
 | I2S stream | `sample_rate:u32, write_timeout:u32, bits_per_sample:u8, channels:u8, read_timeout:u32` | 14 B |
+| PDM PCM RX | `sample_rate:u32, read_timeout:u32, bits_per_sample:u8, channels:u8` | 10 B |
 
 ### BusTransfer の meta
 
@@ -97,9 +108,9 @@ auto consumed = runner.run(data::ConstDataSpan{init_table, sizeof init_table});
 auto chip_id  = runner.storedData(7);               // GpioRead / BusTransfer の結果
 ```
 
-- **動的バス生成** (`BusCreate` / `BusRelease`): `Server::setBusCreateHandler` でアプリ提供のコールバックを登録する。Runner は `unregisterI2C/SPI/UART/I2S(bus_id)` で binding slot を null 化する (release 時)。同じ `(kind,bus_id)` への登録は single-shot で、I2S の TX-only / RX-only / TX+RX のような形状変更は release 後に再 create する
+- **動的バス生成** (`BusCreate` / `BusRelease`): `Server::setBusCreateHandler` でアプリ提供のコールバックを登録する。Runner は `unregisterI2C/SPI/UART/I2S/PDM(bus_id)` で binding slot を null 化する (release 時)。同じ `(kind,bus_id)` への登録は single-shot で、I2S の TX-only / RX-only / TX+RX のような形状変更は release 後に再 create する。create callback 成功後に capability encode / store 確保が失敗した場合は、同じ callback の release を呼んで生成を補償する。release 自体も失敗した場合は、残存資源を隠さないため release error を返す
 - **実行パスは `data::Source` 1 本**: `run(ConstDataSpan)` は内部で `MemorySource` を被せる薄い overload。`StreamSource` (UART 直結) やファイル再生も同じ実装で動く
-- **dispatch 先は事前登録制**: `registerI2C/SPI/UART(bus_id, accessor&)` に加え `registerI2S(bus_id, i2s::Accessor&)` / `registerI2S(bus_id, i2s::TxAccessor&)` / `registerI2S(bus_id, i2s::RxAccessor&)`、および対応する `unregisterI2C/SPI/UART/I2S`。未登録の bus slot / GPIOGroup を指す命令は `INVALID_STATE`
+- **dispatch 先は事前登録制**: `registerI2C/SPI/UART(bus_id, accessor&)` に加え `registerI2S(bus_id, i2s::Accessor&)` / `registerI2S(bus_id, i2s::TxAccessor&)` / `registerI2S(bus_id, i2s::RxAccessor&)`、`registerPDM(bus_id, pdm::RxAccessor&)`、および対応する unregister。未登録の bus slot / GPIOGroup を指す命令は `INVALID_STATE`
 - **store スロット**: ラベル付き 8 枠 (`memory::TempBuffer` 所有)。`run` 開始時に全クリア。同一 `store_id` への再書き込みは上書き、9 個目の異なるラベルは `OUT_OF_RESOURCE`
 - **エラー方針**: 最初に失敗した命令で停止しエラーを返す。`lastOffset()` がその命令の byte offset。応答化 (report) は呼び出し側が `writeResponse` で行う
 - **実行は同期**: `DelayMs` を含む全命令が呼び出しスレッドをブロックする。長い delay 入りスクリプトは runner (remote server なら poll ループ) を専有する。remote server 側の実行時間の制限規約は [remote.md](remote.md) §server の実行モデルが定める
@@ -120,7 +131,7 @@ BytecodeRunner::run       ←frame─  BytecodeRunner::writeResponse
 
 ## BytecodeEncoder
 
-`data::Sink&` へ命令単位 (reserve → 構築 → commit) で書く。`MemorySink` で byte 配列を組み立て、`StreamSink` なら encode 即送信。append 系は `expected<void, error_t>` を返し、Sink が命令全長を貸せない場合は `CLOSED` / `BUFFER_OVERFLOW`。
+`data::Sink&` へ命令単位 (reserve → 構築 → commit) で書く。`MemorySink` で byte 配列を組み立て、`StreamSink` なら encode 即送信。append 系は `result_t<void>` を返し、Sink が命令全長を貸せない場合は `CLOSED` / `BUFFER_OVERFLOW`。
 
 主なメソッド: `delayMs` / `configure(bus_id, <kind>AccessConfig)` / `transfer(bus_id, <kind>TransferDesc, tx, rx_len, store_id)` / `uartTransfer` / `gpioSetMode` / `gpioWriteHigh` / `gpioWriteLow` / `gpioRead` / `gpioPortRead(store_id, slot, port_index)` / `gpioPortWrite(slot, port_index, set_mask, clear_mask)` / `storeData` / `reportError` / `reportComplete` / `end`。
 

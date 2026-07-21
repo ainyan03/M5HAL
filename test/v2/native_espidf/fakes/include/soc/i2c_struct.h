@@ -65,7 +65,12 @@ struct i2c_dev_t {
     // A test sets this before firing an ADDRESS_MATCH-cause stretch or an
     // RX/TX water-mark event, matching what the real LL reports for the
     // in-flight bus transaction.
-    int slave_rw = I2C_SLAVE_WRITE_BY_MASTER;
+    int slave_rw                     = I2C_SLAVE_WRITE_BY_MASTER;
+    bool bus_busy                    = false;
+    uint16_t slave_address           = 0;
+    bool slave_address_10bit         = false;
+    uint16_t pending_slave_address   = 0;
+    bool pending_slave_address_10bit = false;
 
     // Clock-stretch state (i2c_ll_slave_get_stretch_cause /
     // i2c_ll_slave_clear_stretch). `stretch_active` is this fake's stand-in
@@ -83,4 +88,5 @@ struct i2c_dev_t {
     // model is a process-wide singleton per port; see hal/i2c_ll.h).
     unsigned txfifo_rst_count = 0;
     unsigned rxfifo_rst_count = 0;
+    unsigned update_count     = 0;
 };

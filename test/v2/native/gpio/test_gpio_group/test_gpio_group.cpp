@@ -706,6 +706,19 @@ using ServiceRunner = ::m5::hal::v2::service::ServiceRunner;
 // intra-call spins, so a purely virtual local_tick (0) is fine.
 using GroupCtx = ::m5::hal::v2::service::ServiceContext;
 
+#define ASSERT_SERVICE_OK(expression)                                                                  \
+    do {                                                                                               \
+        const auto result_ = (expression);                                                             \
+        ASSERT_TRUE(result_.has_value()) << "err=" << ::m5::hal::v2::error::toString(result_.error()); \
+    } while (false)
+
+#define EXPECT_SERVICE_RUN(expression, expected_progress)                                              \
+    do {                                                                                               \
+        const auto result_ = (expression);                                                             \
+        ASSERT_TRUE(result_.has_value()) << "err=" << ::m5::hal::v2::error::toString(result_.error()); \
+        EXPECT_EQ(result_.value(), (expected_progress));                                               \
+    } while (false)
+
 // IGPIO fake reporting hasPushEvents() == true (models remote GPIO's
 // push-fed pin state): GPIOGroup's poll pass must skip it entirely and
 // state can only reach the sink through notifyPinStateChanged().
@@ -808,14 +821,14 @@ TEST(GPIOGroupWatch, PollDispatchesRisingThenFallingWithCorrectArgs)
     ASSERT_TRUE(g.watch(pin).has_value());
 
     mcu._port.writePort(1u << 3, 0);
-    EXPECT_TRUE(runner.runOnce(GroupCtx{2000, 0}));
+    EXPECT_SERVICE_RUN(runner.runOnce(GroupCtx{2000, 0}), true);
     EXPECT_EQ(cap.count, 1);
     EXPECT_EQ(cap.pin, pin);
     EXPECT_TRUE(cap.level);
     EXPECT_EQ(cap.edge, GPIOGroup::Edge::Rising);
 
     mcu._port.writePort(0, 1u << 3);
-    EXPECT_TRUE(runner.runOnce(GroupCtx{2000, 0}));
+    EXPECT_SERVICE_RUN(runner.runOnce(GroupCtx{2000, 0}), true);
     EXPECT_EQ(cap.count, 2);
     EXPECT_FALSE(cap.level);
     EXPECT_EQ(cap.edge, GPIOGroup::Edge::Falling);
@@ -838,7 +851,7 @@ TEST(GPIOGroupWatch, PollMapsPortOrdinalBackToLocalPin)
     ASSERT_TRUE(watched.has_value()) << "err=" << ::m5::hal::v2::error::toString(watched.error());
 
     mcu._ports[1].writePort(1u << 0, 0);
-    EXPECT_TRUE(runner.runOnce(GroupCtx{2000, 0}));
+    EXPECT_SERVICE_RUN(runner.runOnce(GroupCtx{2000, 0}), true);
     EXPECT_EQ(cap.count, 1);
     EXPECT_EQ(cap.pin, pin);
     EXPECT_TRUE(cap.level);
@@ -862,7 +875,7 @@ TEST(GPIOGroupWatch, WatchSeedsLevelSoUnchangedPollReportsNoEvent)
     ASSERT_TRUE(g.setWatchSink(&captureWatchEvent, &cap, 1000).has_value());
     ASSERT_TRUE(g.watch(makeGpioNumber(0, 2)).has_value());
 
-    EXPECT_FALSE(runner.runOnce(GroupCtx{2000, 0}));
+    EXPECT_SERVICE_RUN(runner.runOnce(GroupCtx{2000, 0}), false);
     EXPECT_EQ(cap.count, 0);
 
     ASSERT_TRUE(g.setWatchSink(nullptr, nullptr).has_value());
@@ -881,7 +894,7 @@ TEST(GPIOGroupWatch, UnwatchedPinChangeProducesNoEvent)
     ASSERT_TRUE(g.watch(makeGpioNumber(0, 1)).has_value());  // watch pin 1, not pin 5
 
     mcu._port.writePort(1u << 5, 0);  // pin 5 changes, unwatched
-    EXPECT_FALSE(runner.runOnce(GroupCtx{2000, 0}));
+    EXPECT_SERVICE_RUN(runner.runOnce(GroupCtx{2000, 0}), false);
     EXPECT_EQ(cap.count, 0);
 
     ASSERT_TRUE(g.setWatchSink(nullptr, nullptr).has_value());
@@ -901,12 +914,12 @@ TEST(GPIOGroupWatch, UnwatchStopsFurtherEvents)
     ASSERT_TRUE(g.watch(pin).has_value());
 
     mcu._port.writePort(1u << 4, 0);
-    EXPECT_TRUE(runner.runOnce(GroupCtx{2000, 0}));
+    EXPECT_SERVICE_RUN(runner.runOnce(GroupCtx{2000, 0}), true);
     EXPECT_EQ(cap.count, 1);
 
     ASSERT_TRUE(g.unwatch(pin).has_value());
     mcu._port.writePort(0, 1u << 4);
-    EXPECT_FALSE(runner.runOnce(GroupCtx{2000, 0}));
+    EXPECT_SERVICE_RUN(runner.runOnce(GroupCtx{2000, 0}), false);
     EXPECT_EQ(cap.count, 1);  // no new event after unwatch
 
     ASSERT_TRUE(g.setWatchSink(nullptr, nullptr).has_value());
@@ -1011,13 +1024,13 @@ TEST(GPIOGroupWatch, PushFedEntrySkipsPollAndDoesNotDoubleDeliverAfterNotify)
     ASSERT_TRUE(g.watch(pin).has_value());
 
     push._port.writePort(1u << 2, 0);  // bypasses notify -- the poll pass must ignore it
-    EXPECT_FALSE(runner.runOnce(GroupCtx{2000, 0}));
+    EXPECT_SERVICE_RUN(runner.runOnce(GroupCtx{2000, 0}), false);
     EXPECT_EQ(cap.count, 0);
 
     ASSERT_TRUE(g.notifyPinStateChanged(pin, true).has_value());
     EXPECT_EQ(cap.count, 1);
 
-    EXPECT_FALSE(runner.runOnce(GroupCtx{2000, 0}));  // push-fed entries are never read by the poll loop
+    EXPECT_SERVICE_RUN(runner.runOnce(GroupCtx{2000, 0}), false);  // push-fed entries are never read by the poll loop
     EXPECT_EQ(cap.count, 1);
 
     ASSERT_TRUE(g.setWatchSink(nullptr, nullptr).has_value());
@@ -1069,12 +1082,12 @@ TEST(GPIOGroupWatch, ClearWatchersDropsMaskReWatchNeededAfter)
 
     ASSERT_TRUE(g.setWatchSink(&captureWatchEvent, &cap, 1000).has_value());
     mcu._port.writePort(1u << 6, 0);
-    EXPECT_FALSE(runner.runOnce(GroupCtx{2000, 0}));
+    EXPECT_SERVICE_RUN(runner.runOnce(GroupCtx{2000, 0}), false);
     EXPECT_EQ(cap.count, 0);  // mask was cleared: re-registering the sink alone isn't enough
 
     ASSERT_TRUE(g.watch(pin).has_value());
     mcu._port.writePort(0, 1u << 6);
-    EXPECT_TRUE(runner.runOnce(GroupCtx{2000, 0}));
+    EXPECT_SERVICE_RUN(runner.runOnce(GroupCtx{2000, 0}), true);
     EXPECT_EQ(cap.count, 1);  // watch()-ing again resumes delivery
 
     ASSERT_TRUE(g.setWatchSink(nullptr, nullptr).has_value());
@@ -1095,13 +1108,13 @@ TEST(GPIOGroupWatch, PollIntervalGatesPortReads)
     ASSERT_TRUE(g.setWatchSink(&captureWatchEvent, &cap, 1000).has_value());
     ASSERT_TRUE(g.watch(pin).has_value());
 
-    EXPECT_FALSE(runner.runOnce(GroupCtx{0, 0}));  // first pass: due immediately (next_tick starts at 0)
+    EXPECT_SERVICE_RUN(runner.runOnce(GroupCtx{0, 0}), false);  // first pass: due immediately (next_tick starts at 0)
     EXPECT_EQ(mcu._port.read_calls, 1u);
 
-    EXPECT_FALSE(runner.runOnce(GroupCtx{500, 0}));  // still inside the 1000-tick window: no read
+    EXPECT_SERVICE_RUN(runner.runOnce(GroupCtx{500, 0}), false);  // still inside the 1000-tick window: no read
     EXPECT_EQ(mcu._port.read_calls, 1u);
 
-    EXPECT_FALSE(runner.runOnce(GroupCtx{1500, 0}));  // past the due tick: reads again
+    EXPECT_SERVICE_RUN(runner.runOnce(GroupCtx{1500, 0}), false);  // past the due tick: reads again
     EXPECT_EQ(mcu._port.read_calls, 2u);
 
     ASSERT_TRUE(g.setWatchSink(nullptr, nullptr).has_value());
@@ -1154,7 +1167,7 @@ TEST(GPIOGroupWatch, SelfUnregisterInSinkStopsSamePassDelivery)
     ASSERT_TRUE(g.watch(makeGpioNumber(0, 1)).has_value());
 
     mcu._port.writePort(0b11, 0);  // both watched pins rise in the same pass
-    (void)runner.runOnce(GroupCtx{2000, 0});
+    EXPECT_SERVICE_RUN(runner.runOnce(GroupCtx{2000, 0}), true);
 
     EXPECT_EQ(ctx.count, 1);       // second changed bit must NOT reach the old sink
     EXPECT_EQ(runner.size(), 0u);  // self-unregister also removed the poll service
@@ -1176,15 +1189,15 @@ TEST(GPIOGroupWatch, ReRegisterWithShorterIntervalTakesEffectImmediately)
     ASSERT_TRUE(g.setWatchSink(&captureWatchEvent, &cap, 1000000).has_value());  // 1s interval
     ASSERT_TRUE(g.watch(pin).has_value());
 
-    EXPECT_FALSE(runner.runOnce(GroupCtx{1000, 0}));  // first pass: publishes a far-future due (~1s)
+    EXPECT_SERVICE_RUN(runner.runOnce(GroupCtx{1000, 0}), false);  // first pass: publishes a far-future due (~1s)
     EXPECT_EQ(mcu._port.read_calls, 1u);
 
-    mcu._port.writePort(1u << 0, 0);                  // edge while the long interval is pending
-    EXPECT_FALSE(runner.runOnce(GroupCtx{1000, 0}));  // still gated by the 1s due: not observed
+    mcu._port.writePort(1u << 0, 0);                               // edge while the long interval is pending
+    EXPECT_SERVICE_RUN(runner.runOnce(GroupCtx{1000, 0}), false);  // still gated by the 1s due: not observed
     EXPECT_EQ(cap.count, 0);
 
     ASSERT_TRUE(g.setWatchSink(&captureWatchEvent, &cap, 1000).has_value());  // shorten to 1ms
-    EXPECT_TRUE(runner.runOnce(GroupCtx{1000, 0}));  // must poll right away, not at the old 1s due
+    EXPECT_SERVICE_RUN(runner.runOnce(GroupCtx{1000, 0}), true);  // must poll right away, not at the old 1s due
     EXPECT_EQ(cap.count, 1);
     EXPECT_EQ(cap.pin, pin);
     EXPECT_TRUE(cap.level);
@@ -1212,7 +1225,7 @@ TEST(GPIOGroupWatch, SetWatchSinkFailureLeavesNoSinkNoService)
 
     NoOpService fillers[ServiceRunner::kMaxServices];
     for (auto& f : fillers) {
-        ASSERT_TRUE(runner.add(f));
+        ASSERT_SERVICE_OK(runner.add(f));
     }
     ASSERT_EQ(runner.size(), ServiceRunner::kMaxServices);
 
@@ -1227,10 +1240,13 @@ TEST(GPIOGroupWatch, SetWatchSinkFailureLeavesNoSinkNoService)
     ASSERT_TRUE(g.notifyPinStateChanged(makeGpioNumber(0, 0), true).has_value());
     EXPECT_EQ(cap.count, 0);
 
-    runner.clear();
+    ASSERT_SERVICE_OK(runner.clear());
 }
 
 }  // namespace
+
+#undef ASSERT_SERVICE_OK
+#undef EXPECT_SERVICE_RUN
 
 int main(int argc, char** argv)
 {

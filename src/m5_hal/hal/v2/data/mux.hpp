@@ -28,11 +28,9 @@ class MuxFrameEncoder {
 public:
     static constexpr size_t kMaxStreams = 16;
 
-    MuxFrameEncoder() = default;
+    MuxFrameEncoder();
 
     explicit MuxFrameEncoder(memory::Allocator& alloc);
-
-    void setAllocator(memory::Allocator& alloc);
 
     bool attach(uint8_t stream_id, Source& src);
 
@@ -72,7 +70,7 @@ private:
     };
 
     BlockSource _output;
-    memory::Allocator* _alloc = nullptr;
+    memory::Allocator* const _alloc;
     Stream _streams[kMaxStreams];
     uint8_t _remote_credit = 0;
     bool _credit_gated     = false;
@@ -110,11 +108,9 @@ public:
     // alive for as long as the peer is still producing for it.
     using stale_data_fn = void (*)(void* ctx, uint8_t stream_id);
 
-    MuxFrameDecoder() = default;
+    MuxFrameDecoder();
 
     explicit MuxFrameDecoder(memory::Allocator& alloc);
-
-    void setAllocator(memory::Allocator& alloc);
 
     void setFrameHandler(frame_handler_t fn, void* ctx);
 
@@ -162,6 +158,10 @@ public:
 
 private:
     struct Stream {
+        Stream() : blocks{BlockSource::DeferredAllocatorBinding{}}
+        {
+        }
+
         RingFIFO ring;
         BlockSource blocks;
         Sink* direct_sink  = nullptr;
@@ -186,7 +186,7 @@ private:
     void consumePendingFrame(size_t consumed);
     void clearPendingFrame();
 
-    memory::Allocator* _alloc    = nullptr;
+    memory::Allocator* const _alloc;
     frame_handler_t _handler     = nullptr;
     void* _handler_ctx           = nullptr;
     stale_data_fn _stale_data_fn = nullptr;

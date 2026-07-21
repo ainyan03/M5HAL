@@ -97,6 +97,7 @@ constexpr size_t kI2CConfigSize  = 12;
 constexpr size_t kSPIConfigSize  = 14;
 constexpr size_t kUARTConfigSize = 20;
 constexpr size_t kI2SConfigSize  = 14;
+constexpr size_t kPDMConfigSize  = 10;
 
 constexpr size_t kI2CConfigWireTimeoutOffset       = 4;   ///< wire_timeout_ms
 constexpr size_t kUARTConfigFirstByteTimeoutOffset = 4;   ///< first_byte_timeout_ms
@@ -104,11 +105,13 @@ constexpr size_t kUARTConfigInterByteTimeoutOffset = 8;   ///< inter_byte_timeou
 constexpr size_t kUARTConfigWriteTimeoutOffset     = 12;  ///< write_timeout_ms
 constexpr size_t kI2SConfigWriteTimeoutOffset      = 4;   ///< write_timeout_ms
 constexpr size_t kI2SConfigReadTimeoutOffset       = 10;  ///< read_timeout_ms
+constexpr size_t kPDMConfigReadTimeoutOffset       = 4;   ///< read_timeout_ms
 
 static_assert(kI2CConfigWireTimeoutOffset + 4 <= kI2CConfigSize, "i2c timeout field must fit the config blob");
 static_assert(kUARTConfigWriteTimeoutOffset + 4 <= kUARTConfigSize, "uart timeout fields must fit the config blob");
 static_assert(kI2SConfigWriteTimeoutOffset + 4 <= kI2SConfigSize, "i2s timeout fields must fit the config blob");
 static_assert(kI2SConfigReadTimeoutOffset + 4 <= kI2SConfigSize, "i2s timeout fields must fit the config blob");
+static_assert(kPDMConfigReadTimeoutOffset + 4 <= kPDMConfigSize, "pdm timeout field must fit the config blob");
 
 namespace detail {
 
@@ -124,12 +127,14 @@ struct RunnerBusOps {
 };
 
 struct RunnerBusBinding {
-    types::bus_kind_t kind  = types::bus_kind_t::Unknown;
-    uint8_t bus_id          = 0;
-    void* main              = nullptr;
-    void* tx                = nullptr;
-    void* rx                = nullptr;
-    const RunnerBusOps* ops = nullptr;
+    types::bus_kind_t kind              = types::bus_kind_t::Unknown;
+    uint8_t bus_id                      = 0;
+    void* main                          = nullptr;
+    void* tx                            = nullptr;
+    void* rx                            = nullptr;
+    bus::IBus* bus                      = nullptr;
+    const RunnerBusOps* ops             = nullptr;
+    uint32_t protocol_transaction_depth = 0;
 
     bool registered() const
     {
@@ -141,12 +146,14 @@ struct RunnerBusBinding {
     }
     void clear()
     {
-        kind   = types::bus_kind_t::Unknown;
-        bus_id = 0;
-        main   = nullptr;
-        tx     = nullptr;
-        rx     = nullptr;
-        ops    = nullptr;
+        kind                       = types::bus_kind_t::Unknown;
+        bus_id                     = 0;
+        main                       = nullptr;
+        tx                         = nullptr;
+        rx                         = nullptr;
+        bus                        = nullptr;
+        ops                        = nullptr;
+        protocol_transaction_depth = 0;
     }
 };
 
@@ -158,6 +165,7 @@ void encodeConfig(uint8_t* dst, const i2c::MasterAccessConfig& cfg);
 void encodeConfig(uint8_t* dst, const spi::MasterAccessConfig& cfg);
 void encodeConfig(uint8_t* dst, const uart::AccessConfig& cfg);
 void encodeConfig(uint8_t* dst, const i2s::AccessConfig& cfg);
+void encodeConfig(uint8_t* dst, const pdm::AccessConfig& cfg);
 
 }  // namespace detail
 
@@ -175,22 +183,17 @@ struct LenVar {
 
 LenVar decodeLenVar(data::ConstDataSpan src);
 
-/*! @brief Encoded byte count of a LenVar for `value` (1, 3, or 5). */
-constexpr size_t lenVarSize(size_t value)
+namespace detail {
+
+/*! @brief Internal LenVar helpers; public entry points validate before narrowing. */
+constexpr size_t lenVarSize(uint32_t value)
 {
     return value <= 0xFC ? 1 : (value <= 0xFFFF ? 3 : 5);
 }
 
-/*!
-  @brief Write a LenVar; `dst` must hold `lenVarSize(value)` bytes. Returns bytes written.
+size_t encodeLenVar(uint8_t* dst, uint32_t value);
 
-  The valid range is [0, 0xFFFFFFFF] (the full u32 space). The reserved marker
-  0xFF is a prefix byte, not a reserved decoded value. On a 64-bit host,
-  passing a value above 0xFFFFFFFF
-  silently truncates to the low 32 bits — this is a caller-contract violation.
-  The caller is responsible for ensuring the value fits in u32 before calling.
- */
-size_t encodeLenVar(uint8_t* dst, size_t value);
+}  // namespace detail
 
 /*!
   @brief Builds bytecode instructions into a `data::Sink`.
@@ -216,6 +219,7 @@ public:
     m5::hal::v2::result_t<void> configure(types::bus_kind_t kind, uint8_t bus_id, data::ConstDataSpan cfg_bytes);
     /*! @brief Configure registered I2S stream accessors (TX/RX). */
     m5::hal::v2::result_t<void> i2sConfig(uint8_t bus_id, const i2s::AccessConfig& cfg);
+    m5::hal::v2::result_t<void> pdmConfig(uint8_t bus_id, const pdm::AccessConfig& cfg);
 
     m5::hal::v2::result_t<void> transfer(uint8_t bus_id, const i2c::TransferDesc& desc, data::ConstDataSpan src,
                                          size_t rx_len, uint8_t store_id = kDiscardStoreId);
@@ -313,6 +317,7 @@ public:
     m5::hal::v2::result_t<void> registerI2S(uint8_t bus_id, i2s::Accessor& acc);
     m5::hal::v2::result_t<void> registerI2S(uint8_t bus_id, i2s::TxAccessor& acc);
     m5::hal::v2::result_t<void> registerI2S(uint8_t bus_id, i2s::RxAccessor& acc);
+    m5::hal::v2::result_t<void> registerPDM(uint8_t bus_id, pdm::RxAccessor& acc);
     void setGPIOGroup(gpio::GPIOGroup& group)
     {
         _gpio_group = &group;
@@ -393,6 +398,19 @@ public:
         _stream_transfer_ctx = ctx;
     }
 
+    /*!
+      @brief Clamp receive limits reported for registered buses.
+
+      A transport owner uses this to project its own per-request ceiling into
+      both static and dynamically-created capability records. The runner does
+      not impose a ceiling unless this is called.
+     */
+    void setCapabilityRxCeiling(uint32_t bytes)
+    {
+        _capability_rx_ceiling     = bytes;
+        _has_capability_rx_ceiling = true;
+    }
+
     using gpio_allowlist_fn_t = m5::hal::v2::result_t<void> (*)(void* ctx, const uint8_t* pins, size_t count);
 
     void setGpioAllowlistHandler(gpio_allowlist_fn_t fn, void* ctx)
@@ -406,6 +424,7 @@ public:
     void unregisterSPI(uint8_t bus_id);
     void unregisterUART(uint8_t bus_id);
     void unregisterI2S(uint8_t bus_id);
+    void unregisterPDM(uint8_t bus_id);
 
     /*! @brief Execute from any Source. Returns the consumed byte count. */
     m5::hal::v2::result_t<size_t> run(data::Source& script);
@@ -483,9 +502,13 @@ public:
      */
     m5::hal::v2::result_t<void> writeResponse(data::Sink& dst, m5::hal::v2::error::error_t status);
     bool hasBinding(types::bus_kind_t kind, uint8_t bus_id) const;
+    /*! @brief Allocation-free capability snapshot of one registered Bus. */
+    m5::hal::v2::result_t<bus::BusCapabilities> busCapabilities(types::bus_kind_t kind, uint8_t bus_id) const;
     m5::hal::v2::result_t<void> streamTransferChunk(types::bus_kind_t kind, uint8_t bus_id, data::ConstDataSpan meta,
                                                     data::ConstDataSpan src, data::DataSpan dst, size_t& actual_tx_len,
                                                     size_t& actual_rx_len);
+    /*! @brief Read a later UART stream chunk using inter-byte timeout as its initial wait. */
+    m5::hal::v2::result_t<void> uartReadContinuationChunk(uint8_t bus_id, data::DataSpan dst, size_t& actual_rx_len);
 
     static constexpr size_t kMaxBindingSlots = 8;
 
@@ -522,7 +545,7 @@ private:
     detail::RunnerBusBinding* binding(types::bus_kind_t kind, uint8_t bus_id);
     const detail::RunnerBusBinding* binding(types::bus_kind_t kind, uint8_t bus_id) const;
     m5::hal::v2::result_t<void> registerBinding(types::bus_kind_t kind, uint8_t bus_id, const detail::RunnerBusOps& ops,
-                                                void* main, void* tx, void* rx);
+                                                void* main, void* tx, void* rx, bus::IBus& bus);
     void unregisterBinding(types::bus_kind_t kind, uint8_t bus_id);
 
     memory::Allocator* _alloc                            = nullptr;
@@ -540,6 +563,8 @@ private:
     void* _bus_create_ctx                    = nullptr;
     stream_transfer_fn_t _stream_transfer_fn = nullptr;
     void* _stream_transfer_ctx               = nullptr;
+    uint32_t _capability_rx_ceiling          = 0;
+    bool _has_capability_rx_ceiling          = false;
     gpio_allowlist_fn_t _gpio_allowlist_fn   = nullptr;
     void* _gpio_allowlist_ctx                = nullptr;
 

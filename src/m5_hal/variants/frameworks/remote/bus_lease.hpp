@@ -11,6 +11,7 @@
 #include "detail_helpers.hpp"
 #include "session.hpp"
 
+#include <cstdlib>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -26,7 +27,7 @@ public:
             return 0xFF;
         }
         const uint8_t idx = detail::remoteKindIndex(kind);
-        if (idx >= 4) {
+        if (idx >= 5) {
             return 0xFF;
         }
         for (uint8_t i = 0; i < bytecode::kMaxBusBindings; ++i) {
@@ -45,7 +46,7 @@ public:
             return;
         }
         const uint8_t idx = detail::remoteKindIndex(kind);
-        if (idx < 4 && bus_id < bytecode::kMaxBusBindings) {
+        if (idx < 5 && bus_id < bytecode::kMaxBusBindings) {
             _used[idx] &= static_cast<uint8_t>(~(1u << bus_id));
         }
     }
@@ -54,19 +55,21 @@ private:
     struct Guard {
         runtime::Mutex& mutex;
         bool locked;
-        explicit Guard(runtime::Mutex& m) : mutex{m}, locked{mutex.lock(types::TIMEOUT_FOREVER)}
+        explicit Guard(runtime::Mutex& m) : mutex{m}, locked{mutex.lock(types::TIMEOUT_FOREVER).has_value()}
         {
         }
         ~Guard()
         {
             if (locked) {
-                mutex.unlock();
+                if (!mutex.unlock().has_value()) {
+                    std::abort();
+                }
             }
         }
     };
 
     runtime::Mutex _mutex;
-    uint8_t _used[4] = {};
+    uint8_t _used[5] = {};
 };
 
 class RemoteBusLease {
@@ -92,8 +95,12 @@ public:
             return;
         }
         if (!_armed) {
-            closing.commit();
-            releaseId();
+            auto committed = closing.commit();
+            if (committed.has_value()) {
+                releaseId();
+            } else {
+                _lifecycle->quarantineWithoutLock();
+            }
             return;
         }
         bool released = false;
@@ -107,10 +114,14 @@ public:
             }
         }
         if (released) {
-            closing.commit();
-            releaseId();
+            auto committed = closing.commit();
+            if (committed.has_value()) {
+                releaseId();
+            } else {
+                _lifecycle->quarantineWithoutLock();
+            }
         } else {
-            closing.quarantine();
+            (void)closing.quarantine();
         }
     }
 

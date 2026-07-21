@@ -3,6 +3,7 @@
 #define M5_HAL_BYTECODE_BYTECODE_INL_
 
 #include "bytecode.hpp"
+#include "../remote/bus_capabilities_wire.hpp"
 
 #include <string.h>
 
@@ -209,6 +210,20 @@ void decodeConfig(data::ConstDataSpan src, i2s::AccessConfig& cfg)
     (void)r.u32(cfg.read_timeout_ms);
 }
 
+void encodeConfig(uint8_t* dst, const pdm::AccessConfig& cfg)
+{
+    putU32(dst, cfg.sample_rate_hz);
+    putU32(dst + kPDMConfigReadTimeoutOffset, cfg.read_timeout_ms);
+    dst[8] = cfg.bits_per_sample;
+    dst[9] = cfg.channels;
+}
+
+void decodeConfig(data::ConstDataSpan src, pdm::AccessConfig& cfg)
+{
+    FieldReader r{src};
+    (void)(r.u32(cfg.sample_rate_hz) && r.u32(cfg.read_timeout_ms) && r.u8(cfg.bits_per_sample) && r.u8(cfg.channels));
+}
+
 // ---- transfer meta ----------------------------------------------------------
 
 constexpr size_t kSPIMetaSize = 15;
@@ -339,6 +354,10 @@ void encodeConfig(uint8_t* dst, const i2s::AccessConfig& cfg)
 {
     m5::hal::v2::bytecode::encodeConfig(dst, cfg);
 }
+void encodeConfig(uint8_t* dst, const pdm::AccessConfig& cfg)
+{
+    m5::hal::v2::bytecode::encodeConfig(dst, cfg);
+}
 
 }  // namespace detail
 
@@ -376,7 +395,7 @@ LenVar decodeLenVar(data::ConstDataSpan src)
     return out;
 }
 
-size_t encodeLenVar(uint8_t* dst, size_t value)
+size_t detail::encodeLenVar(uint8_t* dst, uint32_t value)
 {
     if (value <= 0xFC) {
         dst[0] = static_cast<uint8_t>(value);
@@ -388,7 +407,7 @@ size_t encodeLenVar(uint8_t* dst, size_t value)
         return 3;
     }
     dst[0] = 0xFE;
-    putU32(dst + 1, static_cast<uint32_t>(value));
+    putU32(dst + 1, value);
     return 5;
 }
 
@@ -400,12 +419,14 @@ result_t<data::DataSpan> BytecodeEncoder::beginInstruction(OpCode opcode, size_t
     // host-size overflow and values that only fit size_t on a 64-bit host.
     constexpr size_t kMaxPayloadSize = static_cast<size_t>(UINT32_MAX) - 1;
     if (payload_size > kMaxPayloadSize || payload_size > static_cast<size_t>(-1) - 6) {
+        M5HAL_ASSERT(false, "bytecode instruction length exceeds the u32 wire limit");
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
     }
-    const size_t size_field = 1 + payload_size;
-    const size_t prefix     = lenVarSize(size_field);
-    const size_t total      = prefix + size_field;
-    auto reserved           = _sink->reserve(total);
+    const size_t size_field  = 1 + payload_size;
+    const uint32_t wire_size = static_cast<uint32_t>(size_field);
+    const size_t prefix      = detail::lenVarSize(wire_size);
+    const size_t total       = prefix + size_field;
+    auto reserved            = _sink->reserve(total);
     if (!reserved.has_value()) {
         return m5::stl::make_unexpected(reserved.error());
     }
@@ -413,7 +434,7 @@ result_t<data::DataSpan> BytecodeEncoder::beginInstruction(OpCode opcode, size_t
         return m5::stl::make_unexpected(_sink->closed() ? error_t::CLOSED : error_t::BUFFER_OVERFLOW);
     }
     uint8_t* p = reserved.value().data;
-    encodeLenVar(p, size_field);
+    detail::encodeLenVar(p, wire_size);
     p[prefix]   = static_cast<uint8_t>(opcode);
     _instr_size = total;
     return data::DataSpan{p + prefix + 1, payload_size};
@@ -508,14 +529,32 @@ result_t<void> BytecodeEncoder::i2sConfig(uint8_t bus_id, const i2s::AccessConfi
     return emit();
 }
 
+result_t<void> BytecodeEncoder::pdmConfig(uint8_t bus_id, const pdm::AccessConfig& cfg)
+{
+    auto payload = beginInstruction(OpCode::BusConfigure, 2 + kPDMConfigSize);
+    if (!payload.has_value()) {
+        return m5::stl::make_unexpected(payload.error());
+    }
+    uint8_t* p = payload.value().data;
+    p[0]       = static_cast<uint8_t>(types::bus_kind_t::PDM);
+    p[1]       = bus_id;
+    encodeConfig(p + 2, cfg);
+    return emit();
+}
+
 result_t<void> BytecodeEncoder::transfer(uint8_t bus_id, const i2c::TransferDesc& desc, data::ConstDataSpan src,
                                          size_t rx_len, uint8_t store_id)
 {
+    if (rx_len > UINT32_MAX) {
+        M5HAL_ASSERT(false, "I2C rx_len exceeds the u32 wire limit");
+        return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
+    }
     if (desc.prefix_len > i2c::TransferDesc::PREFIX_CAPACITY || (src.data == nullptr && src.size != 0)) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
     }
-    const size_t meta_size = i2cMetaSize(desc);
-    auto payload_size      = checkedPayload(3 + lenVarSize(rx_len) + 1, meta_size, src.size);
+    const uint32_t wire_rx_len = static_cast<uint32_t>(rx_len);
+    const size_t meta_size     = i2cMetaSize(desc);
+    auto payload_size          = checkedPayload(3 + detail::lenVarSize(wire_rx_len) + 1, meta_size, src.size);
     if (!payload_size.has_value()) {
         return m5::stl::make_unexpected(payload_size.error());
     }
@@ -527,7 +566,7 @@ result_t<void> BytecodeEncoder::transfer(uint8_t bus_id, const i2c::TransferDesc
     p[0]       = static_cast<uint8_t>(types::bus_kind_t::I2C);
     p[1]       = bus_id;
     p[2]       = store_id;
-    size_t at  = 3 + encodeLenVar(p + 3, rx_len);
+    size_t at  = 3 + detail::encodeLenVar(p + 3, wire_rx_len);
     p[at++]    = static_cast<uint8_t>(meta_size);
     encodeMeta(p + at, desc);
     at += meta_size;
@@ -540,10 +579,15 @@ result_t<void> BytecodeEncoder::transfer(uint8_t bus_id, const i2c::TransferDesc
 result_t<void> BytecodeEncoder::transfer(uint8_t bus_id, const spi::TransferDesc& desc, data::ConstDataSpan src,
                                          size_t rx_len, uint8_t store_id)
 {
+    if (rx_len > UINT32_MAX) {
+        M5HAL_ASSERT(false, "SPI rx_len exceeds the u32 wire limit");
+        return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
+    }
     if (src.data == nullptr && src.size != 0) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
     }
-    auto payload_size = checkedPayload(3 + lenVarSize(rx_len) + 1, kSPIMetaSize, src.size);
+    const uint32_t wire_rx_len = static_cast<uint32_t>(rx_len);
+    auto payload_size          = checkedPayload(3 + detail::lenVarSize(wire_rx_len) + 1, kSPIMetaSize, src.size);
     if (!payload_size.has_value()) {
         return m5::stl::make_unexpected(payload_size.error());
     }
@@ -555,7 +599,7 @@ result_t<void> BytecodeEncoder::transfer(uint8_t bus_id, const spi::TransferDesc
     p[0]       = static_cast<uint8_t>(types::bus_kind_t::SPI);
     p[1]       = bus_id;
     p[2]       = store_id;
-    size_t at  = 3 + encodeLenVar(p + 3, rx_len);
+    size_t at  = 3 + detail::encodeLenVar(p + 3, wire_rx_len);
     p[at++]    = static_cast<uint8_t>(kSPIMetaSize);
     encodeMeta(p + at, desc);
     at += kSPIMetaSize;
@@ -567,10 +611,15 @@ result_t<void> BytecodeEncoder::transfer(uint8_t bus_id, const spi::TransferDesc
 
 result_t<void> BytecodeEncoder::uartTransfer(uint8_t bus_id, data::ConstDataSpan src, size_t rx_len, uint8_t store_id)
 {
+    if (rx_len > UINT32_MAX) {
+        M5HAL_ASSERT(false, "UART rx_len exceeds the u32 wire limit");
+        return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
+    }
     if (src.data == nullptr && src.size != 0) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
     }
-    auto payload_size = checkedPayload(3 + lenVarSize(rx_len) + 1, src.size);
+    const uint32_t wire_rx_len = static_cast<uint32_t>(rx_len);
+    auto payload_size          = checkedPayload(3 + detail::lenVarSize(wire_rx_len) + 1, src.size);
     if (!payload_size.has_value()) {
         return m5::stl::make_unexpected(payload_size.error());
     }
@@ -582,7 +631,7 @@ result_t<void> BytecodeEncoder::uartTransfer(uint8_t bus_id, data::ConstDataSpan
     p[0]       = static_cast<uint8_t>(types::bus_kind_t::UART);
     p[1]       = bus_id;
     p[2]       = store_id;
-    size_t at  = 3 + encodeLenVar(p + 3, rx_len);
+    size_t at  = 3 + detail::encodeLenVar(p + 3, wire_rx_len);
     p[at++]    = 0;  // no meta
     if (src.size != 0) {
         ::memcpy(p + at, src.data, src.size);
@@ -882,13 +931,18 @@ result_t<void> BytecodeEncoder::storeData(uint8_t store_id, data::ConstDataSpan 
 
 result_t<void> BytecodeEncoder::reportError(error_t err, size_t offset)
 {
-    auto payload = beginInstruction(OpCode::ReportError, 1 + lenVarSize(offset));
+    if (offset > UINT32_MAX) {
+        M5HAL_ASSERT(false, "bytecode error offset exceeds the u32 wire limit");
+        return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
+    }
+    const uint32_t wire_offset = static_cast<uint32_t>(offset);
+    auto payload               = beginInstruction(OpCode::ReportError, 1 + detail::lenVarSize(wire_offset));
     if (!payload.has_value()) {
         return m5::stl::make_unexpected(payload.error());
     }
     uint8_t* p = payload.value().data;
     p[0]       = static_cast<uint8_t>(static_cast<int8_t>(err));
-    encodeLenVar(p + 1, offset);
+    detail::encodeLenVar(p + 1, wire_offset);
     return emit();
 }
 
@@ -989,6 +1043,18 @@ result_t<void> i2sConfigure(RunnerBusBinding& binding, data::ConstDataSpan cfg_b
     return {};
 }
 
+result_t<void> pdmConfigure(RunnerBusBinding& binding, data::ConstDataSpan cfg_bytes)
+{
+    auto* rx = static_cast<pdm::RxAccessor*>(binding.rx);
+    auto ok  = requireAccessor(rx);
+    if (!ok.has_value()) {
+        return ok;
+    }
+    pdm::AccessConfig cfg = rx->getConfig();
+    decodeConfig(cfg_bytes, cfg);
+    return rx->setConfig(cfg);
+}
+
 result_t<void> i2cTransfer(RunnerBusBinding& binding, data::ConstDataSpan meta, data::ConstDataSpan src,
                            data::DataSpan dst, size_t& actual_tx_len, size_t& actual_rx_len)
 {
@@ -1001,20 +1067,27 @@ result_t<void> i2cTransfer(RunnerBusBinding& binding, data::ConstDataSpan meta, 
     if (!decodeMeta(meta, desc)) {
         return m5::stl::make_unexpected(error_t::PROTOCOL_ERROR);
     }
-    auto begin = acc->beginTransaction();
+    const bool borrowed = acc->inAccess();
+    result_t<void> begin{};
+    if (!borrowed) {
+        begin = acc->beginAccess();
+    }
     if (!begin.has_value()) {
         return m5::stl::make_unexpected(begin.error());
     }
     auto result = acc->transfer(desc, src, dst);
-    auto end    = acc->endTransaction();
+    result_t<void> end{};
+    if (!borrowed) {
+        end = acc->endAccess();
+    }
     if (!result.has_value()) {
         return m5::stl::make_unexpected(result.error());
     }
     if (!end.has_value()) {
         return m5::stl::make_unexpected(end.error());
     }
-    actual_tx_len = src.size;
-    actual_rx_len = end->rx;
+    actual_tx_len = result->tx;
+    actual_rx_len = result->rx;
     return {};
 }
 
@@ -1030,20 +1103,27 @@ result_t<void> spiTransfer(RunnerBusBinding& binding, data::ConstDataSpan meta, 
     if (!decodeMeta(meta, desc)) {
         return m5::stl::make_unexpected(error_t::PROTOCOL_ERROR);
     }
-    auto begin = acc->beginTransaction();
+    const bool borrowed = acc->inAccess();
+    result_t<void> begin{};
+    if (!borrowed) {
+        begin = acc->beginAccess();
+    }
     if (!begin.has_value()) {
         return m5::stl::make_unexpected(begin.error());
     }
     auto result = acc->transfer(desc, src, dst);
-    auto end    = acc->endTransaction();
+    result_t<void> end{};
+    if (!borrowed) {
+        end = acc->endAccess();
+    }
     if (!result.has_value()) {
         return m5::stl::make_unexpected(result.error());
     }
     if (!end.has_value()) {
         return m5::stl::make_unexpected(end.error());
     }
-    actual_tx_len = src.size;
-    actual_rx_len = end->rx;
+    actual_tx_len = result->tx;
+    actual_rx_len = result->rx;
     return {};
 }
 
@@ -1055,22 +1135,12 @@ result_t<void> uartTransfer(RunnerBusBinding& binding, data::ConstDataSpan, data
     if (!ok.has_value()) {
         return ok;
     }
-    actual_tx_len = 0;
-    actual_rx_len = 0;
-    if (src.size != 0) {
-        auto written = acc->write(src);
-        if (!written.has_value()) {
-            return m5::stl::make_unexpected(written.error());
-        }
-        actual_tx_len = written.value();
+    auto transferred = acc->transfer(src, dst);
+    if (!transferred.has_value()) {
+        return m5::stl::make_unexpected(transferred.error());
     }
-    if (dst.size != 0) {
-        auto got = acc->read(dst);
-        if (!got.has_value()) {
-            return m5::stl::make_unexpected(got.error());
-        }
-        actual_rx_len = got.value() <= dst.size ? got.value() : dst.size;
-    }
+    actual_tx_len = transferred->tx <= src.size ? transferred->tx : src.size;
+    actual_rx_len = transferred->rx <= dst.size ? transferred->rx : dst.size;
     return {};
 }
 
@@ -1081,7 +1151,18 @@ result_t<void> spiBeginTransaction(RunnerBusBinding& binding)
     if (!ok.has_value()) {
         return ok;
     }
-    return acc->beginTransaction();
+    if (binding.protocol_transaction_depth == ~uint32_t{0}) {
+        return m5::stl::make_unexpected(error_t::OUT_OF_RESOURCE);
+    }
+    if (binding.protocol_transaction_depth != 0) {
+        ++binding.protocol_transaction_depth;
+        return {};
+    }
+    auto begun = acc->beginAccess();
+    if (begun.has_value()) {
+        binding.protocol_transaction_depth = 1;
+    }
+    return begun;
 }
 
 result_t<void> spiEndTransaction(RunnerBusBinding& binding)
@@ -1091,7 +1172,15 @@ result_t<void> spiEndTransaction(RunnerBusBinding& binding)
     if (!ok.has_value()) {
         return ok;
     }
-    auto end = acc->endTransaction();
+    if (binding.protocol_transaction_depth == 0) {
+        return m5::stl::make_unexpected(error_t::INVALID_STATE);
+    }
+    if (binding.protocol_transaction_depth > 1) {
+        --binding.protocol_transaction_depth;
+        return {};
+    }
+    auto end                           = acc->endAccess();
+    binding.protocol_transaction_depth = 0;
     if (!end.has_value()) {
         return m5::stl::make_unexpected(end.error());
     }
@@ -1107,13 +1196,23 @@ const detail::RunnerBusOps kUARTOps = {uartConfigure, uartTransfer, nullptr, nul
 result_t<void> i2sTransfer(RunnerBusBinding& binding, data::ConstDataSpan, data::ConstDataSpan src, data::DataSpan dst,
                            size_t& actual_tx_len, size_t& actual_rx_len)
 {
-    auto* tx = static_cast<i2s::TxAccessor*>(binding.tx);
-    auto* rx = static_cast<i2s::RxAccessor*>(binding.rx);
+    auto* acc = static_cast<i2s::Accessor*>(binding.main);
+    auto* tx  = static_cast<i2s::TxAccessor*>(binding.tx);
+    auto* rx  = static_cast<i2s::RxAccessor*>(binding.rx);
     if (tx == nullptr && rx == nullptr) {
         return m5::stl::make_unexpected(error_t::INVALID_STATE);
     }
     actual_tx_len = 0;
     actual_rx_len = 0;
+    if (acc != nullptr) {
+        auto transferred = acc->transfer(src, dst);
+        if (!transferred.has_value()) {
+            return m5::stl::make_unexpected(transferred.error());
+        }
+        actual_tx_len = transferred->tx <= src.size ? transferred->tx : src.size;
+        actual_rx_len = transferred->rx <= dst.size ? transferred->rx : dst.size;
+        return {};
+    }
     if (src.size != 0) {
         if (tx == nullptr) {
             return m5::stl::make_unexpected(error_t::NOT_IMPLEMENTED);
@@ -1139,11 +1238,67 @@ result_t<void> i2sTransfer(RunnerBusBinding& binding, data::ConstDataSpan, data:
 
 const detail::RunnerBusOps kI2SOps = {i2sConfigure, i2sTransfer, nullptr, nullptr};
 
+result_t<void> pdmTransfer(RunnerBusBinding& binding, data::ConstDataSpan, data::ConstDataSpan src, data::DataSpan dst,
+                           size_t& actual_tx_len, size_t& actual_rx_len)
+{
+    auto* rx = static_cast<pdm::RxAccessor*>(binding.rx);
+    if (rx == nullptr) {
+        return m5::stl::make_unexpected(error_t::INVALID_STATE);
+    }
+    if (src.size != 0) {
+        return m5::stl::make_unexpected(error_t::NOT_IMPLEMENTED);
+    }
+    actual_tx_len = 0;
+    auto got      = rx->read(dst);
+    if (!got.has_value()) {
+        return m5::stl::make_unexpected(got.error());
+    }
+    actual_rx_len = got.value() <= dst.size ? got.value() : dst.size;
+    return {};
+}
+
+const detail::RunnerBusOps kPDMOps = {pdmConfigure, pdmTransfer, nullptr, nullptr};
+
 }  // namespace
 
 bool BytecodeRunner::hasBinding(types::bus_kind_t kind, uint8_t bus_id) const
 {
     return binding(kind, bus_id) != nullptr;
+}
+
+result_t<bus::BusCapabilities> BytecodeRunner::busCapabilities(types::bus_kind_t kind, uint8_t bus_id) const
+{
+    const auto* registered = binding(kind, bus_id);
+    if (registered == nullptr || registered->bus == nullptr) {
+        return m5::stl::make_unexpected(error_t::INVALID_STATE);
+    }
+    auto capabilities = registered->bus->capabilities();
+    bus::detail::BusCapabilitiesBuilder builder{capabilities};
+
+    // A physical streaming bus can support both directions while the exposed
+    // binding is deliberately Tx-only or Rx-only. Advertise the reachable
+    // accessor surface, not the wider provider object behind it.
+    if (kind == types::bus_kind_t::I2S || kind == types::bus_kind_t::PDM) {
+        if (registered->tx == nullptr) {
+            builder.enable(bus::BusFeature::Transmit, false).clearLimit(bus::BusLimit::MaxAtomicTxBytes);
+        }
+        if (registered->rx == nullptr) {
+            builder.enable(bus::BusFeature::Receive, false).clearLimit(bus::BusLimit::MaxAtomicRxBytes);
+        }
+        if (registered->tx == nullptr || registered->rx == nullptr) {
+            builder.enable(bus::BusFeature::FullDuplex, false);
+        }
+    }
+
+    capabilities = builder.build();
+    if (_has_capability_rx_ceiling && capabilities.supports(bus::BusFeature::Receive)) {
+        auto provider_limit = capabilities.limit(bus::BusLimit::MaxAtomicRxBytes);
+        builder.setLimit(bus::BusLimit::MaxAtomicRxBytes,
+                         provider_limit.has_value() && provider_limit.value() < _capability_rx_ceiling
+                             ? provider_limit.value()
+                             : _capability_rx_ceiling);
+    }
+    return builder.build();
 }
 
 result_t<void> BytecodeRunner::streamTransferChunk(types::bus_kind_t kind, uint8_t bus_id, data::ConstDataSpan meta,
@@ -1170,6 +1325,33 @@ result_t<void> BytecodeRunner::streamTransferChunk(types::bus_kind_t kind, uint8
     return {};
 }
 
+result_t<void> BytecodeRunner::uartReadContinuationChunk(uint8_t bus_id, data::DataSpan dst, size_t& actual_rx_len)
+{
+    auto* bus = binding(types::bus_kind_t::UART, bus_id);
+    if (bus == nullptr || bus->main == nullptr) {
+        return m5::stl::make_unexpected(error_t::INVALID_STATE);
+    }
+    auto* acc                              = static_cast<uart::Accessor*>(bus->main);
+    const auto saved_cfg                   = acc->rx().getConfig();
+    auto continuation_cfg                  = saved_cfg;
+    continuation_cfg.first_byte_timeout_ms = continuation_cfg.inter_byte_timeout_ms;
+    auto configured                        = acc->rx().setConfig(continuation_cfg);
+    if (!configured.has_value()) {
+        return configured;
+    }
+
+    size_t actual_tx_len = 0;
+    auto transfer = streamTransferChunk(types::bus_kind_t::UART, bus_id, {}, {}, dst, actual_tx_len, actual_rx_len);
+    auto restored = acc->rx().setConfig(saved_cfg);
+    if (!transfer.has_value()) {
+        return transfer;
+    }
+    if (!restored.has_value()) {
+        return restored;
+    }
+    return {};
+}
+
 detail::RunnerBusBinding* BytecodeRunner::binding(types::bus_kind_t kind, uint8_t bus_id)
 {
     for (size_t i = 0; i < kMaxBindingSlots; ++i) {
@@ -1191,7 +1373,7 @@ const detail::RunnerBusBinding* BytecodeRunner::binding(types::bus_kind_t kind, 
 }
 
 result_t<void> BytecodeRunner::registerBinding(types::bus_kind_t kind, uint8_t bus_id, const detail::RunnerBusOps& ops,
-                                               void* main, void* tx, void* rx)
+                                               void* main, void* tx, void* rx, bus::IBus& physical_bus)
 {
     if (bus_id >= kMaxBusBindings || ops.configure == nullptr || (main == nullptr && tx == nullptr && rx == nullptr)) {
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
@@ -1214,6 +1396,7 @@ result_t<void> BytecodeRunner::registerBinding(types::bus_kind_t kind, uint8_t b
     slot->main   = main;
     slot->tx     = tx;
     slot->rx     = rx;
+    slot->bus    = &physical_bus;
     slot->ops    = &ops;
     return {};
 }
@@ -1224,22 +1407,26 @@ void BytecodeRunner::unregisterBinding(types::bus_kind_t kind, uint8_t bus_id)
     if (slot == nullptr) {
         return;
     }
+    if (slot->protocol_transaction_depth != 0 && slot->ops->end_transaction != nullptr) {
+        slot->protocol_transaction_depth = 1;
+        (void)slot->ops->end_transaction(*slot);
+    }
     slot->clear();
 }
 
 result_t<void> BytecodeRunner::registerI2C(uint8_t bus_id, i2c::MasterAccessor& acc)
 {
-    return registerBinding(types::bus_kind_t::I2C, bus_id, kI2COps, &acc, nullptr, nullptr);
+    return registerBinding(types::bus_kind_t::I2C, bus_id, kI2COps, &acc, nullptr, nullptr, acc.getBus());
 }
 
 result_t<void> BytecodeRunner::registerSPI(uint8_t bus_id, spi::MasterAccessor& acc)
 {
-    return registerBinding(types::bus_kind_t::SPI, bus_id, kSPIOps, &acc, nullptr, nullptr);
+    return registerBinding(types::bus_kind_t::SPI, bus_id, kSPIOps, &acc, nullptr, nullptr, acc.getBus());
 }
 
 result_t<void> BytecodeRunner::registerUART(uint8_t bus_id, uart::Accessor& acc)
 {
-    return registerBinding(types::bus_kind_t::UART, bus_id, kUARTOps, &acc, &acc.tx(), &acc.rx());
+    return registerBinding(types::bus_kind_t::UART, bus_id, kUARTOps, &acc, &acc.tx(), &acc.rx(), acc.getBus());
 }
 
 void BytecodeRunner::unregisterI2C(uint8_t bus_id)
@@ -1259,17 +1446,17 @@ void BytecodeRunner::unregisterUART(uint8_t bus_id)
 
 result_t<void> BytecodeRunner::registerI2S(uint8_t bus_id, i2s::Accessor& acc)
 {
-    return registerBinding(types::bus_kind_t::I2S, bus_id, kI2SOps, nullptr, &acc.tx(), &acc.rx());
+    return registerBinding(types::bus_kind_t::I2S, bus_id, kI2SOps, &acc, &acc.tx(), &acc.rx(), acc.getBus());
 }
 
 result_t<void> BytecodeRunner::registerI2S(uint8_t bus_id, i2s::TxAccessor& acc)
 {
-    return registerBinding(types::bus_kind_t::I2S, bus_id, kI2SOps, nullptr, &acc, nullptr);
+    return registerBinding(types::bus_kind_t::I2S, bus_id, kI2SOps, nullptr, &acc, nullptr, acc.getBus());
 }
 
 result_t<void> BytecodeRunner::registerI2S(uint8_t bus_id, i2s::RxAccessor& acc)
 {
-    return registerBinding(types::bus_kind_t::I2S, bus_id, kI2SOps, nullptr, nullptr, &acc);
+    return registerBinding(types::bus_kind_t::I2S, bus_id, kI2SOps, nullptr, nullptr, &acc, acc.getBus());
 }
 
 void BytecodeRunner::unregisterI2S(uint8_t bus_id)
@@ -1277,13 +1464,20 @@ void BytecodeRunner::unregisterI2S(uint8_t bus_id)
     unregisterBinding(types::bus_kind_t::I2S, bus_id);
 }
 
+result_t<void> BytecodeRunner::registerPDM(uint8_t bus_id, pdm::RxAccessor& acc)
+{
+    return registerBinding(types::bus_kind_t::PDM, bus_id, kPDMOps, nullptr, nullptr, &acc, acc.getBus());
+}
+
+void BytecodeRunner::unregisterPDM(uint8_t bus_id)
+{
+    unregisterBinding(types::bus_kind_t::PDM, bus_id);
+}
+
 result_t<void> BytecodeRunner::opBusStreamTransfer(data::ConstDataSpan payload)
 {
     if (payload.size < 12) {
-        return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
-    }
-    if (_stream_transfer_fn == nullptr) {
-        return m5::stl::make_unexpected(error_t::INVALID_STATE);
+        return m5::stl::make_unexpected(error_t::PROTOCOL_ERROR);
     }
     StreamTransferDesc desc;
     desc.kind         = static_cast<types::bus_kind_t>(payload.data[0]);
@@ -1295,9 +1489,12 @@ result_t<void> BytecodeRunner::opBusStreamTransfer(data::ConstDataSpan payload)
     desc.rx_len = static_cast<uint32_t>(payload.data[8]) | (static_cast<uint32_t>(payload.data[9]) << 8) |
                   (static_cast<uint32_t>(payload.data[10]) << 16) | (static_cast<uint32_t>(payload.data[11]) << 24);
     if (12 + meta_size > payload.size) {
-        return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
+        return m5::stl::make_unexpected(error_t::PROTOCOL_ERROR);
     }
     desc.meta = {payload.data + 12, meta_size};
+    if (_stream_transfer_fn == nullptr) {
+        return m5::stl::make_unexpected(error_t::UNSUPPORTED);
+    }
     return _stream_transfer_fn(_stream_transfer_ctx, desc);
 }
 
@@ -1309,11 +1506,43 @@ result_t<void> BytecodeRunner::opBusCreate(data::ConstDataSpan payload)
     if (_bus_create_fn == nullptr) {
         return m5::stl::make_unexpected(error_t::UNSUPPORTED);
     }
-    const auto kind   = static_cast<types::bus_kind_t>(payload.data[0]);
-    const uint8_t bid = payload.data[1];
-    // payload[2] = store_id (reserved, skip)
+    const auto kind        = static_cast<types::bus_kind_t>(payload.data[0]);
+    const uint8_t bid      = payload.data[1];
+    const uint8_t store_id = payload.data[2];
     data::ConstDataSpan pin_config{payload.data + 3, payload.size - 3};
-    return _bus_create_fn(_bus_create_ctx, true, kind, bid, pin_config);
+    auto created = _bus_create_fn(_bus_create_ctx, true, kind, bid, pin_config);
+    if (!created.has_value() || store_id == kDiscardStoreId) {
+        return created;
+    }
+    // A legacy or custom lifecycle handler may create a resource without
+    // registering an accessor in this runner. Preserve that v1 success shape:
+    // no StoreData means "capability unreported" to the new host.
+    if (!hasBinding(kind, bid)) {
+        return {};
+    }
+    auto rollback = [&](error_t original_error) -> result_t<void> {
+        auto released = _bus_create_fn(_bus_create_ctx, false, kind, bid, data::ConstDataSpan{});
+        if (!released.has_value()) {
+            return m5::stl::make_unexpected(released.error());
+        }
+        return m5::stl::make_unexpected(original_error);
+    };
+    auto capabilities = busCapabilities(kind, bid);
+    if (!capabilities.has_value()) {
+        return rollback(capabilities.error());
+    }
+    uint8_t record[remote::detail::kBusCapabilitiesWireMaxKnownRecordSize];
+    auto encoded = remote::detail::encodeBusCapabilitiesWire(capabilities.value(), {record, sizeof(record)});
+    if (!encoded.has_value()) {
+        return rollback(encoded.error());
+    }
+    auto allocated = allocStore(store_id, encoded.value());
+    if (!allocated.has_value()) {
+        return rollback(allocated.error());
+    }
+    ::memcpy(allocated.value()->buf.data(), record, encoded.value());
+    allocated.value()->len = encoded.value();
+    return {};
 }
 
 result_t<void> BytecodeRunner::opBusRelease(data::ConstDataSpan payload)

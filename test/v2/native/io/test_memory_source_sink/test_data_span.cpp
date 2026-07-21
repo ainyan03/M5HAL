@@ -39,6 +39,31 @@ TEST(ConstDataSpan, EmptyTrueOnZeroSize)
     EXPECT_FALSE(non_empty.empty());
 }
 
+TEST(ConstDataSpan, DefaultEmptyPreservesNullRange)
+{
+    ConstDataSpan empty_span;
+    EXPECT_EQ(empty_span.begin(), nullptr);
+    EXPECT_EQ(empty_span.end(), nullptr);
+    EXPECT_EQ(empty_span.first(1).data, nullptr);
+    EXPECT_EQ(empty_span.subspan(0, 1).data, nullptr);
+
+    size_t count = 0;
+    for (uint8_t byte : empty_span) {
+        (void)byte;
+        ++count;
+    }
+    EXPECT_EQ(count, 0u);
+}
+
+TEST(ConstDataSpan, NonNullEmptyPreservesOriginalPointer)
+{
+    const uint8_t byte = 0;
+    ConstDataSpan empty_span{&byte, 0};
+    EXPECT_EQ(empty_span.begin(), &byte);
+    EXPECT_EQ(empty_span.end(), &byte);
+    EXPECT_EQ(empty_span.subspan(0, 1).data, &byte);
+}
+
 TEST(ConstDataSpan, BeginEndCoverWholeBuffer)
 {
     const std::array<uint8_t, 4> bytes{0x10, 0x20, 0x30, 0x40};
@@ -124,6 +149,31 @@ TEST(DataSpan, EmptyTrueOnZeroSize)
     uint8_t byte = 0;
     DataSpan non_empty{&byte, 1};
     EXPECT_FALSE(non_empty.empty());
+}
+
+TEST(DataSpan, DefaultEmptyPreservesNullRange)
+{
+    DataSpan empty_span;
+    EXPECT_EQ(empty_span.begin(), nullptr);
+    EXPECT_EQ(empty_span.end(), nullptr);
+    EXPECT_EQ(empty_span.first(1).data, nullptr);
+    EXPECT_EQ(empty_span.subspan(0, 1).data, nullptr);
+
+    size_t count = 0;
+    for (uint8_t byte : empty_span) {
+        (void)byte;
+        ++count;
+    }
+    EXPECT_EQ(count, 0u);
+}
+
+TEST(DataSpan, NonNullEmptyPreservesOriginalPointer)
+{
+    uint8_t byte = 0;
+    DataSpan empty_span{&byte, 0};
+    EXPECT_EQ(empty_span.begin(), &byte);
+    EXPECT_EQ(empty_span.end(), &byte);
+    EXPECT_EQ(empty_span.subspan(0, 1).data, &byte);
 }
 
 TEST(DataSpan, BeginEndCoverWholeBuffer)

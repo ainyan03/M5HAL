@@ -57,9 +57,8 @@ using SoftwareSpiBus = ::m5::hal::v2::spi::Bus_software;
 // therefore non-copyable/non-movable, so it cannot be returned by value.
 void initBus(SoftwareSpiBus& bus)
 {
-    // Typed init: the software Bus takes its own variant config, not the
-    // abstract IBusConfig. Pin fields are inherited from the base.
-    ::m5::hal::v2::spi::BusConfig_software bus_config;
+    // Direct providers and the facade share the same portable BusConfig.
+    ::m5::hal::v2::spi::BusConfig bus_config;
     bus_config.pin_clk  = M5HAL_TEST_SOFTWARE_SPI_PIN_CLOCK;
     bus_config.pin_mosi = M5HAL_TEST_SOFTWARE_SPI_PIN_MOSI;
     bus_config.pin_miso = -1;

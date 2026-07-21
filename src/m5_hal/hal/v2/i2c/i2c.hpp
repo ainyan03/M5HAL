@@ -126,6 +126,9 @@ struct IBusConfig : public bus::IBusConfig {
     }
 };
 
+/*! @brief Variant-independent portable I2C bus configuration. */
+using BusConfig = IBusConfig;
+
 /*!
   @brief Pin + intent acquire request for the logical acquire path.
 
@@ -382,24 +385,26 @@ struct MasterAccessor : public bus::IAccessor {
       and call `setConfig()` once the values are ready.
       @{
      */
-    MasterAccessor(void) = default;
-    explicit MasterAccessor(const MasterAccessConfig& access_config) : _access_config{access_config}
+    MasterAccessor(void) : _context{makeOperationContext(MasterAccessConfig{})}
+    {
+    }
+    explicit MasterAccessor(const MasterAccessConfig& access_config) : _context{makeOperationContext(access_config)}
     {
     }
     /*!
       @brief Bind (or rebind) the accessor to an I2C bus.
 
       Kind-typed on purpose: passing a non-I2C bus is a compile error.
-      Rejected with `INVALID_ARGUMENT` while an access window is open
+      Rejected with `INVALID_STATE` while an access window is open
       (the window holds the previous bus's lock).
      */
-    m5::hal::v2::result_t<void> bind(IBus& bus);
+    [[nodiscard]] m5::hal::v2::result_t<void> bind(IBus& bus);
     /*! @} */
 
     /*! @brief Covariant override: every accessor returns its concrete config. */
     const MasterAccessConfig& getConfig(void) const override
     {
-        return _access_config;
+        return _context.config;
     }
     /*!
       @brief Return the underlying bus as `IBus&`.
@@ -426,23 +431,22 @@ struct MasterAccessor : public bus::IAccessor {
       `cfg.freq != _last_freq`, so this entry point needs no extra
       invalidation logic — transparent to the caller.
      */
-    m5::hal::v2::result_t<void> setConfig(const MasterAccessConfig& cfg);
+    [[nodiscard]] m5::hal::v2::result_t<void> setConfig(const MasterAccessConfig& cfg);
 
     /*!
-      @brief Core transfer start API for an open transaction.
+      @brief Core transfer API for an active Access.
 
       Internally constructs `MemorySource` / `MemorySink` and dispatches
       to `bus->transfer(TransferDesc, Source*, Sink*)`. Callers write
       register addresses (or any leading bytes) directly into
       `desc.prefix`.
 
-      `beginTransaction()` must already be active. The call reports only
-      whether the transfer was accepted/started; cumulative TX/RX counts are
-      returned by `endTransaction()`. Current blocking backends still complete
-      the transfer before returning, but callers must not depend on that.
+      `beginAccess()` must already be active. The call waits for this individual
+      transfer and returns its TX/RX totals. Public sugar opens a temporary
+      Access when inactive and borrows an already-active Access without nesting.
      */
-    m5::hal::v2::result_t<void> transfer(const TransferDesc& desc, data::ConstDataSpan src_bytes,
-                                         data::DataSpan dst_bytes);
+    m5::hal::v2::result_t<bus::TransferTotals> transfer(const TransferDesc& desc, data::ConstDataSpan src_bytes,
+                                                        data::DataSpan dst_bytes);
 
     /*!
       @brief Source/Sink overload for streaming callers.
@@ -451,30 +455,19 @@ struct MasterAccessor : public bus::IAccessor {
       `src` / `dst` are nullable; descriptor prefix bytes are metadata and
       are not counted into either length.
      */
-    m5::hal::v2::result_t<void> transfer(const TransferDesc& desc, data::Source* src, size_t tx_len, data::Sink* dst,
-                                         size_t rx_len);
+    m5::hal::v2::result_t<bus::TransferTotals> transfer(const TransferDesc& desc, data::Source* src, size_t tx_len,
+                                                        data::Sink* dst, size_t rx_len);
 
     /*!
-      @brief Open a bus-ownership transaction.
+      @brief Open a bus-ownership Access.
 
-      This synchronous surface mirrors SPI's transaction API but, for I2C,
-      currently represents only a bus access window. Wire-level START / STOP
-      remain owned by each `transfer` call until the low-level transfer API is
-      switched to asynchronous start semantics.
+      For I2C this represents a bus ownership/configuration window. Wire-level
+      START / STOP remain owned by each `transfer` call.
      */
-    m5::hal::v2::result_t<void> beginTransaction(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
-
-    /*!
-      @brief Close the transaction and return cumulative transfer totals.
-     */
-    m5::hal::v2::result_t<bus::TransferTotals> endTransaction(void);
+    [[nodiscard]] m5::hal::v2::result_t<void> beginAccess(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+    [[nodiscard]] m5::hal::v2::result_t<void> endAccess(uint32_t timeout_ms = 1000);
     bool transferBusy(void);
-    m5::hal::v2::result_t<void> waitTransfer(void);
-
-    bool inTransaction(void) const
-    {
-        return _transaction_depth != 0;
-    }
+    m5::hal::v2::result_t<bus::TransferStatus> getLastTransferStatus(void) const;
 
     /*!
       @name Source/Sink write / read — the canonical data-exchange form.
@@ -494,8 +487,8 @@ struct MasterAccessor : public bus::IAccessor {
     /*!
       @name Span-based write / read sugars.
 
-      Internally open a transaction, call `transfer` with an empty
-      `TransferDesc`, then close the transaction and use its totals.
+      Internally open a temporary Access when needed, call `transfer` with an
+      empty `TransferDesc`, then close that Access and use the per-I/O totals.
       @{
      */
     m5::hal::v2::result_t<size_t> write(data::ConstDataSpan src_bytes);
@@ -636,15 +629,15 @@ protected:
                                                             data::DataSpan dst_bytes);
     m5::hal::v2::result_t<bus::TransferTotals> transferSync(const TransferDesc& desc, data::Source* src, size_t tx_len,
                                                             data::Sink* dst, size_t rx_len);
-    m5::hal::v2::result_t<void> startTransfer(const TransferDesc& desc, data::Source* src, size_t tx_len,
-                                              data::Sink* dst, size_t rx_len);
+    m5::hal::v2::result_t<bus::TransferTotals> startTransfer(const TransferDesc& desc, data::Source* src, size_t tx_len,
+                                                             data::Sink* dst, size_t rx_len);
 
     m5::hal::v2::result_t<TransferDesc> makeLiteralRegisterDesc(int reg) const
     {
         if (reg < 0) {
             return m5::stl::make_unexpected(m5::hal::v2::error::error_t::INVALID_ARGUMENT);
         }
-        const uint8_t width = _access_config.register_address_bytes == 0 ? 1 : _access_config.register_address_bytes;
+        const uint8_t width = _context.config.register_address_bytes == 0 ? 1 : _context.config.register_address_bytes;
         if (width == 1) {
             if (reg > 0xFF) {
                 return m5::stl::make_unexpected(m5::hal::v2::error::error_t::INVALID_ARGUMENT);
@@ -661,12 +654,11 @@ protected:
         return m5::stl::make_unexpected(m5::hal::v2::error::error_t::INVALID_ARGUMENT);
     }
 
-    MasterAccessConfig _access_config;
-    bus::TransferTotals _transaction_totals;
+    bus::OperationContext<MasterAccessConfig> _context;
+    bus::TransferStatus _last_transfer_status;
     data::MemorySource _span_src;
     data::MemorySink _span_dst;
-    error::error_t _transaction_error = error::error_t::OK;
-    uint32_t _transaction_depth       = 0;
+    uint32_t _next_transfer_id = 0;
 };
 
 //-------------------------------------------------------------------------
@@ -674,7 +666,7 @@ protected:
 /*!
   @brief Concrete I2C bus base.
 
-  Variants derive from `IBus` and override `transfer`; the inline
+  Variants derive from `IBus` and override the protected `transferBackend` hook; the inline
   `probe` sugar uses a stack-local accessor so callers can check for
   a device without building one themselves.
  */
@@ -689,7 +681,7 @@ struct IBus : public bus::IBus {
 
       Internally constructs a stack-allocated `MasterAccessor` as a
       sentinel and uses it as the lock owner, so the probe contends for
-      the bus through `Bus::lock` like any other accessor (waits up to
+      the bus through `IBus::acquireAccessLock` like any other accessor (waits up to
       `timeout_ms`, fails with `TIMEOUT_ERROR`). One probe includes
       (sentinel ctor + `beginAccess` + transfer probe path +
       `endAccess` + sentinel dtor); the ctor is inline and trivially
@@ -702,6 +694,9 @@ struct IBus : public bus::IBus {
       than `MasterAccessConfig`'s default of 1000 ms.
      */
     m5::hal::v2::result_t<void> probe(uint16_t i2c_addr, uint32_t freq = 100000, uint32_t timeout_ms = 50);
+
+    m5::hal::v2::result_t<void> beginOperation(bus::OperationContext<MasterAccessConfig>& context);
+    m5::hal::v2::result_t<void> endOperation(bus::OperationContext<MasterAccessConfig>& context);
 
     /*!
       @brief Core I2C transfer entry point.
@@ -721,43 +716,62 @@ struct IBus : public bus::IBus {
       implementation MUST honor this path because `Accessor::probe`
       depends on it.
 
-      `owner` identifies the calling accessor. It is INFORMATIONAL: the
-      backend does NOT verify that `owner` currently holds the bus lock. The
-      lock-owner invariant is enforced only by the `Accessor` sugar, which
-      takes the lock before forwarding `this`. Calling this low-level entry
-      directly therefore bypasses lock ownership and is unsafe unless the
-      caller already holds the bus lock; keep an accessor alive and pass
-      `&accessor`. (Documented as informational, not enforced.)
+      `context` is the active accessor-owned capability. The non-virtual entry
+      validates its bus, owner, address, and generation before dispatching to
+      the provider hook.
 
       `tx_len` / `rx_len` bound the caller data phases independently.
 
-      The return value reports only start/completion success for the backend.
-      Accessors count caller-provided Source/Sink progress and return
-      cumulative totals from `endTransaction()`. `desc.prefix` bytes are
-      driven on the wire but not counted. The default implementation returns
-      `NOT_IMPLEMENTED`; every variant overrides it.
+      The return value reports start/completion success for the backend.
+      The Accessor waits through `waitTransfer()` and returns per-I/O totals;
+      `desc.prefix` bytes are driven on the wire but not counted. The default implementation returns
+      `UNSUPPORTED`; every functional variant overrides `transferBackend`.
      */
-    virtual m5::hal::v2::result_t<void> transfer(bus::IAccessor* owner, const MasterAccessConfig& cfg,
-                                                 const TransferDesc& desc, data::Source* src, size_t tx_len,
-                                                 data::Sink* dst, size_t rx_len);
-    virtual m5::hal::v2::result_t<bus::TransferTotals> waitTransfer(bus::IAccessor* owner,
-                                                                    const MasterAccessConfig& cfg);
-    virtual bool transferBusy(bus::IAccessor* owner);
+    m5::hal::v2::result_t<void> transfer(bus::OperationContext<MasterAccessConfig>& context, const TransferDesc& desc,
+                                         data::Source* src, size_t tx_len, data::Sink* dst, size_t rx_len);
+    m5::hal::v2::result_t<bus::TransferTotals> waitTransfer(bus::OperationContext<MasterAccessConfig>& context);
+    bool transferBusy(bus::OperationContext<MasterAccessConfig>& context);
 
 protected:
+    virtual m5::hal::v2::result_t<void> beginOperationBackend(bus::OperationContext<MasterAccessConfig>& context);
+    virtual m5::hal::v2::result_t<void> endOperationBackend(bus::OperationContext<MasterAccessConfig>& context);
+    virtual m5::hal::v2::result_t<void> transferBackend(bus::OperationContext<MasterAccessConfig>& context,
+                                                        const TransferDesc& desc, data::Source* src, size_t tx_len,
+                                                        data::Sink* dst, size_t rx_len);
+    virtual m5::hal::v2::result_t<bus::TransferTotals> waitTransferBackend(
+        bus::OperationContext<MasterAccessConfig>& context);
+    virtual bool transferBusyBackend(bus::OperationContext<MasterAccessConfig>& context);
+
+    static result_t<void> beginOperationOn(IBus& backend, bus::OperationContext<MasterAccessConfig>& context)
+    {
+        return backend.beginOperationBackend(context);
+    }
+    static result_t<void> endOperationOn(IBus& backend, bus::OperationContext<MasterAccessConfig>& context)
+    {
+        return backend.endOperationBackend(context);
+    }
+    static result_t<void> transferOn(IBus& backend, bus::OperationContext<MasterAccessConfig>& context,
+                                     const TransferDesc& desc, data::Source* src, size_t tx_len, data::Sink* dst,
+                                     size_t rx_len)
+    {
+        return backend.transferBackend(context, desc, src, tx_len, dst, rx_len);
+    }
+    static result_t<bus::TransferTotals> waitTransferOn(IBus& backend,
+                                                        bus::OperationContext<MasterAccessConfig>& context)
+    {
+        return backend.waitTransferBackend(context);
+    }
+    static bool transferBusyOn(IBus& backend, bus::OperationContext<MasterAccessConfig>& context)
+    {
+        return backend.transferBusyBackend(context);
+    }
+
     IBusConfig _config;
+    bus::OperationSlot _operation_slot;
 };
 
-/*!
-  @brief Maps a variant `BusConfig_<variant>` to its backend `Bus_<variant>`.
-
-  Undefined primary on purpose: passing a config type without a
-  specialization to `Bus::init` is an incomplete-type compile error
-  (the same type-safety stance as the typed `init` it replaces). Each
-  variant header specializes this next to its `Bus_<variant>`.
- */
-template <class CfgT>
-struct BackendFor;
+template <class Policy>
+struct NativeProvider;
 
 /*!
   @brief Per-kind Traits for the shared facade and local backend adapter.
@@ -785,8 +799,8 @@ struct BusTraits {
                to the backend (see spec/design/bus_accessor.md §managed policy). */
     static constexpr bool MANAGED_ALLOCATION = true;
 
-    template <class CfgT>
-    using BackendFor = i2c::BackendFor<CfgT>;
+    template <class Policy>
+    using NativeProvider = i2c::NativeProvider<Policy>;
 
     static void applyAdopt(IBusConfig& cfg, const LogicalBusConfig& logical)
     {
@@ -798,13 +812,13 @@ struct BusTraits {
         out.pin_scl = cfg.pin_scl;
         out.pin_sda = cfg.pin_sda;
     }
-    static bus::IdentityKey identityFromConfig(const IBusConfig& cfg)
+    static bus::ResourceKey identityFromConfig(const IBusConfig& cfg)
     {
-        return bus::IdentityKey::fromPins({cfg.pin_scl, cfg.pin_sda});
+        return bus::ResourceKey::fromPins(KIND, {cfg.pin_scl, cfg.pin_sda});
     }
-    static bus::IdentityKey identityFromLogical(const LogicalBusConfig& req)
+    static bus::ResourceKey identityFromLogical(const LogicalBusConfig& req)
     {
-        return bus::IdentityKey::fromPins({req.pin_scl, req.pin_sda});
+        return bus::ResourceKey::fromPins(KIND, {req.pin_scl, req.pin_sda});
     }
     static bool configCompatible(const IBusConfig& current, const IBusConfig& requested)
     {
@@ -819,25 +833,39 @@ struct BusTraits {
   lock/unlock, the accessor binding, `getConfig`/`probe`, the swappable backend
   behind a `unique_ptr`, the query mirror, and the hot-swap seam.
   This thin derived type just fixes the public name `i2c::Bus` and the I2C
-  Traits. `init` selects the backend from the config type via `BackendFor`, so
-  `i2c::Bus bus; bus.init(cfg);` keeps working.
+  Traits. Portable `init` selects the offered provider independently of the
+  config's concrete C++ type.
  */
 struct Bus : public bus::ManagedBusFacade<BusTraits> {
-    using bus::ManagedBusFacade<BusTraits>::transfer;
+    [[nodiscard]] result_t<void> init(const IBusConfig& config);
 
-    result_t<void> transfer(bus::IAccessor* owner, const MasterAccessConfig& cfg, const TransferDesc& desc,
-                            data::Source* src, size_t tx_len, data::Sink* dst, size_t rx_len) override
+protected:
+    result_t<void> beginOperationBackend(bus::OperationContext<MasterAccessConfig>& context) override
     {
-        return forwardBackend([&](IBus& b) { return b.transfer(owner, cfg, desc, src, tx_len, dst, rx_len); });
+        return this->forwardBackend([&](IBus& backend) { return beginOperationOn(backend, context); });
     }
-    result_t<bus::TransferTotals> waitTransfer(bus::IAccessor* owner, const MasterAccessConfig& cfg) override
+
+    result_t<void> endOperationBackend(bus::OperationContext<MasterAccessConfig>& context) override
     {
-        return forwardBackend([&](IBus& b) { return b.waitTransfer(owner, cfg); });
+        return this->forwardBackend([&](IBus& backend) { return endOperationOn(backend, context); });
     }
-    bool transferBusy(bus::IAccessor* owner) override
+
+    result_t<void> transferBackend(bus::OperationContext<MasterAccessConfig>& context, const TransferDesc& desc,
+                                   data::Source* src, size_t tx_len, data::Sink* dst, size_t rx_len) override
     {
-        auto* b = backend();
-        return b != nullptr && b->transferBusy(owner);
+        return this->forwardBackend(
+            [&](IBus& backend) { return transferOn(backend, context, desc, src, tx_len, dst, rx_len); });
+    }
+
+    result_t<bus::TransferTotals> waitTransferBackend(bus::OperationContext<MasterAccessConfig>& context) override
+    {
+        return this->forwardBackend([&](IBus& backend) { return waitTransferOn(backend, context); });
+    }
+
+    bool transferBusyBackend(bus::OperationContext<MasterAccessConfig>& context) override
+    {
+        auto* backend = this->backend();
+        return backend != nullptr && transferBusyOn(*backend, context);
     }
 };
 
@@ -855,14 +883,13 @@ inline m5::hal::v2::result_t<void> MasterAccessor::bind(IBus& bus)
 }
 
 /*!
-  @brief Typed I2C view delegating registry and allocation to the HAL backend.
+  @brief I2C view delegating registry and allocation to the HAL backend.
 
-  Shares the acquire / logical-acquire / commit / release spine with every
+  Shares the acquire / logical-acquire / commit / close spine with every
   other kind through `bus::BusViewCore<BusTraits>` (see bus/bus_view.hpp);
   this derived type adds only the I2C-specific `createBusConfig()` pin
-  overloads. The typed acquire path uses the backend's registry directly so
-  the concrete config type still selects the local variant backend. The
-  logical acquire and commit paths delegate through `bus::IHalBackend`,
+  overloads. Portable and logical acquire plus commit delegate through
+  `bus::IHalBackend`,
   allowing the same BusView surface to point at local or future remote
   backends.
  */

@@ -10,6 +10,7 @@
 #include "./managed_bus.hpp"
 #include "./registry.hpp"
 
+#include <cstdlib>
 #include <memory>
 
 /*!
@@ -83,7 +84,7 @@ public:
       claimed controller survives `commitBuses()`'s `releaseAll()` rebuild
       (see `HwControllerPool::releaseAll`) and is reserved out of the
       resolver's `used[]` set for the whole commit. Call only while the
-      caller holds no access/transaction window for this kind: a concurrent
+      caller holds no Access or protocol-frame claim for this kind: a concurrent
       commit may hold the allocation lock while waiting for that bus lock.
      */
     result_t<int8_t> claimController(const types::AllocationIntent& intent);
@@ -124,19 +125,7 @@ private:
     // claims never take a bus lock themselves. Public callers must likewise
     // hold no access-window bus lock while claiming/releasing; otherwise a
     // concurrent commit can form bus -> serial / serial -> bus lock order.
-    struct SerialGuard {
-        runtime::Mutex& m;
-        explicit SerialGuard(runtime::Mutex& mtx) : m{mtx}
-        {
-            (void)m.lock(types::TIMEOUT_FOREVER);
-        }
-        ~SerialGuard(void)
-        {
-            m.unlock();
-        }
-        SerialGuard(const SerialGuard&)            = delete;
-        SerialGuard& operator=(const SerialGuard&) = delete;
-    };
+    using SerialGuard = runtime::MutexGuard;
 
     BusRegistry& _registry;
     const IAllocationKind& _kind;

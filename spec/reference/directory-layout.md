@@ -2,7 +2,9 @@
 
 > **読者**: メンテナ向け（ビルド・運用・規約）。
 
-M5HAL では、 ライブラリのディレクトリ階層と namespace 階層の 1:1 対応を以下の規約で取る。
+M5HALの物理tree、配置規約、include先の検索台帳を示す。variantの選択・申告契約は
+[../design/variants.md](../design/variants.md)、追加手順は
+[../porting_guide/framework.md](../porting_guide/framework.md)を参照。
 
 ## version 階層
 
@@ -23,9 +25,9 @@ M5HAL では、 ライブラリのディレクトリ階層と namespace 階層�
 | `src/M5HAL_{v0,v2}.{hpp,cpp}` | ファイル名 suffix | entry を版別に分離 |
 | `examples/` | `examples/v2/` | サンプルを版別管理 |
 | `test/` | `test/v0/`, `test/v2/` | 検証を版別管理。 `native/` は host test、 `embedded/` は実機で PASS/FAIL を判定する test |
-| `docs/` | Doxygen 用に別管理 (将来作成) | Markdown 仕様書の置き場には使わない |
+| `docs/` | Doxygen 用に予約 (現行未作成) | Markdown 仕様書の置き場には使わない |
 
-## v2 構造
+## v2 構造と検索先
 
 ```text
 src/
@@ -34,113 +36,59 @@ src/
   M5HAL_v2.{hpp,cpp}
   m5_hal_config.hpp
   m5_hal/
-    _macro/
+    _macro/                         variant勝者binding
       offer_all.inl
       offer_kind.inl
       offer_runtime_only.inl
     hal/
       v2/
-        runtime/runtime.hpp
-        bus/allocation_core.{hpp,inl}
-        bus/bus.{hpp,inl}
-        bus/bus_view.hpp
-        bus/hal_backend.hpp
-        bus/hw_pool.hpp
-        bus/local_backend.{hpp,inl}
-        bus/managed_bus.hpp
-        bus/managed_facade.hpp
-        bus/registry.hpp
-        i2c/i2c.{hpp,inl}
-        i2c/master_clock_limit.hpp
-        i2c/slave.{hpp,inl}
-        i2c/virtual_bus.hpp
-        i2s/i2s.{hpp,inl}
-        spi/slave.hpp
-        spi/spi.{hpp,inl}
-        uart/bus_console.{hpp,inl}
-        uart/bus_streaming.{hpp,inl}
-        uart/uart.{hpp,inl}
-        gpio/gpio.hpp
-        gpio/group.{hpp,inl}
-        gpio/port.hpp
-        data.hpp
-        data/block.hpp
-        data/memory.hpp
-        data/limited.hpp
-        data/mux.{hpp,inl}
-        data/ring.{hpp,inl}
-        data/stdio.hpp
-        data/stream.{hpp,inl}
-        data/tap.hpp
-        frame/frame.{hpp,inl}
-        bytecode/bytecode.{hpp,inl}
-        remote/credit_notifier.hpp
-        remote/remote.hpp
-        remote/remote_connection.{hpp,inl}
-        remote/session_handle.hpp
-        remote/server.{hpp,inl}
-        remote/server_adapter.{hpp,inl}
-        remote/server_bus_pool.{hpp,inl}
-        remote/server_connection_wiring.{hpp,inl}
-        remote/server_handler.{hpp,inl}
-        remote/wire_drain.hpp
-        memory/allocator.{hpp,inl}
-        memory/pool.{hpp,inl}
-        service/completion_gate.hpp
-        service/service.{hpp,inl}
-        types.hpp
-        error.hpp
-        assert.hpp
-        diag.hpp
-        m5_hal.hpp
+        <kind>/<kind>.{hpp,inl}      kindの契約と共通実装
+        bus/                        Bus共通基盤、registry、ownership
+        data/                       Source / Sink具象
+        remote/                     remote protocolとserver
+        memory/                     allocator / pool
+        service/                    background service
+        resource_domain.hpp         local資源domain
+        {types,error}.hpp           API世代に属する共通型
+        m5_hal.hpp                  HAL object層
     variants/
+      ids.hpp                       variant ID台帳
       frameworks/
-        _checker.hpp
-        freertos/
-          _offer.hpp
-          hal/runtime/mutex.hpp
-          hal/runtime/task.hpp
-          hal/runtime/time.hpp
-        bsd/
-          hal/remote/tcp_server.{hpp,inl}
-          hal/tcp/bsd_tcp.{hpp,inl}
-        remote/
-          _offer.hpp
-          backend.{hpp,inl}
-          bus_lease.hpp
-          detail_helpers.hpp
-          hal.hpp
-          hal/gpio/gpio.{hpp,inl}
-          hal/i2c/i2c.{hpp,inl}
-          hal/i2s/i2s.{hpp,inl}
-          hal/spi/spi.{hpp,inl}
-          hal/uart/uart.{hpp,inl}
-          remote_transfer.{hpp,inl}
-          session.{hpp,inl}
+        _checker.hpp                framework検出
         <name>/
-          _offer.hpp
-          hal.hpp
-          hal.inl
+          _offer.hpp                capability申告
+          hal.{hpp,inl}             kind別実装hub
           hal/<kind>/<kind>.{hpp,inl}
       platforms/
-        _checker.hpp
+        _checker.hpp                platform検出
         <vendor>/<chip-family>/
-          _offer.hpp
-          hal.hpp
-          hal.inl
+          _offer.hpp                capability申告
+          hal.{hpp,inl}             kind別実装hub
           hal/<kind>/<kind>.{hpp,inl}
 ```
+
+| 探すもの | 正本・入口 |
+|---|---|
+| public umbrellaとscan順 | `src/M5HAL_v2.hpp` / `src/M5HAL_v2.cpp` |
+| build設定macro | `src/m5_hal_config.hpp` |
+| variant ID | `src/m5_hal/variants/ids.hpp` |
+| framework / platform検出 | `src/m5_hal/variants/{frameworks,platforms}/_checker.hpp` |
+| capability申告 | 各variantの`_offer.hpp` |
+| 勝者binding | `src/m5_hal/_macro/offer_all.inl`と`offer_kind.inl` |
+| kind共通契約 | `src/m5_hal/hal/v2/<kind>/` |
+| provider実装 | `src/m5_hal/variants/{frameworks,platforms}/.../hal/<kind>/` |
 
 ## 規約
 
 1. `src/m5_hal/hal/` 配下は `m5::hal::*` と厳密に対応させる
-2. `src/m5_hal/variants/` 配下は `m5::variants::*` と厳密に対応させる
+2. `src/m5_hal/variants/` 配下は、下記のprovider公開symbolを除き`m5::variants::*`と対応させる
 3. ライブラリルート `src/m5_hal/` は `m5` ルートに対応する例外とする
 4. `_macro/`, `_checker.hpp`, `_offer.hpp` などのメタ要素は namespace 非対応の例外とする。
    variant 横断の共有実装 (FreeRTOS OS プリミティブ、 BSD socket TCP) は `variants/frameworks/`
    配下に独立 variant として配置する (`freertos/`, `bsd/`)
 5. HAL の範疇外要素は `hal/` の外に置く
-6. cross-cutting な型 (`error_t` 等) は `m5::hal::` 直下に置く
+6. API世代に属するcross-cuttingな型 (`error_t` 等) は`m5::hal::vN`配下に置く。現行v2は
+   `m5::hal::v2::error`を正本とし、世代非依存の`m5::hal`直下へは置かない
 
 ## 公開パッケージの除外 (idf_component.yml / library.json)
 
@@ -177,9 +125,11 @@ variant の内部構造 (`_offer.hpp` + `hal.hpp` + `hal.inl` の hub 構成) �
 [../design/variants.md](../design/variants.md) §variant 内部の構造 が正本。
 ここでは配置・namespace 面の規約だけ補足する。
 
-- variant 内の HAL 提供物は `namespace hal::v2::<kind> { ... }` に置く
+- provider公開symbolは物理的にはvariant配下に置き、`m5::hal::v2::<kind>`へ定義する。対象symbolと
+  選択規則は[../design/variants.md](../design/variants.md) §offer 要件 (facade bus kind)が正本
 - `m5::hal::v2::<kind>` 内 (公開型の定義場所) では `::m5::hal::v2::` を省略し相対名で書く (`result_t<T>` / `bus::IAccessor` 等)。 ただし `detail::` は sibling kind の同名 namespace と曖昧になるためフル修飾を維持する
-- `m5::variants::...` 内 (内部構造) では `::m5::hal::v2::` が探索経路にないためフル修飾が必要。 `using namespace ::m5::hal::v2;` で省略も可
+- provider-privateな内部構造は`m5::variants::...`へ置く。このnamespaceでは`::m5::hal::v2::`が
+  探索経路にないためフル修飾が必要。`using namespace ::m5::hal::v2;`で省略も可
 
 ## include 形式
 
@@ -189,7 +139,8 @@ variant の内部構造 (`_offer.hpp` + `hal.hpp` + `hal.inl` の hub 構成) �
 
 ## 検出機構
 
-詳細は [../design/variants.md](../design/variants.md) §走査順 (`M5HAL_v2.hpp` 内) を参照。本 kind 固有の差分のみ以下に示す。
+詳細は [../design/variants.md](../design/variants.md) §走査順 (`M5HAL_v2.hpp` 内) を参照。
+検索入口は以下の2ファイルとする。
 
 - `src/m5_hal/variants/frameworks/_checker.hpp` — `M5HAL_FRAMEWORK_HAS_<NAME>` 系
 - `src/m5_hal/variants/platforms/_checker.hpp` — `M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID` / `M5HAL_V2_DETECTED_PLATFORM_VARIANT_PATH` の検出 (識別番号の正本は `variants/ids.hpp`。 無印は変更不可の v0 が所有)

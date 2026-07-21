@@ -1,100 +1,170 @@
 // SPDX-License-Identifier: MIT
 //
-// HIL device firmware -- SPI slave echo via ESP-IDF spi_slave driver.
-//
-// Runs on a CoreS3 (ESP32-S3) as an SPI slave using Port B + Port C pins:
-//   CLK  = GPIO 8  (Port B Pin1)
-//   MISO = GPIO 9  (Port B Pin2, slave output)
-//   MOSI = GPIO 18 (Port C Pin1)
-//   CS   = GPIO 17 (Port C Pin2)
-//
-// Echo contract (two SPI transactions per round):
-//   1. Master sends N data bytes (CS stays asserted for the entire write).
-//      The slave captures the bytes into rx_buf via DMA.
-//   2. Master then does a separate read (new CS assertion). The slave sends
-//      the previously captured bytes from tx_buf.
-//
-// After each receive, the firmware copies rx_buf to tx_buf so the next
-// transaction echoes the data. It also logs the byte count on the serial
-// console for monitoring.
-//
-// Wiring (2-board HIL, straight GROVE cables):
-//   Core2 PortB-Pin1(26) <-> CoreS3 PortB-Pin1(8)   CLK
-//   Core2 PortB-Pin2(36) <-> CoreS3 PortB-Pin2(9)   MISO
-//   Core2 PortC-Pin1(17) <-> CoreS3 PortC-Pin1(18)  MOSI
-//   Core2 PortC-Pin2(16) <-> CoreS3 PortC-Pin2(17)  CS
-//
-// Build / flash:
-//   export M5HAL_PIO_EXTRA_CONFIG=pio_envs/v2/hil.ini.cli
-//   pio run -e v2_hil_spi_slave_echo_esp32s3 -t upload
+// Public HIL device for the queue-driven M5HAL ESP-IDF SPI slave backend.
+// A CoreS3 preloads a continuous byte ramp, opens one long-lived slave Access,
+// and retains every CS-delimited RX frame for validation after the batch.
 
-#include <driver/spi_slave.h>
-#include <esp_heap_caps.h>
+#include <M5HAL_v2.hpp>
+
 #include <esp_log.h>
-#include <string.h>
+#include <driver/gpio.h>
 
-#define PIN_CLK  2  // CoreS3 PortA Pin1
-#define PIN_MOSI 1  // CoreS3 PortA Pin2
-#define PIN_MISO 8  // CoreS3 PortB → Core2 G36 (input-only = master MISO read)
-#define PIN_CS   9  // CoreS3 PortB → Core2 G26 (output = master CS drive)
+#include <algorithm>
+#include <stddef.h>
+#include <stdint.h>
 
-#define BUF_SIZE 4096
+namespace m5hal = m5::hal::v2;
 
-static const char* TAG = "spi_echo";
+namespace {
 
-static uint8_t* rx_buf = nullptr;
-static uint8_t* tx_buf = nullptr;
+constexpr int kPinClk  = 18;
+constexpr int kPinMosi = 17;
+constexpr int kPinMiso = 8;
+constexpr int kPinCs   = 9;
 
-extern "C" void app_main(void)
+constexpr uint8_t kMode          = 1;
+constexpr size_t kLength         = 32;
+constexpr size_t kTransactions   = 101;
+constexpr size_t kObservedFrames = kTransactions + 1;
+constexpr uint32_t kTimeoutMs    = 10000;
+
+const char* const kTag = "spi_slave_hil";
+
+using QueueStorage = m5hal::slave::StaticSlaveQueueStorage<kLength * kTransactions, kLength * kTransactions,
+                                                           kTransactions, kObservedFrames>;
+
+bool runBatch(m5hal::spi::SpiSlaveAccessor& accessor)
 {
-    spi_bus_config_t buscfg = {};
-    buscfg.mosi_io_num      = PIN_MOSI;
-    buscfg.miso_io_num      = PIN_MISO;
-    buscfg.sclk_io_num      = PIN_CLK;
-    buscfg.quadwp_io_num    = -1;
-    buscfg.quadhd_io_num    = -1;
-    buscfg.max_transfer_sz  = BUF_SIZE;
-
-    spi_slave_interface_config_t slvcfg = {};
-    slvcfg.mode                         = 0;
-    slvcfg.spics_io_num                 = PIN_CS;
-    slvcfg.queue_size                   = 1;
-    slvcfg.flags                        = 0;
-
-    esp_err_t ret = spi_slave_initialize(SPI2_HOST, &buscfg, &slvcfg, SPI_DMA_CH_AUTO);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "spi_slave_initialize failed: %s", esp_err_to_name(ret));
-        return;
+    auto cleared_tx = accessor.clearTx();
+    auto cleared_rx = accessor.clearRx();
+    if (!cleared_tx.has_value() || !cleared_rx.has_value()) {
+        return false;
     }
-    rx_buf = static_cast<uint8_t*>(heap_caps_malloc(BUF_SIZE, MALLOC_CAP_DMA));
-    tx_buf = static_cast<uint8_t*>(heap_caps_malloc(BUF_SIZE, MALLOC_CAP_DMA));
-    if (rx_buf == nullptr || tx_buf == nullptr) {
-        ESP_LOGE(TAG, "DMA buffer alloc failed");
-        return;
+
+    uint8_t chunk[kLength];
+    uint8_t tx_counter = 0;
+    for (size_t transaction = 0; transaction < kTransactions; ++transaction) {
+        for (size_t i = 0; i < kLength; ++i) {
+            chunk[i] = tx_counter++;
+        }
+        auto queued = accessor.write({chunk, sizeof(chunk)});
+        if (!queued.has_value() || *queued != sizeof(chunk)) {
+            return false;
+        }
     }
-    ESP_LOGI(TAG, "SPI slave ready (CLK=%d MOSI=%d MISO=%d CS=%d)", PIN_CLK, PIN_MOSI, PIN_MISO, PIN_CS);
 
-    memset(tx_buf, 0xA5, BUF_SIZE);
-    memset(rx_buf, 0, BUF_SIZE);
+    auto begun = accessor.beginAccess(kTimeoutMs);
+    if (!begun.has_value()) {
+        ESP_LOGE(kTag, "beginAccess failed error=%d", static_cast<int>(begun.error()));
+        return false;
+    }
+    ESP_LOGI(kTag, "ARMED SPI_SLAVE_M5HAL");
 
-    for (;;) {
-        spi_slave_transaction_t t = {};
-        t.length                  = BUF_SIZE * 8;
-        t.rx_buffer               = rx_buf;
-        t.tx_buffer               = tx_buf;
+    const uint32_t started = m5hal::runtime::millis();
+    while (accessor.rxFrames().readableFrames() < kObservedFrames &&
+           m5hal::runtime::millis() - started < kTimeoutMs * 2) {
+        m5hal::runtime::delayMs(1);
+    }
+    auto ended = accessor.endAccess(kTimeoutMs);
+    if (!ended.has_value()) {
+        ESP_LOGE(kTag, "endAccess failed error=%d", static_cast<int>(ended.error()));
+        return false;
+    }
 
-        ret = spi_slave_transmit(SPI2_HOST, &t, portMAX_DELAY);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "spi_slave_transmit err: %s", esp_err_to_name(ret));
+    int previous_last = -1;
+    size_t intra_bad  = 0;
+    size_t inter_bad  = 0;
+    size_t received   = 0;
+    uint8_t rx[kLength];
+    while (received < kTransactions) {
+        auto frame = accessor.rxFrames().peekFrame();
+        if (frame.has_value() && received == 0 && frame->metadata.wire_bytes == 0 &&
+            frame->metadata.stored_bytes == 0) {
+            // ESP-IDF can report the first CS synchronization edge as an empty
+            // boundary. It is real boundary evidence, but not a data frame.
+            (void)accessor.rxFrames().popFrame();
             continue;
         }
+        if (!frame.has_value() || frame->metadata.wire_bytes != kLength || frame->metadata.stored_bytes != kLength) {
+            ESP_LOGE(kTag, "short/missing frame transaction=%u readable=%u cs=%d error=%d wire=%u stored=%u",
+                     static_cast<unsigned>(received), static_cast<unsigned>(accessor.rxFrames().readableFrames()),
+                     ::gpio_get_level(static_cast<::gpio_num_t>(kPinCs)),
+                     frame.has_value() ? 0 : static_cast<int>(frame.error()),
+                     frame.has_value() ? static_cast<unsigned>(frame->metadata.wire_bytes) : 0u,
+                     frame.has_value() ? static_cast<unsigned>(frame->metadata.stored_bytes) : 0u);
+            return false;
+        }
+        std::copy(frame->first.data, frame->first.data + frame->first.size, rx);
+        std::copy(frame->second.data, frame->second.data + frame->second.size, rx + frame->first.size);
+        if (!accessor.rxFrames().popFrame().has_value()) {
+            return false;
+        }
+        ++received;
 
-        size_t rx_bytes = t.trans_len / 8;
-        ESP_LOGI(TAG, "rx %zu bytes  tx[0..3]=%02x %02x %02x %02x  rx[0..3]=%02x %02x %02x %02x", rx_bytes, tx_buf[0],
-                 tx_buf[1], tx_buf[2], tx_buf[3], rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3]);
+        // Exclude the first data frame from continuity checks because no prior
+        // accepted frame exists yet.
+        if (received == 1) {
+            continue;
+        }
+        for (size_t i = 1; i < kLength; ++i) {
+            if (static_cast<uint8_t>(rx[i] - rx[i - 1]) != 1u) {
+                ++intra_bad;
+                break;
+            }
+        }
+        if (previous_last >= 0 && rx[0] != static_cast<uint8_t>(previous_last + 1)) {
+            ++inter_bad;
+        }
+        previous_last = rx[kLength - 1];
+    }
 
-        if (rx_bytes > 0 && rx_bytes <= BUF_SIZE) {
-            memcpy(tx_buf, rx_buf, rx_bytes);
+    ESP_LOGI(kTag, "RESULT SPI_SLAVE_M5HAL %s mode=%u len=%u transactions=%u received=%u intra_bad=%u inter_bad=%u",
+             received == kTransactions && intra_bad == 0 && inter_bad == 0 ? "PASS" : "FAIL",
+             static_cast<unsigned>(kMode), static_cast<unsigned>(kLength), static_cast<unsigned>(kTransactions),
+             static_cast<unsigned>(received), static_cast<unsigned>(intra_bad), static_cast<unsigned>(inter_bad));
+    return received == kTransactions && intra_bad == 0 && inter_bad == 0;
+}
+
+}  // namespace
+
+extern "C" void app_main()
+{
+    auto claimed = m5hal::M5_Hal.SPI.claimController();
+    if (!claimed.has_value()) {
+        ESP_LOGE(kTag, "controller claim failed error=%d", static_cast<int>(claimed.error()));
+        return;
+    }
+
+    m5hal::spi::SlaveBusConfig config;
+    config.pin_clk    = kPinClk;
+    config.pin_mosi   = kPinMosi;
+    config.pin_miso   = kPinMiso;
+    config.pin_cs     = kPinCs;
+    config.spi_mode   = kMode;
+    config.controller = *claimed;
+
+    static m5hal::spi::SpiSlaveBus_espidf bus;
+    auto initialized = bus.init(config);
+    if (!initialized.has_value()) {
+        ESP_LOGE(kTag, "init failed error=%d", static_cast<int>(initialized.error()));
+        (void)m5hal::M5_Hal.SPI.releaseClaimedController(*claimed);
+        return;
+    }
+
+    static QueueStorage storage;
+    m5hal::spi::SlaveAccessConfig access_config;
+    access_config.transaction_bytes = kLength;
+    access_config.tx_mode           = m5hal::slave::QueueMode::Byte;
+    access_config.rx_mode           = m5hal::slave::QueueMode::Frame;
+    m5hal::spi::SpiSlaveAccessor accessor{bus, storage.tx(), storage.rx(), access_config};
+    ESP_LOGI(kTag, "READY SPI_SLAVE_M5HAL clk=%d mosi=%d miso=%d cs=%d mode=%u len=%u transactions=%u", kPinClk,
+             kPinMosi, kPinMiso, kPinCs, static_cast<unsigned>(kMode), static_cast<unsigned>(kLength),
+             static_cast<unsigned>(kTransactions));
+
+    m5hal::runtime::delayMs(5000);
+    for (;;) {
+        if (!runBatch(accessor)) {
+            m5hal::runtime::delayMs(1000);
         }
     }
 }

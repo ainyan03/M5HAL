@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <limits>
 
+#include "../../../../../hal/v2/error.hpp"
 #include "../../../../../hal/v2/types.hpp"
 
 namespace m5::variants::frameworks::freertos::hal::v2::runtime {
@@ -28,13 +29,16 @@ public:
     Task(const Task&)            = delete;
     Task& operator=(const Task&) = delete;
 
-    bool start(entry_fn_t fn, void* arg, const char* name = nullptr, size_t stack_size = 4096, int priority = 1,
-               int core = ::m5::hal::v2::types::TASK_CORE_ANY)
+    ::m5::hal::v2::result_t<void> start(entry_fn_t fn, void* arg, const char* name = nullptr, size_t stack_size = 4096,
+                                        int priority = 1, int core = ::m5::hal::v2::types::TASK_CORE_ANY)
     {
-        if (joinable() || fn == nullptr || stack_size == 0 || stack_size > std::numeric_limits<uint32_t>::max() ||
-            priority < 0 || priority >= static_cast<int>(configMAX_PRIORITIES) ||
-            core < ::m5::hal::v2::types::TASK_CORE_SAME || core >= static_cast<int>(portNUM_PROCESSORS)) {
-            return false;
+        if (fn == nullptr || stack_size == 0 || stack_size > std::numeric_limits<uint32_t>::max() || priority < 0 ||
+            priority >= static_cast<int>(configMAX_PRIORITIES) || core < ::m5::hal::v2::types::TASK_CORE_SAME ||
+            core >= static_cast<int>(portNUM_PROCESSORS)) {
+            return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::INVALID_ARGUMENT);
+        }
+        if (joinable()) {
+            return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::INVALID_STATE);
         }
 
         _fn  = fn;
@@ -60,10 +64,10 @@ public:
             _done.store(true, std::memory_order_relaxed);
             _fn  = nullptr;
             _arg = nullptr;
-            return false;
+            return ::m5::stl::make_unexpected(::m5::hal::v2::error::error_t::OUT_OF_RESOURCE);
         }
         _handle = handle;
-        return true;
+        return {};
     }
 
     void join(void)

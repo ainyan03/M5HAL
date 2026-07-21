@@ -23,7 +23,10 @@ struct SPIBusConfig : public BusConfig {
 #pragma clang diagnostic ignored "-Wnested-anon-types"
 #endif
     union {
-        interface::gpio::Pin* pins[9];
+        // 10 entries: must cover every named member below (clk, dc, mosi,
+        // miso, d2..d7); a shorter array silently drops the tail from
+        // pins[]-based iteration.
+        interface::gpio::Pin* pins[10];
         struct {
             interface::gpio::Pin* pin_clk;
             interface::gpio::Pin* pin_dc;

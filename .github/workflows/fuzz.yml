@@ -1,0 +1,37 @@
+name: fuzz
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: libFuzzer iterations per target
+        default: "100000"
+        required: false
+  schedule:
+    - cron: "23 3 * * 1"
+
+jobs:
+  native-fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: M5HAL
+      - uses: actions/checkout@v6
+        with:
+          repository: m5stack/M5Utility
+          ref: develop
+          path: M5Utility
+      - name: Run bounded ASan and UBSan fuzzers
+        working-directory: M5HAL
+        env:
+          FUZZ_RUNS: ${{ github.event.inputs.runs || (github.event_name == 'schedule' && '100000') || '2000' }}
+        run: bash scripts/fuzz-test.sh
+      - name: Retain crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: fuzz-reproducers
+          path: M5HAL/.generated/fuzz/artifacts

@@ -2,7 +2,8 @@
 //
 // Host POSIX UART variant round-trip test. Uses a pseudo-terminal (pty) as a
 // loopback "serial cable": the test owns the master end, the M5HAL posix UART
-// Bus is attached to the slave end, and bytes are exchanged both ways.
+// Bus is initialized with a borrowed slave descriptor, and bytes are exchanged
+// both ways.
 //
 // A pty (not socketpair) is required because the variant configures the line
 // via termios (tcsetattr), which only succeeds on a tty. We open the pty with
@@ -33,16 +34,24 @@ using ::m5::hal::v2::result_t;
 
 namespace {
 
-namespace uart  = ::m5::hal::v2::uart;
-namespace data  = ::m5::hal::v2::data;
-namespace error = ::m5::hal::v2::error;
+namespace uart   = ::m5::hal::v2::uart;
+namespace data   = ::m5::hal::v2::data;
+namespace error  = ::m5::hal::v2::error;
+namespace native = ::m5::hal::v2::native;
+namespace v2     = ::m5::hal::v2;
 
-// The posix variant never reads the pin fields (`device_path` is
-// the connection identity), so it deliberately does NOT inherit the
-// tag-pin constructors — a one-line pin construction would only look
-// complete while leaving `device_path` unset.
-static_assert(!std::is_constructible<uart::BusConfig_posix, uart::Tx, uart::Rx>::value,
-              "posix config must not expose the tag-pin ctors");
+error::error_t initBorrowed(uart::Bus_posix& bus, int fd)
+{
+    uart::NativeFd native_fd{fd};
+    auto initialized = bus.init(uart::BusConfig{}, native::borrowed(native_fd));
+    return initialized.has_value() ? error::error_t::OK : initialized.error();
+}
+
+error::error_t initManaged(uart::Bus_posix& bus, const char* path, uart::NativeOptions options = {})
+{
+    auto initialized = bus.init(uart::BusConfig{}, native::managed(uart::NativePath{path}, options));
+    return initialized.has_value() ? error::error_t::OK : initialized.error();
+}
 
 // Block until fd is readable for up to timeout_ms. Returns true if readable.
 bool waitReadable(int fd, uint32_t timeout_ms)
@@ -105,18 +114,137 @@ uart::AccessConfig makeConfig()
     return cfg;
 }
 
-TEST(PosixUART, AttachAndConfigure)
+bool sameTermios(const struct termios& lhs, const struct termios& rhs)
+{
+#if defined(PENDIN)
+    // PENDIN is kernel-maintained queue state, not persistent line
+    // configuration. macOS PTYs may set it after tcsetattr restores lflag.
+    constexpr tcflag_t kComparableLflagMask = ~static_cast<tcflag_t>(PENDIN);
+#else
+    constexpr tcflag_t kComparableLflagMask = ~static_cast<tcflag_t>(0);
+#endif
+    return lhs.c_iflag == rhs.c_iflag && lhs.c_oflag == rhs.c_oflag && lhs.c_cflag == rhs.c_cflag &&
+           (lhs.c_lflag & kComparableLflagMask) == (rhs.c_lflag & kComparableLflagMask) &&
+           ::memcmp(lhs.c_cc, rhs.c_cc, sizeof(lhs.c_cc)) == 0 && ::cfgetispeed(&lhs) == ::cfgetispeed(&rhs) &&
+           ::cfgetospeed(&lhs) == ::cfgetospeed(&rhs);
+}
+
+TEST(PosixUART, BorrowedInitDuplicatesAndConfigures)
 {
     PtyPair pty;
     ASSERT_TRUE(pty.open()) << "failed to open pty pair";
 
     uart::Bus_posix bus;
-    ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
-    EXPECT_EQ(bus.nativeHandle(), pty.slave);
+    ASSERT_EQ(initBorrowed(bus, pty.slave), error::error_t::OK);
+    EXPECT_NE(bus.nativeHandle(), pty.slave);
+    EXPECT_GE(bus.nativeHandle(), 0);
 
     auto cfg = makeConfig();
     uart::Accessor dev{bus, cfg};
     ASSERT_TRUE(dev.setConfig(cfg).has_value());
+}
+
+TEST(PosixUARTClose, RestoresTermiosAndAllowsDirectAttachReuse)
+{
+    PtyPair pty;
+    ASSERT_TRUE(pty.open()) << "failed to open pty pair";
+    struct termios original;
+    ASSERT_EQ(::tcgetattr(pty.slave, &original), 0);
+
+    uart::Bus_posix bus;
+    ASSERT_EQ(initBorrowed(bus, pty.slave), error::error_t::OK);
+    auto closed = bus.close();
+    ASSERT_TRUE(closed.has_value()) << "err=" << error::toString(closed.error());
+
+    struct termios restored;
+    ASSERT_EQ(::tcgetattr(pty.slave, &restored), 0);
+    EXPECT_TRUE(sameTermios(original, restored));
+
+    ASSERT_EQ(initBorrowed(bus, pty.slave), error::error_t::OK);
+    uart::AccessConfig cfg = makeConfig();
+    uart::TxAccessor tx{bus, cfg};
+    auto begun = tx.beginAccess(0);
+    ASSERT_TRUE(begun.has_value()) << "err=" << error::toString(begun.error());
+    auto ended = tx.endAccess(0);
+    ASSERT_TRUE(ended.has_value()) << "err=" << error::toString(ended.error());
+    auto reclosed = bus.close();
+    ASSERT_TRUE(reclosed.has_value()) << "err=" << error::toString(reclosed.error());
+}
+
+TEST(PosixUARTClose, TermiosRestoreFailureIsNoMutationAndRetries)
+{
+    PtyPair pty;
+    ASSERT_TRUE(pty.open()) << "failed to open pty pair";
+    uart::Bus_posix bus;
+    ASSERT_EQ(initBorrowed(bus, pty.slave), error::error_t::OK);
+
+    ASSERT_EQ(::close(bus.nativeHandle()), 0);
+    auto first = bus.close();
+    ASSERT_FALSE(first.has_value());
+    EXPECT_EQ(first.error(), error::error_t::IO_ERROR);
+    auto retried = bus.close();
+    ASSERT_FALSE(retried.has_value());
+    EXPECT_EQ(retried.error(), error::error_t::IO_ERROR);
+}
+
+TEST(PosixUARTClose, AmbiguousOwnedFdCloseQuarantinesAndRetainsTokenForRetry)
+{
+    PtyPair pty;
+    ASSERT_TRUE(pty.open()) << "failed to open pty pair";
+    const int owned_fd = ::dup(pty.slave);
+    ASSERT_GE(owned_fd, 0);
+
+    v2::bus::FixedNativeInterner<v2::bus::NativeIdentity, v2::bus::BusRegistry::kCapacity> interner;
+    auto identity = v2::bus::NativeIdentity::make(v2::bus::NativeIdentityKind::PosixDevice, {1, 2, 3});
+    ASSERT_TRUE(identity.has_value()) << "err=" << error::toString(identity.error());
+    auto token = interner.intern(identity.value());
+    ASSERT_TRUE(token.has_value()) << "err=" << error::toString(token.error());
+
+    uart::Bus_posix bus;
+    uart::IBusConfig cfg;
+    auto adopted = bus.adoptOwnedNative(owned_fd, cfg, 0, interner, token.value());
+    ASSERT_TRUE(adopted.has_value()) << "err=" << error::toString(adopted.error());
+    ASSERT_EQ(::close(owned_fd), 0);
+
+    auto first = bus.close();
+    ASSERT_FALSE(first.has_value());
+    EXPECT_EQ(first.error(), error::error_t::IO_ERROR);
+    uart::AccessConfig access_cfg = makeConfig();
+    uart::TxAccessor tx{bus, access_cfg};
+    auto rejected = tx.beginAccess(0);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error(), error::error_t::CLOSED);
+
+    auto retried = bus.close();
+    ASSERT_TRUE(retried.has_value()) << "err=" << error::toString(retried.error());
+    auto released = interner.resolve(token.value());
+    ASSERT_FALSE(released.has_value());
+    EXPECT_EQ(released.error(), error::error_t::INVALID_STATE);
+}
+
+TEST(PosixUARTClose, ManagedAndBorrowedInitCanReopenAClosedDirectBus)
+{
+    PtyPair pty;
+    ASSERT_TRUE(pty.open()) << "failed to open pty pair";
+    const char* path = ::ptsname(pty.master);
+    ASSERT_NE(path, nullptr);
+
+    uart::Bus_posix bus;
+    auto initialized = bus.init(uart::BusConfig{}, native::managed(uart::NativePath{path}));
+    ASSERT_TRUE(initialized.has_value()) << "err=" << error::toString(initialized.error());
+    auto init_closed = bus.close();
+    ASSERT_TRUE(init_closed.has_value()) << "err=" << error::toString(init_closed.error());
+
+    ASSERT_EQ(initManaged(bus, path), error::error_t::OK);
+    auto managed_closed = bus.close();
+    ASSERT_TRUE(managed_closed.has_value()) << "err=" << error::toString(managed_closed.error());
+
+    ASSERT_EQ(initBorrowed(bus, pty.slave), error::error_t::OK);
+    auto borrowed_closed = bus.close();
+    ASSERT_TRUE(borrowed_closed.has_value()) << "err=" << error::toString(borrowed_closed.error());
+
+    initialized = bus.init(uart::BusConfig{}, native::managed(uart::NativePath{path}));
+    ASSERT_TRUE(initialized.has_value()) << "err=" << error::toString(initialized.error());
 }
 
 TEST(PosixUART, WriteReachesMaster)
@@ -125,7 +253,7 @@ TEST(PosixUART, WriteReachesMaster)
     ASSERT_TRUE(pty.open());
 
     uart::Bus_posix bus;
-    ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
+    ASSERT_EQ(initBorrowed(bus, pty.slave), error::error_t::OK);
     auto cfg = makeConfig();
     uart::Accessor dev{bus, cfg};
     ASSERT_TRUE(dev.setConfig(cfg).has_value());
@@ -148,7 +276,7 @@ TEST(PosixUART, ReadReceivesFromMaster)
     ASSERT_TRUE(pty.open());
 
     uart::Bus_posix bus;
-    ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
+    ASSERT_EQ(initBorrowed(bus, pty.slave), error::error_t::OK);
     auto cfg = makeConfig();
     uart::Accessor dev{bus, cfg};
     ASSERT_TRUE(dev.setConfig(cfg).has_value());
@@ -171,7 +299,7 @@ TEST(PosixUART, ReadableBytesReportsPending)
     ASSERT_TRUE(pty.open());
 
     uart::Bus_posix bus;
-    ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
+    ASSERT_EQ(initBorrowed(bus, pty.slave), error::error_t::OK);
     auto cfg = makeConfig();
     uart::Accessor dev{bus, cfg};
     ASSERT_TRUE(dev.setConfig(cfg).has_value());
@@ -191,7 +319,7 @@ TEST(PosixUART, ReadTimesOutWhenIdle)
     ASSERT_TRUE(pty.open());
 
     uart::Bus_posix bus;
-    ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
+    ASSERT_EQ(initBorrowed(bus, pty.slave), error::error_t::OK);
     auto cfg                  = makeConfig();
     cfg.first_byte_timeout_ms = 50;  // keep the test quick
     uart::Accessor dev{bus, cfg};
@@ -203,7 +331,7 @@ TEST(PosixUART, ReadTimesOutWhenIdle)
     EXPECT_EQ(got.value(), static_cast<size_t>(0));
 }
 
-TEST(PosixUART, InitOwnsDevicePathUntilLazyOpen)
+TEST(PosixUART, ManagedInitOwnsDevicePathInput)
 {
     PtyPair pty;
     ASSERT_TRUE(pty.open());
@@ -214,10 +342,8 @@ TEST(PosixUART, InitOwnsDevicePathUntilLazyOpen)
     ASSERT_LT(::strlen(slave_name), sizeof(path));
     ::strcpy(path, slave_name);
 
-    uart::BusConfig_posix bus_cfg;
-    bus_cfg.device_path = path;
     uart::Bus_posix bus;
-    auto initialized = bus.init(bus_cfg);
+    auto initialized = bus.init(uart::BusConfig{}, native::managed(uart::NativePath{path}));
     ASSERT_TRUE(initialized.has_value()) << "err=" << error::toString(initialized.error());
 
     ::strcpy(path, "/invalid");
@@ -232,6 +358,180 @@ TEST(PosixUART, InitOwnsDevicePathUntilLazyOpen)
     EXPECT_EQ(::memcmp(got, tx, sizeof(tx)), 0);
 }
 
+TEST(PosixUARTNativeAcquire, ManagedPathReusesThePhysicalDevice)
+{
+    PtyPair pty;
+    ASSERT_TRUE(pty.open());
+    const char* slave_name = ::ptsname(pty.master);
+    ASSERT_NE(slave_name, nullptr);
+
+    v2::Hal hal;
+    ASSERT_TRUE(hal.init().has_value());
+    uart::BusConfig cfg;
+    auto first = hal.UART.acquire(cfg, native::managed(uart::NativePath{slave_name}));
+    ASSERT_TRUE(first.has_value()) << "err=" << error::toString(first.error());
+    auto second = hal.UART.acquire(cfg, native::managed(uart::NativePath{slave_name}));
+    ASSERT_TRUE(second.has_value()) << "err=" << error::toString(second.error());
+    EXPECT_EQ(first.value().get(), second.value().get());
+}
+
+TEST(PosixUARTNativeAcquire, BorrowedFdIsDuplicatedAndSurvivesCallerClose)
+{
+    PtyPair pty;
+    ASSERT_TRUE(pty.open());
+
+    v2::Hal hal;
+    ASSERT_TRUE(hal.init().has_value());
+    uart::BusConfig cfg;
+    uart::NativeFd caller_fd{pty.slave};
+    auto acquired = hal.UART.acquire(cfg, native::borrowed(caller_fd));
+    ASSERT_TRUE(acquired.has_value()) << "err=" << error::toString(acquired.error());
+
+    ASSERT_EQ(::close(pty.slave), 0);
+    pty.slave = -1;
+
+    auto access_cfg = makeConfig();
+    uart::Accessor dev{acquired.value(), access_cfg};
+    const uint8_t bytes[] = {0x72, 0x31};
+    auto written          = dev.write(data::ConstDataSpan{bytes, sizeof(bytes)});
+    ASSERT_TRUE(written.has_value()) << "err=" << error::toString(written.error());
+    ASSERT_TRUE(waitReadable(pty.master, 1000));
+    uint8_t received[sizeof(bytes)] = {};
+    ASSERT_EQ(::read(pty.master, received, sizeof(received)), static_cast<ssize_t>(sizeof(received)));
+    EXPECT_EQ(::memcmp(received, bytes, sizeof(bytes)), 0);
+}
+
+TEST(PosixUARTNativeAcquire, BorrowedFdReusesThePhysicalDevice)
+{
+    PtyPair pty;
+    ASSERT_TRUE(pty.open());
+
+    v2::Hal hal;
+    ASSERT_TRUE(hal.init().has_value());
+    uart::BusConfig cfg;
+    uart::NativeFd caller_fd{pty.slave};
+    auto first = hal.UART.acquire(cfg, native::borrowed(caller_fd));
+    ASSERT_TRUE(first.has_value()) << "err=" << error::toString(first.error());
+    auto second = hal.UART.acquire(cfg, native::borrowed(caller_fd));
+    ASSERT_TRUE(second.has_value()) << "err=" << error::toString(second.error());
+    EXPECT_EQ(first.value().get(), second.value().get());
+}
+
+TEST(PosixUARTNativeAcquire, BusKeepsNativeInternerAliveAfterHalAndDomainDestruction)
+{
+    PtyPair pty;
+    ASSERT_TRUE(pty.open());
+    std::shared_ptr<uart::IBus> acquired;
+    {
+        v2::ResourceDomain domain;
+        v2::Hal hal{domain};
+        ASSERT_TRUE(hal.init().has_value());
+        uart::BusConfig cfg;
+        uart::NativeFd caller_fd{pty.slave};
+        auto result = hal.UART.acquire(cfg, native::borrowed(caller_fd));
+        ASSERT_TRUE(result.has_value()) << "err=" << error::toString(result.error());
+        acquired = std::move(result.value());
+    }
+
+    {
+        auto access_cfg = makeConfig();
+        uart::Accessor dev{acquired, access_cfg};
+        const uint8_t byte = 0x4D;
+        auto written       = dev.write(data::ConstDataSpan{&byte, 1});
+        ASSERT_TRUE(written.has_value()) << "err=" << error::toString(written.error());
+        ASSERT_TRUE(waitReadable(pty.master, 1000));
+        uint8_t received = 0;
+        ASSERT_EQ(::read(pty.master, &received, 1), 1);
+        EXPECT_EQ(received, byte);
+    }
+
+    // Destruction dereferences the saved interner pointer to release its
+    // token. ASan and this non-crashing teardown fix the lifetime contract.
+    acquired.reset();
+}
+
+TEST(PosixUARTNativeAcquire, ReusedDescriptorNumberDoesNotAliasTheOldDevice)
+{
+    PtyPair first_pty;
+    PtyPair second_pty;
+    ASSERT_TRUE(first_pty.open());
+    ASSERT_TRUE(second_pty.open());
+
+    v2::Hal hal;
+    ASSERT_TRUE(hal.init().has_value());
+    uart::BusConfig cfg;
+    const int reused_number = first_pty.slave;
+    uart::NativeFd descriptor{reused_number};
+    auto first = hal.UART.acquire(cfg, native::borrowed(descriptor));
+    ASSERT_TRUE(first.has_value()) << "err=" << error::toString(first.error());
+
+    ASSERT_EQ(::close(first_pty.slave), 0);
+    first_pty.slave = -1;
+    ASSERT_EQ(::dup2(second_pty.slave, reused_number), reused_number);
+    auto second = hal.UART.acquire(cfg, native::borrowed(descriptor));
+    ASSERT_TRUE(second.has_value()) << "err=" << error::toString(second.error());
+    EXPECT_NE(first.value().get(), second.value().get());
+    ASSERT_EQ(::close(reused_number), 0);
+}
+
+TEST(PosixUARTNativeAcquire, OwnershipAndOptionsAreExactBindingInputs)
+{
+    PtyPair pty;
+    ASSERT_TRUE(pty.open());
+    const char* slave_name = ::ptsname(pty.master);
+    ASSERT_NE(slave_name, nullptr);
+
+    v2::Hal hal;
+    ASSERT_TRUE(hal.init().has_value());
+    uart::BusConfig cfg;
+    auto managed = hal.UART.acquire(cfg, native::managed(uart::NativePath{slave_name}, uart::NativeOptions{64}));
+    ASSERT_TRUE(managed.has_value()) << "err=" << error::toString(managed.error());
+
+    auto different_options =
+        hal.UART.acquire(cfg, native::managed(uart::NativePath{slave_name}, uart::NativeOptions{32}));
+    ASSERT_FALSE(different_options.has_value());
+    EXPECT_EQ(different_options.error(), error::error_t::INVALID_STATE);
+
+    auto different_config = cfg;
+    different_config.rx_buffer_size += 1;
+    auto incompatible_config =
+        hal.UART.acquire(different_config, native::managed(uart::NativePath{slave_name}, uart::NativeOptions{64}));
+    ASSERT_FALSE(incompatible_config.has_value());
+    EXPECT_EQ(incompatible_config.error(), error::error_t::INVALID_STATE);
+
+    uart::NativeFd caller_fd{pty.slave};
+    auto borrowed = hal.UART.acquire(cfg, native::borrowed(caller_fd));
+    ASSERT_FALSE(borrowed.has_value());
+    EXPECT_EQ(borrowed.error(), error::error_t::INVALID_STATE);
+}
+
+TEST(PosixUARTNativeAcquire, RejectsInvalidNativeInputs)
+{
+    v2::Hal hal;
+    ASSERT_TRUE(hal.init().has_value());
+    uart::BusConfig cfg;
+
+    uart::NativeFd invalid_fd{-1};
+    auto borrowed = hal.UART.acquire(cfg, native::borrowed(invalid_fd));
+    ASSERT_FALSE(borrowed.has_value());
+    EXPECT_EQ(borrowed.error(), error::error_t::INVALID_ARGUMENT);
+
+    auto managed = hal.UART.acquire(cfg, native::managed(uart::NativePath{"/m5hal/not/a/device"}));
+    ASSERT_FALSE(managed.has_value());
+    EXPECT_EQ(managed.error(), error::error_t::INVALID_ARGUMENT);
+
+    auto oversized =
+        hal.UART.acquire(cfg, native::managed(uart::NativePath{"/dev/null"},
+                                              uart::NativeOptions{uart::NativeOptions::kMaxTxCoalesceBytes + 1}));
+    ASSERT_FALSE(oversized.has_value());
+    EXPECT_EQ(oversized.error(), error::error_t::INVALID_ARGUMENT);
+
+    cfg.pin_tx       = 1;
+    auto nonportable = hal.UART.acquire(cfg, native::managed(uart::NativePath{"/dev/null"}));
+    ASSERT_FALSE(nonportable.has_value());
+    EXPECT_EQ(nonportable.error(), error::error_t::INVALID_ARGUMENT);
+}
+
 // End-to-end Stream adapter checks: the RX accessor consumed as a
 // `Source` (StreamSource) and the TX accessor fed as a `Sink`
 // (StreamSink), over a real posix UART Bus on a pty.
@@ -241,7 +541,7 @@ TEST(PosixUART, StreamSourcePullsFromRxAccessor)
     ASSERT_TRUE(pty.open());
 
     uart::Bus_posix bus;
-    ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
+    ASSERT_EQ(initBorrowed(bus, pty.slave), error::error_t::OK);
     auto cfg = makeConfig();
     uart::Accessor dev{bus, cfg};
     ASSERT_TRUE(dev.setConfig(cfg).has_value());
@@ -273,7 +573,7 @@ TEST(PosixUART, StreamSourceReturnsEmptyWhenIdle)
     ASSERT_TRUE(pty.open());
 
     uart::Bus_posix bus;
-    ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
+    ASSERT_EQ(initBorrowed(bus, pty.slave), error::error_t::OK);
     auto cfg                  = makeConfig();
     cfg.first_byte_timeout_ms = 50;  // keep the test quick
     uart::Accessor dev{bus, cfg};
@@ -295,7 +595,7 @@ TEST(PosixUART, StreamSinkPushesToTxAccessor)
     ASSERT_TRUE(pty.open());
 
     uart::Bus_posix bus;
-    ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
+    ASSERT_EQ(initBorrowed(bus, pty.slave), error::error_t::OK);
     auto cfg = makeConfig();
     uart::Accessor dev{bus, cfg};
     ASSERT_TRUE(dev.setConfig(cfg).has_value());
@@ -330,7 +630,7 @@ TEST(PosixUART, FrameReaderExtractsFramesFromUART)
     ASSERT_TRUE(pty.open());
 
     uart::Bus_posix bus;
-    ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
+    ASSERT_EQ(initBorrowed(bus, pty.slave), error::error_t::OK);
     auto cfg = makeConfig();
     uart::Accessor dev{bus, cfg};
     ASSERT_TRUE(dev.setConfig(cfg).has_value());
@@ -370,7 +670,7 @@ TEST(PosixUART, FrameWriterTransmitsFramesOverUART)
     ASSERT_TRUE(pty.open());
 
     uart::Bus_posix bus;
-    ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
+    ASSERT_EQ(initBorrowed(bus, pty.slave), error::error_t::OK);
     auto cfg = makeConfig();
     uart::Accessor dev{bus, cfg};
     ASSERT_TRUE(dev.setConfig(cfg).has_value());
@@ -411,7 +711,7 @@ TEST(PosixUART, BytecodeRoundtripOverFramedUART)
     ASSERT_TRUE(pty.open());
 
     uart::Bus_posix bus;
-    ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
+    ASSERT_EQ(initBorrowed(bus, pty.slave), error::error_t::OK);
     auto cfg = makeConfig();
     uart::Accessor dev{bus, cfg};
     ASSERT_TRUE(dev.setConfig(cfg).has_value());
@@ -526,7 +826,7 @@ TEST(PosixUART, ListSerialPortsSmoke)
 TEST(PosixUART, OpenMissingDeviceReportsIoError)
 {
     uart::Bus_posix bus;
-    EXPECT_EQ(bus.open("/dev/m5hal-this-device-should-not-exist", 115200), error::error_t::IO_ERROR);
+    EXPECT_EQ(initManaged(bus, "/dev/m5hal-this-device-should-not-exist"), error::error_t::IO_ERROR);
 }
 
 TEST(PosixUART, AttachNonTtyReportsIoError)
@@ -535,7 +835,7 @@ TEST(PosixUART, AttachNonTtyReportsIoError)
     ASSERT_EQ(::pipe(fds), 0);
 
     uart::Bus_posix bus;
-    EXPECT_EQ(bus.attach(fds[0]), error::error_t::IO_ERROR);
+    EXPECT_EQ(initBorrowed(bus, fds[0]), error::error_t::IO_ERROR);
 
     ::close(fds[0]);
     ::close(fds[1]);
@@ -568,7 +868,7 @@ TEST(PosixUART, AcceptsHighBaudRates)
         PtyPair pty;
         ASSERT_TRUE(pty.open());
         uart::Bus_posix bus;
-        ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
+        ASSERT_EQ(initBorrowed(bus, pty.slave), error::error_t::OK);
         auto cfg      = makeConfig();
         cfg.baud_rate = b;
         uart::Accessor dev{bus, cfg};
@@ -630,7 +930,7 @@ TEST(PosixUART, ReconfigureAppliesWhenChannelsAreQuiescent)
     ASSERT_TRUE(pty.open());
 
     uart::Bus_posix bus;
-    ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
+    ASSERT_EQ(initBorrowed(bus, pty.slave), error::error_t::OK);
 
     auto cfg_a = makeConfig();
     uart::TxAccessor tx{bus, cfg_a};
@@ -647,11 +947,10 @@ TEST(PosixUART, ReconfigureAppliesWhenChannelsAreQuiescent)
     EXPECT_EQ(bus.reconfigSkips(), 0u);
 }
 
-// T2: an open RX access window (on a SEPARATE accessor from TX, not its
-// combined-lock peer) makes a concurrent TX reconfigure not-granted (the
-// transfer still succeeds, using the config already in effect); once the
-// window closes the same pending config applies without counting a further
-// skip. This is decided by the same-task guard (step 2 of
+// T2: an open RX access window makes a concurrent TX reconfigure fail
+// explicitly with BUSY; bytes are never sent under the stale configuration.
+// Once the window closes the same requested config applies. This is decided
+// by the same-task guard (step 2 of
 // IBus::tryAcquireOppositeChannel): both accessors run on this
 // one test thread, so the RX channel's lock-task slot matches the calling
 // task id while its owner is neither `tx` nor `tx`'s lock peer, and the
@@ -663,7 +962,7 @@ TEST(PosixUART, ReconfigureSkipsWhenOppositeChannelBusy)
     ASSERT_TRUE(pty.open());
 
     uart::Bus_posix bus;
-    ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
+    ASSERT_EQ(initBorrowed(bus, pty.slave), error::error_t::OK);
 
     auto cfg_a = makeConfig();
     uart::RxAccessor rx{bus, cfg_a};
@@ -684,8 +983,8 @@ TEST(PosixUART, ReconfigureSkipsWhenOppositeChannelBusy)
     ASSERT_TRUE(tx.setConfig(cfg_b).has_value());
     const uint8_t probe[] = {0x11};
     auto written          = tx.write(data::ConstDataSpan{probe, sizeof(probe)});
-    ASSERT_TRUE(written.has_value()) << "err=" << error::toString(written.error());
-    EXPECT_EQ(written.value(), sizeof(probe));  // transfer proceeds with the still-applied config
+    ASSERT_FALSE(written.has_value());
+    EXPECT_EQ(written.error(), error::error_t::BUSY);
     EXPECT_EQ(bus.reconfigSkips(), 1u);
 
     ASSERT_TRUE(rx.endAccess().has_value());
@@ -697,24 +996,16 @@ TEST(PosixUART, ReconfigureSkipsWhenOppositeChannelBusy)
     EXPECT_EQ(bus.reconfigSkips(), 1u);
 }
 
-// T3: a combined uart::Accessor::transfer() call holds both channels itself
-// (via two SEPARATE per-channel owners, _tx and _rx -- see
-// uart::Accessor::beginAccess), but the two are wired as each other's lock
-// peer (bus::IAccessor::lockPeer, set by uart::Accessor's ctor). The
-// write-half's gate check (entered=Tx, opposite=Rx) sees `_rx_lock_owner ==
-// &_rx == owner->lockPeer()`, so step 1 (self/peer hold) grants it directly
-// -- no try-lock, no skip. The read-half's gate check (entered=Rx,
-// opposite=Tx) likewise sees the SAME owner (&_tx) directly on
-// `_tx_lock_owner`, so step 1 fires there too. Net effect: the new config
-// applies with zero skips, and it is already in effect for the write half
-// of this very transfer (not just the read half).
+// T3: both children of a combined accessor request one identical line
+// configuration. TX applies it at beginOperation and RX observes the same
+// applied config, so both operation starts succeed without a reconfigure.
 TEST(PosixUART, ReconfigureViaCombinedAccessorApplies)
 {
     PtyPair pty;
     ASSERT_TRUE(pty.open());
 
     uart::Bus_posix bus;
-    ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
+    ASSERT_EQ(initBorrowed(bus, pty.slave), error::error_t::OK);
 
     auto cfg_a = makeConfig();
     uart::Accessor dev{bus, cfg_a};
@@ -742,6 +1033,26 @@ TEST(PosixUART, ReconfigureViaCombinedAccessorApplies)
     EXPECT_EQ(bus.reconfigSkips(), 0u);
 }
 
+TEST(PosixUART, CombinedAccessorRejectsDivergentChildLineConfigs)
+{
+    PtyPair pty;
+    ASSERT_TRUE(pty.open());
+
+    uart::Bus_posix bus;
+    ASSERT_EQ(initBorrowed(bus, pty.slave), error::error_t::OK);
+    auto cfg = makeConfig();
+    uart::Accessor dev{bus, cfg};
+    auto rx_cfg      = cfg;
+    rx_cfg.baud_rate = 9600;
+    ASSERT_TRUE(dev.rx().setConfig(rx_cfg).has_value());
+
+    auto begun = dev.beginAccess(0);
+    ASSERT_FALSE(begun.has_value());
+    EXPECT_EQ(begun.error(), error::error_t::BUSY);
+    EXPECT_FALSE(dev.inAccess());
+    EXPECT_EQ(bus.reconfigSkips(), 1u);
+}
+
 // T5: a genuine CROSS-THREAD hold of the opposite channel (a different task,
 // as opposed to T2's same-thread/different-accessor case) is the only
 // scenario that reaches step 3 of IBus::tryAcquireOppositeChannel (the
@@ -757,7 +1068,7 @@ TEST(PosixUART, ReconfigureSkipsWhenOppositeHeldByAnotherThread)
     ASSERT_TRUE(pty.open());
 
     uart::Bus_posix bus;
-    ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
+    ASSERT_EQ(initBorrowed(bus, pty.slave), error::error_t::OK);
 
     auto cfg_a = makeConfig();
     uart::RxAccessor rx{bus, cfg_a};
@@ -786,14 +1097,14 @@ TEST(PosixUART, ReconfigureSkipsWhenOppositeHeldByAnotherThread)
     // same-task guard (step 2) does not fire here -- the RX lock-task slot
     // holds `other`'s task id, not this (main) thread's -- so the gate falls
     // through to the non-blocking try-lock (step 3), which fails because
-    // `other` genuinely holds the RX mutex. Not granted -> skip.
+    // `other` genuinely holds the RX mutex. Not granted -> BUSY.
     auto cfg_b      = cfg_a;
     cfg_b.baud_rate = 9600;
     ASSERT_TRUE(tx.setConfig(cfg_b).has_value());
     const uint8_t probe[] = {0x11};
     auto written          = tx.write(data::ConstDataSpan{probe, sizeof(probe)});
-    ASSERT_TRUE(written.has_value()) << "err=" << error::toString(written.error());
-    EXPECT_EQ(written.value(), sizeof(probe));  // transfer proceeds with the still-applied config
+    ASSERT_FALSE(written.has_value());
+    EXPECT_EQ(written.error(), error::error_t::BUSY);
     EXPECT_EQ(bus.reconfigSkips(), 1u);
 
     may_close_promise.set_value();
@@ -806,37 +1117,34 @@ TEST(PosixUART, ReconfigureSkipsWhenOppositeHeldByAnotherThread)
     EXPECT_EQ(bus.reconfigSkips(), 1u);
 }
 
-// T4: TX-side coalescing defers small writes; an RX-side readableBytes()
-// flushes the pending bytes before it reports (posix Bus_posix::flushCoalesced,
-// B12). A fresh Bus_posix is init()'d with coalescing enabled and then
-// attach()'d to the pty slave (init() sets _tx_coalesce; attach() adopts the
-// fd without touching it — see Bus_posix::release()).
+// T4: TX-side coalescing batches writes within an explicit Access. Closing
+// the Access flushes pending bytes from the backend endOperation hook. A
+// fresh Bus_posix is initialized through the managed native policy with
+// coalescing enabled.
 TEST(PosixUART, CoalesceFlushesOnRxReadableBytes)
 {
     PtyPair pty;
     ASSERT_TRUE(pty.open());
 
-    uart::BusConfig_posix bus_cfg;
-    bus_cfg.tx_coalesce_bytes = 64;
     uart::Bus_posix bus;
-    ASSERT_TRUE(bus.init(bus_cfg).has_value());
-    ASSERT_EQ(bus.attach(pty.slave), error::error_t::OK);
+    const char* path = ::ptsname(pty.master);
+    ASSERT_NE(path, nullptr);
+    ASSERT_EQ(initManaged(bus, path, uart::NativeOptions{64}), error::error_t::OK);
 
     auto cfg = makeConfig();
     uart::Accessor dev{bus, cfg};
     ASSERT_TRUE(dev.setConfig(cfg).has_value());
 
     const uint8_t pat[] = {0x9A, 0x9B, 0x9C};
-    auto written        = dev.write(data::ConstDataSpan{pat, sizeof(pat)});
+    ASSERT_TRUE(dev.tx().beginAccess().has_value());
+    auto written = dev.write(data::ConstDataSpan{pat, sizeof(pat)});
     ASSERT_TRUE(written.has_value());
     EXPECT_EQ(written.value(), sizeof(pat));
 
     // Not yet on the wire: still sitting in the coalescing buffer.
     EXPECT_FALSE(waitReadable(pty.master, 50));
 
-    // The RX-side readableBytes() call flushes the coalescing buffer first.
-    auto avail = dev.readableBytes();
-    ASSERT_TRUE(avail.has_value());
+    ASSERT_TRUE(dev.tx().endAccess().has_value());
 
     ASSERT_TRUE(waitReadable(pty.master, 1000)) << "coalesced bytes never reached the master";
     uint8_t got[16] = {};

@@ -20,30 +20,30 @@
 #endif
 #endif
 
-// Arduino only counts as an active bus config source when it is
+// Arduino only counts as an active bus provider when it is
 // arduino-esp32: this remote server implementation assumes ESP-IDF-family
 // SPI/Wire/task APIs underneath the Arduino surface (SPIClass layout,
 // pdMS_TO_TICKS/vTaskDelay/esp_restart). Other Arduino cores (RP2040 /
 // SAMD51, see _checker.hpp's variant allowlist) fall through to the
-// "!HAS_ACTIVE_BUS_CONFIG_" paths below instead.
+// "!HAS_ACTIVE_PROVIDER_" paths below instead.
 #if ((defined(M5HAL_FRAMEWORK_HAS_ARDUINO) && M5HAL_FRAMEWORK_HAS_ARDUINO) && defined(ESP_PLATFORM)) || \
     (defined(M5HAL_FRAMEWORK_HAS_ESPIDF) && M5HAL_FRAMEWORK_HAS_ESPIDF) ||                              \
     (defined(M5HAL_FRAMEWORK_HAS_POSIX) && M5HAL_FRAMEWORK_HAS_POSIX)
-#define M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ACTIVE_BUS_CONFIG_ 1
+#define M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ACTIVE_PROVIDER_ 1
 #else
-#define M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ACTIVE_BUS_CONFIG_ 0
+#define M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ACTIVE_PROVIDER_ 0
 #endif
 
 #if defined(M5HAL_FRAMEWORK_HAS_ARDUINO) && M5HAL_FRAMEWORK_HAS_ARDUINO && defined(ESP_PLATFORM)
-#define M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_BUS_CONFIG_ 1
+#define M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_PROVIDER_ 1
 #else
-#define M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_BUS_CONFIG_ 0
+#define M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_PROVIDER_ 0
 #endif
 
 #if defined(M5HAL_FRAMEWORK_HAS_ESPIDF) && M5HAL_FRAMEWORK_HAS_ESPIDF
-#define M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ESPIDF_BUS_CONFIG_ 1
+#define M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ESPIDF_PROVIDER_ 1
 #else
-#define M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ESPIDF_BUS_CONFIG_ 0
+#define M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ESPIDF_PROVIDER_ 0
 #endif
 
 namespace m5::hal::v2::remote {
@@ -145,7 +145,13 @@ bool sameI2SPins(data::ConstDataSpan cfg, types::gpio_number_t bclk, types::gpio
            static_cast<types::gpio_number_t>(readI16LE(cfg.data + 6)) == din;
 }
 
-#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_BUS_CONFIG_
+bool samePDMPins(data::ConstDataSpan cfg, types::gpio_number_t clk, types::gpio_number_t din)
+{
+    return cfg.size >= 4 && static_cast<types::gpio_number_t>(readI16LE(cfg.data)) == clk &&
+           static_cast<types::gpio_number_t>(readI16LE(cfg.data + 2)) == din;
+}
+
+#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_PROVIDER_
 bool isArduinoWireInUse(const ServerPhysicalBusPool& phys, ::TwoWire* wire)
 {
     for (size_t i = 0; i < kServerBusPoolSlots; ++i) {
@@ -221,11 +227,11 @@ void releasePhysI2C(ServerPhysicalBusPool& phys, int8_t index)
         if (slot.adopted) {
             return;
         }
-        (void)slot.bus.release();
+        (void)slot.bus.close();
         slot.used    = false;
         slot.adopted = false;
         slot.cfg_len = 0;
-#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_BUS_CONFIG_
+#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_PROVIDER_
         slot.arduino_wire = nullptr;
 #endif
     }
@@ -245,11 +251,11 @@ void releasePhysSPI(ServerPhysicalBusPool& phys, int8_t index)
         if (slot.adopted) {
             return;
         }
-        (void)slot.bus.release();
+        (void)slot.bus.close();
         slot.used    = false;
         slot.adopted = false;
         slot.cfg_len = 0;
-#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_BUS_CONFIG_
+#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_PROVIDER_
         slot.arduino_spi = nullptr;
 #endif
     }
@@ -266,7 +272,7 @@ void releasePhysUART(ServerPhysicalBusPool& phys, int8_t index)
     }
     --slot.refcount;
     if (slot.refcount == 0) {
-        (void)slot.bus.release();
+        (void)slot.bus.close();
         slot.used    = false;
         slot.cfg_len = 0;
     }
@@ -283,7 +289,23 @@ void releasePhysI2S(ServerPhysicalBusPool& phys, int8_t index)
     }
     --slot.refcount;
     if (slot.refcount == 0) {
-        (void)slot.bus.release();
+        (void)slot.bus.close();
+        slot.used    = false;
+        slot.cfg_len = 0;
+    }
+}
+
+void releasePhysPDM(ServerPhysicalBusPool& phys, int8_t index)
+{
+    if (index < 0 || static_cast<size_t>(index) >= kServerBusPoolSlots) {
+        return;
+    }
+    auto& slot = phys.pdm[static_cast<size_t>(index)];
+    if (!slot.used || slot.refcount == 0) {
+        return;
+    }
+    if (--slot.refcount == 0) {
+        (void)slot.bus.close();
         slot.used    = false;
         slot.cfg_len = 0;
     }
@@ -313,17 +335,28 @@ result_t<int8_t> acquirePhysI2C(ServerPhysicalBusPool& phys, data::ConstDataSpan
         if (slot.used) {
             continue;
         }
-#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_BUS_CONFIG_
+#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_PROVIDER_
         auto* wire = acquireArduinoWireProvider(phys);
         if (wire == nullptr) {
             return m5::stl::make_unexpected(error_t::OUT_OF_RESOURCE);
         }
-        i2c::BusConfig_arduino cfg{i2c::Scl{scl}, i2c::Sda{sda}};
-        cfg.wire = wire;
+        i2c::BusConfig cfg{i2c::Scl{scl}, i2c::Sda{sda}};
 #else
         i2c::BusConfig cfg{i2c::Scl{scl}, i2c::Sda{sda}};
 #endif
+
+#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_PROVIDER_
+        std::unique_ptr<i2c::IBus> backend{new (std::nothrow) i2c::Bus_arduino()};
+        if (!backend) {
+            return m5::stl::make_unexpected(error_t::OUT_OF_RESOURCE);
+        }
+        auto r = static_cast<i2c::Bus_arduino*>(backend.get())->init(cfg, native::borrowed(*wire));
+        if (r.has_value()) {
+            r = slot.bus.adoptPortableBackend(std::move(backend), cfg);
+        }
+#else
         auto r = slot.bus.init(cfg);
+#endif
         if (!r.has_value()) {
             return m5::stl::make_unexpected(r.error());
         }
@@ -331,7 +364,7 @@ result_t<int8_t> acquirePhysI2C(ServerPhysicalBusPool& phys, data::ConstDataSpan
         slot.adopted  = false;
         slot.refcount = 1;
         slot.used     = true;
-#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_BUS_CONFIG_
+#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_PROVIDER_
         slot.arduino_wire = wire;
 #endif
         M5HAL_DIAG("phys i2c create idx=%d scl=%d sda=%d", static_cast<int>(i), static_cast<int>(scl),
@@ -364,17 +397,27 @@ result_t<int8_t> acquirePhysSPI(ServerPhysicalBusPool& phys, data::ConstDataSpan
         if (slot.used) {
             continue;
         }
-#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_BUS_CONFIG_
+#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_PROVIDER_
         auto* spi = acquireArduinoSPIProvider(phys);
         if (spi == nullptr) {
             return m5::stl::make_unexpected(error_t::OUT_OF_RESOURCE);
         }
-        spi::BusConfig_arduino cfg{spi::Clk{clk}, spi::Mosi{mosi}, spi::Miso{miso}};
-        cfg.spi = spi;
+        spi::BusConfig cfg{spi::Clk{clk}, spi::Mosi{mosi}, spi::Miso{miso}};
 #else
         spi::BusConfig cfg{spi::Clk{clk}, spi::Mosi{mosi}, spi::Miso{miso}};
 #endif
+#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_PROVIDER_
+        std::unique_ptr<spi::IBus> backend{new (std::nothrow) spi::Bus_arduino()};
+        if (!backend) {
+            return m5::stl::make_unexpected(error_t::OUT_OF_RESOURCE);
+        }
+        auto r = static_cast<spi::Bus_arduino*>(backend.get())->init(cfg, native::borrowed(*spi));
+        if (r.has_value()) {
+            r = slot.bus.adoptPortableBackend(std::move(backend), cfg);
+        }
+#else
         auto r = slot.bus.init(cfg);
+#endif
         if (!r.has_value()) {
             return m5::stl::make_unexpected(r.error());
         }
@@ -382,7 +425,7 @@ result_t<int8_t> acquirePhysSPI(ServerPhysicalBusPool& phys, data::ConstDataSpan
         slot.adopted  = false;
         slot.refcount = 1;
         slot.used     = true;
-#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_BUS_CONFIG_
+#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_PROVIDER_
         slot.arduino_spi = spi;
 #endif
         return static_cast<int8_t>(i);
@@ -390,7 +433,7 @@ result_t<int8_t> acquirePhysSPI(ServerPhysicalBusPool& phys, data::ConstDataSpan
     return m5::stl::make_unexpected(error_t::OUT_OF_RESOURCE);
 }
 
-#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ESPIDF_BUS_CONFIG_
+#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ESPIDF_PROVIDER_
 result_t<int8_t> acquirePhysUART(ServerPhysicalBusPool& phys, data::ConstDataSpan pin_config, types::gpio_number_t tx,
                                  types::gpio_number_t rx, uint8_t port, uint16_t rxsz, uint16_t txsz)
 {
@@ -414,7 +457,7 @@ result_t<int8_t> acquirePhysUART(ServerPhysicalBusPool& phys, data::ConstDataSpa
         if (slot.used) {
             continue;
         }
-        uart::BusConfig_espidf cfg{uart::Tx{tx}, uart::Rx{rx}};
+        uart::BusConfig cfg{uart::Tx{tx}, uart::Rx{rx}};
         cfg.rx_buffer_size = rxsz > 0 ? rxsz : 2048;
         cfg.tx_buffer_size = txsz > 0 ? txsz : 512;
         // The wire cannot express "any port" explicitly; hosts always send 0.
@@ -427,8 +470,15 @@ result_t<int8_t> acquirePhysUART(ServerPhysicalBusPool& phys, data::ConstDataSpa
         const size_t candidate_count     = (port == 0) ? sizeof(candidates_auto) : sizeof(candidates_fixed);
         result_t<void> r                 = m5::stl::make_unexpected(error_t::OUT_OF_RESOURCE);
         for (size_t c = 0; c < candidate_count; ++c) {
-            cfg.port_num = candidates[c];
-            r            = slot.bus.init(cfg);
+            std::unique_ptr<uart::IBus> backend{new (std::nothrow) uart::Bus_espidf()};
+            if (!backend) {
+                return m5::stl::make_unexpected(error_t::OUT_OF_RESOURCE);
+            }
+            r = static_cast<uart::Bus_espidf*>(backend.get())
+                    ->init(cfg, native::managed(uart::NativePort{static_cast<::uart_port_t>(candidates[c])}));
+            if (r.has_value()) {
+                r = slot.bus.adoptPortableBackend(std::move(backend), cfg);
+            }
             if (r.has_value()) {
                 break;
             }
@@ -446,9 +496,8 @@ result_t<int8_t> acquirePhysUART(ServerPhysicalBusPool& phys, data::ConstDataSpa
 #endif
 
 // Needs the std I2S driver (IDF5) — mirror createI2S's guard, not just the
-// espidf one, or arduino-core-2.x builds hit BusConfig_espidf missing.
-#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ESPIDF_BUS_CONFIG_ && defined(M5HAL_ESPIDF_I2S_HAS_STD) && \
-    M5HAL_ESPIDF_I2S_HAS_STD
+// espidf one, or arduino-core-2.x builds hit ESP-IDF provider unavailable.
+#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ESPIDF_PROVIDER_ && defined(M5HAL_ESPIDF_I2S_HAS_STD) && M5HAL_ESPIDF_I2S_HAS_STD
 result_t<int8_t> acquirePhysI2S(ServerPhysicalBusPool& phys, data::ConstDataSpan pin_config, types::gpio_number_t bclk,
                                 types::gpio_number_t ws, types::gpio_number_t dout, types::gpio_number_t din,
                                 uint8_t role, uint8_t txkb, uint8_t rxkb)
@@ -473,7 +522,7 @@ result_t<int8_t> acquirePhysI2S(ServerPhysicalBusPool& phys, data::ConstDataSpan
         if (slot.used) {
             continue;
         }
-        i2s::BusConfig_espidf cfg;
+        i2s::BusConfig cfg;
         cfg.pin_bclk       = bclk;
         cfg.pin_ws         = ws;
         cfg.pin_dout       = dout;
@@ -494,9 +543,48 @@ result_t<int8_t> acquirePhysI2S(ServerPhysicalBusPool& phys, data::ConstDataSpan
 }
 #endif
 
+#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ESPIDF_PROVIDER_ && defined(M5HAL_ESPIDF_PDM_HAS_RX_PCM) && \
+    M5HAL_ESPIDF_PDM_HAS_RX_PCM
+result_t<int8_t> acquirePhysPDM(ServerPhysicalBusPool& phys, data::ConstDataSpan pin_config, types::gpio_number_t clk,
+                                types::gpio_number_t din, uint8_t rxkb)
+{
+    for (size_t i = 0; i < kServerBusPoolSlots; ++i) {
+        auto& slot = phys.pdm[i];
+        if (!slot.used || !samePDMPins({slot.cfg, slot.cfg_len}, clk, din)) {
+            continue;
+        }
+        if (!sameConfigBytes(slot.cfg, slot.cfg_len, pin_config)) {
+            return m5::stl::make_unexpected(error_t::INVALID_STATE);
+        }
+        if (slot.refcount == 0xFFu) {
+            return m5::stl::make_unexpected(error_t::OUT_OF_RESOURCE);
+        }
+        ++slot.refcount;
+        return static_cast<int8_t>(i);
+    }
+    for (size_t i = 0; i < kServerBusPoolSlots; ++i) {
+        auto& slot = phys.pdm[i];
+        if (slot.used) {
+            continue;
+        }
+        pdm::BusConfig cfg{pdm::Clk{clk}, pdm::Din{din}};
+        cfg.rx_buffer_size = rxkb > 0 ? static_cast<size_t>(rxkb) * 1024u : 8192;
+        auto initialized   = slot.bus.init(cfg);
+        if (!initialized.has_value()) {
+            return m5::stl::make_unexpected(initialized.error());
+        }
+        storeConfig(slot, pin_config);
+        slot.refcount = 1;
+        slot.used     = true;
+        return static_cast<int8_t>(i);
+    }
+    return m5::stl::make_unexpected(error_t::OUT_OF_RESOURCE);
+}
+#endif
+
 }  // namespace detail
 
-#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_BUS_CONFIG_
+#if M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_PROVIDER_
 result_t<void> ServerPhysicalBusPool::adoptI2C(::TwoWire& wire, types::gpio_number_t scl, types::gpio_number_t sda)
 {
     for (size_t i = 0; i < kServerBusPoolSlots; ++i) {
@@ -515,9 +603,10 @@ result_t<void> ServerPhysicalBusPool::adoptI2C(::TwoWire& wire, types::gpio_numb
     if (!backend) {
         return m5::stl::make_unexpected(error_t::OUT_OF_RESOURCE);
     }
-    auto err = static_cast<i2c::Bus_arduino*>(backend.get())->attach(wire);
-    if (error::isError(err)) {
-        return m5::stl::make_unexpected(err);
+    i2c::IBusConfig adopted_config{i2c::Scl{scl}, i2c::Sda{sda}};
+    auto initialized = static_cast<i2c::Bus_arduino*>(backend.get())->init(adopted_config, native::borrowed(wire));
+    if (!initialized.has_value()) {
+        return m5::stl::make_unexpected(initialized.error());
     }
     auto adopted_backend =
         slot->bus.adoptBackend(std::move(backend), i2c::LogicalBusConfig{i2c::Scl{scl}, i2c::Sda{sda}});
@@ -556,9 +645,10 @@ result_t<void> ServerPhysicalBusPool::adoptSPI(::SPIClass& spi, types::gpio_numb
     if (!backend) {
         return m5::stl::make_unexpected(error_t::OUT_OF_RESOURCE);
     }
-    auto err = static_cast<spi::Bus_arduino*>(backend.get())->attach(spi);
-    if (error::isError(err)) {
-        return m5::stl::make_unexpected(err);
+    const spi::IBusConfig adopted_config{spi::Clk{clk}, spi::Mosi{mosi}, spi::Miso{miso}};
+    auto initialized = static_cast<spi::Bus_arduino*>(backend.get())->init(adopted_config, native::borrowed(spi));
+    if (!initialized.has_value()) {
+        return m5::stl::make_unexpected(initialized.error());
     }
     auto adopted_backend = slot->bus.adoptBackend(
         std::move(backend), spi::LogicalBusConfig{spi::Clk{clk}, spi::Mosi{mosi}, spi::Miso{miso}});
@@ -582,7 +672,7 @@ result_t<void> ServerPhysicalBusPool::adoptSPI(::SPIClass& spi, types::gpio_numb
 result_t<void> createI2C(I2CSlot* slots, ServerPhysicalBusPool& phys, uint8_t bus_id, data::ConstDataSpan pin_config,
                          Server& server, pins_claimed_fn_t pins_claimed_fn, void* pins_claimed_ctx)
 {
-#if !M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ACTIVE_BUS_CONFIG_
+#if !M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ACTIVE_PROVIDER_
     (void)slots;
     (void)phys;
     (void)bus_id;
@@ -590,7 +680,7 @@ result_t<void> createI2C(I2CSlot* slots, ServerPhysicalBusPool& phys, uint8_t bu
     (void)server;
     (void)pins_claimed_fn;
     (void)pins_claimed_ctx;
-    return m5::stl::make_unexpected(error_t::NOT_IMPLEMENTED);
+    return m5::stl::make_unexpected(error_t::UNSUPPORTED);
 #else
     auto valid = detail::validatePinConfig(pin_config, 4);
     if (!valid.has_value()) {
@@ -656,7 +746,7 @@ void releaseI2C(I2CSlot* slots, ServerPhysicalBusPool& phys, uint8_t bus_id, byt
 result_t<void> createSPI(SPISlot* slots, ServerPhysicalBusPool& phys, uint8_t bus_id, data::ConstDataSpan pin_config,
                          Server& server, pins_claimed_fn_t pins_claimed_fn, void* pins_claimed_ctx)
 {
-#if !M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ACTIVE_BUS_CONFIG_
+#if !M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ACTIVE_PROVIDER_
     (void)slots;
     (void)phys;
     (void)bus_id;
@@ -664,7 +754,7 @@ result_t<void> createSPI(SPISlot* slots, ServerPhysicalBusPool& phys, uint8_t bu
     (void)server;
     (void)pins_claimed_fn;
     (void)pins_claimed_ctx;
-    return m5::stl::make_unexpected(error_t::NOT_IMPLEMENTED);
+    return m5::stl::make_unexpected(error_t::UNSUPPORTED);
 #else
     auto valid = detail::validatePinConfig(pin_config, 6);
     if (!valid.has_value()) {
@@ -734,7 +824,7 @@ void releaseSPI(SPISlot* slots, ServerPhysicalBusPool& phys, uint8_t bus_id, byt
 result_t<void> createUART(UARTSlot* slots, ServerPhysicalBusPool& phys, uint8_t bus_id, data::ConstDataSpan pin_config,
                           Server& server, pins_claimed_fn_t pins_claimed_fn, void* pins_claimed_ctx)
 {
-#if !M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ESPIDF_BUS_CONFIG_
+#if !M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ESPIDF_PROVIDER_
     (void)slots;
     (void)phys;
     (void)bus_id;
@@ -742,7 +832,7 @@ result_t<void> createUART(UARTSlot* slots, ServerPhysicalBusPool& phys, uint8_t 
     (void)server;
     (void)pins_claimed_fn;
     (void)pins_claimed_ctx;
-    return m5::stl::make_unexpected(error_t::NOT_IMPLEMENTED);
+    return m5::stl::make_unexpected(error_t::UNSUPPORTED);
 #else
     auto valid = detail::validatePinConfig(pin_config, 7);
     if (!valid.has_value()) {
@@ -826,7 +916,7 @@ result_t<void> createI2S(I2SSlot* slots, ServerPhysicalBusPool& phys, uint8_t bu
         return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
     }
 
-#if !M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ESPIDF_BUS_CONFIG_ || !defined(M5HAL_ESPIDF_I2S_HAS_STD) || \
+#if !M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ESPIDF_PROVIDER_ || !defined(M5HAL_ESPIDF_I2S_HAS_STD) || \
     !M5HAL_ESPIDF_I2S_HAS_STD
     (void)slots;
     (void)phys;
@@ -834,7 +924,7 @@ result_t<void> createI2S(I2SSlot* slots, ServerPhysicalBusPool& phys, uint8_t bu
     (void)server;
     (void)pins_claimed_fn;
     (void)pins_claimed_ctx;
-    return m5::stl::make_unexpected(error_t::NOT_IMPLEMENTED);
+    return m5::stl::make_unexpected(error_t::UNSUPPORTED);
 #else
     I2SSlot* slot = detail::findFreeBinding(slots);
     if (slot == nullptr) {
@@ -928,6 +1018,74 @@ void releaseI2S(I2SSlot* slots, ServerPhysicalBusPool& phys, uint8_t bus_id, byt
     }
 }
 
+result_t<void> createPDM(PDMSlot* slots, ServerPhysicalBusPool& phys, uint8_t bus_id, data::ConstDataSpan pin_config,
+                         Server& server, pins_claimed_fn_t pins_claimed_fn, void* pins_claimed_ctx)
+{
+    auto valid = detail::validatePinConfig(pin_config, 5);
+    if (!valid.has_value()) {
+        return valid;
+    }
+    const auto clk = static_cast<types::gpio_number_t>(detail::readI16LE(pin_config.data));
+    const auto din = static_cast<types::gpio_number_t>(detail::readI16LE(pin_config.data + 2));
+    if (clk < 0 || din < 0) {
+        return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
+    }
+#if !M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ESPIDF_PROVIDER_ || !defined(M5HAL_ESPIDF_PDM_HAS_RX_PCM) || \
+    !M5HAL_ESPIDF_PDM_HAS_RX_PCM
+    (void)slots;
+    (void)phys;
+    (void)bus_id;
+    (void)server;
+    (void)pins_claimed_fn;
+    (void)pins_claimed_ctx;
+    return m5::stl::make_unexpected(error_t::UNSUPPORTED);
+#else
+    PDMSlot* slot = detail::findFreeBinding(slots);
+    if (slot == nullptr) {
+        return m5::stl::make_unexpected(error_t::OUT_OF_RESOURCE);
+    }
+    auto phys_index = detail::acquirePhysPDM(phys, pin_config, clk, din, pin_config.data[4]);
+    if (!phys_index.has_value()) {
+        return m5::stl::make_unexpected(phys_index.error());
+    }
+    slot->acc_cfg.sample_rate_hz  = 16000;
+    slot->acc_cfg.bits_per_sample = 16;
+    slot->acc_cfg.channels        = 1;
+    slot->acc_cfg.read_timeout_ms = 200;
+    auto& bus                     = phys.pdm[static_cast<size_t>(phys_index.value())].bus;
+    slot->rx                      = new (slot->rx_buf) pdm::RxAccessor{bus, slot->acc_cfg};
+    auto registered               = server.registerPDM(bus_id, *slot->rx);
+    if (!registered.has_value()) {
+        slot->rx->~RxAccessor();
+        slot->rx = nullptr;
+        detail::releasePhysPDM(phys, phys_index.value());
+        return registered;
+    }
+    slot->bus_id                         = bus_id;
+    slot->phys                           = phys_index.value();
+    slot->used                           = true;
+    const types::gpio_number_t claimed[] = {clk, din};
+    detail::notifyPinsClaimed(pins_claimed_fn, pins_claimed_ctx, claimed, 2);
+    return {};
+#endif
+}
+
+void releasePDM(PDMSlot* slots, ServerPhysicalBusPool& phys, uint8_t bus_id, bytecode::BytecodeRunner& runner)
+{
+    for (size_t i = 0; i < kServerBusPoolSlots; ++i) {
+        if (slots[i].used && slots[i].bus_id == bus_id) {
+            const int8_t phys_index = slots[i].phys;
+            runner.unregisterPDM(bus_id);
+            slots[i].rx->~RxAccessor();
+            slots[i].rx   = nullptr;
+            slots[i].phys = -1;
+            slots[i].used = false;
+            detail::releasePhysPDM(phys, phys_index);
+            return;
+        }
+    }
+}
+
 void ServerBusPool::releaseAll()
 {
     if (server == nullptr || phys == nullptr) {
@@ -952,6 +1110,11 @@ void ServerBusPool::releaseAll()
     for (size_t i = 0; i < kServerBusPoolSlots; ++i) {
         if (i2s[i].used) {
             releaseI2S(i2s, *phys, i2s[i].bus_id, runner);
+        }
+    }
+    for (size_t i = 0; i < kServerBusPoolSlots; ++i) {
+        if (pdm[i].used) {
+            releasePDM(pdm, *phys, pdm[i].bus_id, runner);
         }
     }
 }
@@ -992,6 +1155,9 @@ result_t<void> ServerBusPool::handler(void* ctx, bool create, types::bus_kind_t 
             case types::bus_kind_t::I2S:
                 return createI2S(pool->i2s, *pool->phys, bus_id, pin_config, *pool->server, pool->pins_claimed_fn,
                                  pool->pins_claimed_ctx);
+            case types::bus_kind_t::PDM:
+                return createPDM(pool->pdm, *pool->phys, bus_id, pin_config, *pool->server, pool->pins_claimed_fn,
+                                 pool->pins_claimed_ctx);
             default:
                 return m5::stl::make_unexpected(error_t::INVALID_ARGUMENT);
         }
@@ -1010,6 +1176,9 @@ result_t<void> ServerBusPool::handler(void* ctx, bool create, types::bus_kind_t 
         case types::bus_kind_t::I2S:
             releaseI2S(pool->i2s, *pool->phys, bus_id, runner);
             return {};
+        case types::bus_kind_t::PDM:
+            releasePDM(pool->pdm, *pool->phys, bus_id, runner);
+            return {};
         default:
             return {};
     }
@@ -1017,8 +1186,8 @@ result_t<void> ServerBusPool::handler(void* ctx, bool create, types::bus_kind_t 
 
 }  // namespace m5::hal::v2::remote
 
-#undef M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ESPIDF_BUS_CONFIG_
-#undef M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_BUS_CONFIG_
-#undef M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ACTIVE_BUS_CONFIG_
+#undef M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ESPIDF_PROVIDER_
+#undef M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ARDUINO_PROVIDER_
+#undef M5_HAL_REMOTE_SERVER_BUS_POOL_HAS_ACTIVE_PROVIDER_
 
 #endif  // M5_HAL_REMOTE_SERVER_BUS_POOL_INL_

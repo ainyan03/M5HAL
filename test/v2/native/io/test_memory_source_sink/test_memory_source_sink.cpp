@@ -39,6 +39,16 @@ TEST(MemorySource, EmptySpanIsEofImmediately)
     EXPECT_EQ(peeked->data, nullptr);
 }
 
+TEST(MemorySource, DefaultEmptyRemainsValidAcrossZeroAdvance)
+{
+    MemorySource src;
+    ASSERT_TRUE(src.advance(0));
+    auto peeked = src.peek(1);
+    ASSERT_TRUE(peeked);
+    EXPECT_EQ(peeked->data, nullptr);
+    EXPECT_EQ(peeked->size, 0u);
+}
+
 TEST(MemorySource, PeekReturnsClampedSize)
 {
     const std::array<uint8_t, 8> bytes{0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17};
@@ -156,6 +166,16 @@ TEST(MemorySink, EmptyBufferIsClosedImmediately)
     ASSERT_TRUE(reserved);
     EXPECT_EQ(reserved->size, 0u);
     EXPECT_EQ(reserved->data, nullptr);
+}
+
+TEST(MemorySink, DefaultEmptyRemainsValidAcrossZeroCommit)
+{
+    MemorySink sink;
+    ASSERT_TRUE(sink.commit(0));
+    auto reserved = sink.reserve(1);
+    ASSERT_TRUE(reserved);
+    EXPECT_EQ(reserved->data, nullptr);
+    EXPECT_EQ(reserved->size, 0u);
 }
 
 TEST(MemorySink, ReserveReturnsClampedSize)

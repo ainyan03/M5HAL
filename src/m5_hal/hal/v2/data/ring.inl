@@ -79,6 +79,8 @@ m5::hal::v2::result_t<void> RingFIFO::SourceView::advance(size_t N)
     }
     const size_t buf = _owner._buffered.load(std::memory_order_relaxed);
     if (N > buf) {
+        // Bounded-FIFO carve-out of the Source contract (data.hpp):
+        // over-skips are rejected, not queued as StreamSource does.
         return m5::stl::make_unexpected(m5::hal::v2::error::error_t::INVALID_ARGUMENT);
     }
     const size_t tail = _owner._tail.load(std::memory_order_relaxed);

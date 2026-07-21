@@ -5,6 +5,7 @@
 #include "../gpio/group.hpp"
 #include "server_adapter.hpp"
 #include "server_bus_pool.hpp"
+#include "bus_capabilities_wire.hpp"
 
 namespace m5::hal::v2::remote {
 

@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 using ::m5::hal::v2::result_t;
@@ -31,40 +32,56 @@ public:
         size_t rx_len = 0;
     };
 
-    // Typed init: the fake adds no fields, so it takes the
-    // abstract kind config.
+    // The fake uses the same portable kind config as production providers.
     result_t<void> init(const spi::IBusConfig& config)
     {
         _config = config;
         return {};
     }
 
-    result_t<void> beginTransaction(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg) override
+    result_t<void> lockFor(bus::IAccessor& owner)
+    {
+        return acquireAccessLock(owner, 0);
+    }
+
+    result_t<void> unlockFor(bus::IAccessor& owner)
+    {
+        return releaseAccessLock(owner);
+    }
+
+protected:
+    result_t<void> beginOperationBackend(bus::OperationContext<spi::MasterAccessConfig>& context) override
     {
         if (fail_begin_transaction) {
             return m5::stl::make_unexpected(m5::hal::v2::error::error_t::NOT_IMPLEMENTED);
         }
+        auto* owner     = &bus::OperationSlot::contextOwner(context);
+        const auto& cfg = context.config;
         transaction_owners.push_back(owner);
         transaction_cfgs.push_back(cfg);
         ++begin_transaction_count;
         return {};
     }
 
-    bool fail_begin_transaction = false;
-
-    result_t<void> endTransaction(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg) override
+    result_t<void> endOperationBackend(bus::OperationContext<spi::MasterAccessConfig>& context) override
     {
+        auto* owner     = &bus::OperationSlot::contextOwner(context);
+        const auto& cfg = context.config;
         transaction_owners.push_back(owner);
         transaction_cfgs.push_back(cfg);
         ++end_transaction_count;
+        if (fail_end_operation) {
+            return m5::stl::make_unexpected(error::error_t::IO_ERROR);
+        }
         return {};
     }
 
-    bool fail_transfer = false;
-
-    result_t<void> transfer(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg, const spi::TransferDesc& desc,
-                            data::Source* tx, size_t tx_len, data::Sink* rx, size_t rx_len) override
+    result_t<void> transferBackend(bus::OperationContext<spi::MasterAccessConfig>& context,
+                                   const spi::TransferDesc& desc, data::Source* tx, size_t tx_len, data::Sink* rx,
+                                   size_t rx_len) override
     {
+        auto* owner     = &bus::OperationSlot::contextOwner(context);
+        const auto& cfg = context.config;
         if (fail_transfer) {
             return m5::stl::make_unexpected(m5::hal::v2::error::error_t::IO_ERROR);
         }
@@ -123,7 +140,7 @@ public:
         return {};
     }
 
-    result_t<bus::TransferTotals> waitTransfer(bus::IAccessor*, const spi::MasterAccessConfig&) override
+    result_t<bus::TransferTotals> waitTransferBackend(bus::OperationContext<spi::MasterAccessConfig>&) override
     {
         if (fail_wait) {
             return m5::stl::make_unexpected(m5::hal::v2::error::error_t::IO_ERROR);
@@ -134,13 +151,17 @@ public:
         return totals;
     }
 
-    bool transferBusy(bus::IAccessor*) override
+    bool transferBusyBackend(bus::OperationContext<spi::MasterAccessConfig>&) override
     {
         return busy;
     }
 
-    bool fail_wait = false;
-    bool busy      = false;
+public:
+    bool fail_begin_transaction = false;
+    bool fail_transfer          = false;
+    bool fail_end_operation     = false;
+    bool fail_wait              = false;
+    bool busy                   = false;
 
     std::vector<Call> calls;
     std::vector<const bus::IAccessor*> transaction_owners;
@@ -151,6 +172,100 @@ public:
     bus::TransferTotals last_totals{};
     bool has_wait_totals = false;
 };
+
+class InspectableSpiAccessor : public spi::MasterAccessor {
+public:
+    using spi::MasterAccessor::MasterAccessor;
+
+    bus::OperationContext<spi::MasterAccessConfig>& context()
+    {
+        return _context;
+    }
+};
+
+using SpiContext = bus::OperationContext<spi::MasterAccessConfig>;
+static_assert(!std::is_default_constructible_v<SpiContext>);
+static_assert(!std::is_constructible_v<SpiContext, const spi::MasterAccessConfig&>);
+static_assert(!std::is_copy_constructible_v<SpiContext>);
+static_assert(!std::is_copy_assignable_v<SpiContext>);
+static_assert(!std::is_move_constructible_v<SpiContext>);
+static_assert(!std::is_move_assignable_v<SpiContext>);
+static_assert(sizeof(SpiContext) <= sizeof(spi::MasterAccessConfig) + sizeof(bus::OperationRuntime) +
+                                        3 * sizeof(void*) + 2 * sizeof(uint32_t));
+
+TEST(SPICheckedFacade, RejectsInactiveEndedWrongBusAndWrongAccessorContexts)
+{
+    StubIBus first_bus;
+    StubIBus second_bus;
+    InspectableSpiAccessor first{first_bus, spi::MasterAccessConfig{}};
+    InspectableSpiAccessor second{first_bus, spi::MasterAccessConfig{}};
+
+    auto inactive = first_bus.transfer(first.context(), spi::TransferDesc{}, nullptr, 0, nullptr, 0);
+    ASSERT_FALSE(inactive.has_value());
+    EXPECT_EQ(inactive.error(), error::error_t::INVALID_STATE);
+
+    first.context().runtime.begin(0, 0, bus::OperationMode::TxRx);
+    ASSERT_TRUE(first_bus.lockFor(second).has_value());
+    auto wrong_accessor = first_bus.beginOperation(first.context());
+    ASSERT_FALSE(wrong_accessor.has_value());
+    EXPECT_EQ(wrong_accessor.error(), error::error_t::INVALID_STATE);
+    ASSERT_TRUE(first_bus.unlockFor(second).has_value());
+
+    ASSERT_TRUE(first.beginAccess(0).has_value());
+    auto wrong_bus = second_bus.transfer(first.context(), spi::TransferDesc{}, nullptr, 0, nullptr, 0);
+    ASSERT_FALSE(wrong_bus.has_value());
+    EXPECT_EQ(wrong_bus.error(), error::error_t::INVALID_STATE);
+    ASSERT_TRUE(first.endAccess(0).has_value());
+
+    auto ended = first_bus.transfer(first.context(), spi::TransferDesc{}, nullptr, 0, nullptr, 0);
+    ASSERT_FALSE(ended.has_value());
+    EXPECT_EQ(ended.error(), error::error_t::INVALID_STATE);
+}
+
+TEST(SPICheckedFacade, RejectsOldGenerationAndStillRecoversTheSlotAndLock)
+{
+    StubIBus bus;
+    InspectableSpiAccessor accessor{bus, spi::MasterAccessConfig{}};
+
+    ASSERT_TRUE(accessor.beginAccess(0).has_value());
+    const auto registered_generation = accessor.context().runtime.generation;
+    ++accessor.context().runtime.generation;
+    auto stale = bus.transfer(accessor.context(), spi::TransferDesc{}, nullptr, 0, nullptr, 0);
+    ASSERT_FALSE(stale.has_value());
+    EXPECT_EQ(stale.error(), error::error_t::INVALID_STATE);
+    auto ended = accessor.endAccess(0);
+    ASSERT_FALSE(ended.has_value());
+    EXPECT_EQ(ended.error(), error::error_t::INVALID_STATE);
+    EXPECT_FALSE(accessor.inAccess());
+
+    ASSERT_TRUE(accessor.beginAccess(0).has_value());
+    EXPECT_GT(accessor.context().runtime.generation, registered_generation);
+    EXPECT_TRUE(accessor.endAccess(0).has_value());
+}
+
+TEST(SPICheckedFacade, BeginAndEndFailuresDoNotLeaveReusableFalseAuthority)
+{
+    StubIBus bus;
+    InspectableSpiAccessor accessor{bus, spi::MasterAccessConfig{}};
+
+    bus.fail_begin_transaction = true;
+    auto failed_begin          = accessor.beginAccess(0);
+    ASSERT_FALSE(failed_begin.has_value());
+    EXPECT_EQ(failed_begin.error(), error::error_t::NOT_IMPLEMENTED);
+    EXPECT_FALSE(accessor.inAccess());
+
+    bus.fail_begin_transaction = false;
+    ASSERT_TRUE(accessor.beginAccess(0).has_value());
+    bus.fail_end_operation = true;
+    auto failed_end        = accessor.endAccess(0);
+    ASSERT_FALSE(failed_end.has_value());
+    EXPECT_EQ(failed_end.error(), error::error_t::IO_ERROR);
+    EXPECT_FALSE(accessor.inAccess());
+
+    bus.fail_end_operation = false;
+    EXPECT_TRUE(accessor.beginAccess(0).has_value());
+    EXPECT_TRUE(accessor.endAccess(0).has_value());
+}
 
 class RecordingPort : public gpio::IPort {
 public:
@@ -227,11 +342,11 @@ class ScopedServiceRunnerClear {
 public:
     ScopedServiceRunnerClear()
     {
-        m5::hal::v2::M5_Hal.Services.clear();
+        (void)m5::hal::v2::M5_Hal.Services.clear();
     }
     ~ScopedServiceRunnerClear()
     {
-        m5::hal::v2::M5_Hal.Services.clear();
+        (void)m5::hal::v2::M5_Hal.Services.clear();
     }
 };
 
@@ -243,13 +358,35 @@ public:
     }
 };
 
+class FailingAdvanceSource : public data::Source {
+public:
+    result_t<data::ConstDataSpan> peek(size_t max_len) override
+    {
+        return data::ConstDataSpan{&_byte, max_len == 0 ? 0u : 1u};
+    }
+
+    result_t<void> advance(size_t) override
+    {
+        return m5::stl::make_unexpected(error::error_t::IO_ERROR);
+    }
+
+    bool eof() const override
+    {
+        return false;
+    }
+
+private:
+    uint8_t _byte = 0xA5;
+};
+
 std::vector<std::unique_ptr<IdleService>> fillGlobalServiceRunner()
 {
     std::vector<std::unique_ptr<IdleService>> services;
     services.reserve(service::ServiceRunner::kMaxServices);
     for (size_t i = 0; i < service::ServiceRunner::kMaxServices; ++i) {
         services.emplace_back(new IdleService());
-        EXPECT_TRUE(m5::hal::v2::M5_Hal.Services.add(*services.back())) << i;
+        const auto added = m5::hal::v2::M5_Hal.Services.add(*services.back());
+        EXPECT_TRUE(added.has_value()) << "index=" << i << " err=" << error::toString(added.error());
     }
     return services;
 }
@@ -315,7 +452,7 @@ TEST(MasterAccessConfig, SetupWithDCBitSelectsBitModeAndClearsPin)
 TEST(MasterAccessor, WriteWrapsTransferAndCopiesTx)
 {
     StubIBus bus;
-    spi::BusConfig_software bus_cfg;
+    spi::BusConfig bus_cfg;
     bus_cfg.pin_clk  = 18;
     bus_cfg.pin_mosi = 23;
     ASSERT_TRUE(bus.init(bus_cfg).has_value());
@@ -446,77 +583,46 @@ TEST(MasterAccessor, CoreTransferRequiresOpenTransaction)
     EXPECT_TRUE(bus.calls.empty());
 }
 
-TEST(MasterAccessor, ExplicitTransactionSpansNestedTransfers)
+TEST(MasterAccessor, ExplicitAccessSpansBorrowedTransfers)
 {
     StubIBus bus;
     ASSERT_TRUE(bus.init(spi::IBusConfig{}).has_value());
 
     spi::MasterAccessor accessor{bus, spi::MasterAccessConfig{}};
 
-    ASSERT_TRUE(accessor.beginTransaction().has_value());
+    ASSERT_TRUE(accessor.beginAccess(0).has_value());
     const uint8_t first[]  = {0x12};
     const uint8_t second[] = {0x34};
-    EXPECT_TRUE(accessor.write(data::ConstDataSpan{first, sizeof(first)}).has_value());
-    EXPECT_TRUE(accessor.write(data::ConstDataSpan{second, sizeof(second)}).has_value());
-    auto totals = accessor.endTransaction();
-    ASSERT_TRUE(totals.has_value());
-    EXPECT_EQ(totals->tx, sizeof(first) + sizeof(second));
-    EXPECT_EQ(totals->rx, size_t{0});
+    auto first_result      = accessor.write(data::ConstDataSpan{first, sizeof(first)});
+    auto second_result     = accessor.write(data::ConstDataSpan{second, sizeof(second)});
+    ASSERT_TRUE(first_result.has_value());
+    ASSERT_TRUE(second_result.has_value());
+    EXPECT_EQ(*first_result, sizeof(first));
+    EXPECT_EQ(*second_result, sizeof(second));
+    EXPECT_TRUE(accessor.endAccess().has_value());
 
     ASSERT_EQ(bus.calls.size(), 2u);
     EXPECT_EQ(bus.begin_transaction_count, 1u);
     EXPECT_EQ(bus.end_transaction_count, 1u);
 }
 
-TEST(MasterAccessor, AsyncWaitFailurePoisonsTransaction)
+TEST(MasterAccessor, NestedAccessIsRejectedWithoutChangingPhysicalScope)
 {
-    // Sticky-error contract, wire side: a segment failure surfacing via
-    // waitTransfer() latches into the transaction — every later transfer
-    // is rejected with the same error and endTransaction() reports it.
     StubIBus bus;
-    ASSERT_TRUE(bus.init(spi::IBusConfig{}).has_value());
-
     spi::MasterAccessor accessor{bus, spi::MasterAccessConfig{}};
-    const uint8_t byte[] = {0x12};
-    const data::ConstDataSpan tx{byte, sizeof(byte)};
 
-    ASSERT_TRUE(accessor.beginTransaction().has_value());
-    bus.busy = true;  // segment stays pending; its failure surfaces later
-    ASSERT_TRUE(accessor.transfer(spi::TransferDesc{}, tx, data::DataSpan{}).has_value());
-    ASSERT_EQ(bus.calls.size(), 1u);
-
-    bus.fail_wait = true;  // the pending segment failed on the wire
-    auto second   = accessor.transfer(spi::TransferDesc{}, tx, data::DataSpan{});
-    ASSERT_FALSE(second.has_value());
-    EXPECT_EQ(second.error(), error::error_t::IO_ERROR);
-    EXPECT_EQ(bus.calls.size(), 1u);
-
-    // The latch, not the bus, must reject from now on: were the third
-    // attempt to reach the (now healthy) bus, calls would grow to 2.
-    bus.fail_wait = false;
-    auto third    = accessor.transfer(spi::TransferDesc{}, tx, data::DataSpan{});
-    ASSERT_FALSE(third.has_value());
-    EXPECT_EQ(third.error(), error::error_t::IO_ERROR);
-    EXPECT_EQ(bus.calls.size(), 1u);
-
-    auto ended = accessor.endTransaction();
-    ASSERT_FALSE(ended.has_value());
-    EXPECT_EQ(ended.error(), error::error_t::IO_ERROR);
-
-    // A fresh transaction starts clean.
-    bus.busy = false;
-    ASSERT_TRUE(accessor.beginTransaction().has_value());
-    EXPECT_TRUE(accessor.transfer(spi::TransferDesc{}, tx, data::DataSpan{}).has_value());
-    EXPECT_TRUE(accessor.endTransaction().has_value());
-    EXPECT_EQ(bus.calls.size(), 2u);
+    ASSERT_TRUE(accessor.beginAccess(0).has_value());
+    auto nested = accessor.beginAccess(0);
+    ASSERT_FALSE(nested.has_value());
+    EXPECT_EQ(nested.error(), error::error_t::INVALID_STATE);
+    EXPECT_EQ(bus.begin_transaction_count, 1u);
+    EXPECT_TRUE(accessor.inAccess());
+    EXPECT_TRUE(accessor.endAccess().has_value());
+    EXPECT_EQ(bus.end_transaction_count, 1u);
 }
 
-TEST(MasterAccessor, SyncPreflightRejectionAlsoPoisonsTransaction)
+TEST(MasterAccessor, WaitFailureIsPerIoAndLaterTransferCanContinue)
 {
-    // Sticky-error contract, pre-flight side: transaction segments form
-    // one logical operation, so even a synchronous rejection that never
-    // touched the wire invalidates the rest of the transaction — later
-    // transfers are rejected and endTransaction() reports the error.
     StubIBus bus;
     ASSERT_TRUE(bus.init(spi::IBusConfig{}).has_value());
 
@@ -524,29 +630,52 @@ TEST(MasterAccessor, SyncPreflightRejectionAlsoPoisonsTransaction)
     const uint8_t byte[] = {0x12};
     const data::ConstDataSpan tx{byte, sizeof(byte)};
 
-    ASSERT_TRUE(accessor.beginTransaction().has_value());
+    ASSERT_TRUE(accessor.beginAccess(0).has_value());
+    bus.fail_wait = true;
+    auto failed   = accessor.transfer(spi::TransferDesc{}, tx, data::DataSpan{});
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), error::error_t::IO_ERROR);
+    ASSERT_EQ(bus.calls.size(), 1u);
+    auto failed_status = accessor.getLastTransferStatus();
+    ASSERT_TRUE(failed_status.has_value());
+    EXPECT_EQ(failed_status->error, error::error_t::IO_ERROR);
+    EXPECT_EQ(failed_status->completion, bus::CompletionLevel::Aborted);
+
+    bus.fail_wait = false;
+    auto next     = accessor.transfer(spi::TransferDesc{}, tx, data::DataSpan{});
+    ASSERT_TRUE(next.has_value());
+    EXPECT_EQ(next->tx, sizeof(byte));
+    EXPECT_EQ(bus.calls.size(), 2u);
+    auto status = accessor.getLastTransferStatus();
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status->totals.tx, sizeof(byte));
+    EXPECT_EQ(status->error, error::error_t::OK);
+    EXPECT_EQ(status->completion, bus::CompletionLevel::Complete);
+    EXPECT_TRUE(accessor.endAccess().has_value());
+}
+
+TEST(MasterAccessor, PreflightRejectionIsPerIoAndLaterTransferCanContinue)
+{
+    StubIBus bus;
+    ASSERT_TRUE(bus.init(spi::IBusConfig{}).has_value());
+
+    spi::MasterAccessor accessor{bus, spi::MasterAccessConfig{}};
+    const uint8_t byte[] = {0x12};
+    const data::ConstDataSpan tx{byte, sizeof(byte)};
+
+    ASSERT_TRUE(accessor.beginAccess(0).has_value());
     bus.fail_transfer = true;
     auto first        = accessor.transfer(spi::TransferDesc{}, tx, data::DataSpan{});
     ASSERT_FALSE(first.has_value());
     EXPECT_EQ(first.error(), error::error_t::IO_ERROR);
     EXPECT_TRUE(bus.calls.empty());
 
-    // Even though the bus would now succeed, the transaction is poisoned.
     bus.fail_transfer = false;
     auto second       = accessor.transfer(spi::TransferDesc{}, tx, data::DataSpan{});
-    ASSERT_FALSE(second.has_value());
-    EXPECT_EQ(second.error(), error::error_t::IO_ERROR);
-    EXPECT_TRUE(bus.calls.empty());  // the second segment never reached the bus
-
-    auto ended = accessor.endTransaction();
-    ASSERT_FALSE(ended.has_value());
-    EXPECT_EQ(ended.error(), error::error_t::IO_ERROR);
-
-    // A fresh transaction starts clean.
-    ASSERT_TRUE(accessor.beginTransaction().has_value());
-    EXPECT_TRUE(accessor.transfer(spi::TransferDesc{}, tx, data::DataSpan{}).has_value());
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(second->tx, sizeof(byte));
     EXPECT_EQ(bus.calls.size(), 1u);
-    EXPECT_TRUE(accessor.endTransaction().has_value());
+    EXPECT_TRUE(accessor.endAccess().has_value());
 }
 
 TEST(MasterAccessor, WriteCommandDataSplitsDcLevel)
@@ -768,37 +897,42 @@ TEST(MasterAccessor, WriteCommandDataSpanRejectsZeroCommandLength)
     EXPECT_TRUE(bus.calls.empty());
 }
 
-TEST(IBus, DefaultTransferReturnsNotImplemented)
+TEST(IBus, DefaultTransferReturnsUnsupported)
 {
     spi::IBus bus;
     spi::MasterAccessConfig cfg;
+    spi::MasterAccessor accessor{bus, cfg};
     spi::TransferDesc desc;
-    auto result = bus.transfer(nullptr, cfg, desc, nullptr, 0, nullptr, 0);
+    auto begun = accessor.beginAccess(0);
+    ASSERT_TRUE(begun.has_value()) << "err=" << error::toString(begun.error());
+    auto result = accessor.transfer(desc, data::ConstDataSpan{}, data::DataSpan{});
 
     ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), error::error_t::NOT_IMPLEMENTED);
+    EXPECT_EQ(result.error(), error::error_t::UNSUPPORTED);
+    auto ended = accessor.endAccess(0);
+    ASSERT_TRUE(ended.has_value()) << "err=" << error::toString(ended.error());
 }
 
-// ---- ScopedTransaction (CS scope RAII) ---------------------------------
+// ---- ScopedAccess (operation + CS scope RAII) ---------------------------
 
-TEST(ScopedTransaction, ClosesTheTransactionOnScopeExit)
+TEST(ScopedAccess, ClosesTheOperationOnScopeExit)
 {
     StubIBus bus;
     spi::MasterAccessConfig cfg;
     spi::MasterAccessor dev{bus, cfg};
 
     {
-        spi::ScopedTransaction scope{dev};
+        bus::ScopedAccess scope{dev};
         ASSERT_FALSE(scope.has_error());
         EXPECT_TRUE(scope.ok());  // positive view == !has_error()
         EXPECT_EQ(scope.error(), m5::hal::v2::error::error_t::OK);
         EXPECT_EQ(bus.begin_transaction_count, 1u);
         EXPECT_EQ(bus.end_transaction_count, 0u);
-    }  // scope exit = endTransaction, even on an early return
+    }  // scope exit = endAccess, even on an early return
     EXPECT_EQ(bus.end_transaction_count, 1u);
 }
 
-TEST(ScopedTransaction, SurfacesABeginFailureWithoutClosing)
+TEST(ScopedAccess, SurfacesABeginFailureWithoutClosing)
 {
     StubIBus bus;
     bus.fail_begin_transaction = true;
@@ -806,12 +940,28 @@ TEST(ScopedTransaction, SurfacesABeginFailureWithoutClosing)
     spi::MasterAccessor dev{bus, cfg};
 
     {
-        spi::ScopedTransaction scope{dev};
+        bus::ScopedAccess scope{dev};
         EXPECT_TRUE(scope.has_error());
         EXPECT_FALSE(scope.ok());  // positive view == !has_error()
         EXPECT_EQ(scope.error(), m5::hal::v2::error::error_t::NOT_IMPLEMENTED);
     }
     EXPECT_EQ(bus.end_transaction_count, 0u);  // nothing to close
+}
+
+TEST(ScopedAccess, FinishReportsPhysicalEndFailureAndClosesAccess)
+{
+    StubIBus bus;
+    spi::MasterAccessor dev{bus, spi::MasterAccessConfig{}};
+    bus::ScopedAccess scope{dev, 0};
+    ASSERT_TRUE(scope.ok());
+    bus.fail_end_operation = true;
+
+    auto finished = scope.finish(10);
+    ASSERT_FALSE(finished.has_value());
+    EXPECT_EQ(finished.error(), error::error_t::IO_ERROR);
+    EXPECT_TRUE(scope.has_error());
+    EXPECT_FALSE(dev.inAccess());
+    EXPECT_EQ(bus.end_transaction_count, 1u);
 }
 
 TEST(SoftwareIBus, WriteDrivesCsDcClockAndMosi)
@@ -820,7 +970,7 @@ TEST(SoftwareIBus, WriteDrivesCsDcClockAndMosi)
     auto& port = gpio._port;
 
     m5::hal::v2::spi::Bus_software bus;
-    spi::BusConfig_software bus_cfg;
+    spi::BusConfig bus_cfg;
     bus_cfg.pin_clk  = softPin(0);
     bus_cfg.pin_dc   = softPin(1);
     bus_cfg.pin_mosi = softPin(2);
@@ -847,6 +997,48 @@ TEST(SoftwareIBus, WriteDrivesCsDcClockAndMosi)
     EXPECT_EQ(countWrites(port.events, softPin(3), true), 1u);
 }
 
+TEST(SoftwareIBus, CapabilitiesFollowConfiguredDataPins)
+{
+    const auto clk  = softPin(0);
+    const auto mosi = softPin(1);
+    const auto miso = softPin(2);
+
+    m5::hal::v2::spi::Bus_software shared_rx_bus;
+    spi::BusConfig shared_rx_cfg;
+    shared_rx_cfg.pin_clk  = clk;
+    shared_rx_cfg.pin_mosi = mosi;
+    ASSERT_TRUE(shared_rx_bus.init(shared_rx_cfg).has_value());
+    auto shared = shared_rx_bus.capabilities();
+    EXPECT_TRUE(shared.supports(bus::BusFeature::MasterTransfer));
+    EXPECT_TRUE(shared.supports(bus::BusFeature::Transmit));
+    EXPECT_TRUE(shared.supports(bus::BusFeature::Receive));
+    EXPECT_FALSE(shared.supports(bus::BusFeature::FullDuplex));
+    EXPECT_TRUE(shared.supports(bus::BusFeature::MosiSharedRx));
+
+    m5::hal::v2::spi::Bus_software full_duplex_bus;
+    spi::BusConfig full_duplex_cfg;
+    full_duplex_cfg.pin_clk  = clk;
+    full_duplex_cfg.pin_mosi = mosi;
+    full_duplex_cfg.pin_miso = miso;
+    ASSERT_TRUE(full_duplex_bus.init(full_duplex_cfg).has_value());
+    auto full = full_duplex_bus.capabilities();
+    EXPECT_TRUE(full.supports(bus::BusFeature::Transmit));
+    EXPECT_TRUE(full.supports(bus::BusFeature::Receive));
+    EXPECT_TRUE(full.supports(bus::BusFeature::FullDuplex));
+    EXPECT_FALSE(full.supports(bus::BusFeature::MosiSharedRx));
+
+    m5::hal::v2::spi::Bus_software receive_only_bus;
+    spi::BusConfig receive_only_cfg;
+    receive_only_cfg.pin_clk  = clk;
+    receive_only_cfg.pin_miso = miso;
+    ASSERT_TRUE(receive_only_bus.init(receive_only_cfg).has_value());
+    auto receive_only = receive_only_bus.capabilities();
+    EXPECT_FALSE(receive_only.supports(bus::BusFeature::Transmit));
+    EXPECT_TRUE(receive_only.supports(bus::BusFeature::Receive));
+    EXPECT_FALSE(receive_only.supports(bus::BusFeature::FullDuplex));
+    EXPECT_FALSE(receive_only.supports(bus::BusFeature::MosiSharedRx));
+}
+
 // Per-device D/C override: a non-negative MasterAccessConfig::pin_dc
 // beats the bus-level pin_dc — the bus-level pin must stay untouched.
 TEST(SoftwareIBus, AccessorPinDcOverridesBusPinDc)
@@ -855,7 +1047,7 @@ TEST(SoftwareIBus, AccessorPinDcOverridesBusPinDc)
     auto& port = gpio._port;
 
     m5::hal::v2::spi::Bus_software bus;
-    spi::BusConfig_software bus_cfg;
+    spi::BusConfig bus_cfg;
     bus_cfg.pin_clk  = softPin(0);
     bus_cfg.pin_dc   = softPin(1);  // bus-level default D/C
     bus_cfg.pin_mosi = softPin(2);
@@ -887,7 +1079,7 @@ TEST(SoftwareIBus, UnimplementedDataModesAreRejected)
 {
     auto& gpio = softwareSpiGPIO();
     m5::hal::v2::spi::Bus_software bus;
-    spi::BusConfig_software bus_cfg;
+    spi::BusConfig bus_cfg;
     bus_cfg.pin_clk  = softPin(0);
     bus_cfg.pin_miso = softPin(1);
     bus_cfg.pin_mosi = softPin(2);
@@ -905,7 +1097,7 @@ TEST(SoftwareIBus, UnimplementedDataModesAreRejected)
         spi::MasterAccessor accessor{bus, cfg};
         auto result = accessor.write(data::ConstDataSpan{tx, sizeof(tx)});
         ASSERT_FALSE(result.has_value());
-        EXPECT_EQ(result.error(), error::error_t::NOT_IMPLEMENTED);
+        EXPECT_EQ(result.error(), error::error_t::UNSUPPORTED);
     }
 
     // Half-duplex carrying both tx and rx data: TX then RX.
@@ -915,10 +1107,10 @@ TEST(SoftwareIBus, UnimplementedDataModesAreRejected)
         cfg.freq          = 20000000;
         cfg.spi_data_mode = spi::spi_data_mode_t::HalfDuplex;
         spi::MasterAccessor accessor{bus, cfg};
-        ASSERT_TRUE(accessor.beginTransaction().has_value());
+        ASSERT_TRUE(accessor.beginAccess(0).has_value());
         auto result =
             accessor.transfer(spi::TransferDesc{}, data::ConstDataSpan{tx, sizeof(tx)}, data::DataSpan{rx, sizeof(rx)});
-        auto end = accessor.endTransaction();
+        auto end = accessor.endAccess();
         ASSERT_TRUE(result.has_value()) << "err=" << error::toString(result.error());
         ASSERT_TRUE(end.has_value()) << "err=" << error::toString(end.error());
         EXPECT_EQ(rx[0], 0xFF);
@@ -940,7 +1132,7 @@ TEST(SoftwareIBus, MisoLessReadRequiresAndUsesHalfDuplexMosi)
     auto& gpio = softwareSpiGPIO();
     auto& port = gpio._port;
     m5::hal::v2::spi::Bus_software bus;
-    spi::BusConfig_software bus_cfg;
+    spi::BusConfig bus_cfg;
     bus_cfg.pin_clk  = softPin(0);
     bus_cfg.pin_mosi = softPin(2);
     ASSERT_TRUE(bus.init(bus_cfg).has_value());
@@ -951,26 +1143,26 @@ TEST(SoftwareIBus, MisoLessReadRequiresAndUsesHalfDuplexMosi)
     spi::MasterAccessConfig full_cfg;
     full_cfg.freq = 20000000;
     spi::MasterAccessor full{bus, full_cfg};
-    ASSERT_TRUE(full.beginTransaction().has_value());
+    ASSERT_TRUE(full.beginAccess(0).has_value());
     port.clear();
     auto rejected =
         full.transfer(spi::TransferDesc{}, data::ConstDataSpan{tx, sizeof(tx)}, data::DataSpan{rx, sizeof(rx)});
     EXPECT_FALSE(rejected.has_value());
     EXPECT_EQ(rejected.error(), error::error_t::INVALID_STATE);
     EXPECT_EQ(countWrites(port.events, softPin(0), true), 0u);
-    EXPECT_FALSE(full.endTransaction().has_value());
+    EXPECT_TRUE(full.endAccess().has_value());
 
     spi::MasterAccessConfig half_cfg;
     half_cfg.freq          = 20000000;
     half_cfg.spi_data_mode = spi::spi_data_mode_t::HalfDuplex;
     spi::MasterAccessor half{bus, half_cfg};
     port.setReadValue(true);
-    ASSERT_TRUE(half.beginTransaction().has_value());
+    ASSERT_TRUE(half.beginAccess(0).has_value());
     port.clear();
     auto transferred =
         half.transfer(spi::TransferDesc{}, data::ConstDataSpan{tx, sizeof(tx)}, data::DataSpan{rx, sizeof(rx)});
     ASSERT_TRUE(transferred.has_value()) << "err=" << error::toString(transferred.error());
-    ASSERT_TRUE(half.endTransaction().has_value());
+    ASSERT_TRUE(half.endAccess().has_value());
     EXPECT_EQ(rx[0], 0xFF);
 
     const auto input_mode = std::find_if(port.events.begin(), port.events.end(), [](const auto& event) {
@@ -997,7 +1189,7 @@ TEST(SoftwareIBus, ReadSamplesMiso)
     auto& port = gpio._port;
 
     m5::hal::v2::spi::Bus_software bus;
-    spi::BusConfig_software bus_cfg;
+    spi::BusConfig bus_cfg;
     bus_cfg.pin_clk  = softPin(0);
     bus_cfg.pin_miso = softPin(4);
     ASSERT_TRUE(bus.init(bus_cfg).has_value());
@@ -1024,7 +1216,7 @@ TEST(SoftwareIBus, DummyClockCountIsCycleCount)
     auto& port = gpio._port;
 
     m5::hal::v2::spi::Bus_software bus;
-    spi::BusConfig_software bus_cfg;
+    spi::BusConfig bus_cfg;
     bus_cfg.pin_clk = softPin(0);
     ASSERT_TRUE(bus.init(bus_cfg).has_value());
     port.clear();
@@ -1046,7 +1238,7 @@ TEST(SoftwareIBus, CommandAddressDataClockCountMatchesWireContract)
     auto& port = gpio._port;
 
     m5::hal::v2::spi::Bus_software bus;
-    spi::BusConfig_software bus_cfg;
+    spi::BusConfig bus_cfg;
     bus_cfg.pin_clk  = softPin(0);
     bus_cfg.pin_dc   = softPin(1);
     bus_cfg.pin_mosi = softPin(2);
@@ -1077,7 +1269,7 @@ TEST(SoftwareIBus, LowLevelTransferHonorsCommandAddressDummyPhases)
     auto& port = gpio._port;
 
     m5::hal::v2::spi::Bus_software bus;
-    spi::BusConfig_software bus_cfg;
+    spi::BusConfig bus_cfg;
     bus_cfg.pin_clk  = softPin(0);
     bus_cfg.pin_dc   = softPin(1);
     bus_cfg.pin_mosi = softPin(2);
@@ -1088,7 +1280,7 @@ TEST(SoftwareIBus, LowLevelTransferHonorsCommandAddressDummyPhases)
     cfg.freq   = 20000000;
 
     spi::MasterAccessor accessor{bus, cfg};
-    ASSERT_TRUE(accessor.beginTransaction().has_value());
+    ASSERT_TRUE(accessor.beginAccess(0).has_value());
     port.clear();
 
     spi::TransferDesc desc;
@@ -1102,8 +1294,8 @@ TEST(SoftwareIBus, LowLevelTransferHonorsCommandAddressDummyPhases)
     desc.data_dc_level    = 1;
     const uint8_t tx[]    = {0xDE, 0xAD};
 
-    ASSERT_TRUE(accessor.transfer(desc, data::ConstDataSpan{tx, sizeof(tx)}, data::DataSpan{}).has_value());
-    auto totals = accessor.endTransaction();
+    auto totals = accessor.transfer(desc, data::ConstDataSpan{tx, sizeof(tx)}, data::DataSpan{});
+    ASSERT_TRUE(accessor.endAccess().has_value());
 
     ASSERT_TRUE(totals.has_value());
     EXPECT_EQ(totals->tx, sizeof(tx));
@@ -1118,7 +1310,7 @@ TEST(SoftwareIBus, CpolHighIsAppliedBeforeCsAssert)
     auto& port = gpio._port;
 
     m5::hal::v2::spi::Bus_software bus;
-    spi::BusConfig_software bus_cfg;
+    spi::BusConfig bus_cfg;
     bus_cfg.pin_clk  = softPin(0);
     bus_cfg.pin_mosi = softPin(2);
     ASSERT_TRUE(bus.init(bus_cfg).has_value());
@@ -1139,13 +1331,13 @@ TEST(SoftwareIBus, CpolHighIsAppliedBeforeCsAssert)
     EXPECT_LT(firstWriteIndex(port.events, softPin(0), true), firstWriteIndex(port.events, softPin(3), false));
 }
 
-TEST(SoftwareIBus, ExplicitTransactionKeepsCsAssertedAcrossTransfers)
+TEST(SoftwareIBus, ExplicitAccessKeepsCsAssertedAcrossTransfers)
 {
     auto& gpio = softwareSpiGPIO();
     auto& port = gpio._port;
 
     m5::hal::v2::spi::Bus_software bus;
-    spi::BusConfig_software bus_cfg;
+    spi::BusConfig bus_cfg;
     bus_cfg.pin_clk  = softPin(0);
     bus_cfg.pin_mosi = softPin(2);
     ASSERT_TRUE(bus.init(bus_cfg).has_value());
@@ -1159,23 +1351,23 @@ TEST(SoftwareIBus, ExplicitTransactionKeepsCsAssertedAcrossTransfers)
     const uint8_t first[]  = {0x12};
     const uint8_t second[] = {0x34};
 
-    ASSERT_TRUE(accessor.beginTransaction().has_value());
+    ASSERT_TRUE(accessor.beginAccess(0).has_value());
     EXPECT_TRUE(accessor.write(data::ConstDataSpan{first, sizeof(first)}).has_value());
     EXPECT_TRUE(accessor.write(data::ConstDataSpan{second, sizeof(second)}).has_value());
-    ASSERT_TRUE(accessor.endTransaction().has_value());
+    ASSERT_TRUE(accessor.endAccess().has_value());
 
     EXPECT_EQ(countWrites(port.events, softPin(3), false), 1u);
     EXPECT_EQ(countWrites(port.events, softPin(3), true), 1u);
 }
 
-TEST(SoftwareIBus, CoreTransferRunsInServiceRunnerUntilEndTransaction)
+TEST(SoftwareIBus, CoreTransferWaitsForItsOwnServiceCompletion)
 {
     ScopedServiceRunnerClear clear_services;
     auto& gpio = softwareSpiGPIO();
     auto& port = gpio._port;
 
     m5::hal::v2::spi::Bus_software bus;
-    spi::BusConfig_software bus_cfg;
+    spi::BusConfig bus_cfg;
     bus_cfg.pin_clk  = softPin(0);
     bus_cfg.pin_mosi = softPin(2);
     ASSERT_TRUE(bus.init(bus_cfg).has_value());
@@ -1186,26 +1378,40 @@ TEST(SoftwareIBus, CoreTransferRunsInServiceRunnerUntilEndTransaction)
     spi::MasterAccessor accessor{bus, cfg};
 
     const uint8_t tx[] = {0x12, 0x34};
-    ASSERT_TRUE(accessor.beginTransaction().has_value());
+    ASSERT_TRUE(accessor.beginAccess(0).has_value());
     auto started = accessor.transfer(spi::TransferDesc{}, data::ConstDataSpan{tx, sizeof(tx)}, data::DataSpan{});
     ASSERT_TRUE(started.has_value());
-    EXPECT_TRUE(accessor.transferBusy());
-    EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), 1u);
-
-    // SPI paces edges by spinning on the live counter, so local_tick must be
-    // real-fastTick-derived (see the ServiceContext field notes); the fixed
-    // per-pass elapsed advances the service's virtual schedule.
-    for (size_t i = 0; i < 200 && m5::hal::v2::M5_Hal.Services.size() != 0; ++i) {
-        (void)m5::hal::v2::M5_Hal.Services.runOnce(service::ServiceContext{10, service::fastTick()});
-    }
     EXPECT_FALSE(accessor.transferBusy());
     EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), 0u);
-
-    auto totals = accessor.endTransaction();
-    ASSERT_TRUE(totals.has_value());
-    EXPECT_EQ(totals->tx, sizeof(tx));
-    EXPECT_EQ(totals->rx, size_t{0});
+    EXPECT_EQ(started->tx, sizeof(tx));
+    EXPECT_EQ(started->rx, size_t{0});
+    EXPECT_TRUE(accessor.endAccess().has_value());
     EXPECT_GE(countWrites(port.events, softPin(0), true), sizeof(tx) * 8u);
+}
+
+TEST(SoftwareIBus, CoreTransferErrorPublishesOnceAndUnregistersService)
+{
+    ScopedServiceRunnerClear clear_services;
+    auto& gpio = softwareSpiGPIO();
+
+    m5::hal::v2::spi::Bus_software bus;
+    spi::BusConfig bus_cfg;
+    bus_cfg.pin_clk  = softPin(0);
+    bus_cfg.pin_mosi = softPin(2);
+    ASSERT_TRUE(bus.init(bus_cfg).has_value());
+
+    spi::MasterAccessConfig cfg;
+    cfg.freq = 1000000;
+    spi::MasterAccessor accessor{bus, cfg};
+    FailingAdvanceSource source;
+
+    ASSERT_TRUE(accessor.beginAccess(0).has_value());
+    auto transferred = accessor.transfer(spi::TransferDesc{}, &source, 1, nullptr, 0);
+    ASSERT_FALSE(transferred.has_value());
+    EXPECT_EQ(transferred.error(), error::error_t::IO_ERROR);
+    EXPECT_FALSE(accessor.transferBusy());
+    EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), 0u);
+    EXPECT_TRUE(accessor.endAccess().has_value());
 }
 
 TEST(SoftwareIBus, CoreTransferFailsWhenServiceRunnerIsFull)
@@ -1214,7 +1420,7 @@ TEST(SoftwareIBus, CoreTransferFailsWhenServiceRunnerIsFull)
     auto fillers = fillGlobalServiceRunner();
 
     m5::hal::v2::spi::Bus_software bus;
-    spi::BusConfig_software bus_cfg;
+    spi::BusConfig bus_cfg;
     bus_cfg.pin_clk  = softPin(0);
     bus_cfg.pin_mosi = softPin(2);
     ASSERT_TRUE(bus.init(bus_cfg).has_value());
@@ -1224,29 +1430,26 @@ TEST(SoftwareIBus, CoreTransferFailsWhenServiceRunnerIsFull)
     spi::MasterAccessor accessor{bus, cfg};
 
     const uint8_t tx[] = {0x12, 0x34};
-    ASSERT_TRUE(accessor.beginTransaction().has_value());
+    ASSERT_TRUE(accessor.beginAccess(0).has_value());
     auto started = accessor.transfer(spi::TransferDesc{}, data::ConstDataSpan{tx, sizeof(tx)}, data::DataSpan{});
     ASSERT_FALSE(started.has_value());
     EXPECT_EQ(started.error(), error::error_t::OUT_OF_RESOURCE);
     EXPECT_FALSE(accessor.transferBusy());
 
-    // The failed segment poisons the transaction (unified latch contract,
-    // spec/design/spi.md §transaction 中のエラー).
-    auto ended = accessor.endTransaction();
-    ASSERT_FALSE(ended.has_value());
-    EXPECT_EQ(ended.error(), error::error_t::OUT_OF_RESOURCE);
+    auto ended = accessor.endAccess();
+    ASSERT_TRUE(ended.has_value());
     EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), service::ServiceRunner::kMaxServices);
     (void)fillers;
 }
 
-TEST(SoftwareIBus, NextCoreTransferDrainsPreviousBeforeStarting)
+TEST(SoftwareIBus, ConsecutiveCoreTransfersReturnIndividualTotals)
 {
     ScopedServiceRunnerClear clear_services;
     auto& gpio = softwareSpiGPIO();
     auto& port = gpio._port;
 
     m5::hal::v2::spi::Bus_software bus;
-    spi::BusConfig_software bus_cfg;
+    spi::BusConfig bus_cfg;
     bus_cfg.pin_clk  = softPin(0);
     bus_cfg.pin_mosi = softPin(2);
     ASSERT_TRUE(bus.init(bus_cfg).has_value());
@@ -1259,38 +1462,33 @@ TEST(SoftwareIBus, NextCoreTransferDrainsPreviousBeforeStarting)
     const uint8_t first[]  = {0x12, 0x34};
     const uint8_t second[] = {0x56};
 
-    ASSERT_TRUE(accessor.beginTransaction().has_value());
-    ASSERT_TRUE(accessor.transfer(spi::TransferDesc{}, data::ConstDataSpan{first, sizeof(first)}, data::DataSpan{})
-                    .has_value());
-    EXPECT_TRUE(accessor.transferBusy());
-    EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), 1u);
-
-    ASSERT_TRUE(accessor.transfer(spi::TransferDesc{}, data::ConstDataSpan{second, sizeof(second)}, data::DataSpan{})
-                    .has_value());
-    EXPECT_TRUE(accessor.transferBusy());
-    EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), 1u);
-
-    auto totals = accessor.endTransaction();
-    ASSERT_TRUE(totals.has_value());
-    EXPECT_EQ(totals->tx, sizeof(first) + sizeof(second));
-    EXPECT_EQ(totals->rx, size_t{0});
+    ASSERT_TRUE(accessor.beginAccess(0).has_value());
+    auto first_totals =
+        accessor.transfer(spi::TransferDesc{}, data::ConstDataSpan{first, sizeof(first)}, data::DataSpan{});
+    auto second_totals =
+        accessor.transfer(spi::TransferDesc{}, data::ConstDataSpan{second, sizeof(second)}, data::DataSpan{});
+    ASSERT_TRUE(first_totals.has_value());
+    ASSERT_TRUE(second_totals.has_value());
+    EXPECT_EQ(first_totals->tx, sizeof(first));
+    EXPECT_EQ(second_totals->tx, sizeof(second));
+    EXPECT_TRUE(accessor.endAccess().has_value());
     EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), 0u);
 }
 
-TEST(SoftwareIBus, MultipleBusesProgressTogetherInServiceRunner)
+TEST(SoftwareIBus, MultipleBusesCompleteIndependently)
 {
     ScopedServiceRunnerClear clear_services;
     auto& gpio = softwareSpiGPIO();
     auto& port = gpio._port;
 
     m5::hal::v2::spi::Bus_software bus_a;
-    spi::BusConfig_software cfg_a;
+    spi::BusConfig cfg_a;
     cfg_a.pin_clk  = softPin(0);
     cfg_a.pin_mosi = softPin(2);
     ASSERT_TRUE(bus_a.init(cfg_a).has_value());
 
     m5::hal::v2::spi::Bus_software bus_b;
-    spi::BusConfig_software cfg_b;
+    spi::BusConfig cfg_b;
     cfg_b.pin_clk  = softPin(4);
     cfg_b.pin_mosi = softPin(5);
     ASSERT_TRUE(bus_b.init(cfg_b).has_value());
@@ -1304,26 +1502,12 @@ TEST(SoftwareIBus, MultipleBusesProgressTogetherInServiceRunner)
     const uint8_t tx_a[] = {0x12, 0x34};
     const uint8_t tx_b[] = {0x56, 0x78, 0x9a};
 
-    ASSERT_TRUE(accessor_a.beginTransaction().has_value());
-    ASSERT_TRUE(accessor_b.beginTransaction().has_value());
-    ASSERT_TRUE(accessor_a.transfer(spi::TransferDesc{}, data::ConstDataSpan{tx_a, sizeof(tx_a)}, data::DataSpan{})
-                    .has_value());
-    ASSERT_TRUE(accessor_b.transfer(spi::TransferDesc{}, data::ConstDataSpan{tx_b, sizeof(tx_b)}, data::DataSpan{})
-                    .has_value());
-    EXPECT_TRUE(accessor_a.transferBusy());
-    EXPECT_TRUE(accessor_b.transferBusy());
-    EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), 2u);
-
-    for (size_t i = 0; i < 300 && (accessor_a.transferBusy() || accessor_b.transferBusy()); ++i) {
-        (void)m5::hal::v2::M5_Hal.Services.runOnce(service::ServiceContext{10, service::fastTick()});
-    }
-
-    EXPECT_FALSE(accessor_a.transferBusy());
-    EXPECT_FALSE(accessor_b.transferBusy());
-    EXPECT_EQ(m5::hal::v2::M5_Hal.Services.size(), 0u);
-
-    auto totals_a = accessor_a.endTransaction();
-    auto totals_b = accessor_b.endTransaction();
+    ASSERT_TRUE(accessor_a.beginAccess(0).has_value());
+    ASSERT_TRUE(accessor_b.beginAccess(0).has_value());
+    auto totals_a = accessor_a.transfer(spi::TransferDesc{}, data::ConstDataSpan{tx_a, sizeof(tx_a)}, data::DataSpan{});
+    auto totals_b = accessor_b.transfer(spi::TransferDesc{}, data::ConstDataSpan{tx_b, sizeof(tx_b)}, data::DataSpan{});
+    EXPECT_TRUE(accessor_a.endAccess().has_value());
+    EXPECT_TRUE(accessor_b.endAccess().has_value());
     ASSERT_TRUE(totals_a.has_value());
     ASSERT_TRUE(totals_b.has_value());
     EXPECT_EQ(totals_a->tx, sizeof(tx_a));

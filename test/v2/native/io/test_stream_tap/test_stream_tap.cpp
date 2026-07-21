@@ -75,12 +75,19 @@ public:
     result_t<size_t> write(ConstDataSpan src) override
     {
         if (_has_error) {
-            _has_error = false;
+            _has_error     = false;
+            _last_accepted = std::min(src.size, accepted_before_error);
+            written.insert(written.end(), src.data, src.data + _last_accepted);
             return m5::stl::make_unexpected(_armed_error);
         }
+        _last_accepted = 0;
         const size_t n = std::min(src.size, accept_limit);
         written.insert(written.end(), src.data, src.data + n);
         return n;
+    }
+    size_t partialWriteAccepted() const override
+    {
+        return _last_accepted;
     }
     void armError(error_t err)
     {
@@ -88,12 +95,14 @@ public:
         _has_error   = true;
     }
 
-    size_t accept_limit = static_cast<size_t>(-1);
+    size_t accept_limit          = static_cast<size_t>(-1);
+    size_t accepted_before_error = 0;
     std::vector<uint8_t> written;
 
 private:
-    error_t _armed_error = error_t::UNKNOWN_ERROR;
-    bool _has_error      = false;
+    error_t _armed_error  = error_t::UNKNOWN_ERROR;
+    bool _has_error       = false;
+    size_t _last_accepted = 0;
 };
 
 // Records every mirror write call as one entry (call-granularity), so
@@ -303,6 +312,23 @@ TEST(TapWriter, ErrorPropagatesAndIsNotMirrored)
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), error_t::TIMEOUT_ERROR);
     EXPECT_TRUE(mirror.calls.empty());
+}
+
+TEST(TapWriter, ErrorMirrorsAndReportsAcceptedPrefix)
+{
+    FakeStreamWriter inner;
+    inner.accepted_before_error = 2;
+    inner.armError(error_t::CLOSED);
+    MirrorRecorder mirror;
+    TapWriter tap{inner, &mirror};
+
+    const uint8_t payload[] = {0x84, 0x85, 0x86};
+    auto r                  = tap.write(ConstDataSpan{payload, sizeof payload});
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), error_t::CLOSED);
+    EXPECT_EQ(tap.partialWriteAccepted(), 2u);
+    ASSERT_EQ(mirror.calls.size(), 1u);
+    EXPECT_EQ(mirror.calls[0], std::vector<uint8_t>(payload, payload + 2));
 }
 
 TEST(TapWriter, MirrorShortWriteDoesNotAffectPrimaryResult)

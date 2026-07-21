@@ -10,6 +10,7 @@
 #include "../../../hal/v2/remote/credit_notifier.hpp"
 #include "../../../hal/v2/remote/remote.hpp"
 #include "../../../hal/v2/remote/session_handle.hpp"
+#include "../../../hal/v2/remote/wire_drain.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -198,7 +199,7 @@ private:
     uint8_t allocateStreamId();
     result_t<void> pumpWire();
     result_t<void> flushTx();
-    void drainTx();
+    result_t<remote::detail::DrainProgress> drainTx();
     void sendCreditIfChanged();
     result_t<void> awaitResponse(uint8_t seq, frame::Kind want_kind);
     static void frameHandlerThunk(void* ctx, const frame::View& view);

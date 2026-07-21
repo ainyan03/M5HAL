@@ -27,6 +27,8 @@ namespace bus   = ::m5::hal::v2::bus;
 namespace data  = ::m5::hal::v2::data;
 namespace error = ::m5::hal::v2::error;
 namespace i2c   = ::m5::hal::v2::i2c;
+namespace i2s   = ::m5::hal::v2::i2s;
+namespace pdm   = ::m5::hal::v2::pdm;
 namespace spi   = ::m5::hal::v2::spi;
 namespace types = ::m5::hal::v2::types;
 namespace uart  = ::m5::hal::v2::uart;
@@ -38,10 +40,21 @@ template <typename T>
 struct has_kind_generic_init<T, std::void_t<decltype(std::declval<T&>().init(std::declval<const bus::IBusConfig&>()))>>
     : std::true_type {};
 
-static_assert(!has_kind_generic_init<bus::IBus>::value, "bus::IBus must not expose a kind-generic init(IBusConfig)");
-static_assert(std::is_same<decltype(std::declval<bus::IBus&>().release()), ::m5::hal::v2::result_t<void>>::value,
-              "bus::IBus::release must return result_t<void>");
+template <typename T, typename = void>
+struct shared_pointer_has_public_close : std::false_type {};
 
+template <typename T>
+struct shared_pointer_has_public_close<T, std::void_t<decltype(std::declval<std::shared_ptr<T>&>()->close())>>
+    : std::true_type {};
+
+static_assert(!has_kind_generic_init<bus::IBus>::value, "bus::IBus must not expose a kind-generic init(IBusConfig)");
+// The negative form of this expression is not portable: several embedded GCC
+// versions diagnose protected-member access instead of treating it as a
+// substitution failure.  The public API spelling checker enforces that
+// bus::IBus::close remains non-public; this cross-target fence retains the
+// portable positive half for directly owned facades.
+static_assert(shared_pointer_has_public_close<i2c::Bus>::value,
+              "a directly owned facade must expose its guarded close wrapper");
 // Public spellings reproduced in spec/design/{memory,i2c_slave,bus_accessor}.md.
 // Keeping them in the common build fence makes a declaration rename fail every
 // target instead of leaving a stale, plausible-looking snippet in the spec.
@@ -53,25 +66,24 @@ constexpr auto kSpecI2cStretch       = ::m5::hal::v2::i2c::TxUnderrun::Stretch;
 
 class DummyI2cBus : public i2c::IBus {
 public:
-    // Typed init: the fake adds no fields, so it takes the
-    // abstract kind config.
+    // The fake uses the same portable kind config as production providers.
     ::m5::hal::v2::result_t<void> init(const i2c::IBusConfig& config)
     {
         _config = config;
         return {};
     }
 
-    ::m5::hal::v2::result_t<void> release(void) override
+protected:
+    bus::CloseOutcome closeBackend(void) override
     {
-        return {};
+        return bus::CloseOutcome::success();
     }
 
-    ::m5::hal::v2::result_t<void> transfer(bus::IAccessor* owner, const i2c::MasterAccessConfig& cfg,
-                                           const i2c::TransferDesc& desc, data::Source* tx, size_t, data::Sink* rx,
-                                           size_t) override
+    ::m5::hal::v2::result_t<void> transferBackend(bus::OperationContext<i2c::MasterAccessConfig>& context,
+                                                  const i2c::TransferDesc& desc, data::Source* tx, size_t,
+                                                  data::Sink* rx, size_t) override
     {
-        (void)owner;
-        (void)cfg;
+        (void)context;
         (void)desc;
         size_t done = 0;  // data phase only
         while (tx != nullptr && !tx->eof()) {
@@ -115,31 +127,30 @@ public:
         return {};
     }
 
-    ::m5::hal::v2::result_t<void> release(void) override
+protected:
+    bus::CloseOutcome closeBackend(void) override
     {
+        return bus::CloseOutcome::success();
+    }
+
+    ::m5::hal::v2::result_t<void> beginOperationBackend(
+        bus::OperationContext<spi::MasterAccessConfig>& context) override
+    {
+        (void)context;
         return {};
     }
 
-    ::m5::hal::v2::result_t<void> beginTransaction(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg) override
+    ::m5::hal::v2::result_t<void> endOperationBackend(bus::OperationContext<spi::MasterAccessConfig>& context) override
     {
-        (void)owner;
-        (void)cfg;
+        (void)context;
         return {};
     }
 
-    ::m5::hal::v2::result_t<void> endTransaction(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg) override
+    ::m5::hal::v2::result_t<void> transferBackend(bus::OperationContext<spi::MasterAccessConfig>& context,
+                                                  const spi::TransferDesc& desc, data::Source* tx, size_t,
+                                                  data::Sink* rx, size_t) override
     {
-        (void)owner;
-        (void)cfg;
-        return {};
-    }
-
-    ::m5::hal::v2::result_t<void> transfer(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg,
-                                           const spi::TransferDesc& desc, data::Source* tx, size_t, data::Sink* rx,
-                                           size_t) override
-    {
-        (void)owner;
-        (void)cfg;
+        (void)context;
         (void)desc;
         size_t done = 0;
         while (tx != nullptr && !tx->eof()) {
@@ -183,16 +194,16 @@ public:
         return {};
     }
 
-    ::m5::hal::v2::result_t<void> release(void) override
+protected:
+    bus::CloseOutcome closeBackend(void) override
     {
-        return {};
+        return bus::CloseOutcome::success();
     }
 
-    ::m5::hal::v2::result_t<size_t> write(bus::IAccessor* owner, const uart::AccessConfig& cfg, data::Source* tx,
-                                          size_t len) override
+    ::m5::hal::v2::result_t<size_t> writeBackend(bus::OperationContext<uart::AccessConfig>& context, data::Source* tx,
+                                                 size_t len) override
     {
-        (void)owner;
-        (void)cfg;
+        (void)context;
         size_t done = 0;
         while (tx != nullptr && !tx->eof() && done < len) {
             auto span = tx->peek(len - done);
@@ -211,11 +222,10 @@ public:
         return done;
     }
 
-    ::m5::hal::v2::result_t<size_t> read(bus::IAccessor* owner, const uart::AccessConfig& cfg, data::Sink* rx,
-                                         size_t len) override
+    ::m5::hal::v2::result_t<size_t> readBackend(bus::OperationContext<uart::AccessConfig>& context, data::Sink* rx,
+                                                size_t len) override
     {
-        (void)owner;
-        (void)cfg;
+        (void)context;
         size_t done = 0;
         while (rx != nullptr && !rx->closed() && done < len) {
             auto span = rx->reserve(len - done);
@@ -234,10 +244,9 @@ public:
         return done;
     }
 
-    ::m5::hal::v2::result_t<size_t> readableBytes(bus::IAccessor* owner, const uart::AccessConfig& cfg) override
+    ::m5::hal::v2::result_t<size_t> readableBytesBackend(bus::OperationContext<uart::AccessConfig>& context) override
     {
-        (void)owner;
-        (void)cfg;
+        (void)context;
         return size_t{0};
     }
 };
@@ -255,30 +264,94 @@ inline void useResult(const T& value)
 // idioms: the integer marker (usable in #if AND static_assert) and the
 // entity-identity check (flat injection is a using-directive, so the flat
 // name and the variant alias denote the same type).
-// I2C is the runtime facade: the unsuffixed `i2c::Bus` is the facade
-// class, NOT the winner variant alias. The winner is now expressed through the
-// `BusConfig` alias + the `BackendFor` trait (`init(BusConfig)` creates that
-// backend), so the scan-order winner is checked against that backend type.
+// Facade bus kinds expose one variant-independent BusConfig. Scan order now
+// selects a provider factory, not a public config type.
+static_assert(std::is_same<::m5::hal::v2::i2c::BusConfig, ::m5::hal::v2::i2c::IBusConfig>::value);
+static_assert(std::is_same<::m5::hal::v2::spi::BusConfig, ::m5::hal::v2::spi::IBusConfig>::value);
+static_assert(std::is_same<::m5::hal::v2::uart::BusConfig, ::m5::hal::v2::uart::IBusConfig>::value);
+static_assert(std::is_same<::m5::hal::v2::i2s::BusConfig, ::m5::hal::v2::i2s::IBusConfig>::value);
+static_assert(std::is_same<::m5::hal::v2::pdm::BusConfig, ::m5::hal::v2::pdm::IBusConfig>::value);
 static_assert(M5HAL_V2_SELECTED_VARIANT_I2C != M5HAL_V2_VARIANT_ID_NONE, "some variant must provide I2C");
 #if defined(ARDUINO)
 static_assert(M5HAL_V2_SELECTED_VARIANT_I2C == M5HAL_V2_VARIANT_ID_FRAMEWORK_ARDUINO,
               "scan order: arduino wins the I2C BusConfig alias when present");
-static_assert(std::is_same<::m5::hal::v2::i2c::BackendFor<::m5::hal::v2::i2c::BusConfig>::type,
-                           ::m5::hal::v2::i2c::Bus_arduino>::value,
-              "the facade's default backend (BusConfig -> BackendFor) must be the winner variant");
+static_assert(std::is_same<decltype(std::declval<::m5::hal::v2::i2c::BusView&>().acquire(
+                               std::declval<const ::m5::hal::v2::i2c::BusConfig&>(),
+                               ::m5::hal::v2::native::borrowed(std::declval<::TwoWire&>()))),
+                           ::m5::hal::v2::result_t<std::shared_ptr<::m5::hal::v2::i2c::IBus>>>::value);
 #elif defined(ESP_PLATFORM) && M5HAL_ESPIDF_I2C_HAS_MASTER
 static_assert(M5HAL_V2_SELECTED_VARIANT_I2C == M5HAL_V2_VARIANT_ID_FRAMEWORK_ESPIDF,
               "scan order: espidf wins the I2C BusConfig alias on a plain IDF build");
-static_assert(std::is_same<::m5::hal::v2::i2c::BackendFor<::m5::hal::v2::i2c::BusConfig>::type,
-                           ::m5::hal::v2::i2c::Bus_espidf>::value,
-              "the facade's default backend (BusConfig -> BackendFor) must be the winner variant");
 #elif !defined(ESP_PLATFORM)
 static_assert(M5HAL_V2_SELECTED_VARIANT_I2C == M5HAL_V2_VARIANT_ID_FRAMEWORK_SOFTWARE,
               "scan order: software provides I2C on a plain host build");
-static_assert(std::is_same<::m5::hal::v2::i2c::BackendFor<::m5::hal::v2::i2c::BusConfig>::type,
-                           ::m5::hal::v2::i2c::Bus_software>::value,
-              "the facade's default backend (BusConfig -> BackendFor) must be the winner variant");
 #endif
+
+#if defined(ARDUINO)
+static_assert(M5HAL_V2_SELECTED_VARIANT_SPI == M5HAL_V2_VARIANT_ID_FRAMEWORK_ARDUINO,
+              "scan order: arduino wins SPI when present");
+static_assert(std::is_same<decltype(std::declval<::m5::hal::v2::spi::BusView&>().acquire(
+                               std::declval<const ::m5::hal::v2::spi::BusConfig&>(),
+                               ::m5::hal::v2::native::borrowed(std::declval<::SPIClass&>()))),
+                           ::m5::hal::v2::result_t<std::shared_ptr<::m5::hal::v2::spi::IBus>>>::value);
+#elif defined(ESP_PLATFORM) && M5HAL_ESPIDF_SPI_HAS_MASTER
+static_assert(M5HAL_V2_SELECTED_VARIANT_SPI == M5HAL_V2_VARIANT_ID_FRAMEWORK_ESPIDF,
+              "scan order: espidf wins SPI on a plain IDF build");
+#else
+static_assert(M5HAL_V2_SELECTED_VARIANT_SPI == M5HAL_V2_VARIANT_ID_FRAMEWORK_SOFTWARE,
+              "scan order: software provides the SPI fallback");
+#endif
+
+#if defined(ARDUINO)
+static_assert(std::is_same<decltype(std::declval<::m5::hal::v2::uart::BusView&>().acquire(
+                               std::declval<const ::m5::hal::v2::uart::BusConfig&>(),
+                               ::m5::hal::v2::native::borrowed(std::declval<::HardwareSerial&>()))),
+                           ::m5::hal::v2::result_t<std::shared_ptr<::m5::hal::v2::uart::IBus>>>::value);
+static_assert(std::is_same<decltype(std::declval<::m5::hal::v2::uart::BusView&>().acquire(
+                               std::declval<const ::m5::hal::v2::uart::BusConfig&>(),
+                               ::m5::hal::v2::native::borrowed(std::declval<::Stream&>()))),
+                           ::m5::hal::v2::result_t<std::shared_ptr<::m5::hal::v2::uart::IBus>>>::value);
+#endif
+
+#if defined(ESP_PLATFORM) && M5HAL_ESPIDF_I2C_HAS_MASTER_GEN5
+static_assert(::m5::hal::v2::i2c::detail_espidf_i2c::kPortableControllerAuto == -1,
+              "gen5 portable I2C must retain ESP-IDF HP-controller auto selection");
+static_assert(std::is_same<decltype(std::declval<::m5::hal::v2::i2c::BusView&>().acquire(
+                               std::declval<const ::m5::hal::v2::i2c::BusConfig&>(),
+                               ::m5::hal::v2::native::borrowed(std::declval<::m5::hal::v2::i2c::NativeMasterBus&>()))),
+                           ::m5::hal::v2::result_t<std::shared_ptr<::m5::hal::v2::i2c::IBus>>>::value);
+#endif
+
+#if defined(ESP_PLATFORM) && M5HAL_ESPIDF_I2S_HAS_STD
+static_assert(M5HAL_V2_SELECTED_VARIANT_I2S == M5HAL_V2_VARIANT_ID_FRAMEWORK_ESPIDF,
+              "scan order: espidf provides I2S when supported by this IDF target");
+#else
+static_assert(M5HAL_V2_SELECTED_VARIANT_I2S == M5HAL_V2_VARIANT_ID_NONE,
+              "standard builds without an ESP-IDF I2S provider leave I2S unselected");
+#endif
+
+#if defined(ESP_PLATFORM) && M5HAL_ESPIDF_PDM_HAS_RX_PCM
+static_assert(M5HAL_V2_SELECTED_VARIANT_PDM == M5HAL_V2_VARIANT_ID_FRAMEWORK_ESPIDF,
+              "scan order: espidf provides PDM when supported by this IDF target");
+#else
+static_assert(M5HAL_V2_SELECTED_VARIANT_PDM == M5HAL_V2_VARIANT_ID_NONE,
+              "standard builds without an ESP-IDF PDM provider leave PDM unselected");
+#endif
+
+#if defined(ARDUINO)
+static_assert(M5HAL_V2_SELECTED_VARIANT_UART == M5HAL_V2_VARIANT_ID_FRAMEWORK_ARDUINO,
+              "scan order: arduino wins UART when present");
+#elif defined(ESP_PLATFORM)
+static_assert(M5HAL_V2_SELECTED_VARIANT_UART == M5HAL_V2_VARIANT_ID_FRAMEWORK_ESPIDF,
+              "scan order: espidf wins UART on a plain IDF build");
+#elif M5HAL_FRAMEWORK_HAS_POSIX && M5HAL_CONFIG_POSIX_UART
+static_assert(M5HAL_V2_SELECTED_VARIANT_UART == M5HAL_V2_VARIANT_ID_FRAMEWORK_POSIX,
+              "scan order: posix provides UART on a plain host build");
+#else
+static_assert(M5HAL_V2_SELECTED_VARIANT_UART == M5HAL_V2_VARIANT_ID_NONE,
+              "a standard build without a UART offer must report NONE");
+#endif
+
 #if defined(ESP_PLATFORM)
 static_assert(M5HAL_V2_SELECTED_VARIANT_GPIO == M5HAL_V2_VARIANT_ID_PLATFORM_ESP32,
               "scan order: the platform variant wins GPIO on the ESP32 family");
@@ -286,6 +359,12 @@ static_assert(M5HAL_V2_SELECTED_VARIANT_GPIO == M5HAL_V2_VARIANT_ID_PLATFORM_ESP
 // comparison is direct: the detected platform's variant wins GPIO.
 static_assert(M5HAL_V2_SELECTED_VARIANT_GPIO == M5HAL_V2_DETECTED_PLATFORM_VARIANT_ID,
               "the detected platform's variant should win GPIO on ESP32");
+#elif defined(ARDUINO)
+static_assert(M5HAL_V2_SELECTED_VARIANT_GPIO == M5HAL_V2_VARIANT_ID_FRAMEWORK_ARDUINO,
+              "scan order: arduino provides GPIO on non-ESP Arduino targets");
+#else
+static_assert(M5HAL_V2_SELECTED_VARIANT_GPIO == M5HAL_V2_VARIANT_ID_FRAMEWORK_STUB,
+              "scan order: the stub fallback provides GPIO on a plain host build");
 #endif
 
 // ---- runtime kind -----------------------------------------------------
@@ -300,11 +379,21 @@ static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_TASK != M5HAL_V2_VARIANT_ID_NONE
               "some variant must provide runtime::Task");
 static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_EVENT != M5HAL_V2_VARIANT_ID_NONE,
               "some variant must provide runtime::Event (the ServiceRunner idle wait blocks on it)");
+using selected_runtime_task_t = ::m5::hal::v2::runtime::Task;
+static_assert(std::is_same<decltype(std::declval<selected_runtime_task_t&>().start(nullptr, nullptr)),
+                           ::m5::hal::v2::result_t<void>>::value,
+              "runtime::Task::start must report launch failures as result_t<void>");
+static_assert(std::is_same<decltype(std::declval<selected_runtime_task_t&>().join()), void>::value,
+              "runtime::Task::join remains an idempotent void completion command");
+static_assert(std::is_same<decltype(std::declval<const selected_runtime_task_t&>().joinable()), bool>::value,
+              "runtime::Task::joinable remains a plain state query");
 #if defined(ARDUINO) && defined(ESP_PLATFORM)
 static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME == M5HAL_V2_VARIANT_ID_FRAMEWORK_ARDUINO,
               "scan order: arduino wins the runtime time injection when present");
 static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_MUTEX == M5HAL_V2_VARIANT_ID_FRAMEWORK_FREERTOS,
               "scan order: freertos wins runtime::Mutex on arduino (FreeRTOS-hosted)");
+static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_TASK == M5HAL_V2_VARIANT_ID_FRAMEWORK_FREERTOS,
+              "scan order: freertos wins runtime::Task on arduino (FreeRTOS-hosted)");
 static_assert(
     std::is_same<::m5::hal::v2::runtime::Mutex, ::m5::variants::frameworks::freertos::hal::v2::runtime::Mutex>::value,
     "the unsuffixed name and the freertos variant type must be the same entity");
@@ -340,6 +429,8 @@ static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME == M5HAL_V2_VARIANT_ID_FRAMEWORK
               "scan order: espidf wins the runtime time injection on a plain IDF build");
 static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_MUTEX == M5HAL_V2_VARIANT_ID_FRAMEWORK_FREERTOS,
               "scan order: freertos wins runtime::Mutex on espidf (FreeRTOS-hosted)");
+static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_TASK == M5HAL_V2_VARIANT_ID_FRAMEWORK_FREERTOS,
+              "scan order: freertos wins runtime::Task on espidf (FreeRTOS-hosted)");
 static_assert(
     std::is_same<::m5::hal::v2::runtime::Mutex, ::m5::variants::frameworks::freertos::hal::v2::runtime::Mutex>::value,
     "the unsuffixed name and the freertos variant type must be the same entity");
@@ -354,6 +445,8 @@ static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME == M5HAL_V2_VARIANT_ID_FRAMEWORK
               "scan order: posix provides runtime on a plain host build");
 static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_MUTEX == M5HAL_V2_VARIANT_ID_FRAMEWORK_POSIX,
               "scan order: posix provides runtime::Mutex on a plain host build");
+static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_TASK == M5HAL_V2_VARIANT_ID_FRAMEWORK_POSIX,
+              "scan order: posix provides runtime::Task on a plain host build");
 static_assert(
     std::is_same<::m5::hal::v2::runtime::Mutex, ::m5::variants::frameworks::posix::hal::v2::runtime::Mutex>::value,
     "the unsuffixed name and the posix variant type must be the same entity");
@@ -365,6 +458,10 @@ static_assert(
 #else
 static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME == M5HAL_V2_VARIANT_ID_FRAMEWORK_STUB,
               "scan order: the stub fake backs runtime when no other variant offers it");
+static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_MUTEX == M5HAL_V2_VARIANT_ID_FRAMEWORK_STUB,
+              "scan order: the stub fake backs runtime::Mutex when no other variant offers it");
+static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_TASK == M5HAL_V2_VARIANT_ID_FRAMEWORK_STUB,
+              "scan order: the stub fake backs runtime::Task when no other variant offers it");
 static_assert(M5HAL_V2_SELECTED_VARIANT_RUNTIME_EVENT == M5HAL_V2_VARIANT_ID_FRAMEWORK_STUB,
               "scan order: the stub fake backs runtime::Event when no other variant offers it");
 static_assert(
@@ -387,11 +484,35 @@ inline void compileCommonApiSurface(void)
     uint8_t tx[]  = {0x10, 0x20, 0x30, 0x40};
     uint8_t rx[4] = {};
 
+    // Explicit local namespace: tests/VSim may share one domain across Hal
+    // facades or construct another domain with the same pin numbers.
+    ::m5::hal::v2::ResourceDomain isolated_domain;
+    ::m5::hal::v2::Hal isolated_hal{isolated_domain};
+    detail::useResult(isolated_hal.resourceDomain().sharesStateWith(isolated_domain));
+
     detail::DummyI2cBus i2c_bus;
     detail::i2c::IBusConfig i2c_bus_cfg;
     i2c_bus_cfg.pin_scl = 22;
     i2c_bus_cfg.pin_sda = 21;
     detail::useResult(i2c_bus.init(i2c_bus_cfg));
+    static_assert(sizeof(detail::bus::BusCapabilities) <= 32, "BusCapabilities must remain a small bounded snapshot");
+    static_assert(std::is_trivially_copyable<detail::bus::BusCapabilities>::value,
+                  "BusCapabilities must remain allocation-free and value-like");
+    const auto direct_caps = i2c_bus.capabilities();
+    static_assert(std::is_same<decltype(std::declval<const detail::i2c::IBus&>().capabilities()),
+                               detail::bus::BusCapabilities>::value &&
+                      std::is_same<decltype(std::declval<const detail::spi::IBus&>().capabilities()),
+                                   detail::bus::BusCapabilities>::value &&
+                      std::is_same<decltype(std::declval<const detail::uart::IBus&>().capabilities()),
+                                   detail::bus::BusCapabilities>::value &&
+                      std::is_same<decltype(std::declval<const detail::i2s::IBus&>().capabilities()),
+                                   detail::bus::BusCapabilities>::value &&
+                      std::is_same<decltype(std::declval<const detail::pdm::IBus&>().capabilities()),
+                                   detail::bus::BusCapabilities>::value,
+                  "every acquired Bus kind must expose the same value snapshot type");
+    detail::useResult(direct_caps.supports(detail::bus::BusFeature::MasterTransfer));
+    detail::useResult(direct_caps.limit(detail::bus::BusLimit::MaxFrequencyHz));
+    detail::useResult(direct_caps.generation());
     // tag-pin ctors on the kind base: either order, positional stays out.
     detail::useResult(i2c_bus.init(detail::i2c::IBusConfig{detail::i2c::Scl{22}, detail::i2c::Sda{21}}));
     detail::useResult(i2c_bus.init(detail::i2c::IBusConfig{detail::i2c::Sda{21}, detail::i2c::Scl{22}}));
@@ -437,7 +558,7 @@ inline void compileCommonApiSurface(void)
     spi_cfg.spi_data_mode         = detail::spi::spi_data_mode_t::FullDuplex;
     detail::spi::MasterAccessor spi_dev{spi_bus, spi_cfg};
     detail::useResult(spi_dev.setConfig(spi_cfg));
-    detail::useResult(spi_dev.beginTransaction());
+    detail::useResult(spi_dev.beginAccess());
     detail::useResult(spi_dev.transfer(detail::spi::TransferDesc{}, detail::data::ConstDataSpan{tx, sizeof(tx)},
                                        detail::data::DataSpan{rx, sizeof(rx)}));
     detail::data::MemorySource spi_source{detail::data::ConstDataSpan{tx, sizeof(tx)}};
@@ -461,7 +582,7 @@ inline void compileCommonApiSurface(void)
     detail::useResult(
         spi_dev.readCommandAddressData(uint32_t{0x0F}, uint32_t{0x001234}, detail::data::DataSpan{rx, sizeof(rx)}));
     detail::useResult(spi_dev.sendDummyClock(8));
-    detail::useResult(spi_dev.endTransaction());
+    detail::useResult(spi_dev.endAccess());
 
     detail::DummyUartBus uart_bus;
     detail::uart::IBusConfig uart_bus_cfg;
@@ -561,10 +682,7 @@ inline void compileCommonApiSurface(void)
     // Bytecode: encoder + runner surface. All calls stay I/O-free
     // (closed sinks, empty scripts, no registered targets touched).
     namespace bytecode = ::m5::hal::v2::bytecode;
-    uint8_t lenvar_buf[5];
-    (void)bytecode::encodeLenVar(lenvar_buf, bytecode::kMaxStoreSlots);
     (void)bytecode::decodeLenVar(detail::data::ConstDataSpan{});
-    (void)bytecode::lenVarSize(0x1234);
     detail::data::MemorySink bytecode_snk{detail::data::DataSpan{}};  // closed sink
     bytecode::BytecodeEncoder bytecode_enc{bytecode_snk};
     detail::useResult(bytecode_enc.delayMs(0));
@@ -586,21 +704,18 @@ inline void compileCommonApiSurface(void)
 #if defined(ARDUINO)
 inline void compileArduinoApiSurface(void)
 {
-    ::m5::hal::v2::i2c::BusConfig_arduino i2c_cfg;
-    i2c_cfg.wire    = &Wire;
+    ::m5::hal::v2::i2c::BusConfig i2c_cfg;
     i2c_cfg.pin_scl = 22;
     i2c_cfg.pin_sda = 21;
-    ::m5::hal::v2::spi::BusConfig_arduino spi_cfg;
-    spi_cfg.spi = &SPI;
-    ::m5::hal::v2::uart::BusConfig_arduino uart_cfg;
-    uart_cfg.setSerial(Serial1);
+    ::m5::hal::v2::spi::BusConfig spi_cfg;
+    ::m5::hal::v2::uart::BusConfig uart_cfg;
 
-    // tag-pin ctors, inherited by the variant configs; the
-    // variant-specific field stays assignable after tag construction.
-    ::m5::hal::v2::i2c::BusConfig_arduino i2c_tag_cfg{::m5::hal::v2::i2c::Scl{22}, ::m5::hal::v2::i2c::Sda{21}};
-    i2c_tag_cfg.wire = &Wire;
-    ::m5::hal::v2::uart::BusConfig_arduino uart_tag_cfg{::m5::hal::v2::uart::Rx{16}, ::m5::hal::v2::uart::Tx{17}};
-    uart_tag_cfg.setSerial(Serial1);
+    // Portable tag-pin constructors are independent of provider selection.
+    ::m5::hal::v2::i2c::BusConfig i2c_tag_cfg{::m5::hal::v2::i2c::Scl{22}, ::m5::hal::v2::i2c::Sda{21}};
+    ::m5::hal::v2::uart::BusConfig uart_tag_cfg{::m5::hal::v2::uart::Rx{16}, ::m5::hal::v2::uart::Tx{17}};
+    auto wire_policy   = ::m5::hal::v2::native::borrowed(Wire);
+    auto spi_policy    = ::m5::hal::v2::native::borrowed(SPI);
+    auto serial_policy = ::m5::hal::v2::native::borrowed(Serial1);
 
     static_assert(sizeof(::m5::hal::v2::i2c::Bus_arduino) > 0, "Arduino I2C Bus type must be visible");
     static_assert(sizeof(::m5::hal::v2::spi::Bus_arduino) > 0, "Arduino SPI Bus type must be visible");
@@ -610,6 +725,9 @@ inline void compileArduinoApiSurface(void)
     detail::useResult(uart_cfg);
     detail::useResult(i2c_tag_cfg);
     detail::useResult(uart_tag_cfg);
+    detail::useResult(wire_policy);
+    detail::useResult(spi_policy);
+    detail::useResult(serial_policy);
 }
 #endif
 
@@ -617,30 +735,41 @@ inline void compileArduinoApiSurface(void)
 inline void compileEspidfApiSurface(void)
 {
 #if M5HAL_ESPIDF_I2C_HAS_MASTER
-    ::m5::hal::v2::i2c::BusConfig_espidf i2c_cfg;
+    ::m5::hal::v2::i2c::BusConfig i2c_cfg;
     i2c_cfg.pin_scl = 22;
     i2c_cfg.pin_sda = 21;
     static_assert(sizeof(::m5::hal::v2::i2c::Bus_espidf) > 0, "ESP-IDF I2C Bus type must be visible");
     detail::useResult(i2c_cfg);
 
-    // tag-pin ctors, inherited by the variant config.
-    ::m5::hal::v2::i2c::BusConfig_espidf i2c_tag_cfg{::m5::hal::v2::i2c::Scl{22}, ::m5::hal::v2::i2c::Sda{21}};
+    // Portable tag-pin constructors remain available on BusConfig.
+    ::m5::hal::v2::i2c::BusConfig i2c_tag_cfg{::m5::hal::v2::i2c::Scl{22}, ::m5::hal::v2::i2c::Sda{21}};
     detail::useResult(i2c_tag_cfg);
 #endif
 
+#if M5HAL_ESPIDF_I2C_SLAVE_LL || M5HAL_ESPIDF_I2C_SLAVE_LL_BE
+    // Keep the direct ISR backend linked into the official component-build ELF
+    // so the post-link IRAM audit verifies every target instead of accepting a
+    // backend discarded by section GC.
+    ::m5::hal::v2::i2c::SlaveBus_espidf slave_bus;
+    ::m5::hal::v2::i2c::SlaveBusConfig slave_cfg;
+    slave_cfg.pin_scl = 22;
+    slave_cfg.pin_sda = 21;
+    detail::useResult(slave_bus.init(slave_cfg));
+    detail::useResult(slave_bus.close());
+#endif
+
 #if M5HAL_ESPIDF_SPI_HAS_MASTER
-    ::m5::hal::v2::spi::BusConfig_espidf spi_cfg;
+    ::m5::hal::v2::spi::BusConfig spi_cfg;
     static_assert(sizeof(::m5::hal::v2::spi::Bus_espidf) > 0, "ESP-IDF SPI Bus type must be visible");
     detail::useResult(spi_cfg);
 #endif
 
-    ::m5::hal::v2::uart::BusConfig_espidf uart_cfg;
+    ::m5::hal::v2::uart::BusConfig uart_cfg;
     static_assert(sizeof(::m5::hal::v2::uart::Bus_espidf) > 0, "ESP-IDF UART Bus type must be visible");
     detail::useResult(uart_cfg);
 
-    // tag-pin ctors; `port_num` stays assignable after tag construction.
-    ::m5::hal::v2::uart::BusConfig_espidf uart_tag_cfg{::m5::hal::v2::uart::Tx{17}, ::m5::hal::v2::uart::Rx{16}};
-    uart_tag_cfg.port_num = 1;
+    // tag-pin ctors remain portable; controller choice is provider-owned.
+    ::m5::hal::v2::uart::BusConfig uart_tag_cfg{::m5::hal::v2::uart::Tx{17}, ::m5::hal::v2::uart::Rx{16}};
     detail::useResult(uart_tag_cfg);
 }
 #endif
@@ -680,14 +809,13 @@ inline void compileGpioCapabilityApiSurface(void)
 // Host POSIX UART variant surface. On a plain POSIX host build posix is the
 // flat-injected UART provider; this references its suffixed variant type to
 // keep CI honest about the exposure. Compile/surface only: it never opens a
-// device (no open()/attach()), so it is safe to run in CI.
+// device, so it is safe to run in CI.
 inline void compilePosixApiSurface(void)
 {
     static_assert(sizeof(::m5::hal::v2::uart::Bus_posix) > 0, "POSIX UART Bus type must be visible");
 
     ::m5::hal::v2::uart::Bus_posix bus;
-    ::m5::hal::v2::uart::BusConfig_posix uart_cfg;
-    uart_cfg.device_path = nullptr;  // lazy open; nothing is opened here
+    ::m5::hal::v2::uart::BusConfig uart_cfg;
     detail::useResult(bus.init(uart_cfg));
     detail::useResult(bus.nativeHandle());
 }
@@ -705,10 +833,15 @@ inline void compileRuntimeApiSurface(void)
     runtime::delayMs(0);
     runtime::delayUs(0);
     runtime::Mutex mutex;
-    if (mutex.lock(0)) {
-        mutex.unlock();
+    auto locked = mutex.lock(0);
+    detail::useResult(locked);
+    if (locked) {
+        detail::useResult(mutex.unlock());
     }
     runtime::Event event;
+    static_assert(std::is_same_v<decltype(event.wait(0)), ::m5::hal::v2::result_t<void>>,
+                  "runtime::Event::wait must return result_t<void>");
+    static_assert(std::is_same_v<decltype(event.notify()), void>, "runtime::Event::notify must remain infallible void");
     event.notify();
     detail::useResult(event.wait(0));
 }

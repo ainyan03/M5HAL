@@ -10,10 +10,46 @@ namespace spi {
 
 m5::stl::expected<SPIBus*, m5::hal::error::error_t> getBus(const SPIBusConfig& config)
 {
-    // @TODO ソフトウェアSPIの複数のインスタンスを管理できるようにすること。
-    static SoftwareSPIBus spi_bus;
-    spi_bus.init(config);
-    return &spi_bus;
+    // Fixed-slot registry keyed by the full pin set: distinct pin sets get
+    // distinct bus instances instead of aliasing one shared static, and a
+    // failed init() propagates instead of handing back a half-configured bus.
+    static constexpr size_t kMaxBuses = 4;
+    static constexpr size_t kPins     = sizeof(config.pins) / sizeof(config.pins[0]);
+    static SoftwareSPIBus buses[kMaxBuses];
+    static const interface::gpio::Pin* key_pins[kMaxBuses][kPins];
+    static bool used[kMaxBuses];
+
+    for (size_t i = 0; i < kMaxBuses; ++i) {
+        if (!used[i]) {
+            continue;
+        }
+        // SPIBusConfig carries only the pin set, so a key match means the
+        // already-initialized instance is fully equivalent: no re-init.
+        bool match = true;
+        for (size_t p = 0; p < kPins; ++p) {
+            if (key_pins[i][p] != config.pins[p]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            return &buses[i];
+        }
+    }
+    for (size_t i = 0; i < kMaxBuses; ++i) {
+        if (!used[i]) {
+            const auto err = buses[i].init(config);
+            if (err != error::error_t::OK) {
+                return m5::stl::make_unexpected(err);
+            }
+            for (size_t p = 0; p < kPins; ++p) {
+                key_pins[i][p] = config.pins[p];
+            }
+            used[i] = true;
+            return &buses[i];
+        }
+    }
+    return m5::stl::make_unexpected(m5::hal::error::error_t::OUT_OF_RESOURCE);
 }
 
 error::error_t SoftwareSPIBus::init(const BusConfig& config)
@@ -44,11 +80,11 @@ m5::stl::expected<Accessor*, m5::hal::error::error_t> SoftwareSPIBus::beginAcces
     /// @TODO ここで排他制御＆ロック処理を行うこと。
     if (_Accessor.get() != nullptr) {
         M5_LIB_LOGE("SoftwareSPI::beginAccess: error %s", __PRETTY_FUNCTION__);
-        return nullptr;
+        return m5::stl::make_unexpected(m5::hal::error::error_t::INVALID_ARGUMENT);
     }
     if (access_config.getBusType() != getBusType()) {
         M5_LIB_LOGE("SoftwareSPI::beginAccess: error %s", __PRETTY_FUNCTION__);
-        return nullptr;
+        return m5::stl::make_unexpected(m5::hal::error::error_t::INVALID_ARGUMENT);
     }
     auto result = new SoftwareSPIMasterAccessor(*this, static_cast<const SPIMasterAccessConfig&>(access_config));
     _Accessor.reset(result);

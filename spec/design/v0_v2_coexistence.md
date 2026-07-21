@@ -22,6 +22,17 @@ library のビルド成立に必要な target 境界のみ。同一性維持の�
 5. **v0 freeze** — v0 側は配布ビルド用の target 境界を除いて機能変更せず、 v2 の配置規約は適用しない
 6. **variants は v2 オンリー** — variant 機構は v2 用のみ提供する
 
+### v0の検証方針
+
+v0の主検証は、公開entry・対応chip/framework・v0/v2同居を守るcompile/link fenceと、既存下流
+consumerのbuildである。ただしcompileだけでは、過去に修正したzero-length処理のようなgeneric
+実行時回帰を検出できない。このため`test/v0/native/`には、既知の互換契約を守る最小smokeだけを置き、
+通常の`test_native`で毎回実行する。
+
+このsmokeはv0の機能拡張や網羅的なdriver testを再開するものではない。v0 sourceを例外的に修正する
+場合は、hostで再現可能なら当該回帰をここへ追加し、hardware固有なら既存下流buildに加えて対象実機で
+修正点を確認する。新規機能と新規chipの一次対応はv2にのみ追加する。
+
 ## namespace 配置 (1 か所のみ定義)
 
 | 世代 | 完全修飾 namespace | `m5::hal::*` として解決される条件 |

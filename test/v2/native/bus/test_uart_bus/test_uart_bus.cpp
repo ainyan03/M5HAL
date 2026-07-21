@@ -2,6 +2,7 @@
 #include "../static_bus_view_contract.hpp"
 
 #include <M5HAL_v2.hpp>
+#include <m5_hal/hal/v2/bus/local_backend.hpp>
 #include <gtest/gtest.h>
 #include "support/gtest_watchdog.hpp"
 
@@ -18,13 +19,9 @@
 
 namespace m5::hal::v2::uart {
 
-// Test-only config + backend. A BackendFor specialization for a test-local
-// config keeps the production variant landscape unchanged while letting
-// Bus::init / BusView::acquire run natively. No I/O: the lock tests only open
-// access windows (begin/endAccess), which exercise the channel mutexes.
-struct FakeBusConfig : public IBusConfig {
-    using IBusConfig::IBusConfig;
-};
+// Test-only portable provider. No I/O: the lock tests only open access
+// windows (begin/endAccess), which exercise the channel mutexes.
+using FakeBusConfig = IBusConfig;
 
 class FakeBus : public IBus {
 public:
@@ -37,9 +34,37 @@ public:
     // tests here do not move data.
 };
 
-template <>
-struct BackendFor<FakeBusConfig> {
-    using type = FakeBus;
+result_t<std::unique_ptr<IBus>> makeFakeBackend(const bus::LocalResourceContext&, const IBusConfig& cfg)
+{
+    std::unique_ptr<FakeBus> backend{new (std::nothrow) FakeBus()};
+    if (!backend) {
+        return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+    }
+    auto initialized = backend->init(cfg);
+    if (!initialized.has_value()) {
+        return m5::stl::make_unexpected(initialized.error());
+    }
+    return std::unique_ptr<IBus>{std::move(backend)};
+}
+
+result_t<void> initFakeFacade(Bus& facade, const IBusConfig& cfg)
+{
+    auto backend = makeFakeBackend({}, cfg);
+    if (!backend.has_value()) {
+        return m5::stl::make_unexpected(backend.error());
+    }
+    return facade.adoptPortableBackend(std::move(backend.value()), cfg);
+}
+
+struct FakeHal {
+    bus::LocalBackend backend;
+    bus::LocalPortableProvider<BusTraits> provider{&makeFakeBackend};
+    BusView UART{&backend};
+
+    FakeHal()
+    {
+        backend.registerPortableProvider(provider);
+    }
 };
 
 }  // namespace m5::hal::v2::uart
@@ -56,7 +81,7 @@ TEST(UartBusFacade, InitWithFakeBackendSucceeds)
     v2::uart::FakeBusConfig cfg;
     cfg.pin_tx = 1;
     cfg.pin_rx = 3;
-    ASSERT_TRUE(facade.init(cfg).has_value());
+    ASSERT_TRUE(v2::uart::initFakeFacade(facade, cfg).has_value());
     EXPECT_EQ(facade.getConfig().pin_tx, 1);
     EXPECT_EQ(facade.getConfig().pin_rx, 3);
 }
@@ -73,7 +98,7 @@ TEST(UartBusFacade, QueryApiBeforeInitReturnsDefaults)
 
 TEST(UartBusView, SamePinsReturnSameInstance)
 {
-    auto& hal = v2::getM5_Hal();
+    v2::uart::FakeHal hal;
     v2::uart::FakeBusConfig cfg;
     cfg.pin_tx = 10;
     cfg.pin_rx = 11;
@@ -88,7 +113,7 @@ TEST(UartBusView, SamePinsReturnSameInstance)
 
 TEST(UartBusView, SameIdentityWithDifferentBufferConfigIsRejected)
 {
-    auto& hal = v2::getM5_Hal();
+    v2::uart::FakeHal hal;
     v2::uart::FakeBusConfig cfg_a;
     cfg_a.pin_tx         = 22;
     cfg_a.pin_rx         = 23;
@@ -107,7 +132,7 @@ TEST(UartBusView, SameIdentityWithDifferentBufferConfigIsRejected)
 
 TEST(UartBusView, DifferentTxReturnDistinctInstances)
 {
-    auto& hal = v2::getM5_Hal();
+    v2::uart::FakeHal hal;
     v2::uart::FakeBusConfig cfg_a;
     cfg_a.pin_tx = 12;
     cfg_a.pin_rx = 13;
@@ -124,7 +149,7 @@ TEST(UartBusView, DifferentTxReturnDistinctInstances)
 
 TEST(UartBusView, UnsetPinRemainsPartOfIdentity)
 {
-    auto& hal = v2::getM5_Hal();
+    v2::uart::FakeHal hal;
     v2::uart::FakeBusConfig cfg;
     cfg.pin_tx = -1;
     cfg.pin_rx = 5;
@@ -136,13 +161,13 @@ TEST(UartBusView, UnsetPinRemainsPartOfIdentity)
 
 TEST(UartBusView, StaticPolicyCommitIsNoop)
 {
-    auto& hal = v2::getM5_Hal();
+    v2::uart::FakeHal hal;
     v2::test::bus_contract::expectStaticCommitSurface(hal.UART);
 }
 
 TEST(UartBusView, LogicalAcquireSurfaceExistsButIsStaticPolicy)
 {
-    auto& hal = v2::getM5_Hal();
+    v2::uart::FakeHal hal;
     v2::uart::LogicalBusConfig req{v2::uart::Tx{18}, v2::uart::Rx{19}};
     v2::uart::LogicalBusConfig unset_pin{v2::uart::Tx{-1}, v2::uart::Rx{19}};
 
@@ -153,7 +178,7 @@ TEST(UartBusView, LogicalAcquireSurfaceExistsButIsStaticPolicy)
 
 TEST(UartBusView, ChannelLocksAreIndependent)
 {
-    auto& hal = v2::getM5_Hal();
+    v2::uart::FakeHal hal;
     v2::uart::FakeBusConfig cfg;
     cfg.pin_tx = 16;
     cfg.pin_rx = 17;
@@ -178,7 +203,7 @@ TEST(UartBusView, ChannelLocksAreIndependent)
 // the shared_ptr ctor to the base correctly.
 TEST(UartBusViewCoOwn, AccessorOutlivesAcquireTemporary)
 {
-    auto& hal = v2::getM5_Hal();
+    v2::uart::FakeHal hal;
     v2::uart::FakeBusConfig cfg;
     cfg.pin_tx = 16;
     cfg.pin_rx = 17;

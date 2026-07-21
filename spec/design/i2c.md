@@ -45,13 +45,19 @@ pin の設定手段は 2 つで、 どちらも型安全:
 
 タグ無しの positional ctor (`BusConfig{22, 21}`) は**意図的に存在しない**: SCL と SDA は同じ整数型を共有するため、 引数順の取り違えがコンパイルを通ってワイヤ上でだけ壊れる。 タグが役割を型で運ぶ。 タグが要るのは**同型 (`gpio_number_t`) のピン引数同士のみ**で、 型が異なる引数 (`TwoWire*` 等) はオーバーロード解決が型で守るためタグ不要 — variant 固有フィールドはタグ構築後のフィールド代入で設定する。
 
-Framework 依存の native handle / port は共通 `IBusConfig` には置かない。 各 variant は共通 config を継承した `BusConfig_<variant>` を**必ず公開**し (offer の勝者が `BusConfig` の短名を取る、 [variants.md](variants.md) §offer 要件)、 `init` は **その型を直接受ける非 virtual メンバ** (`init(const BusConfig_<variant>&)`) として宣言する (基底 `bus::IBus` に virtual `init` は無い。 variant 固有情報が必須な操作を kind 汎用にはできないため)。 variant config はタグ型 ctor を **ctor 継承** (`using IBusConfig::IBusConfig;`) で見せる — pin フィールドを実際に読む variant だけが対象 (pin を読まない variant は見せない。 UART posix が該当、 [uart.md](uart.md))。
+Framework依存のnative handle / portはportable `IBusConfig`へ置かない。通常取得は全providerで
+`acquire(BusConfig)`に統一し、buildのwinner bindingがproviderを選ぶ。既存native resourceを使う場合だけ、
+対応providerのownership policy overloadを使う。
 
-- Arduino variant: `TwoWire* wire` を明示する。`init(BusConfig_arduino)` はその `TwoWire` に `begin` / `end` を行い、`attach(TwoWire&)` は caller-owned lifecycle として扱う。core の `begin()` が `bool` を返す場合は `false` を `IO_ERROR` として返し、新busを採用しない。`void` を返すcoreは失敗信号を持たないため、呼出完了を成功として扱う。
-- ESP-IDF variant: ESP-IDF driver 世代に応じた `i2c_port` を持つ。pin / buffer など共通にできる値は基底 `IBusConfig` 側に残す。
-- software variant: native handle を持たず固有フィールドが無いため、 `struct BusConfig_software : IBusConfig` の空派生 + ctor 継承で共通 config をそのまま受ける。
+- Arduino variant: `acquire(cfg, native::borrowed(TwoWire&))`を提供し、caller-owned `TwoWire`を借用する。managed取得は提供しない。coreの`begin()`が`bool`を返す場合の失敗とRX buffer上限の契約はportable取得と同じ。
+- ESP-IDF variant: 現行native取得はgen5 driverの`native::borrowed(NativeMasterBus)`だけ。legacy driverやmanaged native取得へ一般化しない。
+  gen5のportable取得はdriverのport自動選択 (`i2c_port=-1`)を使い、空いているHP controllerを選ぶ。特定controllerを
+  必須・優先指定する場合はportable configへfieldを足さず、logical allocation APIを使う。gen4 backendはlegacy
+  driver制約によりcontroller 0を既定とする。
+- software variant: native resource policyを提供せず、portable configだけを受ける。
 
-抽象 `IBusConfig` を拡張フィールド持ち variant (Arduino 等) の `init` に渡す誤用、 および別 variant の config を渡す誤用は、 **どちらもコンパイルエラー**になる (派生参照に基底オブジェクトは束縛できない)。 拡張なし variant への variant config 渡しは upcast として正しく通る。
+provider固有初期化が必要な実装者は`Bus_<variant>::init(...)`を直接使えるが、variant configを
+公開acquireのselectorにはしない。
 
 ## IBus (Bus 抽象基底)
 
@@ -60,28 +66,48 @@ namespace m5::hal::v2::i2c {
 
 class IBus : public bus::IBus {
 public:
-    virtual result_t<size_t> transfer(
-        bus::IAccessor* owner,
-        const MasterAccessConfig& cfg,
+    result_t<void> transfer(
+        bus::OperationContext<MasterAccessConfig>& context,
         const TransferDesc& desc,
         data::Source* src,
-        data::Sink*   dst) = 0;
+        size_t tx_len,
+        data::Sink* dst,
+        size_t rx_len);
+
+    result_t<void> probe(
+        uint16_t i2c_addr,
+        uint32_t freq = 100000,
+        uint32_t timeout_ms = 50);
+
+protected:
+    virtual result_t<void> transferBackend(
+        bus::OperationContext<MasterAccessConfig>& context,
+        const TransferDesc& desc,
+        data::Source* src,
+        size_t tx_len,
+        data::Sink* dst,
+        size_t rx_len);
 
     // 簡易 probe sugar。
     // Accessor を構築せず単一 device の存在確認ができる短縮 API。
     // 内部で stack-allocated な MasterAccessor を sentinel として組み立て、
     // 同じ probe path を呼ぶ。 default `timeout_ms = 50` は I2C scan 用途を
     // 想定 (`MasterAccessConfig` 全体 default の 1000ms とは別)。
-    result_t<void> probe(
-        uint16_t addr,
-        uint32_t freq         = 100000,
-        uint32_t timeout_ms   = 50);
 };
 
 }
 ```
 
 `transfer` は **atomic な 1 回の I2C トランザクション** を表す。
+
+公開`transfer(context, ...)`はactive ContextのBus・Accessor・generationを検査するnon-virtual入口であり、
+providerはprotected `transferBackend(context, ...)`だけをoverrideする。設定は`context.config`、診断用ownerは
+検査済みContextから取得し、raw `IAccessor*`を所有証明として受けない。
+
+I2C masterの`beginOperation`はBus排他と共通runtimeを確立するが、START/STOPやdevice handleを生成しない。
+target address、frequency、wire timeoutは一つの物理transactionに属するため、`transfer`がwireへ触れる前に
+検証・適用する。Arduinoの`setClock/setTimeOut`とESP-IDFのdevice handleはapplied値をcacheし、同じAccess内の
+後続transferで無用な再設定を行わない。このkind固有例外でもrequested ConfigはAccess中に不変である。
 
 ### transfer の wire semantics
 
@@ -127,7 +153,8 @@ STOP
 実装上の注意:
 - variant の `transfer` 実装が「全空だから何もしない」 と短絡してはいけない
 - 必ず wire 上に address+W を送出して ACK / NACK チェック
-- `expected<size_t, error_t>` の戻り値は ACK 時 `0` (transferred bytes は 0)、 NACK 時 `error_t::I2C_NO_ACK`
+- `IBus::probe` / `MasterAccessor::probe` は `result_t<void>`を返し、ACK時success、NACK時
+  `error_t::I2C_NO_ACK`とする。内部transferのtx/rx totalsはいずれも0
 
 `MasterAccessor::probe()` がこの path を sugar として提供する (下記)。
 
@@ -135,10 +162,10 @@ STOP
 
 共通機構は [bus_accessor.md](bus_accessor.md) §Bus の保持 を参照。本 kind 固有の差分のみ以下に示す。
 
-- **facade と直接構築**: 無印 `i2c::Bus` は `IBus` を継承する runtime facade で、`init(cfg)` は config
-  型から backend (`Bus_<variant>`) を選ぶ。`i2c::Bus bus; bus.init(cfg);` の直接構築は引き続き可。
-- **acquire の識別子 (identity) = コアピン `{scl, sda}` のみ**。freq は accessor 設定なので含めず、
-  backend/Wire/port も「駆動手段」なので identity ではない。同一ピンを別 `BusConfig_<variant>` で
+- **facade と直接構築**: 無印 `i2c::Bus` は `IBus` を継承するruntime facadeで、`init(cfg)`は
+  buildで選ばれたprovider backendを作る。`i2c::Bus bus; bus.init(cfg);`の直接構築は引き続き可。
+- **portable acquireのidentity projection = `Pins` tagのコアピン`{scl, sda}`**。freqはaccessor設定なので含めず、
+  backend/Wire/port も「駆動手段」なので identity ではない。同一ピンを異なる取得policyで
   再 acquire しても**最初の backend が勝つ** (差し替えは下記 §intent 駆動の HW 割当 の `commitBuses()`
   経由)。
 
@@ -150,8 +177,8 @@ i2c::MasterAccessor dev{sp.value(), acc_cfg};  // shared_ptr直渡しでaccessor
 
 ### intent 駆動の HW 割当
 
-`acquire<CfgT>(cfg)` は **config の型で backend を固定**する (= 明示指名)。これとは別に
-`acquire(LogicalBusConfig)` は **配線 (ピン) と「意図」だけ**を述べ、HW コントローラの割当はファクトリに
+portable `acquire(cfg)`はbuildで選ばれたproviderを使う。これとは別に
+`acquire(LogicalBusConfig)`は**配線 (ピン) と「意図」だけ**を述べ、HWコントローラの割当はファクトリに
 任せる。ESP32 系は HW I2C コントローラが有限 (例 2 系統) なのに、M5StickC のように内蔵 / PortA / HAT の
 3 系統を欲しがるボードがある — どれを HW にしどれを software (bit-bang) にするかは、固定指名でなく
 **能力 (capability) への要望 + ファクトリの bin-packing** で解く。要望は内部的には capability マスク
@@ -227,14 +254,19 @@ namespace m5::hal::v2::i2c {
 class MasterAccessor : public bus::IAccessor {
 public:
     MasterAccessor(IBus& bus, const MasterAccessConfig& cfg);
-    inline IBus& getBus() const noexcept;
+    IBus& getBus(void) const;
 
     // 通信パラメータ差し替え。
     // 「同じ Accessor を使い回して address だけ変えていく」 scan パターン用 sugar。
     // 排他制御中 (`inAccess() == true`) は INVALID_STATE で reject する。
     result_t<void> setConfig(const MasterAccessConfig& cfg);
 
-    result_t<size_t> transfer(
+    result_t<void> beginAccess(uint32_t timeout_ms = types::TIMEOUT_FOREVER);
+    result_t<void> endAccess(uint32_t timeout_ms = 1000);
+    bool transferBusy();
+    result_t<bus::TransferStatus> getLastTransferStatus() const;
+
+    result_t<bus::TransferTotals> transfer(
         const TransferDesc& desc,
         data::ConstDataSpan src,
         data::DataSpan dst);
@@ -265,21 +297,21 @@ public:
     result_t<void> probe();
 
 private:
-    MasterAccessConfig _access_config;
+    bus::OperationContext<MasterAccessConfig> _context;
+    bus::TransferStatus _last_transfer_status;
+    uint32_t _next_transfer_id;
 };
 
 }
 ```
 
-### transaction 中のエラー
+### transfer中のエラー
 
-transaction 内の segment 群は 1 個の論理操作を成す (register pointer 書き込み →
-repeated start → 読み出し、のような依存チェーン)。したがって **segment の失敗は
-種別を問わず transaction に latch される** — `IBus::transfer` の同期エラー
-(pre-flight 拒否) も、`waitTransfer` で表面化する wire 失敗も同じ扱い。latch 後は
-同一 transaction 内の後続 transfer が同じエラーで reject され、`endTransaction` も
-同じエラーを報告する。復帰は新しい transaction の開始 (`beginTransaction` が latch を
-クリアする) = チェーン先頭からのやり直し。
+一回の`transfer` descriptor内のsegment群は一個のatomic wire操作を成す
+(register pointer書込み → repeated START → read等)。同期pre-flight errorと
+`waitTransfer`で表面化するwire errorは、そのI/Oの戻り値と`TransferStatus`に記録する。
+errorはAccess-wideにlatchせず、backendがbrokenでなければ同じAccess内の後続transferを試せる。
+`endAccess`はoutstanding I/O完了とbackend cleanupだけを返し、過去のI/O errorを再返却しない。
 
 - 「失敗した segment を飛ばして続行」「同一 segment のその場リトライ」は許可しない。
   segment 間に依存が無い操作は、そもそも別 transaction に分ける。
@@ -323,7 +355,11 @@ SPI 由来で `writeCommand` を探した場合は `write` / `writeRegister` を
 
 write buffer は頻出経路なので、 `MasterTransactionService` 側に fast path を持つ。 具体的には `Operation::WriteBuffer` の dispatch を先頭で処理し、 byte write service を直接呼び、 2 byte 目以降は同じ line driver / timing を保持したまま byte state だけを restart する。 これは service 概念を維持したまま、 byte 列送信中の呼び出し層と分岐を減らすための最適化である。
 
+transaction serviceが公開する開始操作は製品の組立て経路で使うaddress / buffer read-write / STOPに限定する。STARTや単発byteのprimitiveは各専用serviceを直接testし、transaction側にtest専用dispatchを持たせない。
+
 byte write / byte read の定常クロックは、各 edge の実行時刻から `now + half_period` で次回予約するのではなく、前回 due に half period を加算して理想位相を維持する。 これにより `service()` dispatch や GPIO 操作の処理時間が SCL half period に毎回上乗せされることを避け、100kHz/400kHz のような低めの設定でも wire 周波数が設定値から下振れしにくくなる。 ただし service の遅延が大きく、次の due が現在時刻を過ぎている場合は `now + half_period` に再同期する。これは遅れを取り戻そうとして複数 edge を runner 速度で連続出力し、設定より大幅に速いクロック burst になることを避けるためである。 START / STOP の setup/hold や clock stretch 解除後は、実際に SCL/SDA の条件が成立した時刻から half period を取り直す。
+
+clock stretchのrelease / waiting / timeout遷移は全primitiveで同じtiming helperを通し、解除後の再同期と`TIMEOUT_ERROR`を一つの経路で扱う。SCLが最初からhighの場合の次edge予約は、定常byte clockの理想位相維持とSTART / STOPのsetup/holdの意味差を保つため、各primitive側に残す。
 
 SCL は `MasterLineDriver::writeSclHigh()` / `writeSclLow()` に分ける。 SCL は全 bit で立ち上げ/立ち下げが発生するため、 bool 引数経由の分岐を避け、 GPIO variant が high/low 専用 path (例: ESP32 の set/clear register) へ落としやすくする。 SDA は bit 値が data に依存するため `writeSda(bool)` のままとする。
 
@@ -337,7 +373,11 @@ software I2C を高め (例: 2MHz) に設定しても、wire 実測は pull-up �
 
 ## I2C slave
 
-I2C slave は master 体系と相似の型 (`ISlaveBus` / `SlaveBus_<variant>` / `SlaveBusConfig` / `SlaveStreamAccessor` / レジスタマップ・アダプタ `SlaveRegMapAccessor`) で提供する。 `serve(Source* src, Sink* dst, timeout)` を高レベル給仕の核に、 トランザクション窓モデル・back-pressure リング・clock-stretch ポリシー・3 種の timeout を持つ。
+I2C slave はmaster体系と相似のBus型 (`ISlaveBus` / `SlaveBus_<variant>` / `SlaveBusConfig`) と、
+caller-owned queueを持つ正準`SlaveAccessor`で提供する。`beginAccess/endAccess`が外部受付期間、Access外でも使える
+`read/write`がRX drain/TX preloadを表す。blocking `SlaveStreamAccessor::serve()`とレジスタマップadapterは
+`legacy_wire_frame_window=true`のopt-in互換面である。frame/segment、queue、timeout、backend capabilityの詳細は
+[i2c_slave.md](i2c_slave.md)を参照する。
 
 詳細は [i2c_slave.md](i2c_slave.md) を参照。
 
@@ -347,7 +387,7 @@ I2C slave は master 体系と相似の型 (`ISlaveBus` / `SlaveBus_<variant>` /
 
 ESP-IDF gen5 I2C master backend (`driver/i2c_master.h`) は `freq == 0`、アドレス範囲外、`i2c_master_probe` で表現できない 10-bit probe を driver 呼び出し前に `INVALID_ARGUMENT` として扱う。 10-bit address の通常 transfer は device config 経由で扱い、probe path だけを制限する。
 
-通常 transfer は `i2c_master_bus_add_device` で得た device handle を Bus 内に保持し、同じ address / frequency / address bit length / SCL wait 設定の連続アクセスでは再利用する。 `probe()` は scan 用の軽量経路として `i2c_master_probe` を直接使い、device handle cache とは独立させる。 設定が変わった場合や `release()` / `attach()` では cached device を外してから bus handle を切り替える。
+通常 transfer は `i2c_master_bus_add_device` で得た device handle を Bus 内に保持し、同じ address / frequency / address bit length / SCL wait 設定の連続アクセスでは再利用する。 `probe()` は scan 用の軽量経路として `i2c_master_probe` を直接使い、device handle cache とは独立させる。 設定が変わった場合や`closeBackend()`ではcached deviceを外してからbus handleを終了する。
 
 `driver/i2c_master.h` が無く `driver/i2c.h` がある ESP-IDF 世代では gen4 master backend (`driver/i2c.h`) を使う。これは Arduino-ESP32 2.x 系のように SPI master driver はあるが gen5 I2C master driver は無い環境で、ESP-IDF I2C variant を明示利用できるようにするためである。 gen4 backend は 7-bit address の master transfer / probe を対象とし、10-bit address は driver 呼び出し前に `INVALID_ARGUMENT` とする。
 
@@ -370,7 +410,7 @@ master の SCL クロック (`MasterAccessConfig::freq`) は、ESP ターゲッ�
 
 ## 関連
 
-- [i2c_slave.md](i2c_slave.md) — I2C slave 機構 (SlaveBus / SlaveStreamAccessor / SlaveRegMapAccessor)
+- [i2c_slave.md](i2c_slave.md) — I2C slave機構 (queue駆動SlaveAccessor + legacy Stream/RegMap)
 - [bus_accessor.md](bus_accessor.md) — Bus / Accessor 責務分離 + RAII
 - [transfer_desc.md](transfer_desc.md) — `i2c::TransferDesc` 詳細
 - [data_io.md](data_io.md) — Source / Sink + Limited 装飾

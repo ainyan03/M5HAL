@@ -17,6 +17,7 @@
 #include "hal/uart/usb_jtag.hpp"
 #include "hal/uart/usb_cdc.hpp"
 #include "hal/i2s/i2s.hpp"
+#include "hal/pdm/pdm.hpp"
 #include "hal/runtime/runtime.hpp"
 #include "hal/tcp/tcp.hpp"
 

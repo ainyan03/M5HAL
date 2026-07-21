@@ -9,20 +9,16 @@
 // Pin defaults match M5Stack Core (Basic / Gray / Fire) style wiring:
 //   SDA=21, SCL=22
 //
-// m5hal::i2c::Bus is a runtime FACADE: the bus type is always i2c::Bus, and
-// init() picks the concrete backend from the CONFIG type you pass. The default
-// i2c::BusConfig maps to the build's winner backend; an explicit suffixed
-// config forces a specific one (see the bus declaration and setup() below).
-// Build with -DM5HAL_EXAMPLE_I2C_SOFTWARE_BACKEND=1 to drive the same pins with the
-// software (bit-bang) backend.
+// i2c::BusConfig is portable: it describes wiring and bus semantics, not a
+// provider-specific handle. The build's selected I2C provider implements it.
+// To select the software (bit-bang) provider explicitly, build with
+// -DM5HAL_CONFIG_VARIANT_I2C=M5HAL_V2_VARIANT_ID_FRAMEWORK_SOFTWARE.
 //
 // Shared-owner model: acquire() interns the wiring and returns an owning
 // shared_ptr. The registry retains only a weak reference. Two acquires of the
 // same pins return the SAME instance (one
 // physical bus, one lock), so a board-support layer and user code cooperate
-// instead of fighting over the wire. The backend is chosen by the config TYPE
-// passed to acquire (default i2c::BusConfig = the build's winner; _arduino /
-// _espidf / _software select a specific one), so the handle is always
+// instead of fighting over the wire. The handle is always
 // shared_ptr<i2c::IBus>. (You can still own a bus yourself with
 // `i2c::Bus bus; bus.init(cfg)` and pass it by reference — see README.)
 // =============================================================================
@@ -44,10 +40,6 @@ static constexpr uint8_t REG_PROBE_R2 = 0x01;
 
 #ifndef M5HAL_EXAMPLE_I2C_FREQUENCY_HZ
 #define M5HAL_EXAMPLE_I2C_FREQUENCY_HZ 100000
-#endif
-
-#ifndef M5HAL_EXAMPLE_I2C_SOFTWARE_BACKEND
-#define M5HAL_EXAMPLE_I2C_SOFTWARE_BACKEND 0
 #endif
 
 // Shared owner, assigned in setup().
@@ -132,16 +124,9 @@ void setup()
     Serial.printf("pins: SDA=%d SCL=%d freq=%u\n", PIN_SDA, PIN_SCL,
                   static_cast<unsigned>(M5HAL_EXAMPLE_I2C_FREQUENCY_HZ));
 
-    // Tag-typed pins: either order is correct (no swapped-pin accidents). The
-    // config TYPE selects the backend: the default BusConfig maps to the winner
-    // backend (and carries the Arduino TwoWire handle), while BusConfig_software
-    // selects the bit-bang backend on the same pins.
-#if M5HAL_EXAMPLE_I2C_SOFTWARE_BACKEND
-    m5hal::i2c::BusConfig_software bus_cfg{m5hal::i2c::Scl{PIN_SCL}, m5hal::i2c::Sda{PIN_SDA}};
-#else
+    // Tag-typed pins: either order is correct (no swapped-pin accidents).
+    // The portable BusConfig uses the provider selected by this build.
     m5hal::i2c::BusConfig bus_cfg{m5hal::i2c::Scl{PIN_SCL}, m5hal::i2c::Sda{PIN_SDA}};
-    bus_cfg.wire = &Wire;
-#endif
 
     // Acquire the interned bus. This shared handle owns its lifetime.
     auto acquired = m5hal::M5_Hal.I2C.acquire(bus_cfg);

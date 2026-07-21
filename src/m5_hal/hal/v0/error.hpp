@@ -19,6 +19,7 @@ enum class ErrorType : int8_t {
     NOT_IMPLEMENTED  = -4,
     I2C_BUS_ERROR    = -5,
     I2C_NO_ACK       = -6,
+    OUT_OF_RESOURCE  = -10,  // Fixed bus-registry slots exhausted. Same value as the v2 code.
     // @ TODO エラーコード細分化する
 };
 using error_t = ErrorType;

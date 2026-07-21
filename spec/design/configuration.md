@@ -13,6 +13,16 @@ consumer TU を含む関連する全 TU に同じ値を渡す。ヘッダ includ
 |---|---|---|---|---|
 | `M5HAL_CONFIG_POSIX_UART` | `1` | `0`/`1` | `1`=POSIX host で termios serial を既定 UART provider として自動提供。 `0`=抑止 (host で UART kind を未提供へ戻す)。 **UART kind のみ** に作用し、 posix variant の runtime kind は影響を受けない ([runtime.md](runtime.md)) | `variants/frameworks/_checker.hpp` |
 | `M5HAL_CONFIG_REMOTE_VARIANT` | `0` | `0`/`1` | `1` のとき remote variant を framework winner scan に参加させる (`M5HAL_FRAMEWORK_HAS_REMOTE`) | `variants/frameworks/_checker.hpp` |
+| `M5HAL_CONFIG_VARIANT_RUNTIME` | `M5HAL_V2_VARIANT_ID_NONE` | 登録済み `M5HAL_V2_VARIANT_ID_*` | time providerを指定。`NONE`はoverrideなし。無効指定はcompile error | `src/m5_hal_config.hpp` |
+| `M5HAL_CONFIG_VARIANT_RUNTIME_MUTEX` | `M5HAL_V2_VARIANT_ID_NONE` | 同上 | runtime mutex providerを指定。同上 | `src/m5_hal_config.hpp` |
+| `M5HAL_CONFIG_VARIANT_RUNTIME_TASK` | `M5HAL_V2_VARIANT_ID_NONE` | 同上 | runtime task providerを指定。同上 | `src/m5_hal_config.hpp` |
+| `M5HAL_CONFIG_VARIANT_RUNTIME_EVENT` | `M5HAL_V2_VARIANT_ID_NONE` | 同上 | runtime event providerを指定。同上 | `src/m5_hal_config.hpp` |
+| `M5HAL_CONFIG_VARIANT_GPIO` | `M5HAL_V2_VARIANT_ID_NONE` | 同上 | GPIO providerを指定。同上 | `src/m5_hal_config.hpp` |
+| `M5HAL_CONFIG_VARIANT_I2C` | `M5HAL_V2_VARIANT_ID_NONE` | 同上 | I2C providerを指定。同上 | `src/m5_hal_config.hpp` |
+| `M5HAL_CONFIG_VARIANT_SPI` | `M5HAL_V2_VARIANT_ID_NONE` | 同上 | SPI providerを指定。同上 | `src/m5_hal_config.hpp` |
+| `M5HAL_CONFIG_VARIANT_I2S` | `M5HAL_V2_VARIANT_ID_NONE` | 同上 | I2S providerを指定。同上 | `src/m5_hal_config.hpp` |
+| `M5HAL_CONFIG_VARIANT_PDM` | `M5HAL_V2_VARIANT_ID_NONE` | 同上 | PDM providerを指定。同上 | `src/m5_hal_config.hpp` |
+| `M5HAL_CONFIG_VARIANT_UART` | `M5HAL_V2_VARIANT_ID_NONE` | 同上 | UART providerを指定。同上 | `src/m5_hal_config.hpp` |
 | `M5HAL_CONFIG_REMOTE_TCP_MAX_CONNECTIONS` | `2` | 整数 `>=1` | BSD TCP remote server が同時保持する connection slot 数と listen backlog。値を増やすと slot 配列の固定メモリも増える | `variants/frameworks/bsd/hal/remote/tcp_server.hpp` |
 | `M5HAL_CONFIG_ESPIDF_I2C_MASTER_LEGACY_DRIVER` | `0` | `0`/`1` | ESP-IDF の I2C backend 選択。 `0`=新 bus-device driver (gen5)、 `1`=legacy command-link driver (gen4)。 legacy driver を既に使うプロジェクトは `1` で混在リンク abort を回避。legacy選択時はLP_I2Cをcontroller poolへ公開しない ([i2c.md](i2c.md) §ESP-IDF LP_I2C) | `variants/frameworks/espidf/detail/espidf_version.hpp` |
 | `M5HAL_CONFIG_ESPIDF_I2C_SLAVE_IRAM_ISR` | `1` | `0`/`1` | `1`=ESP-IDF LL I2C slave ISR と到達コードを IRAM に配置し、flash cache 無効窓中も応答を維持。`0`=IRAM を回収するが、その窓中の slave 応答は保証しない ([i2c_slave.md](i2c_slave.md)) | `variants/frameworks/espidf/hal/i2c/slave.hpp` |
@@ -27,6 +37,14 @@ consumer TU を含む関連する全 TU に同じ値を渡す。ヘッダ includ
 各ノブは値で読まれる (`0`/`1` フラグは値ベース)。
 **`-D<マクロ>=0` は常に無効化として効く** (`#if defined(X)` 方式は `-D...=0` を黙って無視するため採用しない)。
 
+variant selectorの`<KIND>`は `GPIO` / `I2C` / `SPI` / `I2S` / `PDM` / `UART` / `RUNTIME` /
+`RUNTIME_MUTEX` / `RUNTIME_TASK` / `RUNTIME_EVENT` の10種。生の数値は使わず、
+`variants/ids.hpp`の名前付きIDを指定する。各selectorは定義済みのC++整数定数式へ展開できなければならず、
+名前付きIDの綴り誤りもcompile errorになる。remote providerを明示選択する場合、selectorはremote variantを
+自動参加させないため、`M5HAL_CONFIG_REMOTE_VARIANT=1`も必要になる。逆にremoteをscanへ参加させるだけなら
+selectorは不要で、overrideなしの走査順が適用される。これらは型aliasと別TU実装を一致させるため、M5HAL自身の
+source TUを含む全関連TUへ同じ値を渡す。
+
 例:
 
 ```bash
@@ -34,6 +52,9 @@ consumer TU を含む関連する全 TU に同じ値を渡す。ヘッダ includ
 -DM5HAL_CONFIG_POSIX_UART=0
 # legacy driver を既に使う ESP-IDF プロジェクトで gen4 backend を選ぶ
 -DM5HAL_CONFIG_ESPIDF_I2C_MASTER_LEGACY_DRIVER=1
+# hostでremoteもscanしつつ、I2Cの既定providerだけsoftwareへ固定する
+-DM5HAL_CONFIG_REMOTE_VARIANT=1
+-DM5HAL_CONFIG_VARIANT_I2C=M5HAL_V2_VARIANT_ID_FRAMEWORK_SOFTWARE
 # 一時プールを拡げる
 -DM5HAL_CONFIG_MEMORY_TEMP_BLOCK_SIZE_BYTES=512
 ```
@@ -60,49 +81,12 @@ boolean switch は既定 off かつ値ベースで読み、marker pin のよう�
 | `M5HAL_DEBUG_ESPIDF_I2C_SLAVE_NO_TX_WATERMARK` | `0` | `0`/`1` | `1`=先回りの TX FIFO water-mark 補充を止め、TX_EMPTY への reactive 補充だけにする A/B 診断 |
 | `M5HAL_DEBUG_ESPIDF_I2C_SLAVE_NO_CONTROLLER_CLOCK` | `0` | `0`/`1` | `1`=I2C 機能 clock の有効化を省き、C6/H2 等の cold-boot failure を再現する A/B 診断 |
 
-## 規約の対象外: バージョン/ABI 切替
+## バージョン/ABI切替
 
 `M5HAL_V0_INLINE` / `M5HAL_V2_INLINE` は `m5::hal::vN` を `inline namespace` にするかを選ぶ
-**バージョン共存/ABI** の切替であり、挙動 config とは別カテゴリ。歴史的経緯からこの名前のまま
-据え置き、`M5HAL_CONFIG_*` 規約の対象外とする。詳細は
+**バージョン共存/ABI** の切替であり、挙動configではない。詳細は
 [v0_v2_coexistence.md](v0_v2_coexistence.md)。
 
----
-
-## 実装者向け: 命名規約
-
-> **読者**: 実装者・レビュー向け（設計仕様）。
-
-マクロは役割を名前で判別できるよう、次の6分類に分ける。
-
-1. **サポート対象の入力 `M5HAL_CONFIG_*`**: ライブラリの挙動を変える公開設定。
-   `M5HAL_CONFIG_<領域>_<機能>` で命名し、本ページに登録する。各ノブは `#ifndef`＋既定値で定義し、
-   定義の有無ではなく**値**で読む。boolean switch の `1` は、名前が示す肯定命題を常に意味する。
-   `USE_` / `DISABLE_` / `NO_` は使わず、正の名詞と既定値で極性を表す。
-2. **サポート対象外の入力 `M5HAL_DEBUG_*`**: backend の調査・A/B 診断だけに使う。
-   boolean switch は既定 `0` とし、定義の有無ではなく値で読む。marker pin のような依存 parameter は、
-   親 switch が有効なときだけ読む。`NO_` は、正常機構を意図的に止めて故障を再現する A/B fault injection に限り許す。
-   `M5HAL_CONFIG_DIAG` は利用者が使える generic event trace、`M5HAL_DEBUG_*` は backend 内部の診断 probe である。
-3. **公開 read-only output**: `M5HAL_V2_SELECTED_*` / `M5HAL_V2_DETECTED_*` /
-   `M5HAL_FRAMEWORK_HAS_*` / `M5HAL_V2_TARGET_IS_PC`。ライブラリが検出・選択結果として算出する値で、
-   利用者が外部から定義してはならない。
-
-   | 名称 | 意味 | 外部定義 |
-   |---|---|---|
-   | `M5HAL_V2_SELECTED_*` | bus kind ごとの winner 選択結果 | 禁止 |
-   | `M5HAL_V2_DETECTED_*` | platform variant などの自動検出結果 | 禁止 |
-   | `M5HAL_FRAMEWORK_HAS_*` | framework backend の提供可否 | 禁止 |
-   | `M5HAL_V2_TARGET_IS_PC` | v2 target が PC かどうか | 禁止 |
-
-4. **内部 macro**: `M5HAL_DETAIL_*` または末尾 `_` の名前。公開契約ではなく、外部から定義しない。
-5. **header guard `M5_HAL_*`**: include 重複を防ぐファイル内定義。機能設定ではない。
-6. **scope-local input**: `M5HAL_TEST_*` / `M5HAL_EXAMPLE_*` / `M5HAL_EXPERIMENT_*` / `M5HAL_HIL_*`。
-   test、example、experiment、HIL fixture だけの入力で、ライブラリ全体の設定ではない。値の意味と既定は所有する source / README で説明する。
-   公開 sample の `M5HAL_EXAMPLE_*` boolean も `#ifndef` で既定値を与え、定義の有無ではなく値で読む。
-
-物理量は単位を `HZ` / `MS` / `US` / `BYTES` で名前に示し、個数は `COUNT`、GPIO の抽象 pin は `PIN` を使う。
-ESP-IDF を表す macro token は `ESPIDF` を canonical とする。既定値はそれを読むサブシステムの隣に co-locate し、
-横断的なものだけ `src/m5_hal_config.hpp` に置く。本ページが supported config と unsupported debug input の単一カタログである。
-
-`M5HAL_` で始まる runtime environment variable もあるが、これらは compile-time macro ではない。
-各 tool / runtime が文字列として読み取り、その所有文書で別途説明する。
+新しいmacroを追加する実装者向けの分類・命名規約は
+[coding_style.md](../style/coding_style.md) §マクロ を参照する。本ページは利用者が指定できる
+`M5HAL_CONFIG_*`と、サポート対象外の`M5HAL_DEBUG_*`のカタログだけを正本とする。

@@ -6,11 +6,15 @@
 
 #if defined(ESP_PLATFORM) && M5HAL_ESPIDF_I2S_HAS_STD
 
+#include "../../detail/esp_err_map.hpp"
+
 #include <driver/gpio.h>
 #include <esp_err.h>
 #include <freertos/FreeRTOS.h>
 
 #include "../../../freertos/hal/runtime/time.hpp"
+
+#include <cstdlib>
 
 namespace m5::hal::v2::i2s {
 
@@ -19,19 +23,7 @@ namespace impl_espidf {
 
 error::error_t mapEspErr(::esp_err_t err)
 {
-    switch (err) {
-        case ESP_OK:
-            return error::error_t::OK;
-        case ESP_ERR_INVALID_ARG:
-        case ESP_ERR_INVALID_STATE:
-            return error::error_t::INVALID_ARGUMENT;
-        case ESP_ERR_TIMEOUT:
-            return error::error_t::TIMEOUT_ERROR;
-        case ESP_ERR_NO_MEM:
-            return error::error_t::OUT_OF_RESOURCE;
-        default:
-            return error::error_t::IO_ERROR;
-    }
+    return ::m5::variants::frameworks::espidf::detail::mapEspErrCommon(err, error::error_t::IO_ERROR);
 }
 
 // Choose DMA descriptor count and frame count so that
@@ -165,18 +157,26 @@ bool Bus_espidf::onRecvCallback(::i2s_chan_handle_t /*handle*/, ::i2s_event_data
 // ---------------------------------------------------------------------------
 // init
 // ---------------------------------------------------------------------------
-result_t<void> Bus_espidf::init(const BusConfig_espidf& config)
+Bus_espidf::~Bus_espidf()
 {
+    (void)teardownBackend();
+}
+
+result_t<void> Bus_espidf::init(const IBusConfig& config)
+{
+    if (!initializationAllowed(false)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
     // Standard I2S always needs both clocks and at least one data direction.
     // Reject incomplete wiring here so init/acquire cannot succeed only to
     // fail later when the first I/O lazily creates the channel.
     if (config.pin_bclk < 0 || config.pin_ws < 0 || (config.pin_dout < 0 && config.pin_din < 0)) {
         return m5::stl::make_unexpected(m5::hal::v2::error::error_t::INVALID_ARGUMENT);
     }
-    // Re-init: tear down any existing channel first — clearing the handle
-    // without `i2s_del_channel` would leak the old channel with its DMA
-    // still running.
-    destroyChannel();
+    auto reset = resetForInitialization();
+    if (!reset.has_value()) {
+        return reset;
+    }
     _config          = config;
     _configured      = false;
     _channel_enabled = false;
@@ -186,38 +186,66 @@ result_t<void> Bus_espidf::init(const BusConfig_espidf& config)
     _dma_rx_capacity = 0;
     _dma_tx_frames   = 0;
     _dma_rx_frames   = 0;
-    return {};
+    return markInitializationSucceeded(false);
 }
 
 // ---------------------------------------------------------------------------
-// release
+// close
 // ---------------------------------------------------------------------------
-result_t<void> Bus_espidf::release(void)
+bus::CloseOutcome Bus_espidf::closeBackend(void)
 {
-    destroyChannel();
-    return {};
+    return teardownBackend();
 }
 
-void Bus_espidf::destroyChannel(void)
+bus::CloseOutcome Bus_espidf::teardownBackend(void)
 {
+    _active_tx_owner      = nullptr;
+    _active_rx_owner      = nullptr;
+    _operation_configured = false;
     if (_tx_handle == nullptr && _rx_handle == nullptr) {
-        return;
+        if (_controller >= 0) {
+            detail_espidf_i2s_controller::release(_controller);
+            _controller = -1;
+        }
+        return bus::CloseOutcome::success();
     }
     // Disable each non-null handle WITHOUT consulting _channel_enabled: in a
     // partial-enable failure (e.g. TX enabled, then RX enable failed)
     // _channel_enabled is still false, yet the TX channel is enabled and
     // i2s_del_channel rejects an enabled channel. Disabling unconditionally is
-    // safe — i2s_channel_disable on an already-disabled channel just returns
-    // ESP_ERR_INVALID_STATE, which is harmless here (we ignore the result).
+    // safe — i2s_channel_disable on an already-disabled channel returns
+    // ESP_ERR_INVALID_STATE, which is the one harmless error here.
+    error::error_t first_error = error::error_t::OK;
     if (_tx_handle != nullptr) {
-        ::i2s_channel_disable(_tx_handle);
-        ::i2s_del_channel(_tx_handle);
-        _tx_handle = nullptr;
+        const esp_err_t disabled = ::i2s_channel_disable(_tx_handle);
+        if (disabled != ESP_OK && disabled != ESP_ERR_INVALID_STATE) {
+            first_error = impl_espidf::mapEspErr(disabled);
+        } else {
+            const esp_err_t deleted = ::i2s_del_channel(_tx_handle);
+            if (deleted == ESP_OK) {
+                _tx_handle = nullptr;
+            } else {
+                first_error = impl_espidf::mapEspErr(deleted);
+            }
+        }
     }
     if (_rx_handle != nullptr) {
-        ::i2s_channel_disable(_rx_handle);
-        ::i2s_del_channel(_rx_handle);
-        _rx_handle = nullptr;
+        const esp_err_t disabled = ::i2s_channel_disable(_rx_handle);
+        if (disabled != ESP_OK && disabled != ESP_ERR_INVALID_STATE) {
+            if (!error::isError(first_error)) {
+                first_error = impl_espidf::mapEspErr(disabled);
+            }
+        } else {
+            const esp_err_t deleted = ::i2s_del_channel(_rx_handle);
+            if (deleted == ESP_OK) {
+                _rx_handle = nullptr;
+            } else if (!error::isError(first_error)) {
+                first_error = impl_espidf::mapEspErr(deleted);
+            }
+        }
+    }
+    if (_tx_handle != nullptr || _rx_handle != nullptr) {
+        return bus::CloseOutcome::partialOrUnknown(first_error);
     }
     // Unbind the pins ourselves: unlike spi_bus_free (gpio_reset_pin) and the
     // I2C deinit (gpio_output_disable), i2s_del_channel only revokes the
@@ -243,6 +271,87 @@ void Bus_espidf::destroyChannel(void)
     _dma_rx_capacity = 0;
     _dma_tx_frames   = 0;
     _dma_rx_frames   = 0;
+    detail_espidf_i2s_controller::release(_controller);
+    _controller = -1;
+    return bus::CloseOutcome::success();
+}
+
+result_t<void> Bus_espidf::resetForInitialization(void)
+{
+    const auto outcome = teardownBackend();
+    if (outcome.disposition == bus::CloseDisposition::Success) {
+        return {};
+    }
+    quarantineLifecycleAfterPartialTeardown();
+    return m5::stl::make_unexpected(outcome.error_code);
+}
+
+result_t<void> Bus_espidf::failAfterSetup(error::error_t cause)
+{
+    auto reset = resetForInitialization();
+    if (!reset.has_value()) {
+        return reset;
+    }
+    return m5::stl::make_unexpected(cause);
+}
+
+result_t<void> Bus_espidf::beginOperationBackend(bus::OperationContext<i2s::AccessConfig>& context)
+{
+    auto* accessor = operationOwner(context);
+    if (accessor == nullptr) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    const bool tx = context.runtime.mode == bus::OperationMode::Tx;
+    const bool rx = context.runtime.mode == bus::OperationMode::Rx;
+    if ((!tx && !rx) || (tx && _config.pin_dout < 0) || (rx && _config.pin_din < 0)) {
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
+    auto locked = _operation_mutex.lock(bus::remainingTimeout(context.runtime, runtime::millis()));
+    if (!locked.has_value()) {
+        return m5::stl::make_unexpected(locked.error());
+    }
+    runtime::ScopedUnlock unlocker{_operation_mutex};
+
+    bus::IAccessor* opposite = (tx ? _active_rx_owner : _active_tx_owner).load(std::memory_order_acquire);
+    if (opposite != nullptr && _operation_configured &&
+        !impl_espidf::sameAccessConfig(_active_operation_cfg, context.config)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    auto ensured = ensureChannel(context.config);
+    if (!ensured.has_value()) {
+        return ensured;
+    }
+    if (tx) {
+        _active_tx_owner.store(accessor, std::memory_order_release);
+    } else {
+        _active_rx_owner.store(accessor, std::memory_order_release);
+    }
+    _active_operation_cfg = context.config;
+    _operation_configured = true;
+    return {};
+}
+
+result_t<void> Bus_espidf::endOperationBackend(bus::OperationContext<i2s::AccessConfig>& context)
+{
+    auto* accessor = operationOwner(context);
+    auto& active   = context.runtime.mode == bus::OperationMode::Tx ? _active_tx_owner : _active_rx_owner;
+    auto locked    = _operation_mutex.lock(bus::remainingTimeout(context.runtime, runtime::millis()));
+    if (!locked.has_value()) {
+        bus::IAccessor* expected = accessor;
+        (void)active.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel);
+        return m5::stl::make_unexpected(locked.error());
+    }
+    runtime::ScopedUnlock unlocker{_operation_mutex};
+
+    if (active.load(std::memory_order_acquire) != accessor) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    active.store(nullptr, std::memory_order_release);
+    if (_active_tx_owner.load(std::memory_order_acquire) == nullptr &&
+        _active_rx_owner.load(std::memory_order_acquire) == nullptr) {
+        _operation_configured = false;
+    }
+    return {};
 }
 
 // ---------------------------------------------------------------------------
@@ -303,17 +412,13 @@ result_t<void> Bus_espidf::ensureChannel(const i2s::AccessConfig& cfg)
         // and RX paths under independent channel locks, so both can reach here
         // at once; without this gate they could double-create or destroy each
         // other's live handle. The lock is held only across setup (never nested
-        // with the channel locks), and a local RAII guard releases it on every
+        // with the channel locks), and an RAII guard releases it on every
         // return path below.
-        struct Unlocker {
-            runtime::Mutex& m;
-            ~Unlocker()
-            {
-                m.unlock();
-            }
-        };
-        _setup_mutex.lock(types::TIMEOUT_FOREVER);
-        Unlocker unlocker{_setup_mutex};
+        auto setup_locked = _setup_mutex.lock(types::TIMEOUT_FOREVER);
+        if (!setup_locked.has_value()) {
+            return m5::stl::make_unexpected(setup_locked.error());
+        }
+        runtime::ScopedUnlock unlocker{_setup_mutex};
 
         // Re-evaluate under the lock (double-checked): another thread may have
         // configured the channel between the cheap check and acquiring the lock.
@@ -383,9 +488,21 @@ result_t<void> Bus_espidf::ensureChannel(const i2s::AccessConfig& cfg)
             slot_cfg.big_endian    = false;
             slot_cfg.bit_order_lsb = false;
 #endif
-            ::i2s_channel_disable(_tx_handle);
-            ::i2s_channel_disable(_rx_handle);
-            esp_err_t rc = ::i2s_channel_reconfig_std_clock(_tx_handle, &clk_cfg);
+            esp_err_t rc = ::i2s_channel_disable(_tx_handle);
+            if (rc == ESP_ERR_INVALID_STATE) {
+                rc = ESP_OK;
+            }
+            if (rc == ESP_OK) {
+                rc = ::i2s_channel_disable(_rx_handle);
+                if (rc == ESP_ERR_INVALID_STATE) {
+                    rc = ESP_OK;
+                }
+            }
+            if (rc != ESP_OK) {
+                quarantineLifecycleAfterPartialTeardown();
+                return m5::stl::make_unexpected(impl_espidf::mapEspErr(rc));
+            }
+            rc = ::i2s_channel_reconfig_std_clock(_tx_handle, &clk_cfg);
             if (rc == ESP_OK) {
                 rc = ::i2s_channel_reconfig_std_slot(_tx_handle, &slot_cfg);
             }
@@ -395,9 +512,16 @@ result_t<void> Bus_espidf::ensureChannel(const i2s::AccessConfig& cfg)
             if (rc == ESP_OK) {
                 rc = ::i2s_channel_reconfig_std_slot(_rx_handle, &slot_cfg);
             }
-            ::i2s_channel_enable(_tx_handle);
-            ::i2s_channel_enable(_rx_handle);
+            const esp_err_t tx_enabled = ::i2s_channel_enable(_tx_handle);
+            const esp_err_t rx_enabled = ::i2s_channel_enable(_rx_handle);
+            if (rc == ESP_OK && tx_enabled != ESP_OK) {
+                rc = tx_enabled;
+            }
+            if (rc == ESP_OK && rx_enabled != ESP_OK) {
+                rc = rx_enabled;
+            }
             if (rc != ESP_OK) {
+                quarantineLifecycleAfterPartialTeardown();
                 return m5::stl::make_unexpected(impl_espidf::mapEspErr(rc));
             }
             _applied_cfg = cfg;
@@ -405,7 +529,10 @@ result_t<void> Bus_espidf::ensureChannel(const i2s::AccessConfig& cfg)
         }
 
         // Single-channel bus: disable → destroy → recreate below.
-        destroyChannel();
+        auto reset = resetForInitialization();
+        if (!reset.has_value()) {
+            return reset;
+        }
 
         // --- Frame size (bytes per DMA frame = 1 sample across all slots) and
         // the _expand_mono / _swap16 derived state (see updateDerivedState for
@@ -443,8 +570,36 @@ result_t<void> Bus_espidf::ensureChannel(const i2s::AccessConfig& cfg)
         // geometry, the RX accounting capacity is taken from the chan_cfg actually
         // applied (below), not from rx_buffer_size, so _dma_rx_available clamps to
         // the real RX DMA depth in the full-duplex case.
-        const ::i2s_role_t role      = (_config.role == IBusConfig::Role::Slave) ? I2S_ROLE_SLAVE : I2S_ROLE_MASTER;
-        ::i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, role);
+        const ::i2s_role_t role = (_config.role == IBusConfig::Role::Slave) ? I2S_ROLE_SLAVE : I2S_ROLE_MASTER;
+        uint32_t rejected_mask  = 0;
+        esp_err_t ret           = ESP_ERR_NOT_FOUND;
+        while (_controller < 0) {
+            _controller = detail_espidf_i2s_controller::claimStandard(rejected_mask);
+            if (_controller < 0) {
+                return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+            }
+            const auto port_id            = static_cast<decltype(::i2s_chan_config_t{}.id)>(_controller);
+            ::i2s_chan_config_t trial_cfg = I2S_CHANNEL_DEFAULT_CONFIG(port_id, role);
+            trial_cfg.dma_desc_num        = want_tx ? tx_desc_num : rx_desc_num;
+            trial_cfg.dma_frame_num       = want_tx ? tx_frame_num : rx_frame_num;
+            trial_cfg.auto_clear          = true;
+            ret = ::i2s_new_channel(&trial_cfg, want_tx ? &_tx_handle : nullptr, want_rx ? &_rx_handle : nullptr);
+            if (ret == ESP_OK) {
+                break;
+            }
+            // i2s_new_channel may publish one handle before allocating the
+            // paired direction fails. Delete every partial channel before
+            // trying another controller; otherwise the handle is overwritten
+            // on the next iteration and the driver resource becomes unreachable.
+            const int8_t rejected_controller = _controller;
+            reset                            = resetForInitialization();
+            if (!reset.has_value()) {
+                return reset;
+            }
+            rejected_mask |= uint32_t{1} << rejected_controller;
+        }
+        const auto port_id           = static_cast<decltype(::i2s_chan_config_t{}.id)>(_controller);
+        ::i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(port_id, role);
         chan_cfg.dma_desc_num        = want_tx ? tx_desc_num : rx_desc_num;
         chan_cfg.dma_frame_num       = want_tx ? tx_frame_num : rx_frame_num;
         chan_cfg.auto_clear          = true;  // underrun → silence
@@ -463,13 +618,6 @@ result_t<void> Bus_espidf::ensureChannel(const i2s::AccessConfig& cfg)
         if (want_rx) {
             _dma_rx_frames   = chan_frames;
             _dma_rx_capacity = chan_frames * frame_bytes;
-        }
-
-        esp_err_t ret = ::i2s_new_channel(&chan_cfg, want_tx ? &_tx_handle : nullptr, want_rx ? &_rx_handle : nullptr);
-        if (ret != ESP_OK) {
-            _tx_handle = nullptr;
-            _rx_handle = nullptr;
-            return m5::stl::make_unexpected(impl_espidf::mapEspErr(ret));
         }
 
         // --- Slot / clock config (Philips standard; stereo slots when
@@ -519,15 +667,13 @@ result_t<void> Bus_espidf::ensureChannel(const i2s::AccessConfig& cfg)
         if (_tx_handle != nullptr) {
             ret = ::i2s_channel_init_std_mode(_tx_handle, &std_cfg);
             if (ret != ESP_OK) {
-                destroyChannel();
-                return m5::stl::make_unexpected(impl_espidf::mapEspErr(ret));
+                return failAfterSetup(impl_espidf::mapEspErr(ret));
             }
         }
         if (_rx_handle != nullptr) {
             ret = ::i2s_channel_init_std_mode(_rx_handle, &std_cfg);
             if (ret != ESP_OK) {
-                destroyChannel();
-                return m5::stl::make_unexpected(impl_espidf::mapEspErr(ret));
+                return failAfterSetup(impl_espidf::mapEspErr(ret));
             }
         }
 
@@ -538,8 +684,7 @@ result_t<void> Bus_espidf::ensureChannel(const i2s::AccessConfig& cfg)
             cbs.on_sent                 = &Bus_espidf::onSentCallback;
             ret                         = ::i2s_channel_register_event_callback(_tx_handle, &cbs, this);
             if (ret != ESP_OK) {
-                destroyChannel();
-                return m5::stl::make_unexpected(impl_espidf::mapEspErr(ret));
+                return failAfterSetup(impl_espidf::mapEspErr(ret));
             }
         }
         if (_rx_handle != nullptr) {
@@ -547,8 +692,7 @@ result_t<void> Bus_espidf::ensureChannel(const i2s::AccessConfig& cfg)
             cbs.on_recv                 = &Bus_espidf::onRecvCallback;
             ret                         = ::i2s_channel_register_event_callback(_rx_handle, &cbs, this);
             if (ret != ESP_OK) {
-                destroyChannel();
-                return m5::stl::make_unexpected(impl_espidf::mapEspErr(ret));
+                return failAfterSetup(impl_espidf::mapEspErr(ret));
             }
         }
 
@@ -585,15 +729,13 @@ result_t<void> Bus_espidf::ensureChannel(const i2s::AccessConfig& cfg)
         if (_tx_handle != nullptr) {
             ret = ::i2s_channel_enable(_tx_handle);
             if (ret != ESP_OK) {
-                destroyChannel();
-                return m5::stl::make_unexpected(impl_espidf::mapEspErr(ret));
+                return failAfterSetup(impl_espidf::mapEspErr(ret));
             }
         }
         if (_rx_handle != nullptr) {
             ret = ::i2s_channel_enable(_rx_handle);
             if (ret != ESP_OK) {
-                destroyChannel();
-                return m5::stl::make_unexpected(impl_espidf::mapEspErr(ret));
+                return failAfterSetup(impl_espidf::mapEspErr(ret));
             }
         }
         _channel_enabled = true;
@@ -606,7 +748,7 @@ result_t<void> Bus_espidf::ensureChannel(const i2s::AccessConfig& cfg)
         // into audible gaps until the accounting re-equilibrates. _dma_rx_available
         // starts at zero — RX reports readable bytes only as the DMA captures them.
         return {};
-    }  // end setup section (Unlocker releases _setup_mutex here)
+    }  // end setup section (the ScopedUnlock releases _setup_mutex here)
 
     // Already configured with a matching cfg: nothing to do.
     return {};
@@ -615,23 +757,20 @@ result_t<void> Bus_espidf::ensureChannel(const i2s::AccessConfig& cfg)
 // ---------------------------------------------------------------------------
 // write
 // ---------------------------------------------------------------------------
-result_t<size_t> Bus_espidf::write(bus::IAccessor* owner, const i2s::AccessConfig& cfg, data::Source* src, size_t len)
+result_t<size_t> Bus_espidf::writeBackend(bus::OperationContext<i2s::AccessConfig>& context, data::Source* src,
+                                          size_t len)
 {
-    (void)owner;
+    const auto& cfg = context.config;
 
     // Direction guard BEFORE ensureChannel: writing on an RX-only bus (no DOUT
     // wired) must not lazily create a TX channel as a side effect.
     if (_config.pin_dout < 0) {
-        return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
     }
 
-    auto ensure = ensureChannel(cfg);
-    if (!ensure.has_value()) {
-        return m5::stl::make_unexpected(ensure.error());
-    }
     // No TX channel on this bus (RX-only wiring): writing is not supported.
     if (_tx_handle == nullptr) {
-        return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
     }
 
     const ::TickType_t timeout_ticks = impl_espidf::toTicks(cfg.write_timeout_ms);
@@ -806,9 +945,9 @@ result_t<size_t> Bus_espidf::write(bus::IAccessor* owner, const i2s::AccessConfi
 // ---------------------------------------------------------------------------
 // writableBytes
 // ---------------------------------------------------------------------------
-result_t<size_t> Bus_espidf::writableBytes(bus::IAccessor* owner, const i2s::AccessConfig& cfg)
+result_t<size_t> Bus_espidf::writableBytesBackend(bus::OperationContext<i2s::AccessConfig>& context)
 {
-    (void)owner;
+    (void)context;
 
     // Direction guard BEFORE ensureChannel: an RX-only bus (no DOUT) has nothing
     // writable, and querying it must not lazily create a TX channel.
@@ -816,10 +955,6 @@ result_t<size_t> Bus_espidf::writableBytes(bus::IAccessor* owner, const i2s::Acc
         return static_cast<size_t>(0);
     }
 
-    auto ensure = ensureChannel(cfg);
-    if (!ensure.has_value()) {
-        return m5::stl::make_unexpected(ensure.error());
-    }
     // No TX channel on this bus (RX-only wiring): nothing is writable.
     if (_tx_handle == nullptr) {
         return static_cast<size_t>(0);
@@ -834,23 +969,19 @@ result_t<size_t> Bus_espidf::writableBytes(bus::IAccessor* owner, const i2s::Acc
 // ---------------------------------------------------------------------------
 // read
 // ---------------------------------------------------------------------------
-result_t<size_t> Bus_espidf::read(bus::IAccessor* owner, const i2s::AccessConfig& cfg, data::Sink* dst, size_t len)
+result_t<size_t> Bus_espidf::readBackend(bus::OperationContext<i2s::AccessConfig>& context, data::Sink* dst, size_t len)
 {
-    (void)owner;
+    const auto& cfg = context.config;
 
     // Direction guard BEFORE ensureChannel: reading on a TX-only bus (no DIN
     // wired) must not lazily create an RX channel as a side effect.
     if (_config.pin_din < 0) {
-        return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
     }
 
-    auto ensure = ensureChannel(cfg);
-    if (!ensure.has_value()) {
-        return m5::stl::make_unexpected(ensure.error());
-    }
     // No RX channel on this bus (TX-only wiring): reading is not supported.
     if (_rx_handle == nullptr) {
-        return m5::stl::make_unexpected(error::error_t::NOT_IMPLEMENTED);
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
     }
 
     const ::TickType_t timeout_ticks = impl_espidf::toTicks(cfg.read_timeout_ms);
@@ -1051,9 +1182,9 @@ result_t<size_t> Bus_espidf::read(bus::IAccessor* owner, const i2s::AccessConfig
 // ---------------------------------------------------------------------------
 // readableBytes
 // ---------------------------------------------------------------------------
-result_t<size_t> Bus_espidf::readableBytes(bus::IAccessor* owner, const i2s::AccessConfig& cfg)
+result_t<size_t> Bus_espidf::readableBytesBackend(bus::OperationContext<i2s::AccessConfig>& context)
 {
-    (void)owner;
+    (void)context;
 
     // Direction guard BEFORE ensureChannel: a TX-only bus (no DIN) has nothing
     // readable, and querying it must not lazily create an RX channel.
@@ -1061,10 +1192,6 @@ result_t<size_t> Bus_espidf::readableBytes(bus::IAccessor* owner, const i2s::Acc
         return static_cast<size_t>(0);
     }
 
-    auto ensure = ensureChannel(cfg);
-    if (!ensure.has_value()) {
-        return m5::stl::make_unexpected(ensure.error());
-    }
     // No RX channel on this bus (TX-only wiring): nothing is readable.
     if (_rx_handle == nullptr) {
         return static_cast<size_t>(0);

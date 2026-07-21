@@ -6,6 +6,8 @@
 
 #if defined(ESP_PLATFORM) && M5HAL_ESPIDF_SPI_HAS_MASTER
 
+#include "../../detail/esp_err_map.hpp"
+
 #include <driver/gpio.h>
 #include <esp_err.h>
 #include <esp_heap_caps.h>
@@ -38,19 +40,7 @@ int rxBufferIndexForChunk(const DataChunk& chunk, int tx_idx)
 
 error::error_t mapEspErr(::esp_err_t err)
 {
-    switch (err) {
-        case ESP_OK:
-            return error::error_t::OK;
-        case ESP_ERR_INVALID_ARG:
-        case ESP_ERR_INVALID_STATE:
-            return error::error_t::INVALID_ARGUMENT;
-        case ESP_ERR_TIMEOUT:
-            return error::error_t::TIMEOUT_ERROR;
-        case ESP_ERR_NO_MEM:
-            return error::error_t::OUT_OF_RESOURCE;
-        default:
-            return error::error_t::IO_ERROR;
-    }
+    return ::m5::variants::frameworks::espidf::detail::mapEspErrCommon(err, error::error_t::IO_ERROR);
 }
 
 bool isHalfDuplexMode(spi::spi_data_mode_t mode)
@@ -350,9 +340,9 @@ void Bus_espidf::freeDmaBuffers(void)
 
 Bus_espidf::~Bus_espidf()
 {
-    auto released = release();
-    if (!released.has_value()) {
-        // release() deliberately preserves the worker on driver teardown
+    auto closed = teardownBackend();
+    if (closed.disposition != bus::CloseDisposition::Success) {
+        // teardownBackend() deliberately preserves the worker on driver teardown
         // failure so an explicit caller does not lose a still-adopted backend.
         // Destruction cannot preserve it: the task holds `this`, so stop it to
         // avoid use-after-free. DMA remains allocated while a device may still
@@ -364,62 +354,29 @@ Bus_espidf::~Bus_espidf()
     }
 }
 
-error::error_t Bus_espidf::attach(::spi_host_device_t host, int8_t claimed_controller)
+result_t<void> Bus_espidf::init(const IBusConfig& config)
 {
-    if (!detail_espidf_spi::attachedControllerMatches(static_cast<int>(host), claimed_controller,
-                                                      hardwareControllerCountForSPI(), static_cast<int>(SPI2_HOST))) {
-        return error::error_t::INVALID_ARGUMENT;
-    }
-    // Re-entry (attach called again while device/worker/DMA buffers from a
-    // prior attach() or init() are still held) tears down first so nothing
-    // is silently overwritten and orphaned.
-    auto released = release();
-    if (!released.has_value()) {
-        return released.error();
-    }
-    _host       = host;
-    _owns_bus   = false;
-    _dma_buf[0] = static_cast<uint8_t*>(::heap_caps_aligned_alloc(4, kMaxDmaChunk, MALLOC_CAP_DMA));
-    _dma_buf[1] = static_cast<uint8_t*>(::heap_caps_aligned_alloc(4, kMaxDmaChunk, MALLOC_CAP_DMA));
-    if (_dma_buf[0] == nullptr || _dma_buf[1] == nullptr) {
-        if (_dma_buf[0] != nullptr) {
-            ::heap_caps_free(_dma_buf[0]);
-            _dma_buf[0] = nullptr;
-        }
-        if (_dma_buf[1] != nullptr) {
-            ::heap_caps_free(_dma_buf[1]);
-            _dma_buf[1] = nullptr;
-        }
-        return error::error_t::OUT_OF_RESOURCE;
-    }
-    auto created = ::xTaskCreatePinnedToCore(workerEntry, "m5hal-spi", 4096, this, configMAX_PRIORITIES - 2,
-                                             &_worker_task, xPortGetCoreID());
-    if (created != pdPASS) {
-        ::heap_caps_free(_dma_buf[0]);
-        _dma_buf[0] = nullptr;
-        ::heap_caps_free(_dma_buf[1]);
-        _dma_buf[1] = nullptr;
-        return error::error_t::OUT_OF_RESOURCE;
-    }
-    return error::error_t::OK;
+    return initBackend(config, SPI2_HOST);
 }
 
-result_t<void> Bus_espidf::init(const BusConfig_espidf& config)
+result_t<void> Bus_espidf::initBackend(const IBusConfig& config, ::spi_host_device_t host)
 {
-    // Re-entry tears down whatever the previous attach()/init() left behind
-    // regardless of ownership form, so the DMA buffers and worker task below
-    // are never allocated on top of still-live resources.
-    auto released = release();
-    if (!released.has_value()) {
-        return m5::stl::make_unexpected(released.error());
+    if (!initializationAllowed(false)) {
+        return m5::stl::make_unexpected(error::error_t::INVALID_STATE);
+    }
+    // Re-entry tears down the previous backend before allocating replacement
+    // DMA buffers and a worker task.
+    auto reset = resetForInitialization();
+    if (!reset.has_value()) {
+        return reset;
     }
     _config = config;
-    _host   = config.host;
+    _host   = host;
 
     _dma_buf[0] = static_cast<uint8_t*>(::heap_caps_aligned_alloc(4, kMaxDmaChunk, MALLOC_CAP_DMA));
     _dma_buf[1] = static_cast<uint8_t*>(::heap_caps_aligned_alloc(4, kMaxDmaChunk, MALLOC_CAP_DMA));
     if (_dma_buf[0] == nullptr || _dma_buf[1] == nullptr) {
-        (void)release();
+        (void)resetForInitialization();
         return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
     }
 
@@ -437,7 +394,7 @@ result_t<void> Bus_espidf::init(const BusConfig_espidf& config)
 
     auto mapped = impl_espidf::mapEspErr(::spi_bus_initialize(_host, &bus_config, SPI_DMA_CH_AUTO));
     if (error::isError(mapped)) {
-        (void)release();
+        (void)resetForInitialization();
         return m5::stl::make_unexpected(mapped);
     }
     _owns_bus = true;
@@ -449,14 +406,19 @@ result_t<void> Bus_espidf::init(const BusConfig_espidf& config)
     auto created = ::xTaskCreatePinnedToCore(workerEntry, "m5hal-spi", 4096, this, configMAX_PRIORITIES - 2,
                                              &_worker_task, xPortGetCoreID());
     if (created != pdPASS) {
-        (void)release();
+        (void)resetForInitialization();
         return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
     }
 
+    auto initialized = markInitializationSucceeded(false);
+    if (!initialized.has_value()) {
+        (void)resetForInitialization();
+        return initialized;
+    }
     return {};
 }
 
-result_t<void> Bus_espidf::release(void)
+bus::CloseOutcome Bus_espidf::teardownBackend(void)
 {
     waitInFlight();
 
@@ -479,9 +441,21 @@ result_t<void> Bus_espidf::release(void)
     }
 
     if (error::isError(teardown.error)) {
-        return m5::stl::make_unexpected(teardown.error);
+        return bus::CloseOutcome::partialOrUnknown(teardown.error);
     }
-    return {};
+    return bus::CloseOutcome::success();
+}
+
+result_t<void> Bus_espidf::resetForInitialization(void)
+{
+    auto outcome = teardownBackend();
+    if (outcome.disposition == bus::CloseDisposition::Success) {
+        return {};
+    }
+    if (outcome.disposition == bus::CloseDisposition::PartialOrUnknown) {
+        quarantineLifecycleAfterPartialTeardown();
+    }
+    return m5::stl::make_unexpected(outcome.error_code);
 }
 
 result_t<void> Bus_espidf::removeDevice(void)
@@ -548,9 +522,9 @@ result_t<bool> Bus_espidf::ensureDevice(const spi::MasterAccessConfig& cfg)
     return true;
 }
 
-result_t<void> Bus_espidf::beginTransaction(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg)
+result_t<void> Bus_espidf::beginOperationBackend(bus::OperationContext<spi::MasterAccessConfig>& context)
 {
-    (void)owner;
+    const auto& cfg = context.config;
     waitInFlight();
     if (cfg.freq == 0) {
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
@@ -576,19 +550,21 @@ result_t<void> Bus_espidf::beginTransaction(bus::IAccessor* owner, const spi::Ma
     return {};
 }
 
-result_t<void> Bus_espidf::endTransaction(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg)
+result_t<void> Bus_espidf::endOperationBackend(bus::OperationContext<spi::MasterAccessConfig>& context)
 {
-    (void)owner;
+    const auto& cfg = context.config;
     waitInFlight();
     impl_espidf::setPinLevel(cfg.pin_cs, true);
     _transaction_active = false;
     return {};
 }
 
-result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg,
-                                    const spi::TransferDesc& desc, data::Source* src, size_t tx_len, data::Sink* dst,
-                                    size_t rx_len)
+result_t<void> Bus_espidf::transferBackend(bus::OperationContext<spi::MasterAccessConfig>& context,
+                                           const spi::TransferDesc& desc, data::Source* src, size_t tx_len,
+                                           data::Sink* dst, size_t rx_len)
 {
+    auto* owner     = &bus::OperationSlot::contextOwner(context);
+    const auto& cfg = context.config;
     waitInFlight();
     const auto worker_status = _worker_status.load(std::memory_order_acquire);
     if (error::isError(worker_status)) {
@@ -735,9 +711,9 @@ result_t<void> Bus_espidf::transfer(bus::IAccessor* owner, const spi::MasterAcce
     return {};
 }
 
-result_t<bus::TransferTotals> Bus_espidf::waitTransfer(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg)
+result_t<bus::TransferTotals> Bus_espidf::waitTransferBackend(bus::OperationContext<spi::MasterAccessConfig>& context)
 {
-    (void)cfg;
+    auto* owner        = &bus::OperationSlot::contextOwner(context);
     auto worker_status = _worker_status.load(std::memory_order_acquire);
     if ((_in_flight.load(std::memory_order_relaxed) || worker_status == error::error_t::ASYNC_RUNNING) &&
         _transfer_owner != owner) {
@@ -781,8 +757,9 @@ result_t<bus::TransferTotals> Bus_espidf::waitTransfer(bus::IAccessor* owner, co
     return totals;
 }
 
-bool Bus_espidf::transferBusy(bus::IAccessor* owner)
+bool Bus_espidf::transferBusyBackend(bus::OperationContext<spi::MasterAccessConfig>& context)
 {
+    auto* owner = &bus::OperationSlot::contextOwner(context);
     return _worker_status.load(std::memory_order_acquire) == error::error_t::ASYNC_RUNNING && _transfer_owner == owner;
 }
 

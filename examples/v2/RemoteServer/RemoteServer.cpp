@@ -184,7 +184,7 @@ static void initBuses()
 #if M5HAL_FRAMEWORK_HAS_ARDUINO
 
 // ---- arduino ----
-static m5hal::uart::Bus uart_bus;
+static std::shared_ptr<m5hal::uart::IBus> uart_bus;
 
 static m5hal::remote::RemoteServerAdapter* g_adapter = nullptr;
 
@@ -193,12 +193,15 @@ void setup()
     initBuses();
 
     m5hal::uart::BusConfig bus_cfg;
-    bus_cfg.setSerial(Serial);
     bus_cfg.pin_tx         = PIN_UART_TX;
     bus_cfg.pin_rx         = PIN_UART_RX;
     bus_cfg.rx_buffer_size = 8192;
     bus_cfg.tx_buffer_size = 2048;
-    (void)uart_bus.init(bus_cfg);
+    auto acquired          = m5hal::M5_Hal.UART.acquire(bus_cfg, m5hal::native::borrowed(Serial));
+    if (!acquired.has_value()) {
+        return;
+    }
+    uart_bus = acquired.value();
 
     m5hal::uart::AccessConfig uart_cfg;
     uart_cfg.baud_rate             = M5HAL_EXAMPLE_REMOTE_UART_BAUD_RATE;
@@ -282,16 +285,15 @@ extern "C" void app_main(void)
     static m5hal::data::StreamSource wire_src{g_jtag_reader, m5hal::data::DataSpan{rx_scratch, sizeof(rx_scratch)}};
     static m5hal::data::StreamSink wire_snk{g_jtag_writer, m5hal::data::DataSpan{tx_scratch, sizeof(tx_scratch)}};
 #else
-    m5hal::uart::BusConfig_espidf bus_cfg;
-    bus_cfg.port_num       = 0;
+    m5hal::uart::BusConfig bus_cfg;
     bus_cfg.pin_tx         = PIN_UART_TX;
     bus_cfg.pin_rx         = PIN_UART_RX;
     bus_cfg.rx_buffer_size = 8192;
     bus_cfg.tx_buffer_size = 2048;
     (void)uart_bus.init(bus_cfg);
-    uart_flush(static_cast<uart_port_t>(bus_cfg.port_num));
+    uart_flush(uart_bus.nativePort());
     vTaskDelay(pdMS_TO_TICKS(100));
-    uart_flush(static_cast<uart_port_t>(bus_cfg.port_num));
+    uart_flush(uart_bus.nativePort());
 
     m5hal::uart::AccessConfig uart_cfg;
     uart_cfg.baud_rate             = M5HAL_EXAMPLE_REMOTE_UART_BAUD_RATE;
@@ -324,7 +326,7 @@ extern "C" void app_main(void)
         while (true) {
             for (int i = 0; i < 50; ++i) {
                 (void)g_adapter->service();
-                m5hal::M5_Hal.Services.runOnce();
+                (void)m5hal::M5_Hal.Services.runOnce();
             }
             vTaskDelay(1);
         }

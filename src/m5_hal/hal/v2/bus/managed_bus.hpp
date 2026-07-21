@@ -134,17 +134,14 @@ struct IManagedBus {
 /*!
   @brief The per-kind adapter the allocation resolver calls back into.
 
-  Implemented by a kind's bus view (e.g. `i2c::BusView`), which owns the
-  build-injected backend factories and the per-controller capability model.
+  Implemented by a kind's `LocalKindAdapter`, which owns the build-injected
+  backend factories and the per-controller capability model.
   The resolver (`AllocationCore`) is kind-neutral: it holds a reference to
   this interface and drives backend creation / capability checks through it.
 
-  Backend factories take an `IManagedBus&` rather than a kind config: the
-  implementation downcasts to its own facade type (safe because the registry
-  snapshot for a kind only ever holds that kind's facades) and rebuilds the
-  typed logical config there. This keeps the injected / test-overridable
-  factories inside the kind without leaking the kind config type into the
-  core.
+  Raw backend factories remain private to the concrete local adapter. The
+  resolver only sees the atomic commit hooks, so alternate policies and test
+  fakes do not have to expose construction helpers that the core never calls.
  */
 struct IAllocationKind {
     virtual ~IAllocationKind(void) = default;
@@ -162,26 +159,10 @@ struct IAllocationKind {
     virtual IManagedBus& toManaged(IBus& bus) const = 0;
 
     /*!
-      @brief Build the non-hardware placeholder backend for a bus.
-
-      i2c returns a software (bit-bang) backend; a software-less kind (i2s)
-      returns null, which the resolver turns into a pending bus.
-      `intent` is the immutable commit snapshot, not a later live re-tag.
-     */
-    virtual IBus* makePlaceholder(IManagedBus& bus, const types::AllocationIntent& intent) const = 0;
-
-    /*!
-      @brief Build a hardware backend for `controller`; null on failure.
-
-      `intent` is the immutable commit snapshot used to choose `controller`.
-     */
-    virtual IBus* makeHardware(IManagedBus& bus, const types::AllocationIntent& intent, int8_t controller) const = 0;
-
-    /*!
       @brief Build the placeholder backend and swap it in UNDER THE BUS LOCK.
 
-      `makePlaceholder` + adopt, but the build (and its `init()`) runs inside the
-      bus lock so it cannot race an in-flight transfer on the old backend.
+      The build (and its `init()`) runs inside the bus lock so it cannot race
+      an in-flight transfer on the old backend.
       `intent` is the immutable commit snapshot threaded through the build and
       any rollback reconstruction.
       A null placeholder from a software-less kind is its intentional
@@ -196,8 +177,8 @@ struct IAllocationKind {
     /*!
       @brief Build the hardware backend for `controller` and swap it in UNDER THE BUS LOCK.
 
-      `makeHardware` + adopt, but the build (and its `init()`) runs inside the
-      bus lock. `intent` is the immutable commit snapshot used by planning,
+      The build (and its `init()`) runs inside the bus lock. `intent` is the
+      immutable commit snapshot used by planning,
       pin eligibility, the build, and any rollback. A null result is
       `OUT_OF_RESOURCE`; the swap rolls back to a re-made placeholder
       (or pending for a software-less kind). Release errors propagate.

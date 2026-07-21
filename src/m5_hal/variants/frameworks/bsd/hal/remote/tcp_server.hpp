@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <new>
 
 #if M5HAL_DETAIL_BSD_TCP_AVAILABLE
@@ -50,6 +51,12 @@ public:
     result_t<size_t> service();
 
     ServerPhysicalBusPool& physicalPool();
+    /*! @brief Best-effort snapshot of active connection slots.
+
+      May be queried from a monitoring thread while another thread pumps
+      service(). The count is not a barrier for slot payload lifetime; only
+      the service thread accesses a slot's stream/server/adapter objects.
+     */
     size_t connectionCount() const;
 
 private:
@@ -75,7 +82,7 @@ private:
         uint8_t response_scratch[kMaxScriptSize];
         ServerBusPool pool;
         RemoteServerHandler handler;
-        bool active     = false;
+        std::atomic<bool> active{false};
         bool server_ok  = false;
         bool adapter_ok = false;
     };

@@ -4,6 +4,7 @@
 
 #include "stream.hpp"
 
+#include <algorithm>
 #include <cstddef>
 
 // Observation-mirror decorators for StreamReader / StreamWriter. Authoritative
@@ -73,16 +74,27 @@ public:
 
     m5::hal::v2::result_t<size_t> write(ConstDataSpan src) override
     {
-        auto r = _inner.write(src);
-        if (_mirror != nullptr && r.has_value() && r.value() > 0) {
-            (void)_mirror->write(ConstDataSpan{src.data, r.value()});
+        _last_accepted        = 0;
+        auto r                = _inner.write(src);
+        const size_t accepted = r.has_value() ? r.value() : std::min(src.size, _inner.partialWriteAccepted());
+        if (_mirror != nullptr && accepted > 0) {
+            (void)_mirror->write(ConstDataSpan{src.data, accepted});
+        }
+        if (!r.has_value()) {
+            _last_accepted = accepted;
         }
         return r;
+    }
+
+    size_t partialWriteAccepted() const override
+    {
+        return _last_accepted;
     }
 
 private:
     StreamWriter& _inner;
     StreamWriter* _mirror;
+    size_t _last_accepted = 0;
 };
 
 }  // namespace m5::hal::v2::data

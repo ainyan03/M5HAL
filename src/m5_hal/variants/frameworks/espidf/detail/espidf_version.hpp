@@ -91,6 +91,16 @@
 #define M5HAL_ESPIDF_I2S_HAS_STD 0
 #endif
 
+// PDM is a distinct public bus kind. Its initial backend requires hardware
+// PDM RX plus the hardware PDM-to-PCM converter; raw capture is not silently
+// substituted on SoCs lacking the converter.
+#if __has_include(<driver/i2s_pdm.h>) && defined(SOC_I2S_SUPPORTS_PDM_RX) && SOC_I2S_SUPPORTS_PDM_RX && \
+    defined(SOC_I2S_SUPPORTS_PDM2PCM) && SOC_I2S_SUPPORTS_PDM2PCM
+#define M5HAL_ESPIDF_PDM_HAS_RX_PCM 1
+#else
+#define M5HAL_ESPIDF_PDM_HAS_RX_PCM 0
+#endif
+
 // LP_I2C exposure gate: the controller pool only reclaims the LP_I2C
 // instance (SOC_I2C_NUM's HP+LP combined count) as a poolable, opt-in
 // controller when ALL of the following hold:
@@ -126,6 +136,7 @@
 #define M5HAL_ESPIDF_I2C_HAS_SLAVE_V2    0
 #define M5HAL_ESPIDF_SPI_HAS_MASTER      0
 #define M5HAL_ESPIDF_I2S_HAS_STD         0
+#define M5HAL_ESPIDF_PDM_HAS_RX_PCM      0
 #define M5HAL_ESPIDF_I2C_LP_POOL         0
 
 #endif

@@ -46,9 +46,9 @@
 // long read/write, single byte, a zero-gap stress); T11-T13 sweep the length
 // dimension directly -- WTR read (T11), SPLIT read (T12), and a
 // WRITETEST-equivalent write-then-verify (T13) -- each n/k = 1..64 or 1..48;
-// T14 is the onRead-live-value smoke (COUNTERTEST equivalent). This subsumes
-// the private i2c_slave_hybrid HIL pair's WTR/SPLIT/WTEST/COUNTERTEST modes
-// at 100/400/800 kHz (see kSweepRegSeq's comment for the length-sweep
+// T14 is the onRead-live-value smoke (COUNTERTEST equivalent). Together these
+// cover the WTR/SPLIT/WTEST/COUNTERTEST modes at 100/400/800 kHz (see
+// kSweepRegSeq's comment for the length-sweep
 // coverage argument).
 //
 // Build / flash:
@@ -83,9 +83,8 @@ namespace {
 #endif
 constexpr uint8_t SLAVE_ADDR  = MASTER_SLAVE_ADDR;  // matches device/i2c_slave.cpp
 constexpr uint8_t COUNTER_REG = 0xFF;               // live incrementing register; excluded from verify()
-// Register cycle shared by T11-T13's length sweeps. Mirrors the private
-// i2c_slave_hybrid verification master's regseq[8]; because that master's
-// register index (i & 7) and length index (i % 64 or i % 48) are both driven
+// Register cycle shared by T11-T13's length sweeps. The register index (i & 7)
+// and length index (i % 64 or i % 48) are both driven
 // by the same loop counter over a register-count period that divides the
 // length period, its long-running sweep in fact pairs each length with a
 // single fixed register -- reg = regseq[(len - 1) & 7]. Reusing that pairing
@@ -546,7 +545,7 @@ void runSuite(uint32_t freq, int pass_index)
 #if !defined(SWEEP_SKIP_T11)
     // T11 WTR length sweep: n=1..64, one repeated-START read per length, using
     // kSweepRegSeq[(n-1)&7] as the register (see its comment for why this one
-    // pass reproduces the private master's full sweep coverage).
+    // pass provides full sweep coverage).
     {
         bool pass = true;
         for (int n = 1; n <= 64 && pass; ++n) {

@@ -32,6 +32,18 @@ TEST(BlockSource, EmptyIsEof)
     EXPECT_EQ(peeked.value().size, 0u);
 }
 
+TEST(BlockSource, DefaultConstructorUsesDefaultAllocator)
+{
+    mem::Allocator& alloc = mem::defaultAllocator();
+    const size_t before   = alloc.usedBlocks();
+    data::BlockSource blocks;
+    auto* block = static_cast<uint8_t*>(alloc.allocate(16, mem::usage_t::Temp));
+    ASSERT_NE(block, nullptr);
+    ASSERT_TRUE(blocks.addBlock(block, 1));
+    blocks.releaseAll();
+    EXPECT_EQ(alloc.usedBlocks(), before);
+}
+
 TEST(BlockSource, SingleBlockPeekAdvance)
 {
     mem::Allocator& alloc = mem::defaultAllocator();

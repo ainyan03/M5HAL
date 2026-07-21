@@ -52,6 +52,15 @@ std::array<uint8_t, 11> i2sConfig(int16_t bclk, int16_t ws, int16_t dout, int16_
     return out;
 }
 
+std::array<uint8_t, 5> pdmConfig(int16_t clk, int16_t din, uint8_t rxkb = 8)
+{
+    std::array<uint8_t, 5> out{};
+    putI16LE(out, 0, clk);
+    putI16LE(out, 2, din);
+    out[4] = rxkb;
+    return out;
+}
+
 std::array<uint8_t, 4> i2cConfig(int16_t scl, int16_t sda)
 {
     std::array<uint8_t, 4> out{};
@@ -128,6 +137,11 @@ result_t<void> releaseI2C(ServerCtx& ctx, uint8_t bus_id)
 result_t<void> createI2S(ServerCtx& ctx, uint8_t bus_id, data::ConstDataSpan pin_config)
 {
     return remote::ServerBusPool::handler(&ctx.pool, true, types::bus_kind_t::I2S, bus_id, pin_config);
+}
+
+result_t<void> createPDM(ServerCtx& ctx, uint8_t bus_id, data::ConstDataSpan pin_config)
+{
+    return remote::ServerBusPool::handler(&ctx.pool, true, types::bus_kind_t::PDM, bus_id, pin_config);
 }
 
 class ServerBusPoolPhysicalSharing : public ::testing::Test {
@@ -242,19 +256,45 @@ TEST_F(ServerBusPoolPhysicalSharing, I2SBusCreateRejectsIncompleteStandardWiring
     expectError(createI2S(ctx, 0, spanOf(missing_data)), error::error_t::INVALID_ARGUMENT);
 
     const auto valid_rx_only = i2sConfig(24, 25, -1, 26);
-    expectError(createI2S(ctx, 0, spanOf(valid_rx_only)), error::error_t::NOT_IMPLEMENTED);
+    expectError(createI2S(ctx, 0, spanOf(valid_rx_only)), error::error_t::UNSUPPORTED);
 }
 
 TEST(RemoteI2SBusInit, RejectsIncompleteStandardWiringBeforeSessionState)
 {
     i2s::Bus_remote bus;
-    i2s::BusConfig_remote cfg;
+    i2s::BusConfig cfg;
     cfg.pin_ws   = 25;
     cfg.pin_dout = 26;
 
     auto r = bus.init(cfg);
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), error::error_t::INVALID_ARGUMENT) << "err=" << error::toString(r.error());
+}
+
+TEST_F(ServerBusPoolPhysicalSharing, PDMBusCreateValidatesIndependentPayloadBeforeBackendSelection)
+{
+    remote::ServerPhysicalBusPool phys;
+    ServerCtx ctx{phys};
+
+    const auto missing_clk = pdmConfig(-1, 26);
+    expectError(createPDM(ctx, 0, spanOf(missing_clk)), error::error_t::INVALID_ARGUMENT);
+
+    const auto missing_din = pdmConfig(24, -1);
+    expectError(createPDM(ctx, 0, spanOf(missing_din)), error::error_t::INVALID_ARGUMENT);
+
+    const auto valid = pdmConfig(24, 26);
+    expectError(createPDM(ctx, 0, spanOf(valid)), error::error_t::UNSUPPORTED);
+}
+
+TEST(RemotePDMBusInit, RejectsWiringBeforeSessionAndReportsMissingSessionSeparately)
+{
+    pdm::Bus_remote bus;
+    pdm::BusConfig cfg;
+    cfg.pin_din = 26;
+    expectError(bus.init(cfg), error::error_t::INVALID_ARGUMENT);
+
+    cfg.pin_clk = 24;
+    expectError(bus.init(cfg), error::error_t::INVALID_STATE);
 }
 
 }  // namespace

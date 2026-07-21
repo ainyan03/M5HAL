@@ -1,6 +1,6 @@
 # spec — 公開前提の確定仕様
 
-> **読者**: ナビゲーション。
+> **読者**: メンテナ向け（ナビゲーション）。
 
 > 使うだけなら spec/ を読む必要はありません — [../README.md](../README.md) と [examples/v2/](../examples/v2/) を参照。
 
@@ -14,12 +14,12 @@
 | 目的 | 読むもの |
 |---|---|
 | v2 API を使う | [../README.md](../README.md) の v2 入口 + [`examples/v2/`](../examples/v2/) |
-| v0 から v2 への考え方を知る | [style/migration.md](style/migration.md), [design/v0_v2_coexistence.md](design/v0_v2_coexistence.md) |
-| Bus / Accessor の基本設計を知る | [design/bus_accessor.md](design/bus_accessor.md), [design/data_io.md](design/data_io.md), [design/transfer_desc.md](design/transfer_desc.md) |
+| v0からv2、または旧v2 lifecycleから現行へ移行する | [style/migration.md](style/migration.md), [style/accessor_lifecycle_migration.md](style/accessor_lifecycle_migration.md), [design/v0_v2_coexistence.md](design/v0_v2_coexistence.md) |
+| Bus / Accessor とinstance capabilityの基本設計を知る | [design/bus_accessor.md](design/bus_accessor.md), [design/bus_capabilities.md](design/bus_capabilities.md), [design/data_io.md](design/data_io.md), [design/transfer_desc.md](design/transfer_desc.md) |
 | ストリームのフレーム化を知る | [design/frame.md](design/frame.md), [design/data_io.md](design/data_io.md) §Stream アダプタ |
 | HAL 操作の bytecode 化を知る | [design/bytecode.md](design/bytecode.md) |
 | リモートバス機構を知る | [design/remote.md](design/remote.md) (下層: frame / bytecode / data_io) |
-| I2C / I2C slave / SPI / UART / I2S を実装・レビューする | [design/i2c.md](design/i2c.md), [design/i2c_slave.md](design/i2c_slave.md), [design/spi.md](design/spi.md), [design/uart.md](design/uart.md), [design/i2s.md](design/i2s.md), [verification.md](verification.md) |
+| I2C / I2C slave / SPI / UART / I2S / PDM を実装・レビューする | [design/i2c.md](design/i2c.md), [design/i2c_slave.md](design/i2c_slave.md), [design/slave_queue.md](design/slave_queue.md), [design/spi.md](design/spi.md), [design/uart.md](design/uart.md), [design/i2s.md](design/i2s.md), [design/pdm.md](design/pdm.md), [verification.md](verification.md) |
 | 新しい variant を追加する (ポーティング) | [porting_guide/](porting_guide/README.md) (手順レシピ), [design/variants.md](design/variants.md) (設計仕様) |
 | GPIO / variant を実装・レビューする | [design/gpio.md](design/gpio.md), [design/variants.md](design/variants.md), [reference/directory-layout.md](reference/directory-layout.md) |
 | runtime 設備 (time / mutex / task) と Bus 排他の意味論を知る | [design/runtime.md](design/runtime.md), [design/bus_accessor.md](design/bus_accessor.md) §排他制御の意味論 |
@@ -33,29 +33,29 @@
 初見で迷った場合は、まず [goals.md](goals.md) → [architecture.md](architecture.md) →
 [design/bus_accessor.md](design/bus_accessor.md) の順で読むと全体像を掴みやすい。
 
-## 読者の枠 (利用者 / メンテナ)
+## 主な読者と文書の役割
 
-文書は読者軸で 2 つの枠に分かれる。
+冒頭の `> **読者**:` は、その文書を最初に読むべき主な読者を示す。複数の読者が参照する文書でも、
+主役を一つに定め、別の役割の説明は正本へのリンクに留める。
 
 - **利用者向け** — ライブラリを使う人が読む集合: [../README.md](../README.md) と
   [`examples/v2/`](../examples/v2/) を起点に、必要に応じて
   [design/configuration.md](design/configuration.md) / [design/errors.md](design/errors.md) /
   [style/migration.md](style/migration.md)
-- **メンテナ・コントリビュータ向け** — 実装・レビュー・ポーティングをする人が読む集合:
-  [goals.md](goals.md), [architecture.md](architecture.md), [design/](design/) の各設計文書,
+- **実装者・レビュー向け（設計仕様）** — 現行contract、層境界、非自明な設計理由を読む集合:
+  [goals.md](goals.md), [architecture.md](architecture.md), [design/](design/) の各設計文書
+- **メンテナ向け（手順・規約）** — 実装手順、配置・記述規約、検証入口を読む集合:
   [porting_guide/](porting_guide/), [style/coding_style.md](style/coding_style.md),
   [verification.md](verification.md), [reference/directory-layout.md](reference/directory-layout.md)
 
-各文書は冒頭の `> **読者**:` ラベルで枠を明示する。ラベルは 3 種 — 「利用者向け」/
-「実装者・レビュー向け（設計仕様）」/「メンテナ向け（ビルド・運用・規約）」で、後 2 者が
-メンテナ・コントリビュータ枠に属する。メンテナ枠の設計文書は「なぜこの形か・何を不採用に
-したか」を**根拠節** (`## 採用しない要素` / `## なぜ〜か`) に現在形で持つ (→ 運用ルール)。
+設計文書は「なぜこの形か・何を不採用にしたか」を**根拠節**
+(`## 採用しない要素` / `## なぜ〜か`) に現在形で持つ (→ 運用ルール)。
 
 ## ファイルマップ
 
 | パス | 内容 |
 |---|---|
-| [goals.md](goals.md) | 上位方針、スコープ、成功条件 |
+| [goals.md](goals.md) | 上位方針、スコープ、版数の契約 |
 | [architecture.md](architecture.md) | 全体構造、層構成、配置原則 |
 | [stability.md](stability.md) | API 安定度 (experimental / unstable / stable) と変更不可の範囲 |
 | [design/](design/) | kind / 機構ごとの確定仕様 |
@@ -63,11 +63,17 @@
 | [porting_guide/](porting_guide/) | variant 追加のレシピ (framework / platform) |
 | [style/](style/) | コーディング規約、移行ガイド |
 | [verification.md](verification.md) | 検証コマンドと運用方針 |
-| (`docs/` は Doxygen 入力専用、将来作成予定) | |
+| (`docs/` は Doxygen 入力用に予約、現行未作成) | |
 
 ## 運用ルール
 
 - `spec/` には **現行仕様として読む必要がある内容だけ**置く
+- 現在未対応であることが利用者・実装者の判断に必要なら、期限や採用を約束せず
+  **現行スコープ外**として記す。未採用の機能候補、実装順、検証拡充予定は `spec/` に置かない
+- 将来の実装でも破ってはならない互換性予約、層境界、拡張規約は現行仕様として残す。
+  これは機能の採用予定ではなく、拡張時にも守る契約である
+- [stability.md](stability.md) の API 安定度は、現行APIを変更できる範囲を表す。
+  未実装機能の採用状況やroadmapとは別の軸として扱う
 - **時系列・人名・検討プロセス** (いつ誰がどう決めたか、巻き戻しの顛末) は `spec/` の
   本文に書かない
 - ただし**現在形で書ける設計判断の根拠** (なぜこの形か・何を不採用にしたか) は仕様の

@@ -30,7 +30,8 @@ namespace m5::hal::v2::data {
 /*!
   @brief Non-owning, read-only `(ptr, size)` wrapper.
 
-  The caller owns the buffer lifetime.
+  The caller owns the buffer lifetime. A null pointer is valid only when
+  `size == 0`.
  */
 struct ConstDataSpan {
     const uint8_t* data = nullptr;
@@ -51,7 +52,7 @@ struct ConstDataSpan {
     }
     constexpr const uint8_t* end() const
     {
-        return data + size;
+        return size == 0 ? data : data + size;
     }
     /*! @brief First `n` bytes (clamped to `size`). */
     constexpr ConstDataSpan first(size_t n) const
@@ -63,7 +64,7 @@ struct ConstDataSpan {
     {
         size_t off = offset < size ? offset : size;
         size_t rem = size - off;
-        return {data + off, count < rem ? count : rem};
+        return {off == 0 ? data : data + off, count < rem ? count : rem};
     }
 };
 
@@ -71,7 +72,7 @@ struct ConstDataSpan {
   @brief Non-owning, mutable `(ptr, size)` wrapper.
 
   Implicitly converts to `ConstDataSpan`. The caller owns the buffer
-  lifetime.
+  lifetime. A null pointer is valid only when `size == 0`.
  */
 struct DataSpan {
     uint8_t* data = nullptr;
@@ -96,7 +97,7 @@ struct DataSpan {
     }
     constexpr uint8_t* end() const
     {
-        return data + size;
+        return size == 0 ? data : data + size;
     }
     /*! @brief First `n` bytes (clamped to `size`). */
     constexpr DataSpan first(size_t n) const
@@ -108,7 +109,7 @@ struct DataSpan {
     {
         size_t off = offset < size ? offset : size;
         size_t rem = size - off;
-        return {data + off, count < rem ? count : rem};
+        return {off == 0 ? data : data + off, count < rem ? count : rem};
     }
 };
 
@@ -140,8 +141,13 @@ struct DataSpan {
     presence or size of any prior `peek`. Discarding bytes by repeated
     `advance` is a supported usage.
   - When `advance` is asked to skip past not-yet-arrived data,
-    streaming derivations queue the request and consume it on arrival;
-    memory-backed derivations drop the excess and move to end-of-stream.
+    unbounded streaming derivations queue the request and consume it on
+    arrival (`StreamSource`); memory-backed derivations drop the excess
+    and move to end-of-stream. Bounded FIFO derivations (`RingFIFO`)
+    are the documented exception: they reject the over-skip with
+    `INVALID_ARGUMENT`, because their consumer can always bound a skip
+    by `buffered()` and an excess there is a caller bug, not a
+    wait-for-arrival state.
 
   Error handling (see spec/design/data_io.md §error path):
   - `peek` / `advance` return `expected<..., error_t>`. This is the

@@ -66,7 +66,7 @@
 
 // --- X-macro mirror of the registry above (same names, registry order) ---
 //
-// PP constraint ([026]): #define / #if directives cannot be generated
+// Preprocessor constraint: #define / #if directives cannot be generated
 // from a macro expansion, so the #define list above stays hand-written
 // (it must work in #if) and this list mirrors it. The C++ derivations
 // below keep the two in lockstep: an entry added here but not above

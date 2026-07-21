@@ -16,6 +16,22 @@ M5HAL_INLINE_V2 namespace v2
 {
     namespace memory {
 
+    namespace {
+    FallbackOps validateFallback(FallbackOps fallback)
+    {
+        M5HAL_ASSERT(fallback.valid(), "Allocator fallback requires a malloc/free pair");
+        return fallback.valid() ? fallback : FallbackOps{};
+    }
+    }  // namespace
+
+    Allocator::Allocator() : Allocator{FallbackOps{}}
+    {
+    }
+
+    Allocator::Allocator(FallbackOps fallback) : _fallback{validateFallback(fallback)}
+    {
+    }
+
     void* Allocator::allocate(size_t size, usage_t usage)
     {
         if (usage == usage_t::Temp) {
@@ -99,13 +115,18 @@ M5HAL_INLINE_V2 namespace v2
         return _temp_release_count.load(std::memory_order_relaxed);
     }
 
+    bool Allocator::isTempPoolAllocation(const void* ptr) const
+    {
+        return _temp_pool.allocationSize(ptr) != 0;
+    }
+
     void* Allocator::mallocFallback(size_t size, usage_t usage)
     {
         if (size == 0) {
             return nullptr;
         }
 
-        malloc_fn_t malloc_fn = _malloc_fn;
+        malloc_fn_t malloc_fn = _fallback.malloc_fn;
         if (malloc_fn != nullptr) {
             return malloc_fn(size, usage);
         }
@@ -115,7 +136,7 @@ M5HAL_INLINE_V2 namespace v2
 
     void* Allocator::reallocFallback(void* ptr, size_t preserve_size, size_t new_size, usage_t usage)
     {
-        realloc_fn_t realloc_fn = _realloc_fn;
+        realloc_fn_t realloc_fn = _fallback.realloc_fn;
         if (realloc_fn != nullptr) {
             return realloc_fn(ptr, preserve_size, new_size, usage);
         }
@@ -135,7 +156,7 @@ M5HAL_INLINE_V2 namespace v2
             return;
         }
 
-        free_fn_t free_fn = _free_fn;
+        free_fn_t free_fn = _fallback.free_fn;
         if (free_fn != nullptr) {
             free_fn(ptr);
             return;

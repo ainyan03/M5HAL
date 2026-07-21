@@ -6,6 +6,7 @@
 #include "../runtime/runtime.hpp"
 #include "../types.hpp"
 
+#include <cstdlib>
 #include <cstdint>
 
 /*!
@@ -25,7 +26,7 @@ namespace m5::hal::v2::bus {
   abstract `0 .. capacity-1`; a variant maps an index to its concrete
   peripheral (an ESP-IDF `i2c_port`, an `spi_host_device_t`, ...).
 
-  One pool exists per kind (owned by that kind's `BusView`). Capacity comes
+  One pool exists per managed kind inside its `AllocationCore`. Capacity comes
   from the build's hardware variant (e.g. `SOC_I2C_NUM`). A software-only or
   host build has capacity 0, so every `RequireHardware` fails and everything
   lands in software -- exactly the native-test condition.
@@ -213,20 +214,7 @@ public:
     }
 
 private:
-    // Minimal RAII guard over runtime::Mutex (matches registry.hpp).
-    struct Guard {
-        runtime::Mutex& m;
-        explicit Guard(runtime::Mutex& mtx) : m{mtx}
-        {
-            (void)m.lock(types::TIMEOUT_FOREVER);
-        }
-        ~Guard(void)
-        {
-            m.unlock();
-        }
-        Guard(const Guard&)            = delete;
-        Guard& operator=(const Guard&) = delete;
-    };
+    using Guard = runtime::MutexGuard;
 
     uint8_t _capacity     = 0;
     uint32_t _in_use_mask = 0;

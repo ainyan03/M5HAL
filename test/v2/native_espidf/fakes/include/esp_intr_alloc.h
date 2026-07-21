@@ -67,7 +67,7 @@ namespace m5hal_hostharness {
 // handler, as if the interrupt fired right now. No-op if nothing was ever
 // captured (or the backend already esp_intr_free()'d -- the captured
 // function pointer/arg copy is independent of that call, so this stays
-// callable, but firing after release() is a test-authoring bug: the arg
+// callable, but firing after close() is a test-authoring bug: the arg
 // (the backend instance) may already be destroyed).
 inline void fireLastIsr()
 {

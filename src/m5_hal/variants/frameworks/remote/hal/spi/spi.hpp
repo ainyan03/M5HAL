@@ -3,23 +3,21 @@
 #define M5_HAL_VARIANTS_FRAMEWORKS_REMOTE_HAL_SPI_SPI_HPP
 
 #include "../../../../../hal/v2/spi/spi.hpp"
+#include "../../../../../hal/v2/bus/hal_backend.hpp"
+#include "../../../../../hal/v2/bus/portable_factory.hpp"
 #include "../../bus_lease.hpp"
 #include "../../remote_transfer.hpp"
 
 #include <cstddef>
 #include <cstdint>
 
+namespace m5::hal::v2::remote {
+class RemoteBackend;
+}
+
 namespace m5::hal::v2::spi {
 
 using remote::RemoteSession;
-
-struct BusConfig_remote : public spi::IBusConfig {
-    using spi::IBusConfig::IBusConfig;
-
-    constexpr BusConfig_remote(void) : spi::IBusConfig{}
-    {
-    }
-};
 
 class Bus_remote : public spi::IBus {
 public:
@@ -44,7 +42,11 @@ public:
         _config = cfg;
     }
 
-    result_t<void> init(const BusConfig_remote& config);
+    result_t<void> init(const IBusConfig& config);
+    bus::BusCapabilities capabilities(void) const override
+    {
+        return _capabilities;
+    }
 
     uint8_t busId(void) const
     {
@@ -60,18 +62,28 @@ public:
         return _lifecycle;
     }
 
-    result_t<void> beginTransaction(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg) override;
-    result_t<void> endTransaction(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg) override;
-    result_t<void> transfer(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg, const spi::TransferDesc& desc,
-                            data::Source* src, size_t tx_len, data::Sink* dst, size_t rx_len) override;
-    result_t<bus::TransferTotals> waitTransfer(bus::IAccessor* owner, const spi::MasterAccessConfig& cfg) override;
-    bool transferBusy(bus::IAccessor* owner) override;
-
 private:
+    friend class remote::RemoteBackend;
+
+    void setRemoteCapabilities(const bus::BusCapabilities& value)
+    {
+        _capabilities = value;
+    }
+
     static constexpr uint32_t kTransferTimeoutMs = 5000;
 
     static data::ConstDataSpan encodeSpiMeta(uint8_t* buf, const spi::TransferDesc& desc);
 
+protected:
+    result_t<void> beginOperationBackend(bus::OperationContext<spi::MasterAccessConfig>& context) override;
+    result_t<void> endOperationBackend(bus::OperationContext<spi::MasterAccessConfig>& context) override;
+    result_t<void> transferBackend(bus::OperationContext<spi::MasterAccessConfig>& context,
+                                   const spi::TransferDesc& desc, data::Source* src, size_t tx_len, data::Sink* dst,
+                                   size_t rx_len) override;
+    result_t<bus::TransferTotals> waitTransferBackend(bus::OperationContext<spi::MasterAccessConfig>& context) override;
+    bool transferBusyBackend(bus::OperationContext<spi::MasterAccessConfig>& context) override;
+
+private:
     std::shared_ptr<remote::RemoteSessionHandle> _session;
     uint8_t _bus_id                               = 0;
     std::shared_ptr<bus::BusLifecycle> _lifecycle = std::make_shared<bus::BusLifecycle>();
@@ -79,11 +91,20 @@ private:
     bus::TransferTotals _last_totals;
     bool _in_transaction = false;
     remote::RemoteConfigCache _config_cache;
+    bus::BusCapabilities _capabilities;
 };
 
-template <>
-struct BackendFor<BusConfig_remote> {
-    using type = Bus_remote;
+inline result_t<std::unique_ptr<IBus>> makePortableBackend_remote(const bus::LocalResourceContext&, const IBusConfig&)
+{
+    return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+}
+
+template <class Policy>
+struct NativeProvider_remote {
+    static result_t<std::shared_ptr<IBus>> acquire(bus::IHalBackend&, const IBusConfig&, Policy)
+    {
+        return m5::stl::make_unexpected(error::error_t::UNSUPPORTED);
+    }
 };
 
 }  // namespace m5::hal::v2::spi

@@ -37,19 +37,19 @@ class ServiceRunner {
 public:
     static constexpr size_t kMaxServices = 16;
 
-    bool add(IService& service);
-    bool remove(IService& service);   // SYNCHRONOUS (後述 R3)
-    void clear();                     // SYNCHRONOUS like remove()
+    result_t<void> add(IService& service);
+    result_t<void> remove(IService& service);   // SYNCHRONOUS (後述 R3)
+    result_t<void> clear();                     // SYNCHRONOUS like remove()
 
     static ServicePoll run(IService& service, const ServiceContext& ctx);
-    bool runOnce();                           // default-clock 駆動 (fastTick 測定)
-    bool runOnce(const ServiceContext& ctx);  // 明示 ctx 駆動。try-lock、競合は false
+    result_t<bool> runOnce();                           // default-clock 駆動 (fastTick 測定)
+    result_t<bool> runOnce(const ServiceContext& ctx);  // 明示 ctx 駆動
 
     size_t size() const;      // 近似値 (後述)
     size_t capacity() const;
 
-    bool startAutoRun();
-    void stopAutoRun();
+    result_t<void> startAutoRun();
+    result_t<void> stopAutoRun();
     bool autoRunActive() const;  // lock-free の助言値 (後述)
 };
 
@@ -84,25 +84,58 @@ public:
 **駆動モードの混在**: 同一 runner を default-clock 駆動 (`runOnce()` / auto-run) と明示 ctx
 駆動で交互に駆動した場合、切り替え直後の default-clock パスは gap-drop (elapsed=0) から始まり、
 以後は実時間で続行する。状態は腐敗しないが、**タイミング保証はない** — テストで明示駆動する
-場合は blocking API (endTransaction 等。内部の default-clock フォールバックが混在の入口) を
+場合はblocking完了API (`endAccess`等。内部のdefault-clock fallbackが混在する入口)を
 呼ぶ前に転送を完走させること。
 
-- **`add`/`remove` は登録済みサービスの管理**。テーブル容量は `kMaxServices = 16` 固定。
+- **`add`/`remove` は登録済みサービスの管理**。`add` は通信開始ではなく、継続poll対象をrunnerへ
+  登録するライフサイクルcommandである。成功は「要求をpendingへ置いた」だけでなく、テーブルへの適用が
+  確定したことを意味する。auto-run中はrunner taskが適用結果を確定するまで同期して待つ。テーブル容量は
+  `kMaxServices = 16` 固定。外部callerのactive `add` は結果確認まで制御mutexで直列化されるため、
+  pending-add容量は公開failure modeではない。active `add` の待機中にrunnerが既存serviceのcallbackを
+  完了できるよう、callerは登録済み `serviceImpl` が取得し得るlockを保持してはならない。
 - **`runOnce`** は登録済み全サービスを 1 パス分ポーリングする手動駆動。呼び出し元が明示的に
   周期的に呼ぶ (native テストや、auto-run を使わない環境向け)。
 - **`startAutoRun`/`stopAutoRun`** は専用バックグラウンドタスク (`runtime::Task`) で
   `runOnce` 相当を回し続ける自動駆動。**対応 variant は ESP-IDF/Arduino (FreeRTOS task) と
-  posix (`std::thread`) のみ** — stub は対象外 (§stub が対象外である理由)。
+  例外有効posix (`std::thread`) のみ** — stubと例外無効hostは対象外 (§stub が対象外である理由、
+  [runtime.md](runtime.md) §Task API 契約)。例外無効posixの`startAutoRun()`はTaskの
+  `UNSUPPORTED`をそのまま返す。
   ESP-IDF/Arduino では最初の `add()` が暗黙に auto-run を起動する (usability 判断、利用者は
   明示的な `startAutoRun()` を書かなくてよい)。**posix では `add()` からの暗黙起動は行わない**
   (native テストの決定性維持) — posix で auto-run を使うには `startAutoRun()` を明示的に呼ぶ。
+
+### command結果と状態不変条件
+
+| 操作・条件 | 結果 | 状態契約 |
+|---|---|---|
+| `add` 新規・空きあり | success | 戻るまでに登録を適用。embeddedの暗黙Task起動も完了 |
+| `add` duplicate | `INVALID_STATE` | table/pending/timing不変 |
+| `add` table容量不足 | `OUT_OF_RESOURCE` | table/pending/timing不変 |
+| `add` 暗黙Task起動失敗 | `runtime::Task::start`のexact error | 今回の登録をrollbackし、auto-run inactive |
+| `remove` present / absent | success | presentは同期解除。absentはpostcondition済みの冪等no-op |
+| `clear` empty | success | reset commandとしてdefault-clock streamをinvalidate |
+| `runOnce` 正常pass | success + `bool` | `true`はProgress/Doneあり、`false`は正常なno-progress |
+| `runOnce` mutex競合、auto-run中、callback再入 | `BUSY` | stream/virtual/table/pending不変 |
+| `startAutoRun` already running | success | 冪等no-op |
+| `stopAutoRun` already stopped | success | wake latchを含めた冪等no-op |
+| `startAutoRun` Task失敗 | Taskのexact error | Task non-joinable、auto-run inactive、登録表不変 |
+| manual callback内の`startAutoRun` | `INVALID_STATE` | 状態不変 |
+| callback内の`clear`/`stopAutoRun` | `INVALID_STATE` | stop flagを含め状態不変 |
+| 制御mutexの`unlock`失敗後 | `INVALID_STATE` | runnerをBrokenとして後続commandを拒否 |
+
+`result_t<bool>` のtruth値はpayloadでなく「errorがない」ことを表す。従って `runOnce()` の利用側は
+`if (!r)` でerrorを処理した後、`r.value()` でprogressを読む。`!runOnce()` のように両者を一つの
+bool式へ畳んではならない。
+
 - **runner の idle 起床は通知駆動** (`runtime::Event`、latching — [runtime.md](runtime.md)
   §Event API 契約)。テーブルが空の間 runner は wake event でブロックし、`add()` (pending 投入) /
   `remove()` (pending 投入) / `stopAutoRun()` (stop flag) が状態 store 後・制御 mutex 解放前に
   notify で起こす。tick 量子化されたポーリング眠り (旧 `delayMs(1)` = FreeRTOS で実質 10–20ms)
   を排し、空テーブルへの `add()` から最初のポーリングまでの遅延をスケジューラ粒度にする。
   wait の timeout (100ms) は通知漏れバグ時の liveness backstop であって遅延保証ではない —
-  timeout 起床は通知漏れの兆候として DIAG カウンタに数える。サービスが登録されている間の
+  `TIMEOUT_ERROR`だけを通知漏れの兆候としてDIAGカウンタに数える。その他のEvent backend errorは
+  別カウンタ/診断へ分け、短いbackoff後にrunnerを継続する。taskを終了して`autoRunActive()`だけtrueに
+  残したり、backend errorをtimeoutへ偽装したりしない。サービスが登録されている間の
   ポーリング周期 (yield ループ) はこの機構と独立で、変更していない。
 - **runner タスクの core 配置は既定でスケジューラ任せ** (`TASK_CORE_ANY`、
   `M5HAL_CONFIG_SERVICE_AUTORUN_CORE` で上書き可 — [configuration.md](configuration.md))。
@@ -137,25 +170,31 @@ ESP/Arduino では最初の `add()` が専用タスクを自動起動し、以�
 - **R2 (制御プレーンの排他)**: `add`/`remove`/`clear`/`startAutoRun`/`stopAutoRun`/`runOnce`
   は制御 mutex で直列化する。auto-run の稼働判定もすべて制御 mutex 保持下で行う。**auto-run
   タスクの poll パス (`serviceImpl` の呼び出し列) は制御 mutex を取らない** (ホットパスは
-  無ロックのまま維持)。手動 `runOnce()` はパス全体を制御 mutex 保持で実行し、競合する呼び出しは
-  try-lock 失敗で `false` を返す。
+  無ロックのまま維持)。手動 `runOnce()` はパス全体を制御 mutex 保持で実行し、try-lock失敗、
+  auto-run中、callback再入は`BUSY`を返す。成功時のno-progressは`result_t<bool>{false}`であり
+  errorではない。
   公開クエリ `autoRunActive()`/`size()` は lock-free の近似値であり、「タスクが実在して進行
   可能」の証拠として扱ってはならない — `startAutoRun` は**タスク生成後に**フラグを公開する
   (生成前に公開すると、高優先度のスピナーがまだ存在しないタスクの完了を待ち続け、生成スレッド
   自身を飢餓させ得る)。runner の進行を待つスピンは有限回の yield の後、blocking な delay へ
   フォールバックすること (FreeRTOS の `taskYIELD` は同優先度のタスクにしか譲らないため、より
   高い優先度で待つ呼び出し元は無限に spin し得る)。
-- **R3 (remove の意味論)**: `remove()`/`clear()` は「戻った時点で以後 `serviceImpl` は呼ばれ
+  制御mutexの`unlock()`失敗は排他機構の健全性喪失であり、lockに依存しないBroken flagを設定する。
+  以後のcommandはmutexを再利用せず`INVALID_STATE`を返す。本処理とunlockが共に失敗した場合は本処理の
+  errorを返し、Broken flagがcleanup失敗を保持する。本処理が成功していた場合はunlock errorを返す。
+- **R3 (remove の意味論)**: 成功した`remove()`/`clear()` は「戻った時点で以後 `serviceImpl` は呼ばれ
   ない」ことを保証する (svc タスク自身からの呼び出しは R1 の直接適用で同じ保証を得る)。
   呼び出し側の義務: ①対象サービスの `serviceImpl` が取得しうるロックを保持したまま
   `remove`/`clear` を呼ばない (svc タスクがそのロックを待っている間に完了を待ち続けデッドロック
   し得る) ②同一サービスへの `add` と `remove` を異なるスレッドから並行に呼ばない (結果は未定義)。
-  この保証があるため、呼び出し側は `remove()` が返った直後にサービスオブジェクトを破棄してよい。
+  未登録対象の`remove()`はこのpostconditionが既に成立しているためsuccess no-op。この保証があるため、
+  呼び出し側は成功した`remove()`の直後にサービスオブジェクトを破棄してよい。
 - **R4 (serviceImpl のコンテキスト契約)**: `serviceImpl` はタスクコンテキスト専用 (ISR からの
   呼び出し禁止)、ブロッキング禁止 (待ちは戻り値の `next_due` によるスケジューリングヒントで
-  表現する)。直接・間接 (別タスク経由) を問わず、`serviceImpl` 内から `remove`/`clear` の完了を
-  待ってはならない (循環待ちになる)。`stopAutoRun()` も `serviceImpl` 内から呼んではならない
-  (`clear()` と同じ自己 join — runner タスクが自身の終了を待ってハングする)。ある呼び出しスレッドは「auto-run タスク」か「`runOnce`
+  表現する)。`add`/`remove`はwriterが直接適用するためcallback内から許可する。`clear()`/
+  `stopAutoRun()`は自己joinを始めず`INVALID_STATE`を返す。手動`runOnce()`のcallback内からinactive
+  runnerを`startAutoRun()`する操作も`INVALID_STATE`。auto-run callback内の`startAutoRun()`だけは
+  already-runningの冪等successである。ある呼び出しスレッドは「auto-run タスク」か「`runOnce`
   呼び出しスレッド」のどちらか一方としてのみ `serviceImpl` を駆動できる。
 - **R5 (データ受け渡しの標準形)**: svc タスクと他スレッドが共有する状態は、①完了通知型 = 共通
   Gate プリミティブ (release/acquire、ペイロードは通知 store より前に書き終え、読み手は acquire
@@ -191,11 +230,12 @@ auto-run のマルチスレッド化は posix のみを対象とし、stub は�
 
 ## 検証可能性: TSan native レーン
 
-native (posix runtime) ビルドでは `runtime::Task`/`runtime::Mutex` が実体 (`std::thread`/
+例外有効native (posix runtime) ビルドでは `runtime::Task`/`runtime::Mutex` が実体 (`std::thread`/
 `std::timed_mutex`) を持つため、上記 R1-R8 の並行性契約を ThreadSanitizer (`-fsanitize=thread`)
 つきの gtest から機械検証できる。`test/v2/native/core/test_service_runner/test_service_runner.cpp`
 の `ServiceRunnerAutoRunTest` フィクスチャが該当する (2 スレッド `startAutoRun()` の冪等性、
-auto-run 稼働中の並行 `add`/`remove` の R1/R3/R8 検証)。実行は `pio test -e test_native_tsan`
+複数callerの同時`add`によるtable容量結果、異なるserviceへの同時`add`/`remove`と返却後poll停止の
+R1/R2/R3/R8検証)。実行は `pio test -e test_native_tsan`
 (詳細は [verification.md](../verification.md))。
 
 ## 各 kind との関係

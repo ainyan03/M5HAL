@@ -20,6 +20,14 @@ inline uint32_t getU32LE(const uint8_t* p)
            (static_cast<uint32_t>(p[3]) << 24);
 }
 
+inline void putU32LE(uint8_t* p, uint32_t value)
+{
+    p[0] = static_cast<uint8_t>(value);
+    p[1] = static_cast<uint8_t>(value >> 8);
+    p[2] = static_cast<uint8_t>(value >> 16);
+    p[3] = static_cast<uint8_t>(value >> 24);
+}
+
 // Read a u32 config field at `off` inside `cfg` when present; tolerant
 // configs may legitimately be shorter (bytecode.md, tolerant decode).
 inline bool u32FieldExceeds(data::ConstDataSpan cfg, size_t off, uint32_t limit)
@@ -44,6 +52,8 @@ void Server::checkScratch()
 void Server::initRunnerHooks()
 {
     _runner.setStreamTransferHandler(&streamTransferThunk, this);
+    _runner.setCapabilityRxCeiling(_config.max_transfer_rx < kMaxTransferRx ? _config.max_transfer_rx
+                                                                            : static_cast<uint32_t>(kMaxTransferRx));
 }
 
 void Server::beginFrameRequest(uint8_t seq, data::MuxFrameEncoder& enc, data::MuxFrameDecoder& dec)
@@ -69,13 +79,25 @@ result_t<void> Server::recordCapability(types::bus_kind_t kind, uint8_t bus_id)
     // kMaxEntries (e.g. on reconnect).
     for (size_t i = 0; i < _cap_count; ++i) {
         if (_caps[i].kind == kind && _caps[i].bus_id == bus_id) {
+            auto capabilities = _runner.busCapabilities(kind, bus_id);
+            if (!capabilities.has_value()) {
+                return m5::stl::make_unexpected(capabilities.error());
+            }
+            _caps[i].capabilities = capabilities.value();
             return {};
         }
     }
     if (_cap_count >= Capabilities::kMaxEntries) {
         return m5::stl::make_unexpected(remote_error_t::OUT_OF_RESOURCE);
     }
-    _caps[_cap_count++] = Capabilities::BusEntry{kind, bus_id};
+    auto capabilities = _runner.busCapabilities(kind, bus_id);
+    if (!capabilities.has_value()) {
+        return m5::stl::make_unexpected(capabilities.error());
+    }
+    _caps[_cap_count].kind         = kind;
+    _caps[_cap_count].bus_id       = bus_id;
+    _caps[_cap_count].capabilities = capabilities.value();
+    ++_cap_count;
     return {};
 }
 
@@ -114,7 +136,18 @@ result_t<void> Server::handleBusCreate(bool create, types::bus_kind_t kind, uint
         return r;
     }
     if (create) {
-        return recordCapability(kind, bus_id);
+        auto recorded = recordCapability(kind, bus_id);
+        if (!recorded.has_value()) {
+            // The application-side create already committed. Compensate it
+            // before reporting the capability-registration failure so a
+            // failed request cannot retain a hidden binding or pool slot.
+            auto released = _bus_create_app_fn(_bus_create_app_ctx, false, kind, bus_id, data::ConstDataSpan{});
+            if (!released.has_value()) {
+                return released;
+            }
+            return recorded;
+        }
+        return {};
     }
     removeCapability(kind, bus_id);
     return {};
@@ -125,8 +158,10 @@ result_t<void> Server::gpioAllowlistThunk(void* ctx, const uint8_t* pins, size_t
     return static_cast<Server*>(ctx)->handleGpioAllowlist(pins, count);
 }
 
-// TODO: build AllowlistGPIO + GPIOGroup from pin list and call
-// setGPIOGroup(). Currently a stub.
+// The generic runner exposes this optional opcode, but the standard Server
+// cannot own an application-specific physical GPIO provider. Applications
+// must configure GPIOGroup directly; the standard handler rejects allowlist
+// construction until an ownership-safe provider API exists.
 result_t<void> Server::handleGpioAllowlist(const uint8_t* pins, size_t count)
 {
     (void)pins;
@@ -196,7 +231,8 @@ result_t<void> Server::handleStreamTransfer(const bytecode::BytecodeRunner::Stre
     return {};
 }
 
-result_t<void> Server::writeDeferredResponse(data::MuxFrameEncoder& enc, uint8_t seq, remote_error_t status)
+result_t<void> Server::writeDeferredResponse(data::MuxFrameEncoder& enc, uint8_t seq, remote_error_t status,
+                                             size_t actual_tx, size_t actual_rx)
 {
     if ((seq & 0x80) != 0) {
         return {};
@@ -204,7 +240,13 @@ result_t<void> Server::writeDeferredResponse(data::MuxFrameEncoder& enc, uint8_t
     uint8_t resp_buf[frame::kMaxPayload];
     data::MemorySink resp_sink{resp_buf, sizeof(resp_buf)};
     bytecode::BytecodeEncoder resp{resp_sink};
-    auto r = error::isError(status) ? resp.reportError(status, 0) : resp.reportComplete(status);
+    uint8_t totals[8];
+    detail::putU32LE(totals, static_cast<uint32_t>(actual_tx));
+    detail::putU32LE(totals + 4, static_cast<uint32_t>(actual_rx));
+    auto r = resp.storeData(kDefaultStoreId, {totals, sizeof(totals)});
+    if (r.has_value()) {
+        r = error::isError(status) ? resp.reportError(status, 0) : resp.reportComplete(status);
+    }
     if (r.has_value()) {
         r = resp.end();
     }
@@ -224,13 +266,15 @@ result_t<void> Server::completePendingStream(data::MuxFrameEncoder& enc, remote_
     }
     const uint8_t seq       = _pending_stream.seq;
     const uint8_t stream_id = _pending_stream.stream_id;
+    const size_t actual_tx  = _pending_stream.tx_consumed;
+    const size_t actual_rx  = _pending_stream.rx_produced;
     auto* dec               = _pending_stream.dec;
     if (dec != nullptr) {
         dec->destroyStream(stream_id);
     }
     _pending_stream         = PendingStreamTransfer{};
     _defer_current_response = false;
-    return writeDeferredResponse(enc, seq, status);
+    return writeDeferredResponse(enc, seq, status, actual_tx, actual_rx);
 }
 
 void Server::abortPendingStream()
@@ -286,14 +330,24 @@ result_t<void> Server::poll(data::MuxFrameEncoder& enc, uint32_t now_ms)
         const size_t remaining_rx = _pending_stream.rx_len > _pending_stream.rx_produced
                                         ? static_cast<size_t>(_pending_stream.rx_len) - _pending_stream.rx_produced
                                         : 0;
-        const size_t want_rx      = remaining_rx < sizeof(rx_buf) ? remaining_rx : sizeof(rx_buf);
+        // UART transfer() is ordered write-then-read. Keeping RX empty
+        // until all TX bytes have been accepted preserves that contract
+        // even though the stream protocol chunks large requests.
+        const size_t want_rx = (_pending_stream.kind == types::bus_kind_t::UART && need_tx)
+                                   ? 0
+                                   : (remaining_rx < sizeof(rx_buf) ? remaining_rx : sizeof(rx_buf));
         if (want_rx != 0 && enc.output().blockCount() + 1 >= data::BlockSource::kMaxBlocks) {
             return {};
         }
         size_t actual_tx = 0;
         size_t actual_rx = 0;
-        auto r = _runner.streamTransferChunk(_pending_stream.kind, _pending_stream.bus_id, pendingMeta(), tx_chunk,
-                                             data::DataSpan{rx_buf, want_rx}, actual_tx, actual_rx);
+        result_t<void> r;
+        if (_pending_stream.kind == types::bus_kind_t::UART && !need_tx && _pending_stream.rx_produced != 0) {
+            r = _runner.uartReadContinuationChunk(_pending_stream.bus_id, data::DataSpan{rx_buf, want_rx}, actual_rx);
+        } else {
+            r = _runner.streamTransferChunk(_pending_stream.kind, _pending_stream.bus_id, pendingMeta(), tx_chunk,
+                                            data::DataSpan{rx_buf, want_rx}, actual_tx, actual_rx);
+        }
         if (!r.has_value()) {
             return completePendingStream(enc, r.error());
         }
@@ -306,6 +360,32 @@ result_t<void> Server::poll(data::MuxFrameEncoder& enc, uint32_t now_ms)
             }
             _pending_stream.rx_produced += actual_rx;
             _pending_stream.last_progress_ms = now_ms;
+        }
+        if (need_tx && actual_tx != 0) {
+            auto adv = _pending_stream.rx_src->advance(actual_tx);
+            if (!adv.has_value()) {
+                return completePendingStream(enc, adv.error());
+            }
+            _pending_stream.tx_consumed += actual_tx;
+            _pending_stream.last_progress_ms = now_ms;
+        }
+
+        // A UART receive timeout is a successful short read. Its actual
+        // count terminates the logical request; retrying would restart the
+        // first/inter-byte timeout and turn read() into an exact transfer.
+        // TX remains an exact stream operation because the host Source has
+        // already advanced as Data frames cross the wire; the server keeps
+        // accepting a positive short prefix until the transmitted stream is
+        // exhausted.
+        if (_pending_stream.kind == types::bus_kind_t::UART) {
+            const bool short_rx = want_rx != 0 && actual_rx < want_rx;
+            if (short_rx) {
+                return completePendingStream(enc, _pending_stream.status);
+            }
+            if (_pending_stream.tx_consumed >= _pending_stream.tx_len &&
+                _pending_stream.rx_produced < _pending_stream.rx_len) {
+                return {};
+            }
         }
         if (actual_tx == 0) {
             if (actual_rx == 0) {
@@ -325,12 +405,6 @@ result_t<void> Server::poll(data::MuxFrameEncoder& enc, uint32_t now_ms)
             continue;
         }
         if (need_tx) {
-            auto adv = _pending_stream.rx_src->advance(actual_tx);
-            if (!adv.has_value()) {
-                return completePendingStream(enc, adv.error());
-            }
-            _pending_stream.tx_consumed += actual_tx;
-            _pending_stream.last_progress_ms = now_ms;
             if (_pending_stream.tx_consumed >= _pending_stream.tx_len &&
                 _pending_stream.rx_produced < _pending_stream.rx_len) {
                 return {};
@@ -422,6 +496,18 @@ result_t<void> Server::registerI2S(uint8_t bus_id, i2s::RxAccessor& acc)
     return recordCapability(types::bus_kind_t::I2S, bus_id);
 }
 
+result_t<void> Server::registerPDM(uint8_t bus_id, pdm::RxAccessor& acc)
+{
+    if (acc.getConfig().read_timeout_ms > _config.max_bus_timeout_ms) {
+        return m5::stl::make_unexpected(remote_error_t::INVALID_ARGUMENT);
+    }
+    auto r = _runner.registerPDM(bus_id, acc);
+    if (!r.has_value()) {
+        return r;
+    }
+    return recordCapability(types::bus_kind_t::PDM, bus_id);
+}
+
 remote_error_t Server::prescan(data::ConstDataSpan script, size_t& offset) const
 {
     // One pass over the length-prefixed instructions. Only the execution-
@@ -487,8 +573,12 @@ remote_error_t Server::prescan(data::ConstDataSpan script, size_t& offset) const
                                    detail::u32FieldExceeds(cfg, bytecode::kI2SConfigReadTimeoutOffset,
                                                            _config.max_bus_timeout_ms);
                         break;
-                    // SPI carries no wire-time field anymore (its former
-                    // timeout_ms was lock-only); nothing to bound.
+                    case types::bus_kind_t::PDM:
+                        exceeded = detail::u32FieldExceeds(cfg, bytecode::kPDMConfigReadTimeoutOffset,
+                                                           _config.max_bus_timeout_ms);
+                        break;
+                    // SPI carries no wire-time field; its Access lock/close
+                    // budgets are call arguments rather than config fields.
                     default:
                         break;
                 }
@@ -519,6 +609,22 @@ remote_error_t Server::prescan(data::ConstDataSpan script, size_t& offset) const
             }
         } else if (opcode == static_cast<uint8_t>(bytecode::OpCode::BusStreamTransfer)) {
             // payload: [kind:1][bus_id:1][stream_id:1][meta_size:1][tx_len:4LE][rx_len:4LE][meta]
+            // Transactional buses cannot preserve one-transfer wire semantics
+            // when a stream is delivered in several chunks (I2C would repeat
+            // START/prefix; SPI would repeat command/address/dummy phases).
+            // Reject legacy/raw clients before any bus side effect; current
+            // clients use the bounded inline BusTransfer opcode instead.
+            if (payload.size >= 12) {
+                const auto kind = static_cast<types::bus_kind_t>(payload.data[0]);
+                const bool nonempty =
+                    detail::getU32LE(payload.data + 4) != 0 || detail::getU32LE(payload.data + 8) != 0;
+                if (nonempty && (kind == types::bus_kind_t::I2C || kind == types::bus_kind_t::SPI)) {
+                    M5HAL_DIAG("script rejected offset=%zu reason=non-atomic-stream-transfer kind=%u", instr_at,
+                               static_cast<unsigned>(payload.data[0]));
+                    offset = instr_at;
+                    return remote_error_t::UNSUPPORTED;
+                }
+            }
             // Any stream transfer that defers the response (tx or rx
             // pending) must be the script's last instruction: the deferred
             // Response carries only Report*, so response slots stored by a
