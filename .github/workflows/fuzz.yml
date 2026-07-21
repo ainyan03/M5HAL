@@ -28,6 +28,7 @@ jobs:
         working-directory: M5HAL
         env:
           FUZZ_RUNS: ${{ github.event.inputs.runs || (github.event_name == 'schedule' && '100000') || '2000' }}
+          FUZZ_REQUIRE_LIBFUZZER: "1"
         run: bash scripts/fuzz-test.sh
       - name: Retain crash reproducers
         if: failure()

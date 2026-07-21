@@ -52,7 +52,18 @@ result_t<void> RemoteServerAdapter::pumpWire()
     if (!drained.has_value()) {
         return m5::stl::make_unexpected(drained.error());
     }
-    auto decoded = _dec->pump(*_wire_rx);
+    // A decoder pump is the recovery boundary for frame-handler failures. The
+    // previous failure has already been returned to the caller; clearing it
+    // here lets a later pump retry without allowing more non-credit frames from
+    // the failed batch to run handler side effects.
+    _frame_handler_error = error::error_t::OK;
+    auto decoded         = _dec->pump(*_wire_rx);
+    if (error::isError(_frame_handler_error)) {
+        // service() cannot return a count together with an error. Do not carry
+        // successfully handled frames from the failed batch into a later call.
+        _pending_count = 0;
+        return m5::stl::make_unexpected(_frame_handler_error);
+    }
     if (!decoded.has_value()) {
         return m5::stl::make_unexpected(decoded.error());
     }
@@ -90,8 +101,15 @@ void RemoteServerAdapter::onFrame(const frame::View& view)
         M5HAL_DIAG("credit applied remote=%u", static_cast<unsigned>(view.b3));
         return;
     }
+    if (error::isError(_frame_handler_error)) {
+        return;
+    }
     if (_handler != nullptr) {
-        (void)_handler(_handler_ctx, view.kind, view.b3, view.payload, *_enc, *_dec);
+        auto handled = _handler(_handler_ctx, view.kind, view.b3, view.payload, *_enc, *_dec);
+        if (!handled.has_value()) {
+            _frame_handler_error = handled.error();
+            return;
+        }
     } else {
         M5HAL_DIAG("frame dropped kind=%d (no handler installed)", static_cast<int>(view.kind));
     }

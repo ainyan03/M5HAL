@@ -835,8 +835,13 @@ static void checkData()
     (void)mux_encoder.attach(1, mem_src);
     (void)mux_encoder.stream(1);
     (void)mux_encoder.pump();
-    (void)mux_encoder.writeFrame(m5hal::frame::Kind::Ping, 0, {});
-    (void)mux_encoder.writeDelimiter();
+    m5hal::result_t<void> mux_frame = mux_encoder.writeFrame(m5hal::frame::Kind::Ping, 0);
+    m5hal::result_t<void> mux_prefixed = mux_encoder.writeFrameWithOptionalPrefix(
+        m5hal::frame::Kind::Event, 0, {}, m5hal::frame::Kind::Response, 0, {});
+    m5hal::result_t<void> mux_delimiter = mux_encoder.writeDelimiter();
+    (void)mux_frame;
+    (void)mux_prefixed;
+    (void)mux_delimiter;
     (void)mux_encoder.output();
     mux_encoder.detach(1);
     mux_encoder.releaseAll();
@@ -1059,7 +1064,7 @@ static void checkRemote()
     (void)m5hal::remote::kMaxScriptSize;
     (void)m5hal::remote::kMaxTransferRx;
     (void)m5hal::remote::kDefaultStoreId;
-    (void)m5hal::remote::kRemoteUartTimeoutMarginMs;
+    (void)m5hal::remote::kRemoteTimeoutMarginMs;
     (void)m5hal::remote::mapRemoteError(0);
 
     m5hal::remote::DeviceConfig dev_cfg;

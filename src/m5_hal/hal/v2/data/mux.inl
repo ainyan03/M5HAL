@@ -124,50 +124,52 @@ m5::hal::v2::result_t<size_t> MuxFrameEncoder::pump()
     return frames;
 }
 
-bool MuxFrameEncoder::writeFrame(frame::Kind kind, uint8_t b3, ConstDataSpan payload)
+m5::hal::v2::result_t<void> MuxFrameEncoder::writeFrame(frame::Kind kind, uint8_t b3, ConstDataSpan payload)
 {
     if (_alloc == nullptr) {
-        return false;
+        return m5::stl::make_unexpected(m5::hal::v2::error::error_t::INVALID_STATE);
     }
     auto* block = static_cast<uint8_t*>(_alloc->allocate(frame::kMaxFrameSize, memory::usage_t::Temp));
     if (block == nullptr) {
-        return false;
+        return m5::stl::make_unexpected(m5::hal::v2::error::error_t::OUT_OF_RESOURCE);
     }
     auto encoded = frame::encodeChecked({block, frame::kMaxFrameSize}, kind, b3, payload);
     if (!encoded.has_value()) {
         _alloc->deallocate(block);
-        return false;
+        return m5::stl::make_unexpected(encoded.error());
     }
     if (!_output.addBlock(block, encoded.value())) {
         _alloc->deallocate(block);
-        return false;
+        return m5::stl::make_unexpected(m5::hal::v2::error::error_t::OUT_OF_RESOURCE);
     }
-    return true;
+    return {};
 }
 
-bool MuxFrameEncoder::writeFrameWithOptionalPrefix(frame::Kind prefix_kind, uint8_t prefix_b3,
-                                                   ConstDataSpan prefix_payload, frame::Kind required_kind,
-                                                   uint8_t required_b3, ConstDataSpan required_payload,
-                                                   bool* prefix_written)
+m5::hal::v2::result_t<void> MuxFrameEncoder::writeFrameWithOptionalPrefix(
+    frame::Kind prefix_kind, uint8_t prefix_b3, ConstDataSpan prefix_payload, frame::Kind required_kind,
+    uint8_t required_b3, ConstDataSpan required_payload, bool* prefix_written)
 {
     if (prefix_written != nullptr) {
         *prefix_written = false;
     }
-    if (_alloc == nullptr || _output.blockCount() >= BlockSource::kMaxBlocks) {
-        return false;
+    if (_alloc == nullptr) {
+        return m5::stl::make_unexpected(m5::hal::v2::error::error_t::INVALID_STATE);
+    }
+    if (_output.blockCount() >= BlockSource::kMaxBlocks) {
+        return m5::stl::make_unexpected(m5::hal::v2::error::error_t::OUT_OF_RESOURCE);
     }
 
     // Reserve the required frame's memory before attempting the optional
     // prefix. This is the response-priority boundary under allocator pressure.
     auto* required_block = static_cast<uint8_t*>(_alloc->allocate(frame::kMaxFrameSize, memory::usage_t::Temp));
     if (required_block == nullptr) {
-        return false;
+        return m5::stl::make_unexpected(m5::hal::v2::error::error_t::OUT_OF_RESOURCE);
     }
     auto required_encoded =
         frame::encodeChecked({required_block, frame::kMaxFrameSize}, required_kind, required_b3, required_payload);
     if (!required_encoded.has_value()) {
         _alloc->deallocate(required_block);
-        return false;
+        return m5::stl::make_unexpected(required_encoded.error());
     }
 
     if (_output.blockCount() + 1 < BlockSource::kMaxBlocks) {
@@ -189,30 +191,30 @@ bool MuxFrameEncoder::writeFrameWithOptionalPrefix(frame::Kind prefix_kind, uint
     // fail here if its structural contract changes.
     if (!_output.addBlock(required_block, required_encoded.value())) {
         _alloc->deallocate(required_block);
-        return false;
+        return m5::stl::make_unexpected(m5::hal::v2::error::error_t::OUT_OF_RESOURCE);
     }
-    return true;
+    return {};
 }
 
-bool MuxFrameEncoder::writeDelimiter()
+m5::hal::v2::result_t<void> MuxFrameEncoder::writeDelimiter()
 {
     if (_alloc == nullptr) {
-        return false;
+        return m5::stl::make_unexpected(m5::hal::v2::error::error_t::INVALID_STATE);
     }
     auto* block = static_cast<uint8_t*>(_alloc->allocate(frame::kMaxFrameSize, memory::usage_t::Temp));
     if (block == nullptr) {
-        return false;
+        return m5::stl::make_unexpected(m5::hal::v2::error::error_t::OUT_OF_RESOURCE);
     }
     auto encoded = frame::encodeDelimiter({block, frame::kMaxFrameSize});
     if (!encoded.has_value()) {
         _alloc->deallocate(block);
-        return false;
+        return m5::stl::make_unexpected(encoded.error());
     }
     if (!_output.addBlock(block, encoded.value())) {
         _alloc->deallocate(block);
-        return false;
+        return m5::stl::make_unexpected(m5::hal::v2::error::error_t::OUT_OF_RESOURCE);
     }
-    return true;
+    return {};
 }
 
 BlockSource& MuxFrameEncoder::output()

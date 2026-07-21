@@ -62,8 +62,6 @@ private:
     {
         _capabilities = value;
     }
-
-    static constexpr uint32_t kTransferTimeoutMs = 10000;
     std::shared_ptr<remote::RemoteSessionHandle> _session;
     uint8_t _bus_id                               = 0;
     std::shared_ptr<bus::BusLifecycle> _lifecycle = std::make_shared<bus::BusLifecycle>();

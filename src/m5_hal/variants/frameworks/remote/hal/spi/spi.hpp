@@ -70,8 +70,6 @@ private:
         _capabilities = value;
     }
 
-    static constexpr uint32_t kTransferTimeoutMs = 5000;
-
     static data::ConstDataSpan encodeSpiMeta(uint8_t* buf, const spi::TransferDesc& desc);
 
 protected:

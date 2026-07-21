@@ -48,17 +48,20 @@ public:
 
     m5::hal::v2::result_t<size_t> pump();
 
-    bool writeFrame(frame::Kind kind, uint8_t b3, ConstDataSpan payload = {});
+    // Failure modes: INVALID_STATE (no allocator bound), OUT_OF_RESOURCE
+    // (allocator exhausted or the bounded block queue is full), or the
+    // frame::encodeChecked error for a payload that violates the wire format.
+    [[nodiscard]] m5::hal::v2::result_t<void> writeFrame(frame::Kind kind, uint8_t b3, ConstDataSpan payload = {});
 
     // Queue `required` while adding `prefix` first only when both queue and
     // allocator capacity permit it. The required frame block is allocated
     // before the optional prefix, so best-effort traffic cannot consume the
     // resource needed by a terminal response.
-    bool writeFrameWithOptionalPrefix(frame::Kind prefix_kind, uint8_t prefix_b3, ConstDataSpan prefix_payload,
-                                      frame::Kind required_kind, uint8_t required_b3, ConstDataSpan required_payload,
-                                      bool* prefix_written = nullptr);
+    [[nodiscard]] m5::hal::v2::result_t<void> writeFrameWithOptionalPrefix(
+        frame::Kind prefix_kind, uint8_t prefix_b3, ConstDataSpan prefix_payload, frame::Kind required_kind,
+        uint8_t required_b3, ConstDataSpan required_payload, bool* prefix_written = nullptr);
 
-    bool writeDelimiter();
+    [[nodiscard]] m5::hal::v2::result_t<void> writeDelimiter();
 
     BlockSource& output();
 

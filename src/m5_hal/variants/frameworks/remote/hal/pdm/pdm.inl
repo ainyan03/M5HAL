@@ -86,9 +86,11 @@ result_t<size_t> Bus_remote::readBackend(bus::OperationContext<AccessConfig>& co
         return size_t{0};
     }
     uint8_t cfg_buf[bytecode::kPDMConfigSize];
-    auto cfg_bytes   = remote::detail::encodeRemoteConfig(cfg_buf, cfg);
+    auto cfg_bytes            = remote::detail::encodeRemoteConfig(cfg_buf, cfg);
+    const uint32_t timeout_ms = remote::detail::remotePcmResponseTimeoutMs(cfg.sample_rate_hz, cfg.bits_per_sample,
+                                                                           cfg.channels, cfg.read_timeout_ms, len);
     auto transferred = remote::remoteTransferWire(_session, types::bus_kind_t::PDM, _bus_id, cfg_bytes, {}, nullptr, 0,
-                                                  dst, len, kTransferTimeoutMs, &_config_cache);
+                                                  dst, len, timeout_ms, &_config_cache);
     if (!transferred.has_value()) {
         return m5::stl::make_unexpected(transferred.error());
     }

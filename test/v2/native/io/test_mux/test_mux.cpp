@@ -351,7 +351,7 @@ TEST(MuxFrameEncoder, WriteControlFrame)
     data::MuxFrameEncoder enc{alloc};
 
     const uint8_t payload[] = {0x01, 0x02};
-    ASSERT_TRUE(enc.writeFrame(frame::Kind::Request, 0x07, {payload, sizeof(payload)}));
+    ASSERT_TRUE(enc.writeFrame(frame::Kind::Request, 0x07, {payload, sizeof(payload)}).has_value());
 
     auto& out   = enc.output();
     auto peeked = out.peek(256);
@@ -393,7 +393,7 @@ TEST(MuxFrameEncoder, MixedDataAndControlFrames)
     ASSERT_TRUE(enc.attach(0, src));
     uint8_t stream_id = 0;
 
-    ASSERT_TRUE(enc.writeFrame(frame::Kind::HelloReq, 0, {}));
+    ASSERT_TRUE(enc.writeFrame(frame::Kind::HelloReq, 0, {}).has_value());
     pumpValue(enc);
 
     auto& out = enc.output();
@@ -438,7 +438,7 @@ TEST(MuxFrameEncoder, CreditGateLimitsDataFrames)
     EXPECT_FALSE(src.eof());
     EXPECT_EQ(enc.output().blockCount(), 2u);
 
-    ASSERT_TRUE(enc.writeFrame(frame::Kind::Ping, 0x44, {}));
+    ASSERT_TRUE(enc.writeFrame(frame::Kind::Ping, 0x44, {}).has_value());
     EXPECT_EQ(enc.output().blockCount(), 3u);
     EXPECT_EQ(pumpValue(enc), 0u);
 
@@ -455,7 +455,7 @@ TEST(MuxFrameEncoder, WriteDelimiter)
     auto& alloc = memory::defaultAllocator();
     data::MuxFrameEncoder enc{alloc};
 
-    ASSERT_TRUE(enc.writeDelimiter());
+    ASSERT_TRUE(enc.writeDelimiter().has_value());
 
     auto& out   = enc.output();
     auto peeked = out.peek(256);
@@ -483,7 +483,8 @@ TEST(MuxFrameEncoder, OptionalPrefixCannotConsumeRequiredFrameAllocation)
     bool prefix_written              = true;
     ASSERT_TRUE(enc.writeFrameWithOptionalPrefix(frame::Kind::Event, 1, {event_payload, sizeof(event_payload)},
                                                  frame::Kind::Response, 2, {response_payload, sizeof(response_payload)},
-                                                 &prefix_written));
+                                                 &prefix_written)
+                    .has_value());
     EXPECT_FALSE(prefix_written);
     ASSERT_EQ(enc.output().blockCount(), 1u);
 
@@ -997,7 +998,7 @@ TEST(MuxFrameRoundtrip, ControlFrameEndToEnd)
         &ctx);
 
     const uint8_t body[] = {0xDE, 0xAD};
-    ASSERT_TRUE(enc.writeFrame(frame::Kind::Request, 0x03, {body, sizeof(body)}));
+    ASSERT_TRUE(enc.writeFrame(frame::Kind::Request, 0x03, {body, sizeof(body)}).has_value());
 
     pumpValue(dec, enc.output());
     EXPECT_EQ(ctx.calls, 1);

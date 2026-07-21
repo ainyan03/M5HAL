@@ -253,8 +253,9 @@ result_t<void> Server::writeDeferredResponse(data::MuxFrameEncoder& enc, uint8_t
     if (!r.has_value()) {
         return m5::stl::make_unexpected(r.error());
     }
-    if (!enc.writeFrame(frame::Kind::Response, seq, {resp_buf, resp_sink.written()})) {
-        return m5::stl::make_unexpected(remote_error_t::BUFFER_OVERFLOW);
+    if (auto queued = enc.writeFrame(frame::Kind::Response, seq, {resp_buf, resp_sink.written()});
+        !queued.has_value()) {
+        return m5::stl::make_unexpected(queued.error());
     }
     return {};
 }
@@ -355,8 +356,9 @@ result_t<void> Server::poll(data::MuxFrameEncoder& enc, uint32_t now_ms)
             return completePendingStream(enc, remote_error_t::IO_ERROR);
         }
         if (actual_rx != 0) {
-            if (!enc.writeFrame(frame::Kind::Data, _pending_stream.stream_id, {rx_buf, actual_rx})) {
-                return completePendingStream(enc, remote_error_t::BUFFER_OVERFLOW);
+            if (auto queued = enc.writeFrame(frame::Kind::Data, _pending_stream.stream_id, {rx_buf, actual_rx});
+                !queued.has_value()) {
+                return completePendingStream(enc, queued.error());
             }
             _pending_stream.rx_produced += actual_rx;
             _pending_stream.last_progress_ms = now_ms;

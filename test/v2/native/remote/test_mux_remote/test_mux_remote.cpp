@@ -709,7 +709,7 @@ private:
         data::MemorySink resp_sink{resp_buf, sizeof(resp_buf)};
         auto written = _runner.writeResponse(resp_sink, status);
         if (written.has_value()) {
-            _enc->writeFrame(frame::Kind::Response, seq, {resp_buf, resp_sink.written()});
+            (void)_enc->writeFrame(frame::Kind::Response, seq, {resp_buf, resp_sink.written()});
         }
     }
 
@@ -781,7 +781,7 @@ private:
         data::MemorySink sink{response, sizeof(response)};
         auto written = _runner.writeResponse(sink, status);
         if (written.has_value()) {
-            _enc->writeFrame(frame::Kind::Response, seq, {response, sink.written()});
+            (void)_enc->writeFrame(frame::Kind::Response, seq, {response, sink.written()});
         }
     }
 
@@ -932,7 +932,7 @@ struct ScriptCapturePeer {
     {
         if (view.kind == frame::Kind::HelloReq) {
             uint8_t caps[] = {remote::kProtocolVersion, 0};
-            enc->writeFrame(frame::Kind::HelloResp, view.b3, {caps, sizeof(caps)});
+            (void)enc->writeFrame(frame::Kind::HelloResp, view.b3, {caps, sizeof(caps)});
             return;
         }
         if (view.kind != frame::Kind::Request) {
@@ -950,7 +950,7 @@ struct ScriptCapturePeer {
             r = resp.end();
         }
         if (r.has_value()) {
-            enc->writeFrame(frame::Kind::Response, view.b3, {resp_buf, resp_sink.written()});
+            (void)enc->writeFrame(frame::Kind::Response, view.b3, {resp_buf, resp_sink.written()});
         }
     }
 
@@ -1140,7 +1140,7 @@ TEST(MuxRemoteSession, RequestResponseRoundtrip)
             auto* s = static_cast<ServerCtx*>(ctx);
             if (view.kind == frame::Kind::Request) {
                 uint8_t resp[] = {0xDE, 0xAD};
-                s->enc->writeFrame(frame::Kind::Response, view.b3, {resp, sizeof(resp)});
+                (void)s->enc->writeFrame(frame::Kind::Response, view.b3, {resp, sizeof(resp)});
             }
         },
         &server_ctx);
@@ -1226,7 +1226,7 @@ TEST(MuxRemoteSession, HelloRoundtrip)
             auto* s = static_cast<ServerCtx*>(ctx);
             if (view.kind == frame::Kind::HelloReq) {
                 uint8_t caps[] = {0x01, 0x03};
-                s->enc->writeFrame(frame::Kind::HelloResp, view.b3, {caps, sizeof(caps)});
+                (void)s->enc->writeFrame(frame::Kind::HelloResp, view.b3, {caps, sizeof(caps)});
             }
         },
         &server_ctx);
@@ -1260,7 +1260,7 @@ TEST(MuxRemoteSession, PingRoundtrip)
         [](void* ctx, const frame::View& view) {
             auto* s = static_cast<ServerCtx*>(ctx);
             if (view.kind == frame::Kind::Ping) {
-                s->enc->writeFrame(frame::Kind::Pong, view.b3, {});
+                (void)s->enc->writeFrame(frame::Kind::Pong, view.b3, {});
             }
         },
         &server_ctx);
@@ -2172,14 +2172,14 @@ TEST(MuxRemoteServerAdapter, DispatchesRequestToHandler)
             h->last_seq     = seq;
             h->last_payload = payload.size;
             if (kind == frame::Kind::Request) {
-                enc.writeFrame(frame::Kind::Response, seq, payload);
+                (void)enc.writeFrame(frame::Kind::Response, seq, payload);
             }
             return {};
         },
         &handler_ctx);
 
     const uint8_t script[] = {0x42, 0x43};
-    pair.enc_a.writeFrame(frame::Kind::Request, 0x07, {script, sizeof(script)});
+    (void)pair.enc_a.writeFrame(frame::Kind::Request, 0x07, {script, sizeof(script)});
     pair.pump();
 
     adapter.pumpWire();
@@ -2190,6 +2190,78 @@ TEST(MuxRemoteServerAdapter, DispatchesRequestToHandler)
     EXPECT_EQ(handler_ctx.last_kind, frame::Kind::Request);
     EXPECT_EQ(handler_ctx.last_seq, 0x07);
     EXPECT_EQ(handler_ctx.last_payload, sizeof(script));
+}
+
+TEST(MuxRemoteServerAdapter, LatchesFirstHandlerErrorAndRecoversOnNextPump)
+{
+    SessionPair pair;
+
+    struct HandlerCtx {
+        size_t calls = 0;
+        bool fail    = true;
+    } handler_ctx;
+
+    remote::RemoteServerAdapter adapter{pair.enc_b, pair.dec_b, pair.wire_ab.source(), pair.wire_ba.sink()};
+    adapter.setExternalPoll(true);
+    adapter.setHandler(
+        [](void* ctx, frame::Kind, uint8_t, data::ConstDataSpan, data::MuxFrameEncoder&,
+           data::MuxFrameDecoder&) -> result_t<void> {
+            auto* h = static_cast<HandlerCtx*>(ctx);
+            ++h->calls;
+            if (h->fail) {
+                return m5::stl::make_unexpected(error::error_t::OUT_OF_RESOURCE);
+            }
+            return {};
+        },
+        &handler_ctx);
+
+    ASSERT_TRUE(pair.enc_a.writeFrame(frame::Kind::Request, 1, {}).has_value());
+    ASSERT_TRUE(pair.enc_a.writeFrame(frame::Kind::Request, 2, {}).has_value());
+    pumpValue(pair.enc_a);
+    SessionPair::transfer(pair.enc_a.output(), pair.wire_ab.sink());
+
+    auto failed = adapter.pumpWire();
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), error::error_t::OUT_OF_RESOURCE) << "err=" << error::toString(failed.error());
+    EXPECT_EQ(handler_ctx.calls, 1u);
+
+    auto count_after_error = adapter.service();
+    ASSERT_TRUE(count_after_error.has_value()) << "err=" << error::toString(count_after_error.error());
+    EXPECT_EQ(count_after_error.value(), 0u);
+
+    handler_ctx.fail = false;
+    ASSERT_TRUE(pair.enc_a.writeFrame(frame::Kind::Request, 3, {}).has_value());
+    pumpValue(pair.enc_a);
+    SessionPair::transfer(pair.enc_a.output(), pair.wire_ab.sink());
+
+    auto recovered = adapter.pumpWire();
+    ASSERT_TRUE(recovered.has_value()) << "err=" << error::toString(recovered.error());
+    EXPECT_EQ(handler_ctx.calls, 2u);
+    auto recovered_count = adapter.service();
+    ASSERT_TRUE(recovered_count.has_value()) << "err=" << error::toString(recovered_count.error());
+    EXPECT_EQ(recovered_count.value(), 1u);
+
+    adapter.setExternalPoll(false);
+    handler_ctx.fail = true;
+    ASSERT_TRUE(pair.enc_a.writeFrame(frame::Kind::Request, 4, {}).has_value());
+    pumpValue(pair.enc_a);
+    SessionPair::transfer(pair.enc_a.output(), pair.wire_ab.sink());
+
+    auto service_failed = adapter.service();
+    ASSERT_FALSE(service_failed.has_value());
+    EXPECT_EQ(service_failed.error(), error::error_t::OUT_OF_RESOURCE)
+        << "err=" << error::toString(service_failed.error());
+    EXPECT_EQ(handler_ctx.calls, 3u);
+
+    handler_ctx.fail = false;
+    ASSERT_TRUE(pair.enc_a.writeFrame(frame::Kind::Request, 5, {}).has_value());
+    pumpValue(pair.enc_a);
+    SessionPair::transfer(pair.enc_a.output(), pair.wire_ab.sink());
+
+    auto service_recovered = adapter.service();
+    ASSERT_TRUE(service_recovered.has_value()) << "err=" << error::toString(service_recovered.error());
+    EXPECT_EQ(service_recovered.value(), 1u);
+    EXPECT_EQ(handler_ctx.calls, 4u);
 }
 
 TEST(RemoteServerHandler, GpioPollReadsSubscribedPortOnceAndEmitsPinEvents)
@@ -2251,6 +2323,52 @@ TEST(RemoteServerHandler, GpioPollReadsSubscribedPortOnceAndEmitsPinEvents)
     EXPECT_TRUE(capture.events[0].level);
     EXPECT_EQ(capture.events[1].pin, pins[1]);
     EXPECT_TRUE(capture.events[1].level);
+}
+
+TEST(RemoteServerHandler, GpioPollDoesNotConsumeEventSequenceWhenQueueIsFull)
+{
+    PortMaskGPIO device;
+    gpio::GPIOGroup group{&device};
+    remote::RemoteServerHandler handler;
+    handler.gpio_group = &group;
+
+    const auto pin = types::makeGpioNumber(0, 1);
+    ASSERT_TRUE(remote::RemoteServerHandler::gpioSubscribe(&handler, true, &pin, 1).has_value());
+    ASSERT_TRUE(remote::RemoteServerHandler::gpioModeSet(&handler, pin, types::gpio_mode_t::Input).has_value());
+    device.port.value = 1u << 1;
+
+    mem::Allocator& alloc = mem::defaultAllocator();
+    data::MuxFrameEncoder enc{alloc};
+    for (size_t i = 0; i < data::BlockSource::kMaxBlocks; ++i) {
+        ASSERT_TRUE(enc.writeDelimiter().has_value());
+    }
+
+    auto full = remote::RemoteServerHandler::poll(&handler, enc);
+    ASSERT_FALSE(full.has_value());
+    EXPECT_EQ(full.error(), error::error_t::OUT_OF_RESOURCE);
+    EXPECT_EQ(handler.gpio_event_seq, 0u);
+    enc.releaseAll();
+
+    uint8_t frame_buf[1024];
+    data::RingFIFO frames;
+    frames.setBuf(frame_buf, sizeof(frame_buf));
+    data::MuxFrameDecoder dec{alloc};
+    uint8_t event_seq = 0xFF;
+    dec.setFrameHandler(
+        [](void* ctx, const frame::View& view) {
+            if (view.kind == frame::Kind::Event) {
+                *static_cast<uint8_t*>(ctx) = view.b3;
+            }
+        },
+        &event_seq);
+
+    auto retried = remote::RemoteServerHandler::poll(&handler, enc);
+    ASSERT_TRUE(retried.has_value()) << "err=" << error::toString(retried.error());
+    EXPECT_EQ(handler.gpio_event_seq, 1u);
+    pumpValue(enc);
+    SessionPair::transfer(enc.output(), frames.sink());
+    pumpValue(dec, frames.source());
+    EXPECT_EQ(event_seq, 0u);
 }
 
 TEST(RemoteServerHandler, GpioSubscriptionUsesIGPIOPortOrdinal)
@@ -2577,7 +2695,7 @@ TEST(RemoteServerHandler, GpioSnapshotYieldsLastEncoderSlotToResponse)
     MuxFrameCapture capture;
     pair.dec_a.setFrameHandler(&MuxFrameCapture::onFrame, &capture);
     for (size_t i = 0; i + 1 < data::BlockSource::kMaxBlocks; ++i) {
-        ASSERT_TRUE(pair.enc_b.writeFrame(frame::Kind::Ping, static_cast<uint8_t>(i), {}));
+        ASSERT_TRUE(pair.enc_b.writeFrame(frame::Kind::Ping, static_cast<uint8_t>(i), {}).has_value());
     }
     ASSERT_EQ(pair.enc_b.output().blockCount(), data::BlockSource::kMaxBlocks - 1);
 
@@ -2824,6 +2942,34 @@ TEST(RemoteUARTTimeout, ResponseDeadlineIncludesConfiguredNominalTimeouts)
     EXPECT_EQ(remote::detail::remoteUartReadResponseTimeoutMs(100, 20, 5), 430u);
     EXPECT_EQ(remote::detail::remoteUartTransferResponseTimeoutMs(100, 100, 20, 5, 5), 930u);
     EXPECT_EQ(remote::detail::remoteUartTransferResponseTimeoutMs(100, 100, 20, 0, 5), 430u);
+}
+
+TEST(RemoteBusTimeout, ResponseDeadlineDerivesFromAccessConfig)
+{
+    // I2C: ceil(10 bytes * 9 bits / 100 kHz) = 1 ms wire + 1000 ms stall
+    // allowance + 250 ms margin.
+    EXPECT_EQ(remote::detail::remoteI2cResponseTimeoutMs(100000, 1000, 10), 1251u);
+    EXPECT_EQ(remote::detail::remoteI2cResponseTimeoutMs(0, 1000, 10), 1250u);  // freq 0: no wire term
+    // SPI payload only: ceil(1000 bytes * 8 bits * 1000 / 1 MHz) = 8 ms wire
+    // + 250 ms margin.
+    EXPECT_EQ(remote::detail::remoteSpiResponseTimeoutMs(1000000, 500, 500, 0, 0, 0), 258u);
+    // Descriptor phases are also on the wire: 1 payload byte + 4 command
+    // bytes + 4 address bytes + 255 dummy clocks = 327 clocks at 1 kHz.
+    EXPECT_EQ(remote::detail::remoteSpiResponseTimeoutMs(1000, 1, 0, 4, 4, 255), 577u);
+    // Payload and phase clocks share one ceil operation.
+    EXPECT_EQ(remote::detail::remoteSpiResponseTimeoutMs(1000000, 1000, 0, 2, 3, 7), 259u);
+    // Independent lengths must saturate instead of wrapping their size_t sum.
+    EXPECT_EQ(remote::detail::remoteSpiResponseTimeoutMs(1, SIZE_MAX, SIZE_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX),
+              types::TIMEOUT_FOREVER - 1);
+    EXPECT_EQ(remote::detail::remoteWireBitDurationMs(UINT32_MAX - 1u, 1000), UINT32_MAX - 1u);
+    EXPECT_EQ(remote::detail::remoteWireBitDurationMs(UINT32_MAX, 1000), UINT32_MAX);
+    // PCM: 3200 bytes of 16-bit mono @ 16 kHz = 1600 frames = 100 ms.
+    EXPECT_EQ(remote::detail::remotePcmDurationMs(16000, 16, 1, 3200), 100u);
+    // 16-bit stereo @ 44.1 kHz: 4-byte frames.
+    EXPECT_EQ(remote::detail::remotePcmDurationMs(44100, 16, 2, 4410 * 4), 100u);
+    EXPECT_EQ(remote::detail::remotePcmResponseTimeoutMs(16000, 16, 1, 1000, 3200), 1350u);
+    // Saturation must clamp below the TIMEOUT_FOREVER sentinel.
+    EXPECT_EQ(remote::detail::remotePcmResponseTimeoutMs(16000, 16, 1, UINT32_MAX, 0), types::TIMEOUT_FOREVER - 1);
 }
 
 TEST(RemoteAtomicTransfer, OversizeI2CReadIsRejectedBeforeWireActivity)
@@ -3356,7 +3502,7 @@ TEST(MuxRemoteSession, AttachStreamDataRoundtrip)
     EXPECT_EQ(::memcmp(peeked.value().data, tx_data, sizeof(tx_data)), 0);
 
     const uint8_t reply[] = {0xCA, 0xFE};
-    pair.enc_b.writeFrame(frame::Kind::Data, id, {reply, sizeof(reply)});
+    (void)pair.enc_b.writeFrame(frame::Kind::Data, id, {reply, sizeof(reply)});
     pair.pump();
 
     EXPECT_EQ(rx_buf[0], 0xCA);
@@ -3389,7 +3535,7 @@ struct DelayedResponsePeer {
     void sendPendingResponse()
     {
         const uint8_t payload[] = {0x00};
-        enc->writeFrame(frame::Kind::Response, seq, {payload, sizeof(payload)});
+        (void)enc->writeFrame(frame::Kind::Response, seq, {payload, sizeof(payload)});
     }
 };
 
@@ -3416,11 +3562,11 @@ struct StaleThenCurrentResponsePeer {
         }
         if (p->has_stale) {
             const uint8_t stale_payload[] = {0x01};
-            p->enc->writeFrame(frame::Kind::Response, p->stale_seq, {stale_payload, sizeof(stale_payload)});
+            (void)p->enc->writeFrame(frame::Kind::Response, p->stale_seq, {stale_payload, sizeof(stale_payload)});
             p->has_stale = false;
         }
         const uint8_t resp[] = {0x02};
-        p->enc->writeFrame(frame::Kind::Response, view.b3, {resp, sizeof(resp)});
+        (void)p->enc->writeFrame(frame::Kind::Response, view.b3, {resp, sizeof(resp)});
     }
 };
 
@@ -3438,7 +3584,7 @@ struct NorespAwareEchoPeer {
             return;
         }
         const uint8_t resp[] = {0x00};
-        p->enc->writeFrame(frame::Kind::Response, view.b3, {resp, sizeof(resp)});
+        (void)p->enc->writeFrame(frame::Kind::Response, view.b3, {resp, sizeof(resp)});
     }
 };
 
@@ -3718,11 +3864,11 @@ TEST(MuxRemoteSession, QuarantinedStreamDataFrameDoesNotLeakIntoNewSink)
     // it targets a stream whose Sink was cleared by quarantineStream(), so
     // the decoder has to drop it (mux.inl deliverData() null-Sink path).
     const uint8_t stray[] = {0xEE, 0xEE};
-    pair.enc_b.writeFrame(frame::Kind::Data, id0, {stray, sizeof(stray)});
+    (void)pair.enc_b.writeFrame(frame::Kind::Data, id0, {stray, sizeof(stray)});
 
     // Legitimate Data for the new transfer's id, in the same pump batch.
     const uint8_t good[] = {0x01, 0x02};
-    pair.enc_b.writeFrame(frame::Kind::Data, id1, {good, sizeof(good)});
+    (void)pair.enc_b.writeFrame(frame::Kind::Data, id1, {good, sizeof(good)});
 
     pair.pump();
 
@@ -3760,7 +3906,7 @@ TEST(MuxRemoteSession, HelloClearsAllQuarantine)
             auto* enc = static_cast<data::MuxFrameEncoder*>(ctx);
             if (view.kind == frame::Kind::HelloReq) {
                 uint8_t caps[] = {remote::kProtocolVersion, 0};
-                enc->writeFrame(frame::Kind::HelloResp, view.b3, {caps, sizeof(caps)});
+                (void)enc->writeFrame(frame::Kind::HelloResp, view.b3, {caps, sizeof(caps)});
             }
         },
         &pair.enc_b);
@@ -3847,7 +3993,7 @@ TEST(MuxRemoteSession, StaleDataRefreshesQuarantineInactivityTimer)
     // deadline.
     const uint8_t stray[] = {0xEE};
     for (int i = 0; i < 8; ++i) {
-        pair.enc_b.writeFrame(frame::Kind::Data, id0, {stray, sizeof(stray)});
+        (void)pair.enc_b.writeFrame(frame::Kind::Data, id0, {stray, sizeof(stray)});
         pair.pump();
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
@@ -3898,7 +4044,7 @@ TEST(MuxRemoteSession, StaleDataRefreshesQuarantineForRxBearingStream)
 
     const uint8_t stray[] = {0xEE};
     for (int i = 0; i < 8; ++i) {
-        pair.enc_b.writeFrame(frame::Kind::Data, id0, {stray, sizeof(stray)});
+        (void)pair.enc_b.writeFrame(frame::Kind::Data, id0, {stray, sizeof(stray)});
         pair.pump();
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
@@ -4357,7 +4503,7 @@ struct E2EServer {
         uint8_t resp_buf[frame::kMaxPayload];
         data::MemorySink resp_sink(resp_buf, sizeof(resp_buf));
         (void)runner.writeResponse(resp_sink, err);
-        enc->writeFrame(frame::Kind::Response, seq, {resp_buf, resp_sink.written()});
+        (void)enc->writeFrame(frame::Kind::Response, seq, {resp_buf, resp_sink.written()});
     }
 
     void writeEcho(data::ConstDataSpan bytes, size_t n)
@@ -4377,7 +4523,7 @@ struct E2EServer {
             for (size_t i = 0; i < echo_n; ++i) {
                 echo[i] ^= 0xFF;
             }
-            enc->writeFrame(frame::Kind::Data, pending.desc.stream_id, {echo, echo_n});
+            (void)enc->writeFrame(frame::Kind::Data, pending.desc.stream_id, {echo, echo_n});
             echo_offset += echo_n;
         }
     }
@@ -4417,7 +4563,7 @@ struct E2EServer {
             while (remaining > 0) {
                 size_t chunk = remaining < sizeof(fill) ? remaining : sizeof(fill);
                 ::memset(fill, val++, chunk);
-                s->enc->writeFrame(frame::Kind::Data, desc.stream_id, {fill, chunk});
+                (void)s->enc->writeFrame(frame::Kind::Data, desc.stream_id, {fill, chunk});
                 remaining -= chunk;
             }
         }
@@ -4705,7 +4851,7 @@ struct NoReportResponsePeer {
             return;
         }
         if (empty_response) {
-            enc->writeFrame(frame::Kind::Response, view.b3, {});
+            (void)enc->writeFrame(frame::Kind::Response, view.b3, {});
             return;
         }
         uint8_t resp_buf[frame::kMaxPayload];
@@ -4714,7 +4860,7 @@ struct NoReportResponsePeer {
         // Terminator only: a well-formed script that reports nothing.
         auto r = resp.end();
         if (r.has_value()) {
-            enc->writeFrame(frame::Kind::Response, view.b3, {resp_buf, resp_sink.written()});
+            (void)enc->writeFrame(frame::Kind::Response, view.b3, {resp_buf, resp_sink.written()});
         }
     }
 

@@ -29,7 +29,7 @@ result_t<void> RemoteServerHandler::handler(void* ctx, frame::Kind kind, uint8_t
             // Response and simply not restarting is within contract (already
             // the case for posix hosts, which have never called esp_restart
             // here either; RP2040/SAMD51 now share that same behavior).
-            if (!enc.writeFrame(frame::Kind::Response, seq, {})) {
+            if (!enc.writeFrame(frame::Kind::Response, seq, {}).has_value()) {
                 // Fire-and-forget (see above): the host never reads this
                 // Response, so a saturated encoder only costs a breadcrumb.
                 M5HAL_DIAG("control response dropped, encoder full seq=%u", static_cast<unsigned>(seq));
@@ -45,9 +45,9 @@ result_t<void> RemoteServerHandler::handler(void* ctx, frame::Kind kind, uint8_t
             return {};
 
         case frame::Kind::Ping:
-            if (!enc.writeFrame(frame::Kind::Pong, seq, {})) {
+            if (auto queued = enc.writeFrame(frame::Kind::Pong, seq, {}); !queued.has_value()) {
                 M5HAL_DIAG("pong dropped, encoder full seq=%u", static_cast<unsigned>(seq));
-                return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
+                return m5::stl::make_unexpected(queued.error());
             }
             return {};
 
@@ -66,6 +66,11 @@ result_t<void> RemoteServerHandler::handler(void* ctx, frame::Kind kind, uint8_t
             // HelloResp: [proto_ver][flags][n]([bus_kind][bus_id])*n [gpio_port][gpio_pin:u16]?
             // (spec/design/remote.md §hello). n mirrors the server's statically
             // registered bus capabilities; the host decodes with decodeHelloCaps.
+            // Worst-case fixed section: [ver][flags][n] + 2 bytes per
+            // capability + [gpio_port][gpio_pin:u16]. The extension envelope
+            // below is bounds-checked dynamically; this section is not.
+            static_assert(3 + 2 * Capabilities::kMaxEntries + 3 <= frame::kMaxPayload,
+                          "HelloResp fixed section must fit kMaxPayload at kMaxEntries capabilities");
             uint8_t hello_body[frame::kMaxPayload];
             // The structured extension flag is owned by the encoder below; do not
             // let an application advertise it without the corresponding body.
@@ -135,9 +140,10 @@ result_t<void> RemoteServerHandler::handler(void* ctx, frame::Kind kind, uint8_t
                     hello_body[1] = flags;
                 }
             }
-            if (!enc.writeFrame(frame::Kind::HelloResp, seq, {hello_body, hello_len})) {
+            if (auto queued = enc.writeFrame(frame::Kind::HelloResp, seq, {hello_body, hello_len});
+                !queued.has_value()) {
                 M5HAL_DIAG("hello response dropped, encoder full seq=%u", static_cast<unsigned>(seq));
-                return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
+                return m5::stl::make_unexpected(queued.error());
             }
             return {};
         }
@@ -416,9 +422,11 @@ result_t<void> RemoteServerHandler::poll(void* ctx, data::MuxFrameEncoder& enc)
     if (!r.has_value()) {
         return m5::stl::make_unexpected(r.error());
     }
-    if (!enc.writeFrame(frame::Kind::Event, h->gpio_event_seq++, {script_buf, script.written()})) {
-        return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
+    if (auto queued = enc.writeFrame(frame::Kind::Event, h->gpio_event_seq, {script_buf, script.written()});
+        !queued.has_value()) {
+        return m5::stl::make_unexpected(queued.error());
     }
+    ++h->gpio_event_seq;
     for (size_t i = 0; i < changed_sub_count; ++i) {
         changed_subs[i]->last_value = changed_values[i];
     }
@@ -477,9 +485,11 @@ result_t<void> RemoteServerHandler::writeGpioSnapshotEvent(data::MuxFrameEncoder
     if (!r.has_value()) {
         return m5::stl::make_unexpected(r.error());
     }
-    if (!enc.writeFrame(frame::Kind::Event, gpio_event_seq++, {script_buf, script.written()})) {
-        return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
+    if (auto queued = enc.writeFrame(frame::Kind::Event, gpio_event_seq, {script_buf, script.written()});
+        !queued.has_value()) {
+        return m5::stl::make_unexpected(queued.error());
     }
+    ++gpio_event_seq;
     return {};
 }
 
@@ -487,8 +497,8 @@ result_t<void> RemoteServerHandler::writeGpioSnapshotThenResponse(data::MuxFrame
                                                                   data::ConstDataSpan response)
 {
     if (gpio_snapshot_count == 0) {
-        if (!enc.writeFrame(frame::Kind::Response, seq, response)) {
-            return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
+        if (auto queued = enc.writeFrame(frame::Kind::Response, seq, response); !queued.has_value()) {
+            return m5::stl::make_unexpected(queued.error());
         }
         return {};
     }
@@ -505,9 +515,11 @@ result_t<void> RemoteServerHandler::writeGpioSnapshotThenResponse(data::MuxFrame
     }
 
     bool event_written = false;
-    if (!enc.writeFrameWithOptionalPrefix(frame::Kind::Event, gpio_event_seq, {script_buf, script.written()},
-                                          frame::Kind::Response, seq, response, &event_written)) {
-        return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
+    if (auto queued =
+            enc.writeFrameWithOptionalPrefix(frame::Kind::Event, gpio_event_seq, {script_buf, script.written()},
+                                             frame::Kind::Response, seq, response, &event_written);
+        !queued.has_value()) {
+        return m5::stl::make_unexpected(queued.error());
     }
     if (event_written) {
         ++gpio_event_seq;
@@ -687,11 +699,12 @@ result_t<void> RemoteServerHandler::writeError(data::MuxFrameEncoder& enc, uint8
 {
     int8_t err = static_cast<int8_t>(code);
     M5HAL_DIAG("protocol error seq=%u code=%d", static_cast<unsigned>(seq), static_cast<int>(code));
-    if (!enc.writeFrame(frame::Kind::Control, seq, {reinterpret_cast<const uint8_t*>(&err), 1})) {
+    if (auto queued = enc.writeFrame(frame::Kind::Control, seq, {reinterpret_cast<const uint8_t*>(&err), 1});
+        !queued.has_value()) {
         // Without this breadcrumb an encoder-full drop here is
         // indistinguishable from an ordinary client timeout.
         M5HAL_DIAG("error report dropped, encoder full seq=%u", static_cast<unsigned>(seq));
-        return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
+        return m5::stl::make_unexpected(queued.error());
     }
     return {};
 }

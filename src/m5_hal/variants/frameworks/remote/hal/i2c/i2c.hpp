@@ -73,8 +73,6 @@ private:
         _capabilities = value;
     }
 
-    static constexpr uint32_t kTransferTimeoutMs = 5000;
-
     static size_t encodeI2cMeta(uint8_t* buf, const i2c::MasterAccessConfig& cfg, const i2c::TransferDesc& desc);
 
     std::shared_ptr<remote::RemoteSessionHandle> _session;

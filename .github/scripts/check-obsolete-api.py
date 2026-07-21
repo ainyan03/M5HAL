@@ -34,6 +34,7 @@ RULES = {
     "raw_bus_lock": re.compile(r"\b(?:Bus|IBus)::(?:lock|unlock)\b|\block\(owner|`lock`\s*/\s*`unlock`"),
     "mutable_allocator_binding": re.compile(r"\bsetAllocator\b"),
     "mutable_fallback_family": re.compile(r"\bsetFallback\b"),
+    "uart_specific_timeout_margin": re.compile(r"\bkRemoteUartTimeoutMarginMs\b"),
 }
 
 # These exact lines explain migration or call a framework-native API. Every
@@ -166,6 +167,7 @@ def self_test() -> list[str]:
         ("`lock` / `unlock`", "raw_bus_lock"),
         ("setAllocator", "mutable_allocator_binding"),
         ("setFallback", "mutable_fallback_family"),
+        ("kRemoteUartTimeoutMarginMs", "uart_specific_timeout_margin"),
         ("makeHardwareBackendForI2C", None),
         ("BusBeginTransaction", None),
     )

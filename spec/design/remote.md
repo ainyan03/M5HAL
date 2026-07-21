@@ -28,7 +28,7 @@ RemoteSession                             RemoteServerAdapter
 wireは **frame v1 codecの単一フレーム列**である。多重化は **frameのKINDと`Data`フレームの
 B3 (= stream_id)** で表現し、別系統のchannel-id枠、CRC16形式、管理チャネルは持たない。
 
-- `MuxFrameEncoder::writeFrame(kind, b3, payload)` が 1 メッセージ = 1 フレームを内部バッファへ encode し、`pump()` が出力 Source を介して wire Sink へ流す
+- `MuxFrameEncoder::writeFrame(kind, b3, payload)` が 1 メッセージ = 1 フレームを内部バッファへ encode し、`pump()` が出力 Source を介して wire Sink へ流す。writeFrame 系は `result_t<void>` で失敗理由を返す (allocator 未束縛 = `INVALID_STATE`、allocator 枯渇・block queue 満杯 = `OUT_OF_RESOURCE`、wire 形式違反 = encode 層のエラーをそのまま伝播)。呼び出し側は独自のエラー code へ読み替えず伝播する
 - `MuxFrameDecoder::pump(wire_rx)` が wire からフレームを取り出し、`Data` フレームは stream_id 対応の Sink へ demux、それ以外の KIND は frame handler コールバックへ渡す
 - `MuxFrameDecoder::pump(wire_rx)` は 1 呼び出しあたり最大 `kPumpMaxFramesPerCall = 32` frame で返る。密なインバウンドイベント列で応答待ち側へ制御が戻らなくなる livelock の防止が目的
 - 最大 `kMaxStreams` (16) のデータストリーム
@@ -272,6 +272,14 @@ UART remote proxyはUARTの設定値からhost側の応答期限を保守的に�
 `first_byte_timeout_ms + (rx_len - 1) * inter_byte_timeout_ms`をnominal期限とし、複合transferでは
 両者を加算する。最後にtransport往復margin 250 msを一度だけ加え、32 bit overflowと
 `TIMEOUT_FOREVER` sentinelを避けて飽和させる。
+
+他のproxy busも固定定数でなく同じ方式で応答期限を実設定から導出する。I2C/SPIはclock周波数から
+求めた期待wire時間をnominalとし（I2Cは9 bit/byte + address相当バイト、さらにserverのtransaction
+予算に対応するSCL stall許容 `wire_timeout_ms` を加算）、I2S/PDMはPCM実時間
+（sample_rate/bits/channelsから算出。全二重I2Sは両方向の長い方）にDMA待ち予算
+（`write_timeout_ms` / `read_timeout_ms`）を加える。margin・飽和の扱いはUARTと同一。
+PCM導出はpayload実効レートがtransportレートを下回ることを前提とする（現行サポート形状では成立。
+より高速な形状を追加する場合は再検討する）。
 
 device側のpending stream timeout（既定5000 ms、進捗ごとに更新）はData欠落や停止したpeerを
 回収するtransport安全網であり、UART readの論理期限ではない。UART backendが要求長未満を正常に

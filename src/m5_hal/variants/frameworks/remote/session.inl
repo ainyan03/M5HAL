@@ -52,8 +52,8 @@ result_t<void> RemoteSession::request(data::ConstDataSpan script, uint8_t* out_s
         *out_seq = seq;
     }
     _last_request_enqueued = false;
-    if (!_enc->writeFrame(frame::Kind::Request, seq, script)) {
-        return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
+    if (auto queued = _enc->writeFrame(frame::Kind::Request, seq, script); !queued.has_value()) {
+        return m5::stl::make_unexpected(queued.error());
     }
     _last_request_enqueued = true;
     auto flushed           = flushTx();
@@ -69,8 +69,8 @@ result_t<void> RemoteSession::requestNoResponse(data::ConstDataSpan script)
         return m5::stl::make_unexpected(error::error_t::INVALID_ARGUMENT);
     }
     uint8_t seq = nextSeq();
-    if (!_enc->writeFrame(frame::Kind::Request, seq | 0x80, script)) {
-        return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
+    if (auto queued = _enc->writeFrame(frame::Kind::Request, seq | 0x80, script); !queued.has_value()) {
+        return m5::stl::make_unexpected(queued.error());
     }
     // No response is expected for this frame, so nothing else in this
     // session would naturally read the wire afterward. A transport that
@@ -84,8 +84,8 @@ result_t<void> RemoteSession::requestNoResponse(data::ConstDataSpan script)
 result_t<void> RemoteSession::hello()
 {
     uint8_t seq = nextSeq();
-    if (!_enc->writeFrame(frame::Kind::HelloReq, seq, {})) {
-        return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
+    if (auto queued = _enc->writeFrame(frame::Kind::HelloReq, seq, {}); !queued.has_value()) {
+        return m5::stl::make_unexpected(queued.error());
     }
     ++_config_generation;
     auto flushed = flushTx();
@@ -104,8 +104,8 @@ result_t<void> RemoteSession::hello()
 result_t<void> RemoteSession::ping()
 {
     uint8_t seq = nextSeq();
-    if (!_enc->writeFrame(frame::Kind::Ping, seq, {})) {
-        return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
+    if (auto queued = _enc->writeFrame(frame::Kind::Ping, seq, {}); !queued.has_value()) {
+        return m5::stl::make_unexpected(queued.error());
     }
     auto flushed = flushTx();
     if (!flushed.has_value()) {
@@ -117,8 +117,8 @@ result_t<void> RemoteSession::ping()
 result_t<void> RemoteSession::reset()
 {
     uint8_t seq = nextSeq();
-    if (!_enc->writeFrame(frame::Kind::Control, seq, {})) {
-        return m5::stl::make_unexpected(error::error_t::BUFFER_OVERFLOW);
+    if (auto queued = _enc->writeFrame(frame::Kind::Control, seq, {}); !queued.has_value()) {
+        return m5::stl::make_unexpected(queued.error());
     }
     // Reset is fire-and-forget: the host API does not wait for the
     // device's reset Response (spec/design/remote.md §Control), so a
@@ -356,11 +356,17 @@ void RemoteSession::onFrame(const frame::View& view)
         case frame::Kind::HelloResp:
         case frame::Kind::Pong:
             if (view.b3 == _awaiting_seq && view.kind == _awaiting_kind) {
-                _resp_len = view.payload.size;
-                if (view.payload.size > 0 && view.payload.size <= sizeof(_resp_buf)) {
-                    ::memcpy(_resp_buf, view.payload.data, view.payload.size);
+                // A payload larger than _resp_buf violates the decoder's
+                // kMaxPayload contract. Recording its length while copying
+                // nothing would hand callers uninitialized bytes; drop the
+                // frame instead and let the caller time out.
+                if (view.payload.size <= sizeof(_resp_buf)) {
+                    _resp_len = view.payload.size;
+                    if (view.payload.size > 0) {
+                        ::memcpy(_resp_buf, view.payload.data, view.payload.size);
+                    }
+                    _got_response = true;
                 }
-                _got_response = true;
             }
             break;
         case frame::Kind::Control:

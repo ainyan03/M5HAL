@@ -44,7 +44,7 @@ struct CreditNotifier {
         // the resend condition into a self-triggering endless Credit loop.
         const size_t release_count = dec.blockStreamReleasedTotal();
         if (!_sent || credit != _last || release_count != _last_release_count) {
-            if (enc.writeFrame(frame::Kind::Credit, credit, {})) {
+            if (enc.writeFrame(frame::Kind::Credit, credit, {}).has_value()) {
                 M5HAL_DIAG("credit advertise free=%u prev_last=%u release_count=%zu", static_cast<unsigned>(credit),
                            static_cast<unsigned>(_last), release_count);
                 _last               = credit;

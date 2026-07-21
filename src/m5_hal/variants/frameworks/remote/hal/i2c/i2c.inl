@@ -48,8 +48,11 @@ result_t<void> Bus_remote::transferBackend(bus::OperationContext<i2c::MasterAcce
 
     uint8_t cfg_buf[bytecode::kI2CConfigSize];
     auto cfg_bytes = remote::detail::encodeRemoteConfig(cfg_buf, cfg);
-    auto r         = remote::remoteAtomicTransferWire(_session, _bus_id, cfg_bytes, desc, src, tx_len, dst, rx_len,
-                                                      kTransferTimeoutMs, &_config_cache);
+    // +2 covers the (repeated-start) address phases on top of the data bytes.
+    const uint32_t timeout_ms = remote::detail::remoteI2cResponseTimeoutMs(cfg.freq, cfg.wire_timeout_ms,
+                                                                           tx_len + rx_len + desc.prefix_len + 2);
+    auto r = remote::remoteAtomicTransferWire(_session, _bus_id, cfg_bytes, desc, src, tx_len, dst, rx_len, timeout_ms,
+                                              &_config_cache);
     if (!r.has_value()) {
         return m5::stl::make_unexpected(r.error());
     }

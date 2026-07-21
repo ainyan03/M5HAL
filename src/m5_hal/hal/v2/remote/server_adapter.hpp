@@ -70,7 +70,8 @@ private:
     void* _poll_handler_ctx      = nullptr;
     bool _external_poll          = false;
     detail::CreditNotifier _credit;
-    size_t _pending_count = 0;
+    size_t _pending_count               = 0;
+    error::error_t _frame_handler_error = error::error_t::OK;
 };
 
 // ---- RemoteWireService — IService wrapper for pump/flush --------------------

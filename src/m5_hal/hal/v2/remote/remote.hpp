@@ -63,8 +63,8 @@ constexpr size_t kMaxAtomicSPITx = 229;
   the response, so slot 0 is always fresh after each round trip.
  */
 constexpr uint8_t kDefaultStoreId = 0;
-/*! @brief Round-trip margin added on top of remote-side UART timeouts (spec §UART proxy). */
-constexpr uint32_t kRemoteUartTimeoutMarginMs = 250;
+/*! @brief Round-trip margin added on top of every derived remote response timeout (spec §UART proxy). */
+constexpr uint32_t kRemoteTimeoutMarginMs = 250;
 
 namespace detail {
 
@@ -78,6 +78,16 @@ constexpr uint32_t saturatingMulU32(uint32_t lhs, uint32_t rhs)
     return (rhs != 0 && lhs > UINT32_MAX / rhs) ? UINT32_MAX : static_cast<uint32_t>(lhs * rhs);
 }
 
+constexpr uint64_t saturatingAddU64(uint64_t lhs, uint64_t rhs)
+{
+    return (UINT64_MAX - lhs < rhs) ? UINT64_MAX : static_cast<uint64_t>(lhs + rhs);
+}
+
+constexpr uint64_t saturatingMulU64(uint64_t lhs, uint64_t rhs)
+{
+    return (rhs != 0 && lhs > UINT64_MAX / rhs) ? UINT64_MAX : static_cast<uint64_t>(lhs * rhs);
+}
+
 constexpr uint32_t clampBelowForever(uint32_t v)
 {
     return v == types::TIMEOUT_FOREVER ? types::TIMEOUT_FOREVER - 1 : v;
@@ -86,15 +96,14 @@ constexpr uint32_t clampBelowForever(uint32_t v)
 constexpr uint32_t remoteUartWriteResponseTimeoutMs(uint32_t write_timeout_ms, size_t tx_len)
 {
     const uint32_t nominal = saturatingMulU32(static_cast<uint32_t>(tx_len), write_timeout_ms);
-    return clampBelowForever(saturatingAddU32(nominal, kRemoteUartTimeoutMarginMs));
+    return clampBelowForever(saturatingAddU32(nominal, kRemoteTimeoutMarginMs));
 }
 
 constexpr uint32_t remoteUartReadResponseTimeoutMs(uint32_t first_byte_timeout_ms, uint32_t inter_byte_timeout_ms,
                                                    size_t rx_len)
 {
     const uint32_t gaps = rx_len != 0 ? saturatingMulU32(static_cast<uint32_t>(rx_len - 1), inter_byte_timeout_ms) : 0;
-    return clampBelowForever(
-        saturatingAddU32(saturatingAddU32(first_byte_timeout_ms, gaps), kRemoteUartTimeoutMarginMs));
+    return clampBelowForever(saturatingAddU32(saturatingAddU32(first_byte_timeout_ms, gaps), kRemoteTimeoutMarginMs));
 }
 
 constexpr uint32_t remoteUartTransferResponseTimeoutMs(uint32_t write_timeout_ms, uint32_t first_byte_timeout_ms,
@@ -108,7 +117,86 @@ constexpr uint32_t remoteUartTransferResponseTimeoutMs(uint32_t write_timeout_ms
         const uint32_t gaps = saturatingMulU32(static_cast<uint32_t>(rx_len - 1), inter_byte_timeout_ms);
         nominal             = saturatingAddU32(nominal, saturatingAddU32(first_byte_timeout_ms, gaps));
     }
-    return clampBelowForever(saturatingAddU32(nominal, kRemoteUartTimeoutMarginMs));
+    return clampBelowForever(saturatingAddU32(nominal, kRemoteTimeoutMarginMs));
+}
+
+/*! @brief Expected on-wire duration of `bits` in ms (ceil, saturating). */
+constexpr uint32_t remoteWireBitDurationMs(uint64_t bits, uint32_t clock_hz)
+{
+    if (clock_hz == 0) {
+        return 0;
+    }
+    const uint64_t whole_seconds = bits / clock_hz;
+    if (whole_seconds > UINT32_MAX / 1000u) {
+        return UINT32_MAX;
+    }
+    const uint64_t whole_ms   = whole_seconds * 1000u;
+    const uint64_t remainder  = bits % clock_hz;
+    const uint64_t partial_ms = (remainder * 1000u + clock_hz - 1) / clock_hz;
+    return UINT32_MAX - whole_ms < partial_ms ? UINT32_MAX : static_cast<uint32_t>(whole_ms + partial_ms);
+}
+
+/*! @brief Expected on-wire duration of `bytes` at `bits_per_byte` bits each, in ms (ceil, saturating). */
+constexpr uint32_t remoteWireDurationMs(size_t bytes, uint32_t bits_per_byte, uint32_t clock_hz)
+{
+    const uint64_t bits = saturatingMulU64(static_cast<uint64_t>(bytes), bits_per_byte);
+    return remoteWireBitDurationMs(bits, clock_hz);
+}
+
+/*!
+  @brief I2C proxy response timeout: expected wire time (9 bits/byte: 8 data
+  + ACK) plus the stall allowance the server folds into its transaction
+  budget (`wire_timeout_ms`), plus the round-trip margin.
+ */
+constexpr uint32_t remoteI2cResponseTimeoutMs(uint32_t freq, uint32_t wire_timeout_ms, size_t total_bytes)
+{
+    const uint32_t wire = remoteWireDurationMs(total_bytes, 9, freq);
+    return clampBelowForever(saturatingAddU32(saturatingAddU32(wire, wire_timeout_ms), kRemoteTimeoutMarginMs));
+}
+
+/*!
+  @brief SPI proxy response timeout: all descriptor phases plus payload wire
+  time (worst case: half-duplex tx+rx), then the round-trip margin.
+ */
+constexpr uint32_t remoteSpiResponseTimeoutMs(uint32_t freq, size_t tx_len, size_t rx_len, uint8_t command_bytes,
+                                              uint8_t address_bytes, uint8_t dummy_cycles)
+{
+    const uint64_t payload_bytes = saturatingAddU64(static_cast<uint64_t>(tx_len), static_cast<uint64_t>(rx_len));
+    const uint64_t phase_bytes   = saturatingAddU64(command_bytes, address_bytes);
+    uint64_t total_bits          = saturatingMulU64(saturatingAddU64(payload_bytes, phase_bytes), 8u);
+    total_bits                   = saturatingAddU64(total_bits, dummy_cycles);
+    return clampBelowForever(saturatingAddU32(remoteWireBitDurationMs(total_bits, freq), kRemoteTimeoutMarginMs));
+}
+
+/*! @brief PCM playback/capture duration of `bytes` at the configured shape, in ms (ceil, saturating). */
+constexpr uint32_t remotePcmDurationMs(uint32_t sample_rate_hz, uint32_t bits_per_sample, uint32_t channels,
+                                       size_t bytes)
+{
+    if (sample_rate_hz == 0) {
+        return 0;
+    }
+    uint32_t frame_bytes = channels * (bits_per_sample / 8u);
+    if (frame_bytes == 0) {
+        frame_bytes = 1;
+    }
+    const uint64_t frames = (static_cast<uint64_t>(bytes) + frame_bytes - 1) / frame_bytes;
+    const uint64_t ms     = (frames * 1000u + sample_rate_hz - 1) / sample_rate_hz;
+    return ms > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(ms);
+}
+
+/*!
+  @brief I2S/PDM proxy response timeout: real-time duration of the PCM data
+  plus the configured DMA wait budget, plus the round-trip margin.
+
+  Assumes the PCM payload rate stays below the session transport rate
+  (true for the supported 16-bit shapes up to 48 kHz stereo over the 3 Mbaud
+  default); revisit if faster shapes are added.
+ */
+constexpr uint32_t remotePcmResponseTimeoutMs(uint32_t sample_rate_hz, uint32_t bits_per_sample, uint32_t channels,
+                                              uint32_t dma_timeout_ms, size_t bytes)
+{
+    const uint32_t duration = remotePcmDurationMs(sample_rate_hz, bits_per_sample, channels, bytes);
+    return clampBelowForever(saturatingAddU32(saturatingAddU32(duration, dma_timeout_ms), kRemoteTimeoutMarginMs));
 }
 
 }  // namespace detail

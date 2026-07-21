@@ -166,9 +166,11 @@ result_t<size_t> Bus_remote::writeBackend(bus::OperationContext<i2s::AccessConfi
     }
 
     uint8_t cfg_buf[bytecode::kI2SConfigSize];
-    auto cfg_bytes = remote::detail::encodeRemoteConfig(cfg_buf, cfg);
+    auto cfg_bytes            = remote::detail::encodeRemoteConfig(cfg_buf, cfg);
+    const uint32_t timeout_ms = remote::detail::remotePcmResponseTimeoutMs(cfg.sample_rate_hz, cfg.bits_per_sample,
+                                                                           cfg.channels, cfg.write_timeout_ms, len);
     auto r = remote::remoteTransferWire(_session, types::bus_kind_t::I2S, _bus_id, cfg_bytes, {}, src, len, nullptr, 0,
-                                        kTransferTimeoutMs, &_config_cache);
+                                        timeout_ms, &_config_cache);
     if (!r.has_value()) {
         return m5::stl::make_unexpected(r.error());
     }
@@ -203,9 +205,11 @@ result_t<size_t> Bus_remote::readBackend(bus::OperationContext<i2s::AccessConfig
     }
 
     uint8_t cfg_buf[bytecode::kI2SConfigSize];
-    auto cfg_bytes = remote::detail::encodeRemoteConfig(cfg_buf, cfg);
+    auto cfg_bytes            = remote::detail::encodeRemoteConfig(cfg_buf, cfg);
+    const uint32_t timeout_ms = remote::detail::remotePcmResponseTimeoutMs(cfg.sample_rate_hz, cfg.bits_per_sample,
+                                                                           cfg.channels, cfg.read_timeout_ms, len);
     auto r = remote::remoteTransferWire(_session, types::bus_kind_t::I2S, _bus_id, cfg_bytes, {}, nullptr, 0, dst, len,
-                                        kTransferTimeoutMs, &_config_cache);
+                                        timeout_ms, &_config_cache);
     if (!r.has_value()) {
         return m5::stl::make_unexpected(r.error());
     }
@@ -247,8 +251,20 @@ result_t<bus::TransferTotals> Bus_remote::transferBackend(bus::OperationContext<
     cfg_buf[9] = format_cfg.channels;
     putU32(cfg_buf + bytecode::kI2SConfigReadTimeoutOffset, rx_cfg.read_timeout_ms);
     data::ConstDataSpan cfg_bytes{cfg_buf, sizeof(cfg_buf)};
+    // Full-duplex: both directions run concurrently at the shared format, so
+    // the data term is the longer of the two; each side keeps its own DMA
+    // wait budget.
+    const uint32_t tx_ms = remote::detail::remotePcmDurationMs(format_cfg.sample_rate_hz, format_cfg.bits_per_sample,
+                                                               format_cfg.channels, tx_len);
+    const uint32_t rx_ms = remote::detail::remotePcmDurationMs(format_cfg.sample_rate_hz, format_cfg.bits_per_sample,
+                                                               format_cfg.channels, rx_len);
+    const uint32_t timeout_ms = remote::detail::clampBelowForever(remote::detail::saturatingAddU32(
+        remote::detail::saturatingAddU32(
+            tx_ms > rx_ms ? tx_ms : rx_ms,
+            remote::detail::saturatingAddU32(tx_cfg.write_timeout_ms, rx_cfg.read_timeout_ms)),
+        remote::kRemoteTimeoutMarginMs));
     auto r = remote::remoteTransferWire(_session, types::bus_kind_t::I2S, _bus_id, cfg_bytes, {}, src, tx_len, dst,
-                                        rx_len, kTransferTimeoutMs, &_config_cache);
+                                        rx_len, timeout_ms, &_config_cache);
     if (!r.has_value()) {
         return m5::stl::make_unexpected(r.error());
     }
