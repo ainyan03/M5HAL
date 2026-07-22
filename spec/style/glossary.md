@@ -12,13 +12,13 @@
 | 通信バス | bus | コード上 `Bus` |
 | 資源ドメイン | resource domain | local registry / GPIO / Services / Memoryをco-ownするidentity namespace。`M5_Hal`はdefault domain入口 |
 | バスインターンレジストリ | bus registry | 各ResourceDomainが全kindのbusをexact `ResourceKey`でinternするweak registry。寿命は返されたstrong ownerが決める ([design/bus_accessor.md](../design/bus_accessor.md)) |
-| 共有取得 | shared acquisition / acquire | `M5_Hal.<kind>.acquire(cfg)` が所有権を持つ共有ハンドル (`shared_ptr<IBus>`) を返す。直接構築はエスケープ |
-| 共同所有 | co-own | `shared_ptr` からアクセサを構築するとアクセサがバスの生存を共有保持する (`Accessor dev{handle, cfg}`) |
-| 明示終了 | explicit consuming close | `result_t<void> close(std::shared_ptr<IBus>& bus)`。exact instance + sole owner のときだけ成功し、caller の handle を消費する |
-| 自然終了 | natural close / final-holder destruction | 最後の strong owner が消えたときの bus dtor 起点の終了 |
+| 共有取得 | shared acquisition / acquire | `acquire(cfg)` が返す共有ハンドル取得。詳細は [bus_accessor.md](../design/bus_accessor.md) を参照 |
+| 共同所有 | co-own | アクセサがバスの生存を共有保持する構築形。詳細は [bus_accessor.md](../design/bus_accessor.md) を参照 |
+| 明示終了 | explicit consuming close | caller の handle を消費する consuming close。詳細は [bus_accessor.md](../design/bus_accessor.md) を参照 |
+| 自然終了 | natural close / final-holder destruction | 最後の strong owner 消滅起点の終了。詳細は [bus_accessor.md](../design/bus_accessor.md) を参照 |
 | portable取得 | portable acquisition | 共通`BusConfig`を`acquire(cfg)`へ渡す。provider選択はbuildのwinner bindingが行い、config型では選ばない |
 | native所有方針 | native ownership policy | 対応providerだけが受理する`native::borrowed(resource)` / `native::managed(resource)`。bus取得用の`attach` / `open`は公開しない |
-| 隔離済み墓標 | quarantined tombstone | 外部解放を確認できず、identity / remote bus ID の再利用を止める registry 状態 |
+| 隔離済み墓標 | quarantined tombstone | identity / remote bus ID の再利用を止める registry 状態。詳細は [bus_accessor.md](../design/bus_accessor.md) を参照 |
 | バス種別 | bus kind | v2 では識別子も `bus_kind_t` / `BusKind` / `getBusKind()` で統一済 (旧 `bus_type_t` 等は v0 のみ) |
 | 通信相手 / アクセス対象 | accessor | コード上 `Accessor`、 固有名詞扱い |
 | 通信本体 (atomic I/O) | transfer | 動詞・名詞共通 |

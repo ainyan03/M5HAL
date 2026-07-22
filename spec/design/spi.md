@@ -154,11 +154,12 @@ hostとcontrollerの不一致はdirect初期化を`INVALID_ARGUMENT`で拒否す
 ## SPI slave
 
 SPI slave は address phase や clock stretch を持たず、master がclockを供給する前にslave側が送信予定dataを
-用意する必要がある。正準APIはcaller-owned SPSC queueを持つ`SpiSlaveAccessor`である。`write()`または
-`txFrames()`でTXをpreloadし、`beginAccess()`でCS受付を開始する。一つの長期Accessへ任意個のCS frameが到着し、
-`read()`または`rxFrames()`で受信済みdataを取り出す。`endAccess(timeout)`は新規受付をfenceし、進行中frameを
-期限内に完了またはabortしてbackend producerを停止してからBus lockを解放する。local queue I/OはAccess外でも
+用意する必要がある。正準APIはcaller-owned SPSC queueを持つ`SpiSlaveAccessor`である。Access lifecycleの契約は
+[slave_queue.md](slave_queue.md) §Access lifecycle と同一。SPI固有のqueue API名は`write()` / `txFrames()`
+(TX preload) と`read()` / `rxFrames()` (RX取得) で、CS受付単位が一つのAccessに対応する。local queue I/OはAccess外でも
 利用できるため、停止後のRX drainと次回Access用TX preloadが可能である。
+ESP-IDF backend は全二重 `spi_slave` driver を使う。半二重の `spi_slave_hd` は classic ESP32 が
+非対応で、全 chip で同一モデルを成立させるには全二重が唯一の選択である。
 
 `SlaveAccessConfig::transaction_bytes`はbackendへqueueする一回の最大CS frame長で、TX/RXの
 `QueueMode::Byte` / `QueueMode::Frame`は方向ごとに固定する。TX不足分は`SlaveBusConfig::tx_fill_byte`で埋め、

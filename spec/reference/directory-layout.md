@@ -87,8 +87,7 @@ src/
    variant 横断の共有実装 (FreeRTOS OS プリミティブ、 BSD socket TCP) は `variants/frameworks/`
    配下に独立 variant として配置する (`freertos/`, `bsd/`)
 5. HAL の範疇外要素は `hal/` の外に置く
-6. API世代に属するcross-cuttingな型 (`error_t` 等) は`m5::hal::vN`配下に置く。現行v2は
-   `m5::hal::v2::error`を正本とし、世代非依存の`m5::hal`直下へは置かない
+6. cross-cuttingな型の配置規則は [../architecture.md](../architecture.md) §namespace 帰属 を参照
 
 ## 公開パッケージの除外 (idf_component.yml / library.json)
 

@@ -87,15 +87,7 @@ block countは最大32なので、bitmapは`uint32_t`一つで持つ。
 
 ## 内部データ構造
 
-```cpp
-template <size_t BlockSize, size_t BlockCount>
-class FixedBlockPool {
-    alignas(16) uint8_t storage_[BlockSize * BlockCount]{};
-    uint32_t bitmap_;
-    uint8_t block_counts_[BlockCount]{};
-};
-```
-
+実際の型定義 (`FixedBlockPool<BlockSize, BlockCount>`) は [pool.hpp](../../src/m5_hal/hal/v2/memory/pool.hpp) を正本とする。
 `bitmap_` は 1 bit = 1 block。`block_counts_[head]` は、その head block から何 blocks を確保したかを持つ。head 以外の `block_counts_` は 0 のまま。
 
 解放時は pointer が pool 範囲内かつ block boundary 上にあることを確認し、`block_counts_[index]` の値から該当 bit 範囲を clear する。pool 外 pointer は `false` を返し、`Allocator` 側が fallback free へ回す。

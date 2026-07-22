@@ -14,7 +14,8 @@
 | 目的 | 読むもの |
 |---|---|
 | v2 API を使う | [../README.md](../README.md) の v2 入口 + [`examples/v2/`](../examples/v2/) |
-| v0からv2、または旧v2 lifecycleから現行へ移行する | [style/migration.md](style/migration.md), [style/accessor_lifecycle_migration.md](style/accessor_lifecycle_migration.md), [design/v0_v2_coexistence.md](design/v0_v2_coexistence.md) |
+| v0からv2に移行する | [style/migration.md](style/migration.md), [design/v0_v2_coexistence.md](design/v0_v2_coexistence.md) |
+| 旧v2 lifecycleから現行へ移行する | [style/legacy_v2_migration.md](style/legacy_v2_migration.md) |
 | Bus / Accessor とinstance capabilityの基本設計を知る | [design/bus_accessor.md](design/bus_accessor.md), [design/bus_capabilities.md](design/bus_capabilities.md), [design/data_io.md](design/data_io.md), [design/transfer_desc.md](design/transfer_desc.md) |
 | ストリームのフレーム化を知る | [design/frame.md](design/frame.md), [design/data_io.md](design/data_io.md) §Stream アダプタ |
 | HAL 操作の bytecode 化を知る | [design/bytecode.md](design/bytecode.md) |

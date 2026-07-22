@@ -30,6 +30,7 @@ auto isolated = hal.Gpio.tryGetPin(gpio_num);
 
 - **encoded 隠蔽** — Pin / IPort / IGPIO 操作 API は `gpio_local_pin_t` (= IGPIO 内 local pin 空間) で受ける。 internal 表現 (絶対 gpio / bit 位置 / pin_mask / index 等) は variant 実装が支配し、 利用者には見せない。 グローバル `gpio_number_t` の解決は `GPIOGroup` が担う
 - **高速 path を阻害しない** — `writeHigh` / `writeLow` の独立 hook を持つ
+- **暗黙 input** — `gpio_mode_t` は output / open_drain / pull_up / pull_down の 4 軸 bitfield で、 **output が立っている時は input read も自動的に有効**とする。 variant 実装の `_setPinModeEncoded` は output 設定時に必ず ESP-IDF `GPIO_MODE_INPUT_OUTPUT[_OD]` 相当へ倒す。 bit-bang protocol (I2C / SPI) の ACK 検出・clock stretch 検出・bus 回復が出力中の line state read に依存するためで、 output-only 経路は実需のない escape hatch として基底契約から除外している
 - **契約ベース (assert + UB)** — 範囲外 `gpio_local_pin_t` は variant 実装の `_fromLocalPin` 内で **assert で debug 即死、 release UB**。 `expected` で穢さない
 - **constexpr 化可能** — `IPort` / `IGPIO` は protected non-virtual dtor を持つ
 - **expander 統合** — MCU GPIO と I/O expander を単一の `gpio_number_t` 空間で扱う

@@ -243,6 +243,11 @@ R1/R2/R3/R8検証)。実行は `pio test -e test_native_tsan`
 - **software I2C/SPI**: 状態機械の駆動を `IService` として登録する。svc タスクとコンシューマ
   (ユーザースレッド) 間の完了通知は R5 の Gate プリミティブ (`service::CompletionGate`) に
   従う。詳細は [i2c.md](i2c.md) / [spi.md](spi.md)。
+- **hardware I2C (ESP-IDF gen5 master)**: `ServiceRunner` の async 対象にしない。IDF の async queue
+  (`trans_queue_depth > 0`) は `i2c_master_probe()` と非互換で、callback 経由の error 観測・同一 bus 上の
+  async device 制約・外部 native handle 利用者との排他が複雑になる。標準 backend は
+  `trans_queue_depth = 0` の同期 bus とし、ServiceRunner 駆動は M5HAL が進行/完了観測を安全に
+  所有できる backend に限定する。
 - **GPIO watch**: `GPIOGroup` が watch サービスを `ServiceRunner` に登録してポーリングを駆動する
   (`bindServiceRunner`)。コールバック契約は R6、mutex は R7 の leaf lock。詳細は
   [gpio.md](gpio.md) §watcher API。

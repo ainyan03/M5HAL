@@ -41,7 +41,7 @@ RULES = {
 # other occurrence is a regression, including a suffix added to an allowed
 # line or another occurrence elsewhere in the same file tree.
 ALLOWLIST = {
-    ("spec/style/accessor_lifecycle_migration.md", "transaction_lifecycle"): frozenset(
+    ("spec/style/legacy_v2_migration.md", "transaction_lifecycle"): frozenset(
         {
             "| Accessor `beginTransaction()` / `endTransaction()` | `beginAccess(timeout)` / `endAccess(timeout)` | lock、設定、backend開始終了、最後のI/O完了を一つのlifecycleへ統合 |",
             "| `endTransaction() -> TransferTotals` | 各`transfer`の戻り値 + `getLastTransferStatus()` | `endAccess`はlifecycle結果だけを返す |",
@@ -53,25 +53,25 @@ ALLOWLIST = {
             "1. Accessor旧`begin/endTransaction`を全削除し、明示scopeを`begin/endAccess`へ変更する",
         }
     ),
-    ("spec/style/accessor_lifecycle_migration.md", "scoped_transaction"): frozenset(
+    ("spec/style/legacy_v2_migration.md", "scoped_transaction"): frozenset(
         {"| `spi::ScopedTransaction` | `bus::ScopedAccess` | SPI Accessが一つのCS frame |"}
     ),
-    ("spec/style/accessor_lifecycle_migration.md", "scoped_lock"): frozenset(
+    ("spec/style/legacy_v2_migration.md", "scoped_lock"): frozenset(
         {"| public `Bus::lock/unlock`, `ScopedLock` | Accessor内部lock seam | 利用者はAccessor lifecycleだけを使う |"}
     ),
-    ("spec/style/accessor_lifecycle_migration.md", "legacy_transaction_window"): frozenset(
+    ("spec/style/legacy_v2_migration.md", "legacy_transaction_window"): frozenset(
         {"| `legacy_transaction_window` | `legacy_wire_frame_window` | 旧blocking stream受付を明示opt-in |"}
     ),
-    ("spec/style/accessor_lifecycle_migration.md", "transaction_completion"): frozenset(
+    ("spec/style/legacy_v2_migration.md", "transaction_completion"): frozenset(
         {"| I2C slave `transactionComplete()` | `wireFrameComplete()` | master STOP観測query |"}
     ),
-    ("spec/style/accessor_lifecycle_migration.md", "raw_bus_lock"): frozenset(
+    ("spec/style/legacy_v2_migration.md", "raw_bus_lock"): frozenset(
         {"| public `Bus::lock/unlock`, `ScopedLock` | Accessor内部lock seam | 利用者はAccessor lifecycleだけを使う |"}
     ),
     ("spec/style/migration.md", "transaction_lifecycle"): frozenset(
-        {"旧v2 `begin/endTransaction`から統一Access lifecycleへの移行は"}
+        {"旧v2 Bus取得API・`begin/endTransaction`から現行v2への移行は"}
     ),
-    ("spec/style/migration.md", "backend_for"): frozenset(
+    ("spec/style/legacy_v2_migration.md", "backend_for"): frozenset(
         {"| `BackendFor<Config>` | 通常は`Hal.<kind>.acquire(cfg)` | direct provider型が必要な場合だけ`Bus_<variant>::init(...)`をadvanced escape hatchとして使う |"}
     ),
     ("spec/design/bus_accessor.md", "scoped_lock"): frozenset(
@@ -87,14 +87,14 @@ ALLOWLIST = {
 
 # Pin the number of intentional lines as well as their exact spelling.
 ALLOWLIST_COUNTS = {
-    ("spec/style/accessor_lifecycle_migration.md", "transaction_lifecycle"): 8,
-    ("spec/style/accessor_lifecycle_migration.md", "scoped_transaction"): 1,
-    ("spec/style/accessor_lifecycle_migration.md", "scoped_lock"): 1,
-    ("spec/style/accessor_lifecycle_migration.md", "legacy_transaction_window"): 1,
-    ("spec/style/accessor_lifecycle_migration.md", "transaction_completion"): 1,
-    ("spec/style/accessor_lifecycle_migration.md", "raw_bus_lock"): 1,
+    ("spec/style/legacy_v2_migration.md", "transaction_lifecycle"): 8,
+    ("spec/style/legacy_v2_migration.md", "scoped_transaction"): 1,
+    ("spec/style/legacy_v2_migration.md", "scoped_lock"): 1,
+    ("spec/style/legacy_v2_migration.md", "legacy_transaction_window"): 1,
+    ("spec/style/legacy_v2_migration.md", "transaction_completion"): 1,
+    ("spec/style/legacy_v2_migration.md", "raw_bus_lock"): 1,
     ("spec/style/migration.md", "transaction_lifecycle"): 1,
-    ("spec/style/migration.md", "backend_for"): 1,
+    ("spec/style/legacy_v2_migration.md", "backend_for"): 1,
     ("spec/design/bus_accessor.md", "scoped_lock"): 1,
     ("spec/design/uart.md", "transaction_lifecycle"): 1,
     ("src/m5_hal/variants/frameworks/arduino/hal/spi/spi.inl", "transaction_lifecycle"): 2,
@@ -103,14 +103,14 @@ ALLOWLIST_COUNTS = {
 # A future allowlist edit must not append another obsolete token while keeping
 # the number of exact lines unchanged.
 ALLOWLIST_TOKEN_COUNTS = {
-    ("spec/style/accessor_lifecycle_migration.md", "transaction_lifecycle"): 11,
-    ("spec/style/accessor_lifecycle_migration.md", "scoped_transaction"): 1,
-    ("spec/style/accessor_lifecycle_migration.md", "scoped_lock"): 1,
-    ("spec/style/accessor_lifecycle_migration.md", "legacy_transaction_window"): 1,
-    ("spec/style/accessor_lifecycle_migration.md", "transaction_completion"): 1,
-    ("spec/style/accessor_lifecycle_migration.md", "raw_bus_lock"): 1,
+    ("spec/style/legacy_v2_migration.md", "transaction_lifecycle"): 11,
+    ("spec/style/legacy_v2_migration.md", "scoped_transaction"): 1,
+    ("spec/style/legacy_v2_migration.md", "scoped_lock"): 1,
+    ("spec/style/legacy_v2_migration.md", "legacy_transaction_window"): 1,
+    ("spec/style/legacy_v2_migration.md", "transaction_completion"): 1,
+    ("spec/style/legacy_v2_migration.md", "raw_bus_lock"): 1,
     ("spec/style/migration.md", "transaction_lifecycle"): 1,
-    ("spec/style/migration.md", "backend_for"): 1,
+    ("spec/style/legacy_v2_migration.md", "backend_for"): 1,
     ("spec/design/bus_accessor.md", "scoped_lock"): 1,
     ("spec/design/uart.md", "transaction_lifecycle"): 2,
     ("src/m5_hal/variants/frameworks/arduino/hal/spi/spi.inl", "transaction_lifecycle"): 2,

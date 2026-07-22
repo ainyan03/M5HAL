@@ -23,6 +23,40 @@ RemoteSession                             RemoteServerAdapter
 - **server** は `RemoteServerAdapter` が受信フレームを `RemoteServerHandler::handler` に渡し、`Request` フレームを `Server::processScript` で実行して `Response` フレームを返す受動エンドポイント
 - 両端とも wire I/O は **`MuxFrameEncoder::pump()` / `MuxFrameDecoder::pump(wire_rx)`** で駆動する。`RemoteWireService` (§server の実行モデル) を使うと service poll ループの中で協調駆動される
 
+## 目次
+
+- [Transport 層 — frame mux 多重化](#transport-層--frame-mux-多重化)
+  - [TCP トランスポート](#tcp-トランスポート)
+  - [診断 (wire dump)](#診断-wire-dump)
+  - [arduino ビルドの動的バス生成](#arduino-ビルドの動的バス生成)
+  - [stream_id レジストリ](#stream_id-レジストリ)
+- [メッセージ層 (frame KIND)](#メッセージ層-frame-kind)
+  - [SEQ](#seq)
+  - [hello — 最小能力交換](#hello--最小能力交換)
+  - [request / response](#request--response)
+  - [サイズ上限](#サイズ上限)
+  - [timeout / resync](#timeout--resync)
+- [server の実行モデル](#server-の実行モデル)
+- [データチャネル](#データチャネル)
+  - [BusStreamTransfer + attachStream](#busstreamtransfer--attachstream)
+  - [I2C / SPI atomic transfer](#i2c--spi-atomic-transfer)
+  - [UART stream timeout / short transfer](#uart-stream-timeout--short-transfer)
+- [push イベント (GPIO 変化通知)](#push-イベント-gpio-変化通知)
+  - [wire](#wire)
+  - [意味論](#意味論)
+- [GPIO ポート操作](#gpio-ポート操作)
+  - [wire](#wire-1)
+  - [意味論](#意味論-1)
+- [動的バス生成 (BusCreate / BusRelease)](#動的バス生成-buscreate--busrelease)
+  - [wire](#wire-2)
+  - [意味論](#意味論-2)
+- [安全境界](#安全境界)
+- [エラー写像](#エラー写像)
+- [採用しない要素](#採用しない要素)
+- [Hal facade](#hal-facade)
+- [互換性と版管理](#互換性と版管理)
+- [関連](#関連)
+
 ## Transport 層 — frame mux 多重化
 
 wireは **frame v1 codecの単一フレーム列**である。多重化は **frameのKINDと`Data`フレームの
@@ -244,6 +278,11 @@ frame chunkやSourceの短い`peek()`ごとにSTART/prefixまたはcommand/addre
 対象外)。実長を持たない旧protocol v1 serverに新hostが接続した場合だけ、互換動作として要求長を
 実長とみなす。実長が要求長を超える応答は`PROTOCOL_ERROR`である。
 
+転送の完了条件は `tx_consumed >= tx_len` **かつ** `rx_produced >= rx_len` である。device 側 stream
+実行はチャンク単位で write/read を呼ぶため、転送全体にわたる TX+RX 両チャネルロック保持や真の
+同時性は wire 越しには保証されない (ローカル既定実装も方向独立の逐次合成であり、remote だけが
+劣るわけではない)。
+
 ### I2C / SPI atomic transfer
 
 I2C / SPI remote proxyはinline `BusTransfer` opcodeを使い、公開1 transferをserver backendの
@@ -252,6 +291,8 @@ Sourceが短いspanを返してもwire transactionは分割されない。respon
 集約中にSourceが空になった場合、`closed()`または`eof()`なら`BUFFER_UNDERFLOW`、openならretry可能な
 `WOULD_BLOCK`としてwire送信前に返す。現在のatomic APIはSource到着待ちの期限を別に持たないため、暗黙に
 pollや無期限待機を行わない。
+zero-length の transfer も script として送る。device は zero-length チャンクを 1 回実行し、リモート
+`probe` の開通確認はこの経路を使う (NACK はエラーとして返る)。
 
 protocol v1 frame内にrequest/responseを収める保証上限は次の通り。これを超えるatomic要求は
 `UNSUPPORTED`であり、暗黙分割しない。
@@ -373,7 +414,7 @@ host の GPIO read は通信せずキャッシュを読む。device 側で購読
 - `slot` は `GPIOGroup` の GPIO スロット (登録済み `IGPIO` を識別)
 - `port_index` は`IGPIO::getPort()`のlogical port ordinal。個別pinとの対応は`IGPIO::locatePin()`が決める (ESP32ではport0 = GPIO0-31、port1 = GPIO32以降)
 - **deny_mask**: `GPIOGroup` が`(slot, port_index)`ごとに管理。個別pinのsubscribe/monitorとport opcodeは同じ`locatePin()` mappingを使う。`GpioPortRead`は読み出し値を`~deny_mask`でマスクし、`GpioPortWrite`はset_mask / clear_maskの両方を`~deny_mask`でマスクしてから適用する
-- ESP32 実装: `readPort()` は `GPIO_IN_REG` 直読み、`writePort()` は `W1TS`/`W1TC` レジスタへの直書き (read-modify-write なしのアトミック操作)
+- **非 read-modify-write 契約**: `GpioPortWrite` は `set_mask` / `clear_mask` 以外のビットへ影響してはならない。実装はポート値の read-modify-write を行わず、set/clear 専用レジスタ等のアトミック経路で書く (並行する pin 書き込み・watcher poll と競合してもマスク外のビットを壊さない)
 
 ## 動的バス生成 (BusCreate / BusRelease)
 
@@ -438,6 +479,9 @@ host の GPIO read は通信せずキャッシュを読む。device 側で購読
 | channel-id ベース mux (旧 CRC16 + credit 管理チャネル) | frame v1 codec の単一フレーム列 (KIND + Data B3 stream_id) で多重化を表現。別系統のフレーム形式を持たない |
 | 既定での自動再送 | リモート操作は非冪等であり得る。再試行の判断は呼び出し側に委ねる |
 | bytecode への認証埋め込み | 層が違う。transport の責務とする |
+| WiFiClient 依存の transport variant 分裂 | lwIP socket 直叩きの単一実装で足りる。framework ごとに transport を分岐しない |
+| transport 層での DeviceSlot 多重デバイス管理・delimiter 再同期 | 多重化とフレーム境界は frame codec が担う。transport に別系統の多重化機構を持たない |
+| push イベントのレート制限 | opt-in マスクで「監視対象」を意味論として定義する方が、帯域も判定コストも構造的に消える |
 
 ## Hal facade
 

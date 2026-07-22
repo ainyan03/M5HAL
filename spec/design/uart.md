@@ -16,10 +16,7 @@ async executor連携はスコープ外とする。
 - RTS / CTS と buffer size は identity 外だが、同一 TX/RX identity の acquire で値が食い違う場合は
   `INVALID_STATE` を返す (既存 bus は再構成しない)。通常はportable `acquire(cfg)`を使う。
   対応providerではNative / Path identityを、同名`acquire`の`native::borrowed` / `native::managed` policyで指定する。
-- UART は **static-backend policy**。`commitBuses()` は no-op、`hardwareInUse()` は 0。
-  `acquire(LogicalBusConfig)` は I2C/SPI と同じ surface とintent validationを持つが、現時点では
-  pin値によらず `NOT_IMPLEMENTED` を返す。bus生成はportable `acquire(cfg)`が担い、
-  providerはbuildのwinner bindingで固定される。
+- UART は **static-backend policy** ([bus_accessor.md](bus_accessor.md) §UART / I2S / PDM: static-backend policy 参照)。
 
 ```cpp
 auto uart = M5_Hal.UART.acquire(m5hal::uart::BusConfig{m5hal::uart::Tx{17}, m5hal::uart::Rx{16}});
@@ -136,9 +133,8 @@ Access は **non-nestable** であり、同じ accessor に対する二重 `begi
 borrowし、inactiveなら一時 Access を開閉する。旧 `beginTransaction` / `endTransaction` と
 depth/totals 集約は `beginAccess` / `endAccess` および転送単位 status に統合され、公開 API から削除する。
 
-Busの`beginOperation/endOperation/write/read/transfer/readableBytes`はnon-virtual checked入口である。
-TX/RX別slotのContext address、構築元Accessor、Bus、generation、live channel ownerを検査し、複合`transfer`は
-TX/RX二つのContextを同時検査する。providerの派生点はprotected `beginOperationBackend` /
+Contextのチェック機構は [bus_accessor.md](bus_accessor.md) §OperationContext capabilityとchecked facade と同一
+(TX/RX別slot前提もそこで一般化済み)。providerの派生点はprotected `beginOperationBackend` /
 `endOperationBackend` / `writeBackend` / `readBackend` / `transferBackend` / `readableBytesBackend`へ統一し、
 raw owner/configを公開virtual引数として受けない。
 

@@ -16,17 +16,22 @@ hardware PDM-to-PCM filterで得る16-bit mono PCM RXである。WAV、codec、g
   非ネストの`beginAccess()` / `endAccess()`で、開始時にRX lockを取得して`Bus::beginOperation`を1回呼び、
   終了時に`Bus::endOperation`を1回呼んでから解放する。これは物理フレーム境界でなく連続DMA streamの
   RX排他・設定適用区間である。read sugarは既存Accessを借用し、無ければ一時Accessを開閉する。
-- Busの`beginOperation/endOperation/read/readableBytes`はAccessor-owned ContextのBus、Accessor、active、
-  generation、live lock ownerを検査するnon-virtual入口である。providerはprotected
+- Context検査の契約は [bus_accessor.md](bus_accessor.md) §OperationContext capabilityとchecked facade と同一
+  (PDMはRX単一slot)。providerはprotected
   `beginOperationBackend/endOperationBackend/readBackend/readableBytesBackend`だけをoverrideする。
 - 各`read()`は個別の`result_t<size_t>`を返す。`getLastTransferStatus()`は直近read 1件のtransfer id、
   bytes、complete/partial/aborted、errorを保持し、Access全体のbyte totalsは集計しない。
-- `M5_Hal.PDM.acquire(cfg)`はCLK/DINを`Pins` tagのidentityへ射影してbusをinternする。buffer sizeが異なる同一identityの
-  再acquireは`INVALID_STATE`。
 
 現行scopeにPDM TX、raw PDM byte stream、複数DIN lineは含めない。これらをPCM RXのmode fieldや無効pinとして
 先行公開せず、SoC間で共通の意味と利用要求が確定した時点で方向別APIを追加する。standard I2SのBCLK/WS要件は
 このPDM APIの追加によって変わらない。
+
+## Bus の入手
+
+共通機構は [bus_accessor.md](bus_accessor.md) §Bus の保持 を参照。本 kind 固有の差分のみ以下に示す。
+
+- **portable acquireのidentity projection = `Pins` tagのCLK / DIN**。buffer sizeが異なる同一identityの
+  再acquireは`INVALID_STATE`を返す (既存 bus は再構成しない)。
 
 ## ESP-IDF backendとcapability
 

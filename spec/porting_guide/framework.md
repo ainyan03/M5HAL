@@ -2,6 +2,15 @@
 
 > **読者**: 新しい framework variant、HAL kind、chip capability を実装する実装者向け。
 
+## 前提知識
+
+このガイドを読む前に、以下を把握しておく:
+
+- [../architecture.md](../architecture.md) — 層構成と設計原則
+- [../design/bus_accessor.md](../design/bus_accessor.md) — Bus / Accessor の責務分離
+- [../design/data_io.md](../design/data_io.md) — Source / Sink のデータ流通
+- [../design/transfer_desc.md](../design/transfer_desc.md) — per-call メタ情報
+
 SPI バックエンドを例に、framework variant を M5HAL に追加する全手順を示す。
 I2C / UART / I2S / PDM も同じパターンに従う。HAL kindとchip capabilityの追加手順は
 §14と§15に示す。
@@ -334,6 +343,9 @@ DMA 転送する場合は、peek/reserve で得た span を DMA バッファに�
 | `BUSY` | リソースが他で使用中 |
 | `TIMEOUT_ERROR` | 操作がタイムアウト |
 | `INVALID_STATE` | 不正な操作順序 (例: init 前の transfer) |
+
+上表はbackend実装時にどのコードをinit/transferBackendで返すかの最小選択表である。各コードの
+完全な意味は [errors.md](../design/errors.md) §エラー対処 hint 表 を参照。
 
 ## 12. build_check にコンパイルフェンスを追加
 

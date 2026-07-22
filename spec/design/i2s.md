@@ -8,6 +8,8 @@ Philips standard・16bit・mono/stereo** で、raw PCM の搬送までを役割�
 `role` (master = BCLK/WS を生成 / slave = ピアのクロックに追従) で選ぶ。
 WAV 等のコンテナ解釈・デコード・ミキシングは上位 (アプリケーション / example) の責務
 ([goals.md](../goals.md) の「音声のドメインロジックは含めない」を維持する)。
+内蔵 DAC は I2S と異なるペリフェラルであり、同じ設定・転送契約へ統合すると bus abstraction の
+責務が歪むため、I2S kind には吸収しない。
 
 ### Standard I2S と必須 pin
 
@@ -110,20 +112,17 @@ struct Accessor;  // TX + RX 束ね (全二重を 1 つで)
 
 - `TxAccessor` / `RxAccessor` はそれぞれ [data_io.md](data_io.md) の `StreamWriter` /
   `StreamReader` を実装する。汎用ストリームコードがそのまま音声の出力先 / 入力源に使える。
-- **独立 2-mutex** (uart 同型): TX と RX は別チャネルロックを握るため、全二重バスでは
-  片方が write 中でももう片方が read できる (単一ロックなら直列化される)。`Accessor` (束ね)
-  は両チャネルを TX→RX 順で取る。`readUntil` は連続ストリームの I2S には無い (uart 専用)。
-  remote proxy の channel 所有権も同じだが、標準 `RemoteSession` の個々の wire RPC は共通
-  session gate で直列化される。1 RPC 内の全二重は複合 transfer が担う
-  ([remote.md](remote.md) §SEQ)。
+- **TX/RX二重ロックの契約は [uart.md](uart.md) §channel semantics と同型** (TX→RX順取得・非ネストAccess・
+  sugarのborrow規則、remote proxyのchannel所有権とsession gateによる直列化を含む)。I2S固有差分:
+  `readUntil` は連続ストリームの I2S には無い (uart 専用)。
 - 公開ライフサイクルは `beginAccess()` / `endAccess()` であり、**非ネスト**。開始時に方向別
   lock を取得して `Bus::beginOperation(context)` を1回呼び、終了時に
   `Bus::endOperation(context)` を1回呼んでから lock を解放する。ここでの
   Operation は物理フレーム境界ではなく、要求設定を適用し同一方向を排他する連続 stream の
   利用区間である。`write` / `read` sugar は既存 Access を借用し、無ければ一時 Access を開閉する。
-- BusはTX/RX別slotへContext address、Accessor、generation、live channel ownerを登録する。
-  `write/writableBytes`はTX、`read/readableBytes`はRXを検査し、複合`transfer`は二つのContextを同時検査する。
-  providerはprotected `*Backend` hookだけをoverrideし、raw owner/configを公開virtual引数として受けない。
+- Context検査契約は [bus_accessor.md](bus_accessor.md) §OperationContext capabilityとchecked facade と同一
+  (TX/RX別slot前提もそこで一般化済み)。providerはprotected `*Backend` hookだけをoverrideし、raw owner/configを
+  公開virtual引数として受けない。
 - `Accessor` の複合 Access は TX→RX の順に開始し、RX 開始失敗時は TX を rollback する。終了は
   RX→TX。子 accessor が直接 Access 中なら複合開始を `INVALID_STATE` で拒否する。
 - 各 `write` / `read` / 複合 `transfer` は個別の `result_t` を返し、成功・short transfer・失敗を
@@ -136,15 +135,11 @@ struct Accessor;  // TX + RX 束ね (全二重を 1 つで)
 - **portable acquireのidentity projection = `Pins` tagのBCLK / WS / DOUT / DIN**。MCLK / buffer size / role は identity 外だが、
   同一 identity の acquire で食い違う場合は `INVALID_STATE` を返す (既存 bus は再構成しない)。
 - I2S backend は **espidf のみ提供** (software/host では未提供)。
-- I2S は **static-backend policy**。`commitBuses()` は no-op、`hardwareInUse()` は 0。
-  `acquire(LogicalBusConfig)` は I2C/SPI と同じ surface と validation を持つが、現時点では
-  有効な logical request に `NOT_IMPLEMENTED` を返す。bus生成はportable `acquire(cfg)`が担い、
-  providerはbuildのwinner bindingで固定される。
+- I2S は **static-backend policy** ([bus_accessor.md](bus_accessor.md) §UART / I2S / PDM: static-backend policy 参照)。
 - 直接構築 (`i2s::Bus bus; bus.init(cfg);`) も可。
 
-ESP-IDF backendでは、PDMと共通のcontroller leaseを使う。standard I2Sは番号の高いcontrollerから取得して
-I2S0をPDM用に残し、単一controller SoCでは両kindを相互排他にする。この物理controller選択はbackend内部の
-実装詳細であり、static-backend policyの`hardwareInUse() == 0`という公開契約は変えない。
+PDMとの物理controller共有規則は [pdm.md](pdm.md) §standard I2Sとのcontroller排他 を参照 (この選択はbackend内部
+実装であり、static-backend policyの`hardwareInUse() == 0`という公開契約は変えない)。
 
 ## 設定の分担
 

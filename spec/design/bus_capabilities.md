@@ -28,7 +28,9 @@ copyしたsnapshotはBusのclose、local backend hot-swap、remote disconnect後
 
 - `supports(BusFeature)`は対応時true、未知のfeature IDを含め非対応時false
 - `limit(BusLimit)`は提供時`result_t<uint32_t>`の値、未提供・未知IDは`UNSUPPORTED`
-- `generation()`はsnapshotが属するBus backend/session世代を表すopaqueな`uint32_t`
+- `generation()`はsnapshotが属するBus backend/session世代を表すopaqueな`uint32_t`。
+  [bus_accessor.md](bus_accessor.md) §OperationContext capabilityとchecked facade のOperationContext slot
+  generation (Access単位の登録トークン) とは別の軸である
 
 limit値0を「不明」のsentinelとして使わない。不明ならlimit自体を提供しない。既存scalar
 `maxFrequency()`の0（ceiling未申告）とはこの点が異なる。既存scalar queryは互換のため残るが、genericな

@@ -45,7 +45,7 @@ M5HAL は **API 世代** (spec の系統番号) と **リリース版数** (ラ�
 既定は引き続き v0。 `v1` という API 世代は欠番である (世代番号とメジャー版数が
 食い違う組み合わせを作らないよう、 意図的に飛ばしている)。
 
-呼称と版管理の仕組みの詳細は [../README.md](../README.md) §API generations (v0 / v2) and release numbering と [design/v0_v2_coexistence.md](design/v0_v2_coexistence.md) §切替マクロ を参照。
+呼称と版管理の仕組みの詳細は [../README.md](../README.md) §API generations and entry headers と [design/v0_v2_coexistence.md](design/v0_v2_coexistence.md) §切替マクロ を参照。
 
 ## 成功条件 / 2.0.0 ゲート
 

@@ -3,23 +3,8 @@
 > **読者**: 利用者向け。
 
 v0 API 利用者が v2 API に移行する際の指針を示す。
-旧v2 `begin/endTransaction`から統一Access lifecycleへの移行は
-[accessor_lifecycle_migration.md](accessor_lifecycle_migration.md)を参照する。
-
-## 旧v2 Bus取得APIからの移行
-
-旧v2 Bus取得APIを利用するコードは次の形へ移行する。この表はv0からの移行には適用しない。
-
-| 旧v2 prototype | 現行形 | 要点 |
-|---|---|---|
-| `acquire(BusConfig_<variant>{...})` | `acquire(BusConfig{...})` | config型でproviderを選ばない。buildで選ばれたproviderがportable configを受ける |
-| `BackendFor<Config>` | 通常は`Hal.<kind>.acquire(cfg)` | direct provider型が必要な場合だけ`Bus_<variant>::init(...)`をadvanced escape hatchとして使う |
-| `attach(native)` / `open(path)` | `acquire(cfg, native::borrowed(native))` / `acquire(cfg, native::managed(native))` | 対応policyはproviderごとに明示される。未対応の組合せは利用できない |
-| `bus.release()` | registry管理: `Hal.<kind>.close(handle)`、direct: `bus.close()` | registry管理handleのcloseはsole ownerを要求し、成功時にhandleを消費する |
-
-registryから取得したBusは、具象型へdowncastして`close()`を迂回呼出ししてはならない。
-実装もregistry-bound instanceを`INVALID_STATE`で拒否する。direct Busは`close()`成功後に同じ
-オブジェクトを`init()`で再利用できる。
+旧v2 Bus取得API・`begin/endTransaction`から現行v2への移行は
+[legacy_v2_migration.md](legacy_v2_migration.md)を参照する。
 
 ## 基本方針
 

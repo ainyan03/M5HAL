@@ -64,6 +64,8 @@ variants      層を横断するメタ機構                                    
 `ResourceDomain` facadeのco-owned stateであり、`BusRegistry`、`GPIOGroup`、`ServiceRunner`、
 `Allocator`を一つのidentity namespaceに置く。`Hal()`は独立domainを作り、`Hal(domain)`は指定domainを
 共有する。`init()` / `connect("local")` はそのHalのdomainへlocal backendとadapterを束縛する。
+束縛経路での自 variant GPIO 登録 (`addGPIO`) の失敗は invariant break であり、戻り値を握り潰さず
+fail-fast で顕在化させる (正しく束ねられた variant では必ず成功するため、失敗 = 構成バグの即時検出)。
 
 同一domainの同一`ResourceKey`は同じBus/lockへinternされ、別domainではkey値が同じでも別Busになる。
 `ResourceKey`のproduction ABIは全対応targetで32 B固定とし、target幅でidentity表現やregistry layoutを

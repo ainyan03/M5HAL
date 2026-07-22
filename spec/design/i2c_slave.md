@@ -457,10 +457,10 @@ backend では受信の解釈 (先頭 byte = ポインタ、 以降 = レジス�
   | v2 callback fallback | `UNSUPPORTED`。read STOP、実TX量、repeated START理由を観測不能 | `UNSUPPORTED` | opt-inのみ |
 
   LL/BEのqueue経路はISR内でcaller queueを直接操作せず、backend-owned固定staging/event ringからworker taskが
-  replayする。TX byteはFIFOへloadした時点でpopせず、STOP/TX_EMPTYで実消費を確定できたprefixだけをpopし、
-  未clock suffixは順序を保って次回へ残す。実機では、STOP時のFIFO departureが1 byteだけならprefetchはなく全量を
-  確定し、複数byteなら最後の1 byteをshifter候補として保留する。TX_EMPTY等でshifterまでdrainした証拠がある場合は
-  全departureを確定する。この規則をearly NACKの1/3/5 byte readで受け入れている。
+  replayする。FIFO占有からTX byteの実消費 (`Real`/`Fill`) を確定するアルゴリズム (shifter候補の保留基準、
+  early NACK時の受入基準を含む) は
+  [slave_tx_ledger.hpp](../../src/m5_hal/variants/frameworks/espidf/hal/i2c/detail/slave_tx_ledger.hpp) の
+  `SlaveTxLedger` doc comment (`observeFifoOccupancy()` / `confirmBoundaryAndDiscard()`) を正本とする。
   `beginAccess/endAccess`で動的にslave addressを切り替えるLL backendは、shadow register書込み後に
   `i2c_ll_update()`を発行してから受付状態を変更する。inactive fenceにはconfigured 7-bit addressと重ならない
   10-bit `0x3FF`を使うため、通常の7-bit masterに対する受付停止は保証するが、共有bus上のmasterが10-bit
@@ -497,6 +497,12 @@ backend では受信の解釈 (先頭 byte = ポインタ、 以降 = レジス�
     ISR/timeout レースが引き金であり、 M5HAL 固有のバグではない)。 この制約により
     **実用推奨は 400kHz まで**とし、 800kHz は BE flavor と同様に参考 (informational) 止まりとする。
     回復にはチップリセット相当の操作が必要。
+  - **LL 層を直接扱う根拠 (既知の upstream issue)**: IDF v2 slave driver は start / repeated-start /
+    stop を検出できず R/W ビットも読めない ([esp-idf#9036](https://github.com/espressif/esp-idf/issues/9036))。
+    S3 では slave read の先頭に自アドレスが混入する報告 ([arduino-esp32#10145](https://github.com/espressif/arduino-esp32/issues/10145))、
+    callback 不発・TX バッファ異常 ([esp-idf#15592](https://github.com/espressif/esp-idf/issues/15592))、
+    stretch 中に on_request がタスクを起こさない ([esp-idf#15259](https://github.com/espressif/esp-idf/issues/15259)) がある。
+    本実装の LL/BE flavor と TX プリロード方式はこれらを構造的に回避する。
 - 実機 bit-bang slave は edge 捕捉・ACK setup の timing 制約が厳しいため低クロック実験用と
   位置付ける。
 

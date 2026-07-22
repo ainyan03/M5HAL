@@ -329,6 +329,7 @@ errorはAccess-wideにlatchせず、backendがbrokenでなければ同じAccess�
 - register 値は幅に対して範囲チェックされる (1-byte device で `> 0xFF` の register は `INVALID_ARGUMENT`)。 未対応の幅は debug で assert、 release で `INVALID_ARGUMENT`。
 - **2-byte address のデバイス (一部 EEPROM / sensor) は `register_address_bytes = 2` を設定する**。 多数派は 1-byte default。 型駆動・呼び出しごとの幅は無いので、 **幅が無言で誤る/呼び出しスタイル間で食い違うことは起きない** (旧 API の「型 sizeof 経路 vs config 経路」フットガンを解消)。
 - value 側のサイズ・バイト順は呼び出し側責任 (`ConstDataSpan`/`DataSpan` または `Source`/`Sink`)。 big/little-endian の value helper は M5UU 層 (`M5UnitComponent`) の役割。
+- **register address 専用の strong type (`RegAddr` 等) は追加しない** — typed register 定数 (`static constexpr uint8_t REG = …;`) が幅を型に持たせる正準経路として既にあり、第三の流派を増やさない。 register address は 1 引数で順序事故が構造的に起きず、 需要が顕在化すれば非 BREAKING で後から追加できる。
 
 ### raw pointer overload の位置付け
 
@@ -349,19 +350,12 @@ SPI 由来で `writeCommand` を探した場合は `write` / `writeRegister` を
 
 ## software I2C variant の実装方針
 
-`variants::frameworks::software` の I2C master は、 GPIO `Pin` を open-drain 相当で駆動する bit-bang 実装として扱う。 実装は START / STOP / byte write / byte read / transaction を小さな service に分け、 呼び出し元が測った経過 (`ServiceContext::elapsed`、 [service.md](service.md) §時間契約) で **service private の仮想時計**を進めて駆動する。 detail service 群は仮想時計上の 32-bit tick を受け取り、 due 値を同じ単位で持ち、 加算と mod 2^32 比較しかしない (絶対 `fastTick()` を保存・比較しない)。 `MasterAccessConfig::freq` から得た half period は fast tick 単位へ変換して使い、 `micros()` / `esp_timer_get_time()` の呼び出しコストを hot path から外す。 native test は仮想時計を素の数値で直接進められる。
+`variants::frameworks::software` の I2C master は、 GPIO `Pin` を open-drain 相当で駆動する bit-bang 実装として扱う。 START / STOP / byte write / byte read / transaction の各 service は、 呼び出し元が測った経過 (`ServiceContext::elapsed`、 [service.md](service.md) §時間契約) で **service private の仮想時計**を進めて駆動する。
 
-**転送全体デッドライン (`wire_timeout_ms`) の測定クロック**: 仮想時計は gap-drop ([service.md](service.md)) で実時間より遅れうるため、 デッドラインには使わない。 コア間共有の単調クロック (`service::sharedNowUs()`) で開始時刻との差分により判定し、 読みコスト (~100+ cycles) を抑えるため**ポール回数で償却** (初回 + 256 ポールごと) する。 したがってタイムアウトの発火精度は償却量子ぶん粗くなる (クロックストレッチ個別上限は従来どおり仮想時計上で毎回判定)。
+**転送全体デッドライン (`wire_timeout_ms`) の測定クロック**: 仮想時計は gap-drop ([service.md](service.md)) で実時間より遅れうるため、 デッドラインには使わない。 コア間共有の単調クロック (`service::sharedNowUs()`) で開始時刻との差分により別途判定する (クロックストレッチ個別上限は従来どおり仮想時計上で毎回判定する)。
 
-write buffer は頻出経路なので、 `MasterTransactionService` 側に fast path を持つ。 具体的には `Operation::WriteBuffer` の dispatch を先頭で処理し、 byte write service を直接呼び、 2 byte 目以降は同じ line driver / timing を保持したまま byte state だけを restart する。 これは service 概念を維持したまま、 byte 列送信中の呼び出し層と分岐を減らすための最適化である。
-
-transaction serviceが公開する開始操作は製品の組立て経路で使うaddress / buffer read-write / STOPに限定する。STARTや単発byteのprimitiveは各専用serviceを直接testし、transaction側にtest専用dispatchを持たせない。
-
-byte write / byte read の定常クロックは、各 edge の実行時刻から `now + half_period` で次回予約するのではなく、前回 due に half period を加算して理想位相を維持する。 これにより `service()` dispatch や GPIO 操作の処理時間が SCL half period に毎回上乗せされることを避け、100kHz/400kHz のような低めの設定でも wire 周波数が設定値から下振れしにくくなる。 ただし service の遅延が大きく、次の due が現在時刻を過ぎている場合は `now + half_period` に再同期する。これは遅れを取り戻そうとして複数 edge を runner 速度で連続出力し、設定より大幅に速いクロック burst になることを避けるためである。 START / STOP の setup/hold や clock stretch 解除後は、実際に SCL/SDA の条件が成立した時刻から half period を取り直す。
-
-clock stretchのrelease / waiting / timeout遷移は全primitiveで同じtiming helperを通し、解除後の再同期と`TIMEOUT_ERROR`を一つの経路で扱う。SCLが最初からhighの場合の次edge予約は、定常byte clockの理想位相維持とSTART / STOPのsetup/holdの意味差を保つため、各primitive側に残す。
-
-SCL は `MasterLineDriver::writeSclHigh()` / `writeSclLow()` に分ける。 SCL は全 bit で立ち上げ/立ち下げが発生するため、 bool 引数経由の分岐を避け、 GPIO variant が high/low 専用 path (例: ESP32 の set/clear register) へ落としやすくする。 SDA は bit 値が data に依存するため `writeSda(bool)` のままとする。
+内部アルゴリズム (fast tick 変換、 位相維持、 fast path 分岐等) は [i2c.inl](../../src/m5_hal/variants/frameworks/software/hal/i2c/i2c.inl) の実装コメントを正本とする。
+transaction service が公開する開始操作は、 製品の組立て経路で使う address / buffer read-write / STOP に限定する。 START や単発 byte の primitive は各専用 service を直接 test し、 transaction 側に test 専用 dispatch を持たせない。
 
 ### timing と物理層の注意
 
@@ -395,18 +389,7 @@ master の SCL クロック (`MasterAccessConfig::freq`) は、ESP ターゲッ�
 
 ## RAII (ScopedAccess) との組み合わせ
 
-各 sugar は内部で `beginAccess` → `transfer` → `endAccess` を行う。 連続アクセスは `ScopedAccess` で外側を囲う。
-
-```cpp
-{
-    m5::hal::v2::bus::ScopedAccess access{accessor};
-    if (access.has_error()) return;
-
-    accessor.writeRegister(REG_CTRL_MEAS, VAL_MODE);
-    accessor.readRegister(REG_DATA, dst_span);
-    // 内部の beginAccess/endAccess は ScopedAccess の 1 段で吸収される
-}
-```
+各 sugar は内部で `beginAccess` → `transfer` → `endAccess` を行う。 連続アクセスを `ScopedAccess` で外側を囲う一般形は [bus_accessor.md](bus_accessor.md) §利用形 を参照。
 
 ## 関連
 
